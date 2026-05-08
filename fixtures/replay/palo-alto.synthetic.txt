@@ -1,0 +1,12 @@
+admin@pa-lab-01> show system info
+hostname: pa-lab-01
+model: PA-VM
+sw-version: 11.1.0
+admin@pa-lab-01> show interface all
+name                id    vsys zone             forwarding               tag    address
+ethernet1/1         16    1    untrust          vr:default               0      192.0.2.10/24
+ethernet1/2.1191    17    1    trust            vr:default               1191   198.51.100.10/24
+tunnel.10           20    1    vpn              vr:default               0      203.0.113.10/32
+admin@pa-lab-01> show routing route
+S 0.0.0.0/0 [10/0] via 192.0.2.1, ethernet1/1
+O 198.51.100.0/24 [110/20] via tunnel.10

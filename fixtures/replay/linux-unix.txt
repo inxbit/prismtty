@@ -1,0 +1,12 @@
+root@linux-lab:~# hostnamectl
+Operating System: Ubuntu 24.04.4 LTS
+Kernel: Linux 6.8.0-110-generic
+root@linux-lab:~# ip -br addr
+lo               UNKNOWN        127.0.0.1/8 ::1/128
+ens18            UP             192.0.2.50/24
+root@linux-lab:~# ss -tulpen
+tcp   LISTEN 0 4096 0.0.0.0:22    0.0.0.0:* users:(("sshd",pid=101,fd=3))
+udp   UNCONN 0 0    127.0.0.53:53 0.0.0.0:* users:(("systemd-resolve",pid=88,fd=13))
+root@linux-lab:~# systemctl --failed
+UNIT              LOAD   ACTIVE SUB    DESCRIPTION
+backup.service    loaded failed failed Synthetic backup failure

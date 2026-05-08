@@ -1,0 +1,34 @@
+#compdef prismtty ptty ct
+
+local -a profiles
+profiles=(generic juniper cisco versa arista fortinet palo-alto linux-unix)
+
+_arguments -C \
+  '(-p --profile)'{-p,--profile}'[force a profile]:profile:($profiles)' \
+  '--no-auto-detect[use only generic unless profiles are forced]' \
+  '(-c --config)'{-c,--config}'[load a ChromaTerm-compatible YAML config]:config:_files -g "*.yml *.yaml"' \
+  '--strip-ansi[strip existing ANSI before highlighting]' \
+  '--show-profile[print selected profiles to stderr]' \
+  '--local-echo[locally echo typed printable keys for no-echo device sessions]' \
+  '--trace-io[append hex-encoded PTY input/output diagnostics]:trace file:_files' \
+  '(-R --rgb)'{-R,--rgb}'[force RGB color output]' \
+  '--pcre[accepted for ChromaTerm compatibility]' \
+  '(-b --benchmark)'{-b,--benchmark}'[print per-rule benchmark timings]' \
+  '(-r --reload)'{-r,--reload}'[reload running PrismTTY sessions]' \
+  '(-h --help)'{-h,--help}'[show help]' \
+  '(-V -v --version)'{-V,-v,--version}'[show version]' \
+  '1: :->command' \
+  '*:: :->args'
+
+case $state in
+  command)
+    _values 'command' profiles
+    ;;
+  args)
+    if [[ $words[2] == profiles ]]; then
+      _values 'profiles subcommand' list show validate test
+    else
+      _normal
+    fi
+    ;;
+esac

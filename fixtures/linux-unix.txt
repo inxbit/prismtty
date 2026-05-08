@@ -1,0 +1,5 @@
+root@server:~# systemctl status sshd
+sshd.service - OpenSSH server daemon
+     Loaded: loaded (/usr/lib/systemd/system/sshd.service; enabled)
+     Active: active (running)
+May 06 18:30:00 server sshd[100]: error: failed password for root from 192.0.2.50 port 51222

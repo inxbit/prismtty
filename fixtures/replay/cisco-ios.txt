@@ -1,0 +1,16 @@
+LAB-IOS-01#show version
+Cisco IOS XE Software, Version 17.09.04
+LAB-IOS-01#show interfaces description
+Interface              Status         Protocol Description
+Gi1/0/1                up             up       Uplink to LAB-CORE
+Gi1/0/2                down           down     Spare access port
+Po10                   up             up       Bundle to DIST-A
+Vlan1191               up             up       Synthetic users VLAN
+LAB-IOS-01#show ip route
+O        192.0.2.0/24 [110/20] via 198.51.100.1, 00:00:14, Vlan1191
+B        203.0.113.0/24 [20/0] via 198.51.100.2, 00:01:02
+LAB-IOS-01#show running-config | section router ospf
+router ospf 10
+ router-id 192.0.2.22
+ network 198.51.100.0 0.0.0.255 area 0
+ network 192.0.2.0 0.0.0.255 area 0

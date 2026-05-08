@@ -1,0 +1,5 @@
+Router#show ip interface brief
+Interface              IP-Address      OK? Method Status                Protocol
+Gi0/1                  192.0.2.1       YES manual up                    down
+Po10                   198.51.100.2    YES manual up                    up
+%LINK-3-UPDOWN: Interface Gi0/1, changed state to down

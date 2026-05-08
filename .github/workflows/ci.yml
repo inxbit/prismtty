@@ -1,0 +1,28 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    name: Test
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install PCRE2
+        run: |
+          if [[ "${{ runner.os }}" == "macOS" ]]; then
+            brew install pcre2 pkg-config
+          else
+            sudo apt-get update
+            sudo apt-get install -y libpcre2-dev pkg-config
+          fi
+      - run: cargo fmt --check
+      - run: cargo test
+      - run: cargo build --release

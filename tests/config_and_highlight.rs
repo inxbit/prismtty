@@ -1,0 +1,1584 @@
+use prismtty::highlight::strip_ansi;
+use prismtty::style::{ColorMode, Style};
+use prismtty::{Highlighter, PrismConfig, ProfileStore, StreamingHighlighter};
+
+#[test]
+fn loads_chromaterm_yaml_with_lookarounds_and_capture_styles() {
+    let yaml = r##"
+rules:
+  - description: advanced lookaround
+    regex: (?<=foo)bar(?=baz)
+    color: f#ff0000 bold
+  - description: grouped prompt
+    regex: "(user)(@)(host>)"
+    color:
+      1: f#00bfff bold
+      2: f#00ffc0
+      3: f#ffffff bold
+"##;
+
+    let config = PrismConfig::from_chromaterm_yaml(yaml).expect("chromaterm config loads");
+    let highlighter = Highlighter::from_config(config).expect("rules compile");
+
+    let output = highlighter.highlight_str("foobarbaz user@host>\n");
+
+    assert!(output.contains("\x1b[1;38;2;255;0;0mbar\x1b[0m"));
+    assert!(output.contains("\x1b[1;38;2;0;191;255muser\x1b[0m"));
+    assert!(output.contains("\x1b[38;2;0;255;192m@\x1b[0m"));
+    assert!(output.contains("\x1b[1;38;2;255;255;255mhost>\x1b[0m"));
+}
+
+#[test]
+fn ansi16_color_mode_keeps_core_prismtty_colors_distinct_with_short_sgr() {
+    let interface = Style::parse("f#0099ff").expect("interface style parses");
+    let ip = Style::parse("f#00ffff").expect("ip style parses");
+    let up = Style::parse("f#00ff00").expect("up style parses");
+    let down = Style::parse("f#ff0000").expect("down style parses");
+    let warning = Style::parse("f#ff9900").expect("warning style parses");
+    let mac = Style::parse("f#ff9aff").expect("mac style parses");
+
+    assert_eq!(
+        interface.ansi_start_with_mode(ColorMode::Ansi16),
+        "\x1b[94m"
+    );
+    assert_eq!(ip.ansi_start_with_mode(ColorMode::Ansi16), "\x1b[96m");
+    assert_eq!(up.ansi_start_with_mode(ColorMode::Ansi16), "\x1b[92m");
+    assert_eq!(down.ansi_start_with_mode(ColorMode::Ansi16), "\x1b[91m");
+    assert_eq!(warning.ansi_start_with_mode(ColorMode::Ansi16), "\x1b[33m");
+    assert_eq!(mac.ansi_start_with_mode(ColorMode::Ansi16), "\x1b[95m");
+}
+
+#[test]
+fn loads_chromaterm_palette_named_captures_group_zero_and_extra_styles() {
+    let yaml = r##"
+palette:
+  prompt-user: "#00bfff"
+  prompt-host: "#ffffff"
+  banner: "#333333"
+rules:
+  - description: whole prompt fallback
+    regex: (?P<user>\w+)(@)(?P<host>[\w-]+>)
+    color:
+      user: f.prompt-user bold underline
+      host: f.prompt-host italic
+  - description: whole line background
+    regex: ^banner$
+    color:
+      0: b.banner invert strike blink
+"##;
+
+    let config = PrismConfig::from_chromaterm_yaml(yaml).expect("chromaterm config loads");
+    let highlighter = Highlighter::from_config(config).expect("rules compile");
+
+    let output = highlighter.highlight_str("admin@router1>\nbanner\n");
+
+    assert!(output.contains("\x1b[1;4;38;2;0;191;255madmin\x1b[0m"));
+    assert!(output.contains("\x1b[3;38;2;255;255;255mrouter1>\x1b[0m"));
+    assert!(output.contains("\x1b[5;7;9;48;2;51;51;51mbanner\x1b[0m"));
+}
+
+#[test]
+fn non_exclusive_chromaterm_rules_merge_attributes_by_type() {
+    let yaml = r##"
+rules:
+  - description: error foreground
+    regex: error
+    color: f#ff0000
+  - description: error underline
+    regex: error
+    color: underline
+"##;
+
+    let config = PrismConfig::from_chromaterm_yaml(yaml).expect("chromaterm config loads");
+    let highlighter = Highlighter::from_config(config).expect("rules compile");
+
+    let output = highlighter.highlight_str("error\n");
+
+    assert!(output.contains("\x1b[4;38;2;255;0;0merror\x1b[0m"));
+}
+
+#[test]
+fn exclusive_chromaterm_rules_prevent_later_rules_inside_their_span() {
+    let yaml = r##"
+rules:
+  - description: quoted string
+    regex: '"[^"]+"'
+    exclusive: true
+    color: f#ffffff
+  - description: bad status
+    regex: error
+    color: f#ff0000 bold
+"##;
+
+    let config = PrismConfig::from_chromaterm_yaml(yaml).expect("chromaterm config loads");
+    let highlighter = Highlighter::from_config(config).expect("rules compile");
+
+    let output = highlighter.highlight_str(r#""error" error"#);
+
+    assert!(output.contains("\x1b[38;2;255;255;255m\"error\"\x1b[0m"));
+    assert!(output.contains("\x1b[1;38;2;255;0;0merror\x1b[0m"));
+    assert!(!output.contains("\x1b[1;38;2;255;0;0merror\"\x1b[0m"));
+}
+
+#[test]
+fn exclusive_chromaterm_rules_block_later_matches_that_cross_their_span() {
+    let yaml = r##"
+rules:
+  - description: protected word
+    regex: error
+    exclusive: true
+    color: f#ffffff
+  - description: crossing phrase
+    regex: error next
+    color: f#ff0000 bold
+"##;
+
+    let config = PrismConfig::from_chromaterm_yaml(yaml).expect("chromaterm config loads");
+    let highlighter = Highlighter::from_config(config).expect("rules compile");
+
+    let output = highlighter.highlight_str("error next");
+
+    assert!(output.contains("\x1b[38;2;255;255;255merror\x1b[0m next"));
+    assert!(!output.contains("\x1b[1;38;2;255;0;0mnext\x1b[0m"));
+}
+
+#[test]
+fn chromaterm_prompt_rules_match_each_line_and_override_builtin_prompt_color() {
+    let store = ProfileStore::builtin();
+    let builtin = PrismConfig::from_profiles(&store, &["juniper"]).expect("juniper loads");
+    let user = PrismConfig::from_chromaterm_yaml(
+        r##"
+rules:
+  - description: User highlight Juniper
+    regex: (^\w+)(@)(.*>)
+    color:
+      1: f#00bfff bold
+      2: f#00ffc0 bold
+      3: f#ffffff bold
+"##,
+    )
+    .expect("chromaterm config loads");
+    let highlighter = Highlighter::from_config(builtin.merge(user)).expect("rules compile");
+
+    let output = highlighter.highlight_str("JUNOS banner\nlabuser@LAB-MX-01>\n");
+
+    assert!(output.contains("\x1b[1;38;2;0;191;255mlabuser\x1b[0m"));
+    assert!(output.contains("\x1b[1;38;2;0;255;192m@\x1b[0m"));
+    assert!(output.contains("\x1b[1;38;2;255;255;255mLAB-MX-01>\x1b[0m"));
+}
+
+#[test]
+fn preserves_existing_ansi_when_highlighting_visible_text() {
+    let yaml = r##"
+rules:
+  - description: bad status
+    regex: (?i)\berror\b
+    color: f#ff0000 bold
+"##;
+
+    let config = PrismConfig::from_chromaterm_yaml(yaml).expect("chromaterm config loads");
+    let highlighter = Highlighter::from_config(config).expect("rules compile");
+
+    let output = highlighter.highlight_str("\x1b[32mservice error tail\x1b[0m\n");
+
+    assert!(output.contains("\x1b[32m"));
+    assert!(output.contains("\x1b[1;38;2;255;0;0merror\x1b[0m"));
+    assert!(output.contains("service "));
+    assert!(output.contains("error\x1b[0m\x1b[32m tail"));
+}
+
+#[test]
+fn preserves_composed_native_sgr_after_highlighted_prompt_time() {
+    let yaml = r##"
+rules:
+  - description: prompt time
+    regex: \b\d{2}:\d{2}:\d{2}\b
+    color: f#ffff80
+"##;
+
+    let config = PrismConfig::from_chromaterm_yaml(yaml).expect("chromaterm config loads");
+    let highlighter = Highlighter::from_config(config).expect("rules compile");
+    let input = "\x1b[48;2;20;30;40m\x1b[38;2;200;210;220m10:29:58 PM\x1b[0m\n";
+
+    let output = highlighter.highlight_str(input);
+
+    assert!(output.contains("\x1b[38;2;255;255;128m10:29:58\x1b[0m"));
+    assert!(
+        output.contains("\x1b[38;2;200;210;220;48;2;20;30;40m PM")
+            || output.contains("\x1b[48;2;20;30;40;38;2;200;210;220m PM"),
+        "{output:?}"
+    );
+}
+
+#[test]
+fn streaming_highlighter_bypasses_alternate_screen_apps() {
+    let store = ProfileStore::builtin();
+    let config = PrismConfig::from_profiles(&store, &["generic"]).expect("generic loads");
+    let highlighter = Highlighter::from_config(config).expect("rules compile");
+    let mut streaming = StreamingHighlighter::new(highlighter);
+    let htop_like = "\x1b[?1049h\x1b[38;2;77;166;255m192.0.2.1 down\x1b[0m\x1b[?1049l";
+
+    let output = streaming.push_str(&format!("before 10.0.0.1 {htop_like} after 10.0.0.2"));
+    let output = format!(
+        "{output}{}",
+        String::from_utf8(streaming.finish()).expect("output remains UTF-8")
+    );
+
+    assert!(output.contains("\x1b[38;2;0;255;255m10.0.0.1\x1b[0m"));
+    assert!(output.contains(htop_like));
+    assert!(output.contains("\x1b[38;2;0;255;255m10.0.0.2\x1b[0m"));
+    assert!(!output.contains("\x1b[38;2;0;255;255m192.0.2.1"));
+}
+
+#[test]
+fn streaming_highlighter_keeps_alternate_screen_bypass_across_chunks() {
+    let store = ProfileStore::builtin();
+    let config = PrismConfig::from_profiles(&store, &["generic"]).expect("generic loads");
+    let highlighter = Highlighter::from_config(config).expect("rules compile");
+    let mut streaming = StreamingHighlighter::new(highlighter);
+
+    let first = streaming.push_str("\x1b[?1049h\x1b[38;2;77;166;255m192.0.");
+    let second = streaming.push_str("2.1 down\x1b[0m");
+    let third = streaming.push_str("\x1b[?1049l 10.0.0.2");
+    let output = format!(
+        "{first}{second}{third}{}",
+        String::from_utf8(streaming.finish()).expect("output remains UTF-8")
+    );
+
+    assert!(output.contains("\x1b[38;2;77;166;255m192.0.2.1 down\x1b[0m"));
+    assert!(output.contains("\x1b[38;2;0;255;255m10.0.0.2\x1b[0m"));
+    assert!(!output.contains("\x1b[38;2;0;255;255m192.0.2.1"));
+}
+
+#[test]
+fn interactive_streaming_highlighter_does_not_token_buffer_alternate_screen_chunks() {
+    let store = ProfileStore::builtin();
+    let config = PrismConfig::from_profiles(&store, &["generic"]).expect("generic loads");
+    let highlighter = Highlighter::from_config(config).expect("rules compile");
+    let mut streaming = StreamingHighlighter::new_interactive(highlighter);
+
+    let enter = "\x1b[?1049hPID USER Command";
+    let redraw = "\x1b[H1234 admin running";
+
+    assert_eq!(streaming.push_str(enter), enter);
+    assert_eq!(streaming.push_str(redraw), redraw);
+}
+
+#[test]
+fn interactive_streaming_highlighter_buffers_only_incomplete_alternate_screen_escapes() {
+    let store = ProfileStore::builtin();
+    let config = PrismConfig::from_profiles(&store, &["generic"]).expect("generic loads");
+    let highlighter = Highlighter::from_config(config).expect("rules compile");
+    let mut streaming = StreamingHighlighter::new_interactive(highlighter);
+
+    let first = streaming.push_str("\x1b[?1049hCPU%\x1b[");
+    let second = streaming.push_str("39mPID USER Command");
+
+    assert_eq!(first, "\x1b[?1049hCPU%");
+    assert_eq!(second, "\x1b[39mPID USER Command");
+}
+
+#[test]
+fn interactive_streaming_highlighter_preserves_htop_header_sgr_in_alternate_screen() {
+    let store = ProfileStore::builtin();
+    let config = PrismConfig::from_profiles(&store, &["generic"]).expect("generic loads");
+    let highlighter = Highlighter::from_config(config).expect("rules compile");
+    let mut streaming = StreamingHighlighter::new_interactive(highlighter);
+
+    let enter = "\x1b[?1049h\x1b[1;40r\x1b(B\x1b[m\x1b[4l\x1b[?7h\x1b[?1h\x1b=";
+    assert_eq!(streaming.push_str(enter), enter);
+
+    let header = concat!(
+        "\x1b[8;61HUptime: \x1b(B\x1b[0;1m\x1b[36m21 days, 16:11:14",
+        "\x1b[10;3H\x1b(B\x1b[0m\x1b[32m\x1b[42m[",
+        "\x1b[30m\x1b[42mMain",
+        "\x1b[32m\x1b[42m]",
+        "\x1b[11;5H\x1b[30m\x1b[42m\x1b[1K PID USER       PRI",
+        "\x1b[30m\x1b[46m CPU%\x1b[30m\x1b[42mMEM%   TIME+  Command",
+    );
+
+    assert_eq!(streaming.push_str(header), header);
+}
+
+#[test]
+fn interactive_streaming_highlighter_applies_user_rules_in_alternate_screen() {
+    let config = PrismConfig::from_chromaterm_yaml(
+        r##"
+rules:
+  - description: process owner
+    regex: \boperator\b
+    color: f#00ffff
+"##,
+    )
+    .expect("chromaterm config loads");
+    let highlighter = Highlighter::from_config(config).expect("rules compile");
+    let mut streaming = StreamingHighlighter::new_interactive(highlighter);
+
+    let enter = "\x1b[?1049h\x1b[1;40r\x1b(B\x1b[m\x1b[?7h";
+    assert_eq!(streaming.push_str(enter), enter);
+
+    let row = "\x1b[13;5H\x1b[39;49m\x1b(B\x1b[m1234 operator\x1b[22G17";
+    let output = streaming.push_str(row);
+
+    assert!(output.contains("\x1b[13;5H"));
+    assert!(
+        output.contains("\x1b[38;2;0;255;255moperator"),
+        "{output:?}"
+    );
+    assert_eq!(strip_ansi(output.as_bytes()), strip_ansi(row.as_bytes()));
+}
+
+#[test]
+fn interactive_streaming_highlighter_keeps_charset_sequences_intact_inside_overlay() {
+    let config = PrismConfig::from_chromaterm_yaml(
+        r##"
+rules:
+  - description: process owner
+    regex: \boperator\b
+    color: f#00ffff
+"##,
+    )
+    .expect("chromaterm config loads");
+    let highlighter = Highlighter::from_config(config).expect("rules compile");
+    let mut streaming = StreamingHighlighter::new_interactive(highlighter);
+
+    let enter = "\x1b[?1049h\x1b[1;40r\x1b(B\x1b[m\x1b[?7h";
+    assert_eq!(streaming.push_str(enter), enter);
+
+    let row = "1234 operator \x1b(B running";
+    let output = streaming.push_str(row);
+
+    assert!(output.contains("operator \x1b(B"), "{output:?}");
+    assert!(!output.contains("\x1b(\x1b["), "{output:?}");
+    assert_eq!(strip_ansi(output.as_bytes()), strip_ansi(row.as_bytes()));
+}
+
+#[test]
+fn highlighter_preserves_utf8_terminal_glyphs_without_mojibake() {
+    let config = PrismConfig::default();
+    let highlighter = Highlighter::from_config(config).expect("empty config compiles");
+    let input = "CPU: ━━━━━━━ ã é 🚀 \n";
+
+    let output = highlighter.highlight_str(input);
+
+    assert_eq!(output, input);
+}
+
+#[test]
+fn detects_builtin_profiles_from_network_prompts_and_output() {
+    let store = ProfileStore::builtin();
+
+    let juniper = store.detect_profiles("admin@mx480> show route\n");
+    assert!(juniper.iter().any(|profile| profile == "juniper"));
+
+    let cisco = store.detect_profiles("Router#show ip interface brief\n");
+    assert!(cisco.iter().any(|profile| profile == "cisco"));
+
+    let palo_alto = store.detect_profiles("admin@PA-VM> show system info\n");
+    assert!(palo_alto.iter().any(|profile| profile == "palo-alto"));
+
+    let linux = store.detect_profiles("root@server:~# systemctl status sshd\n");
+    assert!(linux.iter().any(|profile| profile == "linux-unix"));
+
+    let ubuntu_banner = store.detect_profiles(
+        "OS: Ubuntu 24.04.4 LTS x86_64\nKernel: Linux 6.8.0-110-generic\nTerminal: /dev/pts/0\n",
+    );
+    assert!(ubuntu_banner.iter().any(|profile| profile == "linux-unix"));
+
+    let cisco_prompt = store.detect_profiles("CORE-SW01#show version\nCisco IOS XE Software\n");
+    assert!(cisco_prompt.iter().any(|profile| profile == "cisco"));
+
+    let nexus_banner = store.detect_profiles("Cisco Nexus Operating System Software\n");
+    assert!(nexus_banner.iter().any(|profile| profile == "cisco"));
+
+    let fortinet_prompt = store.detect_profiles("FGVM04TM22000000 # get system status\n");
+    assert!(fortinet_prompt.iter().any(|profile| profile == "fortinet"));
+}
+
+#[test]
+fn detects_and_highlights_arubacx_profile() {
+    let store = ProfileStore::builtin();
+    let detected = store.detect_profiles(
+        "LAB-ARUBA-01# show version\nArubaOS-CX 10.13.1000\nhpe-restd Event|7708|LOG_INFO|AMM|1/1|\n",
+    );
+    assert!(detected.iter().any(|profile| profile == "arubacx"));
+    assert!(!detected.iter().any(|profile| profile == "cisco"));
+
+    let config = PrismConfig::from_profiles(&store, &["arubacx"]).expect("arubacx loads");
+    let highlighter = Highlighter::from_config(config).expect("rules compile");
+    let output = highlighter.highlight_str("1/1/1 up\nlag10 up\nvlan1191 down\n");
+
+    assert!(output.contains("\x1b[38;2;0;153;255m1/1/1"));
+    assert!(output.contains("\x1b[38;2;0;153;255mlag10"));
+    assert!(output.contains("\x1b[38;2;0;153;255mvlan1191"));
+}
+
+#[test]
+fn detects_arista_from_ceos_banner_and_highlights_eos_interfaces() {
+    let store = ProfileStore::builtin();
+    let detected = store.detect_profiles(
+        "ceos-lab-01#show version\nArista cEOSLab\nSoftware image version: 4.36.0F\n",
+    );
+    assert!(detected.iter().any(|profile| profile == "arista"));
+
+    let config = PrismConfig::from_profiles(&store, &["arista"]).expect("arista loads");
+    let highlighter = Highlighter::from_config(config).expect("rules compile");
+    let output =
+        highlighter.highlight_str("Ethernet1 up\nEt2 down\nPort-Channel10 up\nVlan1191 up\n");
+
+    assert!(output.contains("\x1b[38;2;0;153;255mEthernet1"));
+    assert!(output.contains("\x1b[38;2;0;153;255mEt2"));
+    assert!(output.contains("\x1b[38;2;0;153;255mPort-Channel10"));
+    assert!(output.contains("\x1b[38;2;0;153;255mVlan1191"));
+}
+
+#[test]
+fn cisco_nexus_interface_status_highlights_operational_reason_codes() {
+    let store = ProfileStore::builtin();
+    let config = PrismConfig::from_profiles(&store, &["cisco"]).expect("cisco loads");
+    let highlighter = Highlighter::from_config(config).expect("rules compile");
+
+    let output = highlighter.highlight_str(
+        "Eth1/31 LAB suspended trunk auto auto QSFP-40G-SR-BD\n\
+         Eth1/50 LAB notconnec trunk auto auto 10Gbase-SR\n\
+         Eth1/56 -- xcvrAbsen routed auto auto --\n\
+         Po24 LAB noOperMem trunk auto auto --\n",
+    );
+
+    assert!(
+        output.contains("\x1b[1;38;2;255;0;0msuspended\x1b[0m"),
+        "{output:?}"
+    );
+    assert!(
+        output.contains("\x1b[1;38;2;255;0;0mnotconnec\x1b[0m"),
+        "{output:?}"
+    );
+    assert!(
+        output.contains("\x1b[38;2;255;165;0mxcvrAbsen\x1b[0m"),
+        "{output:?}"
+    );
+    assert!(
+        output.contains("\x1b[38;2;255;165;0mnoOperMem\x1b[0m"),
+        "{output:?}"
+    );
+}
+
+#[test]
+fn palo_alto_profile_highlights_interfaces() {
+    let store = ProfileStore::builtin();
+    let detected = store
+        .detect_profiles("admin@pa-lab-01> show system info\nmodel: PA-VM\nsw-version: 11.1.0\n");
+    assert!(detected.iter().any(|profile| profile == "palo-alto"));
+    assert!(!detected.iter().any(|profile| profile == "juniper"));
+
+    let config = PrismConfig::from_profiles(&store, &["palo-alto"]).expect("palo alto loads");
+    let highlighter = Highlighter::from_config(config).expect("rules compile");
+    let output = highlighter
+        .highlight_str("ethernet1/1 up\nethernet1/2.1191 up\ntunnel.10 down\nloopback.1 up\n");
+
+    assert!(output.contains("\x1b[38;2;0;153;255methernet1/1"));
+    assert!(output.contains("\x1b[38;2;0;153;255methernet1/2.1191"));
+    assert!(output.contains("\x1b[38;2;0;153;255mtunnel.10"));
+    assert!(output.contains("\x1b[38;2;0;153;255mloopback.1"));
+}
+
+#[test]
+fn versa_profile_highlights_interfaces_and_bgp_state() {
+    let store = ProfileStore::builtin();
+    let detected = store
+        .detect_profiles("admin@versa-lab-01> show interfaces brief\nSoftware Version: 22.1.4\n");
+    assert!(detected.iter().any(|profile| profile == "versa"));
+    assert!(!detected.iter().any(|profile| profile == "juniper"));
+
+    let config = PrismConfig::from_profiles(&store, &["versa"]).expect("versa loads");
+    let highlighter = Highlighter::from_config(config).expect("rules compile");
+    let output = highlighter.highlight_str("vni-0/0 up\ntvi-0/332 up\nptvi-1 down\nEstablished\n");
+
+    assert!(output.contains("\x1b[38;2;0;153;255mvni-0/0"));
+    assert!(output.contains("\x1b[38;2;0;153;255mtvi-0/332"));
+    assert!(output.contains("\x1b[38;2;0;153;255mptvi-1"));
+    assert!(output.contains("\x1b[1;38;2;77;166;255mEstablished"));
+}
+
+#[test]
+fn arista_detection_does_not_match_generic_eos_substring() {
+    let store = ProfileStore::builtin();
+    let detected = store.detect_profiles("stereos service ok\n");
+    assert!(!detected.iter().any(|profile| profile == "arista"));
+}
+
+#[test]
+fn arista_detection_requires_vendor_context_for_software_image_version() {
+    let store = ProfileStore::builtin();
+    let detected =
+        store.detect_profiles("router# show version\nSoftware image version: generic 1.0\n");
+
+    assert!(detected.iter().any(|profile| profile == "cisco"));
+    assert!(!detected.iter().any(|profile| profile == "arista"));
+}
+
+#[test]
+fn panos_and_versa_detection_do_not_match_cisco_interface_brief() {
+    let store = ProfileStore::builtin();
+    let detected = store.detect_profiles(
+        "CORE# show interfaces brief\nInterface Ethernet1/1 is up\nCisco IOS XE Software\n",
+    );
+    assert!(detected.iter().any(|profile| profile == "cisco"));
+    assert!(!detected.iter().any(|profile| profile == "palo-alto"));
+    assert!(!detected.iter().any(|profile| profile == "versa"));
+}
+
+#[test]
+fn palo_alto_detection_requires_vendor_context_for_show_system_info() {
+    let store = ProfileStore::builtin();
+    let detected = store.detect_profiles("router# show system info\nmodel: generic\n");
+
+    assert!(detected.iter().any(|profile| profile == "cisco"));
+    assert!(!detected.iter().any(|profile| profile == "palo-alto"));
+}
+
+#[test]
+fn versa_detection_does_not_match_ordinary_words() {
+    let store = ProfileStore::builtin();
+    let detected = store.detect_profiles("universal serial console ready\n");
+
+    assert!(!detected.iter().any(|profile| profile == "versa"));
+}
+
+#[test]
+fn arubacx_detection_does_not_match_plain_cisco_prompt() {
+    let store = ProfileStore::builtin();
+    let detected = store.detect_profiles("CORE-SW01#show version\nCisco IOS XE Software\n");
+
+    assert!(detected.iter().any(|profile| profile == "cisco"));
+    assert!(!detected.iter().any(|profile| profile == "arubacx"));
+}
+
+#[test]
+fn arubacx_detection_requires_aruba_specific_event_context() {
+    let store = ProfileStore::builtin();
+    let detected = store.detect_profiles("Application event|123|LOG_INFO|service\n");
+
+    assert!(!detected.iter().any(|profile| profile == "arubacx"));
+}
+
+#[test]
+fn arubacx_detection_does_not_match_generic_show_interface_brief() {
+    let store = ProfileStore::builtin();
+    let detected =
+        store.detect_profiles("CORE-SW01# show interface brief\nCisco IOS XE Software\n");
+
+    assert!(detected.iter().any(|profile| profile == "cisco"));
+    assert!(!detected.iter().any(|profile| profile == "arubacx"));
+}
+
+#[test]
+fn macos_zsh_prompt_does_not_detect_as_juniper() {
+    let store = ProfileStore::builtin();
+
+    let profiles = store.detect_profiles("labuser@mac-lab:~ %\n");
+
+    assert!(profiles.iter().any(|profile| profile == "generic"));
+    assert!(!profiles.iter().any(|profile| profile == "juniper"));
+}
+
+#[test]
+fn builtins_highlight_common_network_and_vendor_terms() {
+    let store = ProfileStore::builtin();
+    let config = PrismConfig::from_profiles(&store, &["generic", "cisco", "juniper", "fortinet"])
+        .expect("built-in profiles load");
+    let highlighter = Highlighter::from_config(config).expect("built-in rules compile");
+
+    let output = highlighter.highlight_str(
+        "Gi0/1 is up, line protocol is down\nge-0/0/0 FULL 192.0.2.1\nFGT # diagnose vpn tunnel down\n",
+    );
+
+    assert!(output.contains("Gi0/1"));
+    assert!(output.contains("ge-0/0/0"));
+    assert!(output.contains("192.0.2.1"));
+    assert!(output.contains("\x1b["));
+}
+
+#[test]
+fn streaming_highlighter_keeps_split_interface_tokens_consistently_colored() {
+    let store = ProfileStore::builtin();
+    let config = PrismConfig::from_profiles(&store, &["juniper"]).expect("juniper loads");
+    let highlighter = Highlighter::from_config(config).expect("rules compile");
+    let mut streaming = StreamingHighlighter::new(highlighter);
+
+    let first = streaming.push_str("gr-0");
+    let second = streaming.push_str("/0/0.1 up up zscaler-primary\n");
+    let flushed = streaming.finish();
+    let output = format!(
+        "{first}{second}{}",
+        String::from_utf8(flushed).expect("ASCII test input remains valid UTF-8")
+    );
+
+    assert!(output.contains("\x1b[38;2;0;153;255mgr-0/0/0.1\x1b[0m"));
+}
+
+#[test]
+fn streaming_highlighter_keeps_char_split_ipv4_addresses_colored() {
+    let store = ProfileStore::builtin();
+    let config = PrismConfig::from_profiles(&store, &["cisco"]).expect("cisco loads");
+    let highlighter = Highlighter::from_config(config).expect("rules compile");
+    let mut streaming = StreamingHighlighter::new(highlighter);
+
+    let mut output = String::new();
+    for byte in "router-id 10.96.0.22\r\nnetwork 10.80.0.0 0.7.255.255 area 0\r\n".bytes() {
+        output.push_str(
+            &String::from_utf8(streaming.push(&[byte]))
+                .expect("ASCII test input remains valid UTF-8"),
+        );
+    }
+    output.push_str(
+        &String::from_utf8(streaming.finish()).expect("ASCII test input remains valid UTF-8"),
+    );
+
+    assert!(output.contains("\x1b[38;2;0;255;255m10.96.0.22\x1b[0m"));
+    assert!(output.contains("\x1b[38;2;0;255;255m10.80.0.0\x1b[0m"));
+    assert!(output.contains("\x1b[38;2;0;255;255m0.7.255.255\x1b[0m"));
+}
+
+#[test]
+fn interactive_streaming_highlighter_does_not_buffer_slow_typed_echoes() {
+    let store = ProfileStore::builtin();
+    let config = PrismConfig::from_profiles(&store, &["generic"]).expect("generic loads");
+    let highlighter = Highlighter::from_config(config).expect("rules compile");
+    let mut streaming = StreamingHighlighter::new_interactive(highlighter);
+
+    assert_eq!(streaming.push_str("router# "), "router# ");
+    assert_eq!(streaming.push_str("s"), "s");
+    assert_eq!(streaming.push_str("h"), "h");
+    assert_eq!(streaming.push_str("o"), "o");
+    assert_eq!(streaming.push_str("w"), "w");
+    assert!(streaming.finish().is_empty());
+}
+
+#[test]
+fn interactive_streaming_highlighter_does_not_buffer_coalesced_typed_echoes() {
+    let store = ProfileStore::builtin();
+    let config = PrismConfig::from_profiles(&store, &["generic"]).expect("generic loads");
+    let highlighter = Highlighter::from_config(config).expect("rules compile");
+    let mut streaming = StreamingHighlighter::new_interactive(highlighter);
+
+    assert_eq!(streaming.push_str("router# "), "router# ");
+    assert_eq!(streaming.push_str("show"), "show");
+    assert_eq!(streaming.push_str(" interfaces"), " interfaces");
+    assert!(streaming.finish().is_empty());
+}
+
+#[test]
+fn interactive_streaming_highlighter_does_not_highlight_coalesced_prompt_and_echo_before_enter() {
+    let store = ProfileStore::builtin();
+    let config = PrismConfig::from_profiles(&store, &["generic"]).expect("generic loads");
+    let highlighter = Highlighter::from_config(config).expect("rules compile");
+    let mut streaming = StreamingHighlighter::new_interactive(highlighter);
+
+    let input = "router# show interfaces up down";
+    let output = streaming.push_str(input);
+    assert_eq!(output, input);
+    assert!(!output.contains("\x1b[1;38;2;255;0;0mdown"));
+    assert!(streaming.finish().is_empty());
+}
+
+#[test]
+fn interactive_streaming_highlighter_does_not_highlight_long_pasted_echo_before_enter() {
+    let store = ProfileStore::builtin();
+    let config = PrismConfig::from_profiles(&store, &["generic"]).expect("generic loads");
+    let highlighter = Highlighter::from_config(config).expect("rules compile");
+    let mut streaming = StreamingHighlighter::new_interactive(highlighter);
+    let paste = "show interfaces up down ".repeat(16);
+
+    assert_eq!(streaming.push_str("router# "), "router# ");
+    assert_eq!(streaming.push_str(&paste), paste);
+    assert!(streaming.finish().is_empty());
+}
+
+#[test]
+fn interactive_streaming_highlighter_does_not_highlight_ansi_line_edit_echo_before_enter() {
+    let store = ProfileStore::builtin();
+    let config = PrismConfig::from_profiles(&store, &["generic"]).expect("generic loads");
+    let highlighter = Highlighter::from_config(config).expect("rules compile");
+    let mut streaming = StreamingHighlighter::new_interactive(highlighter);
+
+    assert_eq!(streaming.push_str("router# "), "router# ");
+    let output = streaming.push_str("\x1b[Kup down");
+
+    assert!(output.contains("\x1b[Kup down"), "{output:?}");
+    assert!(!output.contains("\x1b[38;2;0;255;0mup"), "{output:?}");
+    assert!(!output.contains("\x1b[1;38;2;255;0;0mdown"), "{output:?}");
+    assert!(streaming.finish().is_empty());
+}
+
+#[test]
+fn interactive_streaming_highlighter_does_not_highlight_cr_redraw_echo_before_enter() {
+    let store = ProfileStore::builtin();
+    let config = PrismConfig::from_profiles(&store, &["generic"]).expect("generic loads");
+    let highlighter = Highlighter::from_config(config).expect("rules compile");
+    let mut streaming = StreamingHighlighter::new_interactive(highlighter);
+
+    assert_eq!(streaming.push_str("router# "), "router# ");
+    let redraw = "\r\x1b[Kup down";
+    let output = streaming.push_str(redraw);
+    assert_eq!(output, redraw);
+    assert!(!output.contains("\x1b[1;38;2;255;0;0mdown"));
+    assert!(streaming.finish().is_empty());
+}
+
+#[test]
+fn interactive_streaming_highlighter_highlights_device_prompts_without_bold_or_full_reset() {
+    let store = ProfileStore::builtin();
+    let config = PrismConfig::from_profiles(&store, &["cisco"]).expect("cisco loads");
+    let highlighter = Highlighter::from_config(config).expect("rules compile");
+    let mut streaming = StreamingHighlighter::new_interactive(highlighter);
+
+    let output = streaming.push_str("LAB-N9K-01#");
+
+    assert!(output.contains("\x1b[38;2;255;255;255mLAB-N9K-01#"));
+    assert!(!output.contains("\x1b[1;38;2;255;255;255m"), "{output:?}");
+    assert!(!output.contains("\x1b[0m"), "{output:?}");
+    assert!(streaming.finish().is_empty());
+}
+
+#[test]
+fn interactive_streaming_highlighter_highlights_trailing_device_prompt_without_full_reset() {
+    let store = ProfileStore::builtin();
+    let config = PrismConfig::from_profiles(&store, &["cisco"]).expect("cisco loads");
+    let highlighter = Highlighter::from_config(config).expect("rules compile");
+    let mut streaming = StreamingHighlighter::new_interactive(highlighter);
+
+    let output = streaming.push_str("Vlan1107    Plant 3 Shopfloor Device Vlan\nLAB-N9K-01#");
+
+    assert!(
+        output.contains("\x1b[38;2;0;153;255mVlan1107"),
+        "{output:?}"
+    );
+    assert!(output.contains("\x1b[38;2;255;255;255mLAB-N9K-01#"));
+    assert!(!output.contains("\x1b[0m"), "{output:?}");
+    assert!(
+        !output.contains("\x1b[1;38;2;255;255;255mLAB-N9K-01#"),
+        "{output:?}"
+    );
+    assert!(streaming.finish().is_empty());
+}
+
+#[test]
+fn interactive_streaming_highlighter_highlights_repeated_device_prompts_without_full_reset() {
+    let store = ProfileStore::builtin();
+    let config = PrismConfig::from_profiles(&store, &["cisco"]).expect("cisco loads");
+    let highlighter = Highlighter::from_config(config).expect("rules compile");
+    let mut streaming = StreamingHighlighter::new_interactive(highlighter);
+
+    let output = streaming.push_str("\r\nLAB-N9K-01#\r\nLAB-N9K-01#\r\nLAB-N9K-01#");
+
+    assert_eq!(
+        count_occurrences(&strip_ansi(output.as_bytes()), b"LAB-N9K-01#"),
+        3
+    );
+    assert_all_token_occurrences_have_foreground(&output, "LAB-N9K-01#", "38;2;255;255;255");
+    assert!(!output.contains("\x1b[0m"), "{output:?}");
+    assert!(streaming.finish().is_empty());
+}
+
+#[test]
+fn interactive_streaming_highlighter_highlights_question_mark_help_prompt_without_full_reset() {
+    let store = ProfileStore::builtin();
+    let config = PrismConfig::from_profiles(&store, &["cisco"]).expect("cisco loads");
+    let highlighter = Highlighter::from_config(config).expect("rules compile");
+    let mut streaming = StreamingHighlighter::new_interactive(highlighter);
+
+    let output = streaming.push_str("% Type 'show ?' for a list of subcommands\r\nLAB-N9K-01#");
+
+    assert!(output.contains("% Type 'show ?' for a list of subcommands"));
+    assert!(output.contains("\x1b[38;2;255;255;255mLAB-N9K-01#"));
+    assert!(!output.contains("\x1b[0m"), "{output:?}");
+    assert!(
+        !output.contains("\x1b[1;38;2;255;255;255mLAB-N9K-01#"),
+        "{output:?}"
+    );
+}
+
+#[test]
+fn interactive_streaming_highlighter_highlights_juniper_prompt_without_bold_or_full_reset() {
+    let store = ProfileStore::builtin();
+    let config = PrismConfig::from_profiles(&store, &["juniper"]).expect("juniper loads");
+    let highlighter = Highlighter::from_config(config).expect("rules compile");
+    let mut streaming = StreamingHighlighter::new_interactive(highlighter);
+
+    let output = streaming.push_str("labuser@LAB-WD02>\n");
+
+    assert!(
+        output.contains("\x1b[38;2;0;191;255mlabuser@LAB-WD02>"),
+        "{output:?}"
+    );
+    assert!(!output.contains("\x1b[1;38;2;0;191;255m"), "{output:?}");
+    assert!(!output.contains("\x1b[0m"), "{output:?}");
+}
+
+#[test]
+fn interactive_streaming_highlighter_highlights_output_after_cr_only_command_echo() {
+    let store = ProfileStore::builtin();
+    let config = PrismConfig::from_profiles(&store, &["cisco"]).expect("cisco loads");
+    let highlighter = Highlighter::from_config(config).expect("rules compile");
+    let mut streaming = StreamingHighlighter::new_interactive(highlighter);
+
+    let mut output = String::new();
+    output.push_str(&streaming.push_str("LAB-N9K-01# "));
+    output.push_str(&streaming.push_str("show vlan\rVlan1107    Plant 3 Shopfloor Device Vlan\n"));
+    output.push_str(
+        &String::from_utf8(streaming.finish()).expect("ASCII test input remains valid UTF-8"),
+    );
+
+    assert!(output.contains("show vlan\r"), "{output:?}");
+    assert!(
+        output.contains("\x1b[38;2;0;153;255mVlan1107"),
+        "{output:?}"
+    );
+}
+
+#[test]
+fn interactive_streaming_highlighter_highlights_output_after_pager_clear() {
+    let store = ProfileStore::builtin();
+    let config = PrismConfig::from_profiles(&store, &["cisco"]).expect("cisco loads");
+    let highlighter = Highlighter::from_config(config).expect("rules compile");
+    let mut streaming = StreamingHighlighter::new_interactive(highlighter);
+
+    let mut output = String::new();
+    output.push_str(&streaming.push_str("LAB-N9K-01# "));
+    output.push_str(&streaming.push_str("show vlan\r"));
+    output.push_str(&streaming.push_str("\x1b[KVlan1107    Plant 3 Shopfloor Device Vlan\n"));
+    output.push_str(
+        &String::from_utf8(streaming.finish()).expect("ASCII test input remains valid UTF-8"),
+    );
+
+    assert!(output.contains("\x1b[K"), "{output:?}");
+    assert!(
+        output.contains("\x1b[38;2;0;153;255mVlan1107"),
+        "{output:?}"
+    );
+}
+
+#[test]
+fn interactive_streaming_highlighter_preserves_zsh_redraws_before_enter() {
+    let store = ProfileStore::builtin();
+    let config = PrismConfig::from_profiles(&store, &["linux-unix"]).expect("linux profile loads");
+    let highlighter = Highlighter::from_config(config).expect("rules compile");
+    let mut streaming = StreamingHighlighter::new_interactive(highlighter);
+
+    assert_eq!(
+        streaming.push_str("labuser@mac-lab % "),
+        "labuser@mac-lab % "
+    );
+    assert_eq!(streaming.push_str("sho"), "sho");
+    let redraw = "\r\x1b[Klabuser@mac-lab % \x1b[38;5;244mshow ip route\x1b[0m";
+    let output = streaming.push_str(redraw);
+
+    assert_eq!(output, redraw);
+    assert!(!output.contains("\x1b[38;2;0;255;192m"));
+    assert!(streaming.finish().is_empty());
+}
+
+#[test]
+fn interactive_streaming_highlighter_bypasses_fastfetch_cursor_painting() {
+    let store = ProfileStore::builtin();
+    let config = PrismConfig::from_profiles(&store, &["linux-unix"]).expect("linux profile loads");
+    let highlighter = Highlighter::from_config(config).expect("rules compile");
+    let mut streaming = StreamingHighlighter::new_interactive(highlighter);
+
+    let priming = streaming.push_str("192.0.2.1 ");
+    assert!(
+        priming.contains("\x1b[38;2;0;255;255m192.0.2.1"),
+        "{priming:?}"
+    );
+
+    let logo = "\x1b[1m\x1b[31m             --+oossssssoo+--\r\n\x1b[m\x1b[1G";
+    let info = "\x1b[1A\x1b[m\x1b[?7l\x1b[44C\x1b[m\x1b[1m\x1b[31mlabuser@linux-host\x1b[m\r\n";
+    let logo_output = streaming.push_str(logo);
+    let info_output = streaming.push_str(info);
+
+    assert_eq!(
+        strip_ansi(logo_output.as_bytes()),
+        strip_ansi(logo.as_bytes())
+    );
+    assert_eq!(
+        strip_ansi(info_output.as_bytes()),
+        strip_ansi(info.as_bytes())
+    );
+    assert!(
+        !logo_output.contains("\x1b[38;2;0;255;255m"),
+        "{logo_output:?}"
+    );
+    assert!(
+        !info_output.contains("\x1b[38;2;0;255;255m"),
+        "{info_output:?}"
+    );
+    assert!(
+        !info_output.contains("\x1b[38;2;0;191;255m"),
+        "{info_output:?}"
+    );
+}
+
+#[test]
+fn interactive_streaming_highlighter_highlights_promptless_device_chunks() {
+    let store = ProfileStore::builtin();
+    let config = PrismConfig::from_profiles(&store, &["juniper"]).expect("juniper loads");
+    let highlighter = Highlighter::from_config(config).expect("rules compile");
+    let mut streaming = StreamingHighlighter::new_interactive(highlighter);
+
+    let first = streaming.push_str("st0.9");
+    let second = streaming.push_str("\n");
+    let output = format!("{first}{second}");
+    assert!(output.contains("\x1b[38;2;0;153;255mst0.9"));
+}
+
+#[test]
+fn cisco_profile_highlights_vlan_svis_without_making_them_juniper_interfaces() {
+    let store = ProfileStore::builtin();
+    let cisco_config = PrismConfig::from_profiles(&store, &["cisco"]).expect("cisco loads");
+    let cisco_highlighter = Highlighter::from_config(cisco_config).expect("rules compile");
+    let cisco_output = cisco_highlighter.highlight_str("Vlan1191    New TZ GW to Internal\n");
+
+    assert!(cisco_output.contains("\x1b[38;2;0;153;255mVlan1191"));
+
+    let juniper_config = PrismConfig::from_profiles(&store, &["juniper"]).expect("juniper loads");
+    let juniper_highlighter = Highlighter::from_config(juniper_config).expect("rules compile");
+    let juniper_output = juniper_highlighter.highlight_str("Vlan1191    New TZ GW to Internal\n");
+
+    assert!(
+        !juniper_output.contains("\x1b[38;2;0;153;255mVlan1191"),
+        "{juniper_output:?}"
+    );
+}
+
+#[test]
+fn builtin_mac_addresses_use_magenta_address_color() {
+    let store = ProfileStore::builtin();
+    let config = PrismConfig::from_profiles(&store, &["cisco"]).expect("cisco loads");
+    let highlighter = Highlighter::from_config(config).expect("rules compile");
+
+    let output = highlighter.highlight_str("0 0050.569d.175e ARPA 192.0.2.10\n");
+
+    assert!(
+        output.contains("\x1b[38;2;255;154;255m0050.569d.175e\x1b[0m"),
+        "{output:?}"
+    );
+    assert!(
+        output.contains("\x1b[38;2;0;255;255m192.0.2.10\x1b[0m"),
+        "{output:?}"
+    );
+}
+
+#[test]
+fn style_probe_reports_visible_token_styles_without_ansi_snapshot() {
+    let store = ProfileStore::builtin();
+    let config = PrismConfig::from_profiles(&store, &["cisco"]).expect("cisco loads");
+    let highlighter = Highlighter::from_config(config).expect("rules compile");
+
+    let spans = highlighter.style_spans("Vlan1191 up\n".as_bytes());
+    let vlan = spans
+        .iter()
+        .find(|span| span.text == "Vlan1191")
+        .expect("Vlan1191 span exists");
+    let up = spans
+        .iter()
+        .find(|span| span.text == "up")
+        .expect("up span exists");
+
+    assert_eq!(
+        vlan.style.foreground.map(|rgb| (rgb.r, rgb.g, rgb.b)),
+        Some((0, 153, 255))
+    );
+    assert_eq!(
+        up.style.foreground.map(|rgb| (rgb.r, rgb.g, rgb.b)),
+        Some((0, 255, 0))
+    );
+}
+
+#[test]
+fn interactive_streaming_highlighter_keeps_split_cisco_vlan_svis_colored() {
+    let store = ProfileStore::builtin();
+    let config = PrismConfig::from_profiles(&store, &["cisco"]).expect("cisco loads");
+    let highlighter = Highlighter::from_config(config).expect("rules compile");
+    let mut streaming = StreamingHighlighter::new_interactive(highlighter);
+
+    let first = streaming.push_str("Vlan11");
+    let second = streaming.push_str("91    New TZ GW to Internal\n");
+    let output = format!("{first}{second}");
+
+    assert!(
+        output.contains("\x1b[38;2;0;153;255mVlan1191"),
+        "{output:?}"
+    );
+}
+
+#[test]
+fn interactive_streaming_highlighter_uses_minimal_resets_for_highlighted_tokens() {
+    let store = ProfileStore::builtin();
+    let config = PrismConfig::from_profiles(&store, &["cisco"]).expect("cisco loads");
+    let highlighter = Highlighter::from_config(config).expect("rules compile");
+    let mut streaming = StreamingHighlighter::new_interactive(highlighter);
+
+    let output = streaming.push_str("Eth1/31 suspended\nVl528 up\n");
+
+    assert!(output.contains("\x1b[38;2;0;153;255mEth1/31"), "{output:?}");
+    assert!(output.contains("\x1b[38;2;0;153;255mVl528"), "{output:?}");
+    assert!(!output.contains("\x1b[0m"), "{output:?}");
+    assert!(!output.contains("\x1b[22m"), "{output:?}");
+    assert!(!output.contains(";39m"), "{output:?}");
+}
+
+#[test]
+fn interactive_streaming_highlighter_does_not_reset_between_colored_space_separated_columns() {
+    let store = ProfileStore::builtin();
+    let config = PrismConfig::from_profiles(&store, &["juniper"]).expect("juniper loads");
+    let highlighter = Highlighter::from_config(config).expect("rules compile");
+    let mut streaming = StreamingHighlighter::new_interactive(highlighter);
+
+    let input = "xe-0/0/6.906        up    up   aenet     --> reth6.906\n";
+    let output = streaming.push_str(input);
+
+    assert_eq!(strip_ansi(output.as_bytes()), input.as_bytes());
+    assert!(
+        output.contains("\x1b[38;2;0;153;255mxe-0/0/6.906"),
+        "{output:?}"
+    );
+    assert!(
+        output.contains("\x1b[38;2;0;153;255mreth6.906"),
+        "{output:?}"
+    );
+    assert!(
+        !output.contains("up\x1b[39m    \x1b[38;2;0;255;0mup"),
+        "{output:?}"
+    );
+    assert!(
+        !output.contains("xe-0/0/6.906\x1b[39m        \x1b[38;2;0;255;0mup"),
+        "{output:?}"
+    );
+}
+
+#[test]
+fn interactive_streaming_highlighter_resets_overlay_after_trailing_prompt_segment() {
+    let store = ProfileStore::builtin();
+    let config = PrismConfig::from_profiles(&store, &["juniper"]).expect("juniper loads");
+    let highlighter = Highlighter::from_config(config).expect("rules compile");
+    let mut streaming = StreamingHighlighter::new_interactive(highlighter);
+
+    let input = "labuser@LAB-WD02>";
+    let output = streaming.push_str(input);
+
+    assert_eq!(strip_ansi(output.as_bytes()), input.as_bytes());
+    assert!(
+        output.contains("\x1b[38;2;0;191;255mlabuser@LAB-WD02>"),
+        "{output:?}"
+    );
+    assert!(output.contains("\x1b[39m"), "{output:?}");
+}
+
+#[test]
+fn interactive_streaming_highlighter_highlights_juniper_prompt_after_empty_enter_chunk() {
+    let store = ProfileStore::builtin();
+    let config = PrismConfig::from_profiles(&store, &["juniper"]).expect("juniper loads");
+    let highlighter = Highlighter::from_config(config).expect("rules compile");
+    let mut streaming = StreamingHighlighter::new_interactive(highlighter);
+
+    let first_prompt = streaming.push_str("labuser@LAB-WD02> ");
+    let second_prompt = streaming.push_str("\r\n\r\n{primary:node0}\r\nlabuser@LAB-WD02> ");
+    let output = format!("{first_prompt}{second_prompt}");
+
+    assert_eq!(
+        strip_ansi(output.as_bytes()),
+        b"labuser@LAB-WD02> \r\n\r\n{primary:node0}\r\nlabuser@LAB-WD02> "
+    );
+    assert_eq!(output.matches("\x1b[38;2;0;191;255mlabuser").count(), 2);
+}
+
+#[test]
+fn interactive_streaming_highlighter_keeps_juniper_interface_tokens_colored_across_chunk_sizes() {
+    let store = ProfileStore::builtin();
+    let config = PrismConfig::from_profiles(&store, &["juniper"]).expect("juniper loads");
+    let highlighter = Highlighter::from_config(config).expect("rules compile");
+    let input = "\
+xe-0/0/1.816        up    up   aenet     --> reth1.816
+xe-0/0/2.0          up    up   aenet     --> reth2.0
+xe-0/0/6.907        up    up   aenet     --> reth6.907
+xe-0/0/7.491        up    up   aenet     --> reth7.491
+";
+    let expected_tokens = [
+        "xe-0/0/1.816",
+        "reth1.816",
+        "xe-0/0/2.0",
+        "reth2.0",
+        "xe-0/0/6.907",
+        "reth6.907",
+        "xe-0/0/7.491",
+        "reth7.491",
+    ];
+
+    for chunk_size in 1..=17 {
+        let mut streaming = StreamingHighlighter::new_interactive(highlighter.clone());
+        let mut output = String::new();
+        for chunk in input.as_bytes().chunks(chunk_size) {
+            output.push_str(
+                &String::from_utf8(streaming.push(chunk))
+                    .expect("ASCII test input remains valid UTF-8"),
+            );
+        }
+        output.push_str(
+            &String::from_utf8(streaming.finish()).expect("ASCII test input remains valid UTF-8"),
+        );
+
+        assert_eq!(strip_ansi(output.as_bytes()), input.as_bytes());
+        for token in expected_tokens {
+            assert_all_token_occurrences_have_foreground(&output, token, "38;2;0;153;255");
+        }
+    }
+}
+
+#[test]
+fn interactive_streaming_highlighter_does_not_treat_juniper_route_marker_as_prompt() {
+    let store = ProfileStore::builtin();
+    let config = PrismConfig::from_profiles(&store, &["juniper"]).expect("juniper loads");
+    let highlighter = Highlighter::from_config(config).expect("rules compile");
+    let mut streaming = StreamingHighlighter::new_interactive(highlighter);
+
+    let first = streaming.push_str("10.67.4.0/23\n>");
+    let second = streaming.push_str(" to 192.0.2.1 via st0.1055\n");
+    let output = format!("{first}{second}");
+    let visible = "10.67.4.0/23\n> to 192.0.2.1 via st0.1055\n";
+
+    assert_eq!(strip_ansi(output.as_bytes()), visible.as_bytes());
+    assert!(
+        output.contains("\x1b[38;2;0;255;255m192.0.2.1"),
+        "{output:?}"
+    );
+    assert!(
+        output.contains("\x1b[38;2;0;153;255mst0.1055"),
+        "{output:?}"
+    );
+}
+
+#[test]
+fn interactive_streaming_highlighter_does_not_reemit_same_color_after_newline() {
+    let store = ProfileStore::builtin();
+    let config = PrismConfig::from_profiles(&store, &["juniper"]).expect("juniper loads");
+    let highlighter =
+        Highlighter::from_config_with_color_mode(config, ColorMode::Ansi16).expect("rules compile");
+    let mut streaming = StreamingHighlighter::new_interactive(highlighter);
+
+    let input = "xe-0/0/7.409        up    up   aenet     --> reth7.409\nxe-0/0/7.491        up    up   aenet     --> reth7.491\n";
+    let output = streaming.push_str(input);
+
+    assert_eq!(strip_ansi(output.as_bytes()), input.as_bytes());
+    assert!(
+        !output.contains("reth7.409\n\x1b[94mxe-0/0/7.491"),
+        "{output:?}"
+    );
+}
+
+#[test]
+fn interactive_streaming_highlighter_does_not_leak_split_ansi16_prefix_as_text() {
+    let store = ProfileStore::builtin();
+    let config = PrismConfig::from_profiles(&store, &["generic"]).expect("generic loads");
+    let highlighter = Highlighter::from_config(config).expect("rules compile");
+    let mut streaming = StreamingHighlighter::new_interactive(highlighter);
+
+    let first = streaming.push_str("\x1b[96m10");
+    let second = streaming.push_str(".96.2.132/31\n");
+    let output = format!("{first}{second}");
+
+    assert_eq!(strip_ansi(first.as_bytes()), b"");
+    assert_eq!(strip_ansi(second.as_bytes()), b"10.96.2.132/31\n");
+    assert_eq!(strip_ansi(output.as_bytes()), b"10.96.2.132/31\n");
+}
+
+#[test]
+fn interactive_streaming_highlighter_does_not_leak_split_truecolor_prefix_as_text() {
+    let store = ProfileStore::builtin();
+    let config = PrismConfig::from_profiles(&store, &["generic"]).expect("generic loads");
+    let highlighter = Highlighter::from_config(config).expect("rules compile");
+    let mut streaming = StreamingHighlighter::new_interactive(highlighter);
+
+    let first = streaming.push_str("\x1b[38;2;0;255;255m10");
+    let second = streaming.push_str(".96.2.132/31\n");
+    let output = format!("{first}{second}");
+
+    assert_eq!(strip_ansi(first.as_bytes()), b"");
+    assert_eq!(strip_ansi(second.as_bytes()), b"10.96.2.132/31\n");
+    assert_eq!(strip_ansi(output.as_bytes()), b"10.96.2.132/31\n");
+}
+
+#[test]
+fn interactive_streaming_highlighter_does_not_emit_default_white_restore_between_device_tokens() {
+    let store = ProfileStore::builtin();
+    let config = PrismConfig::from_profiles(&store, &["cisco"]).expect("cisco loads");
+    let highlighter = Highlighter::from_config(config).expect("rules compile");
+    let mut streaming = StreamingHighlighter::new_interactive(highlighter);
+
+    let input = "Gi2/13/27   admin down     down\n";
+    let output = streaming.push_str(input);
+
+    assert!(
+        output.contains("\x1b[38;2;0;153;255mGi2/13/27"),
+        "{output:?}"
+    );
+    assert!(output.contains("\x1b[38;2;255;0;0mdown"), "{output:?}");
+    assert_eq!(strip_ansi(output.as_bytes()), input.as_bytes());
+    assert!(
+        !output.contains("\x1b[38;2;255;255;255m   admin"),
+        "{output:?}"
+    );
+    assert!(!output.contains("\x1b[0m"), "{output:?}");
+    assert!(!output.contains("255m   admin"), "{output:?}");
+}
+
+#[test]
+fn interactive_streaming_highlighter_resets_before_unhighlighted_columns() {
+    let store = ProfileStore::builtin();
+    let config = PrismConfig::from_profiles(&store, &["juniper"]).expect("juniper loads");
+    let highlighter = Highlighter::from_config(config).expect("rules compile");
+    let mut streaming = StreamingHighlighter::new_interactive(highlighter);
+
+    let input = "st0.1025        up    up   vpn_MTL-POSTALPRST-I\n";
+    let output = streaming.push_str(input);
+
+    assert!(
+        output.contains("\x1b[38;2;0;153;255mst0.1025"),
+        "{output:?}"
+    );
+    assert!(output.contains("\x1b[38;2;0;255;0mup"), "{output:?}");
+    assert_eq!(strip_ansi(output.as_bytes()), input.as_bytes());
+    assert!(
+        !output.contains("\x1b[38;2;0;255;0mup   vpn_MTL-POSTALPRST-I"),
+        "{output:?}"
+    );
+    assert!(!output.contains("\x1b[38;2;255;255;255m"), "{output:?}");
+}
+
+#[test]
+fn interactive_streaming_highlighter_restores_known_source_foreground_across_chunks() {
+    let store = ProfileStore::builtin();
+    let config = PrismConfig::from_profiles(&store, &["generic"]).expect("generic loads");
+    let highlighter = Highlighter::from_config(config).expect("rules compile");
+    let mut streaming = StreamingHighlighter::new_interactive(highlighter);
+
+    let first = streaming.push_str("\x1b[38;2;200;210;220mpeer ");
+    let second = streaming.push_str("192.0.2.1 plain\n");
+    let output = format!("{first}{second}");
+
+    assert!(
+        output.contains("\x1b[38;2;0;255;255m192.0.2.1 \x1b[38;2;200;210;220mplain"),
+        "{output:?}"
+    );
+    assert!(!output.contains("\x1b[38;2;255;255;255m"), "{output:?}");
+    assert!(!output.contains("\x1b[39m"), "{output:?}");
+}
+
+#[test]
+fn interactive_streaming_highlighter_keeps_arubacx_interface_colored_after_prompt_echo() {
+    let store = ProfileStore::builtin();
+    let config = PrismConfig::from_profiles(&store, &["arubacx"]).expect("arubacx loads");
+    let highlighter = Highlighter::from_config(config).expect("rules compile");
+    let mut streaming = StreamingHighlighter::new_interactive(highlighter);
+
+    let mut output = String::new();
+    for chunk in [
+        "LAB-ARUBA-01# ",
+        "s",
+        "how interface brief\nInterface  Status  Protocol  Description\n1/1",
+        "/1      up      up        Core uplink\n",
+    ] {
+        output.push_str(&streaming.push_str(chunk));
+    }
+    output.push_str(
+        &String::from_utf8(streaming.finish()).expect("ASCII test input remains valid UTF-8"),
+    );
+
+    assert!(output.contains("\x1b[38;2;0;153;255m1/1/1"), "{output:?}");
+}
+
+#[test]
+fn interactive_streaming_highlighter_does_not_highlight_typed_words_after_prompt() {
+    let store = ProfileStore::builtin();
+    let config = PrismConfig::from_profiles(&store, &["generic"]).expect("generic loads");
+    let highlighter = Highlighter::from_config(config).expect("rules compile");
+    let mut streaming = StreamingHighlighter::new_interactive(highlighter);
+
+    assert_eq!(streaming.push_str("router# "), "router# ");
+    assert_eq!(streaming.push_str("up"), "up");
+    assert_eq!(streaming.push_str(" down"), " down");
+    assert_eq!(streaming.push_str("\n"), "\n");
+    assert!(streaming.finish().is_empty());
+}
+
+#[test]
+fn interactive_streaming_highlighter_resets_overlay_after_linux_root_prompt_before_typed_command() {
+    let store = ProfileStore::builtin();
+    let config = PrismConfig::from_profiles(&store, &["linux-unix"]).expect("linux profile loads");
+    let highlighter = Highlighter::from_config(config).expect("rules compile");
+    let mut streaming = StreamingHighlighter::new_interactive(highlighter);
+
+    let mut output = String::new();
+    output.push_str(&streaming.push_str("root@server:~# "));
+    output.push_str(&streaming.push_str("ping 1.1.1.1"));
+
+    assert_eq!(
+        strip_ansi(output.as_bytes()),
+        b"root@server:~# ping 1.1.1.1"
+    );
+    assert_all_token_occurrences_have_no_foreground(&output, "ping");
+}
+
+#[test]
+fn interactive_streaming_highlighter_does_not_highlight_fortinet_typed_diagnose_after_prompt() {
+    let store = ProfileStore::builtin();
+    let config = PrismConfig::from_profiles(&store, &["fortinet"]).expect("fortinet loads");
+    let highlighter = Highlighter::from_config(config).expect("rules compile");
+    let mut streaming = StreamingHighlighter::new_interactive(highlighter);
+
+    let mut output = String::new();
+    output.push_str(&streaming.push_str("command list\r\nFGT01 # "));
+    output.push_str(&streaming.push_str("diagnose"));
+
+    assert_eq!(
+        strip_ansi(output.as_bytes()),
+        b"command list\r\nFGT01 # diagnose"
+    );
+    assert_all_token_occurrences_have_no_foreground(&output, "diagnose");
+}
+
+#[test]
+fn interactive_streaming_highlighter_neutralizes_source_sgr_on_fortinet_prompt_echo() {
+    let store = ProfileStore::builtin();
+    let config = PrismConfig::from_profiles(&store, &["fortinet"]).expect("fortinet loads");
+    let highlighter = Highlighter::from_config(config).expect("rules compile");
+    let mut streaming = StreamingHighlighter::new_interactive(highlighter);
+
+    let input = concat!(
+        "\r         \ron-demand-sniffer         On-demand sniffer command.\r\n",
+        "\r\n \r\n",
+        "\x1b[38;2;255;255;255mFGT01 # ",
+        "\x1b[38;2;255;0;255mdiagnose "
+    );
+    let output = streaming.push_str(input);
+
+    assert_eq!(strip_ansi(output.as_bytes()), strip_ansi(input.as_bytes()));
+    assert_all_token_occurrences_have_no_foreground(&output, "diagnose");
+}
+
+#[test]
+fn interactive_streaming_highlighter_still_highlights_complete_chunks() {
+    let store = ProfileStore::builtin();
+    let config = PrismConfig::from_profiles(&store, &["generic"]).expect("generic loads");
+    let highlighter = Highlighter::from_config(config).expect("rules compile");
+    let mut streaming = StreamingHighlighter::new_interactive(highlighter);
+
+    let output = streaming.push_str("198.51.100.7 down\n");
+
+    assert!(output.contains("\x1b[38;2;0;255;255m198.51.100.7"));
+    assert!(output.contains("\x1b[38;2;255;0;0mdown"));
+    assert!(!output.contains("\x1b[1;38;2;255;0;0mdown"));
+    assert!(!output.contains("\x1b[0m"), "{output:?}");
+}
+
+#[test]
+fn linux_unix_profile_does_not_highlight_clock_times_as_ports() {
+    let store = ProfileStore::builtin();
+    let config = PrismConfig::from_profiles(&store, &["linux-unix"]).expect("linux profile loads");
+    let highlighter = Highlighter::from_config(config).expect("rules compile");
+
+    let output = highlighter.highlight_str("at Wednesday 2026-05-06 10:07:20 PM\n");
+
+    assert!(output.contains("10:07:20 PM"));
+}
+
+#[test]
+fn linux_unix_profile_still_highlights_real_ports() {
+    let store = ProfileStore::builtin();
+    let config = PrismConfig::from_profiles(&store, &["linux-unix"]).expect("linux profile loads");
+    let highlighter = Highlighter::from_config(config).expect("rules compile");
+
+    let output = highlighter.highlight_str("nginx tcp/443 localhost:8443 192.0.2.1:22\n");
+
+    assert!(output.contains("\x1b[38;2;0;255;192mtcp/443\x1b[0m"));
+    assert!(output.contains("localhost\x1b[38;2;0;255;192m:8443\x1b[0m"));
+    assert!(output.contains("\x1b[38;2;0;255;192m:22\x1b[0m"));
+}
+
+#[test]
+fn streaming_highlighter_flushes_complete_prompts_without_waiting_for_newline() {
+    let store = ProfileStore::builtin();
+    let config = PrismConfig::from_profiles(&store, &["juniper"]).expect("juniper loads");
+    let highlighter = Highlighter::from_config(config).expect("rules compile");
+    let mut streaming = StreamingHighlighter::new(highlighter);
+
+    let output = streaming.push_str("labuser@LAB-MX-01>");
+
+    assert!(output.contains("LAB-MX-01>"));
+}
+
+#[test]
+fn invalid_regex_errors_include_rule_description() {
+    let yaml = r##"
+rules:
+  - description: broken user rule
+    regex: "(["
+    color: f#ff0000
+"##;
+
+    let config = PrismConfig::from_chromaterm_yaml(yaml).expect("yaml parses");
+    let error = Highlighter::from_config(config).expect_err("regex should fail");
+
+    assert!(error.to_string().contains("broken user rule"));
+}
+
+#[test]
+fn every_builtin_profile_highlights_a_representative_fixture() {
+    let store = ProfileStore::builtin();
+    let cases = [
+        ("generic", "192.0.2.10 down\n"),
+        ("juniper", "admin@mx480> show interfaces ge-0/0/0 up\n"),
+        ("cisco", "Router# show interface Gi0/1 down\n"),
+        ("versa", "versa branch appliance vni-10 down\n"),
+        (
+            "arista",
+            "leaf1# show interfaces Ethernet1 up mlag active\n",
+        ),
+        ("fortinet", "FGT # diagnose vpn tunnel phase1 down\n"),
+        ("palo-alto", "admin@PA-VM> show system info vsys1 active\n"),
+        (
+            "linux-unix",
+            "root@server:~# systemctl status sshd failed\n",
+        ),
+    ];
+
+    for (profile, sample) in cases {
+        let config =
+            PrismConfig::from_profiles(&store, &[profile]).expect("built-in profile loads");
+        let highlighter = Highlighter::from_config(config).expect("profile compiles");
+        let output = highlighter.highlight_str(sample);
+        assert!(
+            output.contains("\x1b["),
+            "profile {profile} did not highlight sample: {output:?}"
+        );
+    }
+}
+
+fn count_occurrences(haystack: &[u8], needle: &[u8]) -> usize {
+    if needle.is_empty() || needle.len() > haystack.len() {
+        return 0;
+    }
+    haystack
+        .windows(needle.len())
+        .filter(|window| *window == needle)
+        .count()
+}
+
+fn assert_all_token_occurrences_have_foreground(output: &str, token: &str, expected: &str) {
+    let (visible, foregrounds) = visible_bytes_and_foregrounds(output.as_bytes());
+    let visible_text = String::from_utf8(visible).expect("test output remains UTF-8");
+    let mut found = 0;
+
+    for (idx, _) in visible_text.match_indices(token) {
+        found += 1;
+        assert_eq!(
+            foregrounds.get(idx).and_then(Clone::clone).as_deref(),
+            Some(expected),
+            "token {token:?} at {idx} did not have foreground {expected:?} in {output:?}"
+        );
+    }
+
+    assert!(found > 0, "token {token:?} was not present in {output:?}");
+}
+
+fn assert_all_token_occurrences_have_no_foreground(output: &str, token: &str) {
+    let (visible, foregrounds) = visible_bytes_and_foregrounds(output.as_bytes());
+    let visible_text = String::from_utf8(visible).expect("test output remains UTF-8");
+    let mut found = 0;
+
+    for (idx, _) in visible_text.match_indices(token) {
+        found += 1;
+        assert_eq!(
+            foregrounds.get(idx).and_then(Clone::clone),
+            None,
+            "token {token:?} at {idx} unexpectedly had a foreground in {output:?}"
+        );
+    }
+
+    assert!(found > 0, "token {token:?} was not present in {output:?}");
+}
+
+fn visible_bytes_and_foregrounds(input: &[u8]) -> (Vec<u8>, Vec<Option<String>>) {
+    let mut visible = Vec::new();
+    let mut foregrounds = Vec::new();
+    let mut foreground = None;
+    let mut idx = 0;
+
+    while idx < input.len() {
+        if input[idx] == 0x1b {
+            let end = ansi_sequence_end(input, idx);
+            apply_test_sgr_foreground(&input[idx..end], &mut foreground);
+            idx = end;
+        } else {
+            visible.push(input[idx]);
+            foregrounds.push(foreground.clone());
+            idx += 1;
+        }
+    }
+
+    (visible, foregrounds)
+}
+
+fn apply_test_sgr_foreground(sequence: &[u8], foreground: &mut Option<String>) {
+    if !sequence.starts_with(b"\x1b[") || sequence.last() != Some(&b'm') {
+        return;
+    }
+
+    let params = String::from_utf8_lossy(&sequence[2..sequence.len() - 1]);
+    let codes = if params.is_empty() {
+        vec![0]
+    } else {
+        params
+            .split(';')
+            .filter_map(|part| part.parse::<u16>().ok())
+            .collect::<Vec<_>>()
+    };
+    let mut idx = 0;
+    while idx < codes.len() {
+        match codes[idx] {
+            0 | 39 => *foreground = None,
+            30..=37 | 90..=97 => *foreground = Some(codes[idx].to_string()),
+            38 if idx + 2 < codes.len() && codes[idx + 1] == 5 => {
+                *foreground = Some(format!("38;5;{}", codes[idx + 2]));
+                idx += 2;
+            }
+            38 if idx + 4 < codes.len() && codes[idx + 1] == 2 => {
+                *foreground = Some(format!(
+                    "38;2;{};{};{}",
+                    codes[idx + 2],
+                    codes[idx + 3],
+                    codes[idx + 4]
+                ));
+                idx += 4;
+            }
+            _ => {}
+        }
+        idx += 1;
+    }
+}
+
+fn ansi_sequence_end(input: &[u8], start: usize) -> usize {
+    if start + 1 >= input.len() || input[start + 1] != b'[' {
+        return (start + 2).min(input.len());
+    }
+
+    let mut idx = start + 2;
+    while idx < input.len() {
+        let byte = input[idx];
+        idx += 1;
+        if (0x40..=0x7e).contains(&byte) {
+            break;
+        }
+    }
+    idx
+}

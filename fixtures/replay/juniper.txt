@@ -1,0 +1,11 @@
+lab@mx-lab-01> show version
+Junos: 22.4R3.8
+lab@mx-lab-01> show interfaces descriptions
+Interface       Admin Link Description
+ge-0/0/0        up    up   Transit to lab core
+xe-7/0/2        down  down Spare optic
+reth1.808       up    up   Synthetic trust segment
+st0.9           up    up   VPN_WIC_PEA-I
+lab@mx-lab-01> show route protocol ospf
+192.0.2.0/24    *[OSPF/10] 00:01:20, metric 20
+                 > to 198.51.100.1 via ge-0/0/0.0

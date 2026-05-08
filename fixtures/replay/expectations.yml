@@ -1,0 +1,88 @@
+fixtures:
+  cisco-ios.txt:
+    synthetic: true
+    expected_profiles: ["generic", "cisco"]
+    tokens:
+      - text: "Gi1/0/1"
+        foreground: "#0099ff"
+      - text: "Po10"
+        foreground: "#0099ff"
+      - text: "192.0.2.22"
+        foreground: "#00ffff"
+  cisco-nexus.txt:
+    synthetic: true
+    expected_profiles: ["generic", "cisco"]
+    tokens:
+      - text: "Cisco Nexus Operating System"
+      - text: "Vlan407"
+        foreground: "#0099ff"
+      - text: "Vlan1191"
+        foreground: "#0099ff"
+  juniper.txt:
+    synthetic: true
+    expected_profiles: ["generic", "juniper"]
+    tokens:
+      - text: "xe-7/0/2"
+        foreground: "#0099ff"
+      - text: "reth1.808"
+        foreground: "#0099ff"
+      - text: "st0.9"
+        foreground: "#0099ff"
+  fortinet.txt:
+    synthetic: true
+    expected_profiles: ["generic", "fortinet"]
+    tokens:
+      - text: "FortiGate-VM64"
+      - text: "192.0.2.10"
+        foreground: "#00ffff"
+  linux-unix.txt:
+    synthetic: true
+    expected_profiles: ["generic", "linux-unix"]
+    tokens:
+      - text: "Ubuntu"
+      - text: "192.0.2.50"
+        foreground: "#00ffff"
+      - text: "0.0.0.0:22"
+  arubacx.txt:
+    synthetic: true
+    expected_profiles: ["generic", "arubacx"]
+    tokens:
+      - text: "ArubaOS-CX"
+      - text: "1/1/1"
+        foreground: "#0099ff"
+      - text: "lag10"
+        foreground: "#0099ff"
+      - text: "vlan1191"
+        foreground: "#0099ff"
+      - text: "LOG_INFO"
+        foreground: "#65d7fd"
+  arista.txt:
+    synthetic: true
+    expected_profiles: ["generic", "arista", "cisco"]
+    tokens:
+      - text: "Arista cEOSLab"
+      - text: "Et2"
+        foreground: "#0099ff"
+      - text: "Port-Channel10"
+        foreground: "#0099ff"
+      - text: "Vlan1191"
+        foreground: "#0099ff"
+  palo-alto.synthetic.txt:
+    synthetic: true
+    expected_profiles: ["generic", "palo-alto"]
+    tokens:
+      - text: "PA-VM"
+      - text: "ethernet1/2.1191"
+        foreground: "#0099ff"
+      - text: "vsys"
+  versa.synthetic.txt:
+    synthetic: true
+    expected_profiles: ["generic", "versa"]
+    tokens:
+      - text: "vni-0/0"
+        foreground: "#0099ff"
+      - text: "ptvi-1"
+        foreground: "#0099ff"
+      - text: "Established"
+        foreground: "#4da6ff"
+        bold: true

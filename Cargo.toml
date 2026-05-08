@@ -1,0 +1,22 @@
+[package]
+name = "prismtty"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Fast terminal output highlighter focused on network devices and Unix systems"
+
+[dependencies]
+anyhow = "1.0"
+directories = "6.0"
+is-terminal = "0.4"
+nix = { version = "0.28", features = ["term"] }
+pcre2 = "0.2"
+portable-pty = "0.9"
+serde = { version = "1.0", features = ["derive"] }
+serde_yaml = "0.9"
+thiserror = "2.0"
+
+[dev-dependencies]
+assert_cmd = "2.0"
+predicates = "3.1"
+tempfile = "3.14"

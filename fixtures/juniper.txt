@@ -1,0 +1,6 @@
+admin@mx480> show interfaces terse
+Interface               Admin Link Proto    Local                 Remote
+ge-0/0/0                up    up
+ge-0/0/1                up    down
+admin@mx480> show route 203.0.113.0/24
+OSPF  Preference: 10, Metric: 20

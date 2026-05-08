@@ -1,0 +1,13 @@
+admin@versa-lab-01> show system details
+Appliance Name: versa-lab-01
+Software Version: 22.1.4
+admin@versa-lab-01> show interfaces brief
+NAME        TYPE      ADMIN  OPER  VRF       IP
+vni-0/0     ethernet  up     up    global    192.0.2.20/24
+tvi-0/332   tunnel    up     up    TenantA   198.51.100.20/30
+ptvi-1      tunnel    down   down  TenantA   -
+admin@versa-lab-01> show route table
+TenantA  203.0.113.0/24  via 198.51.100.21  tvi-0/332
+admin@versa-lab-01> show bgp summary
+Neighbor        AS      State        PfxRcd
+198.51.100.21   64512   Established  42

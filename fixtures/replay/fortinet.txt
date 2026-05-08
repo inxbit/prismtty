@@ -1,0 +1,11 @@
+FGT-LAB-01 # get system status
+Version: FortiGate-VM64 v7.4.3,build2573
+Hostname: FGT-LAB-01
+FGT-LAB-01 # get system interface
+== [ port1 ]
+name: port1   mode: static   ip: 192.0.2.10 255.255.255.0   status: up
+== [ port2 ]
+name: port2   mode: dhcp     ip: 0.0.0.0 0.0.0.0            status: down
+FGT-LAB-01 # get router info routing-table all
+S*      0.0.0.0/0 [10/0] via 192.0.2.1, port1
+O       198.51.100.0/24 [110/20] via 192.0.2.2, port1

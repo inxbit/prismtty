@@ -1,0 +1,12 @@
+profile:
+  name: custom-router
+  inherits: [generic]
+  detection:
+    - CustomOS
+rules:
+  - description: CustomOS interface
+    regex: '\bcust\d+/\d+\b'
+    color: f#00ffff bold
+  - description: CustomOS HA role
+    regex: '(?i)\b(primary|secondary|standby)\b'
+    color: f#ffff00

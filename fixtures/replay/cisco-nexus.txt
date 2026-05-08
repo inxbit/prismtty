@@ -1,0 +1,13 @@
+N9K-LAB-01#show version
+Cisco Nexus Operating System (NX-OS) Software
+system: version 10.2(5)
+N9K-LAB-01#show interface description
+Interface       Status  Protocol  Description
+Eth1/1          up      up        Link to spine-1
+Eth1/2          down    down      Spare
+Po20            up      up        vPC peer-link
+Vlan407         up      up        Synthetic app vlan
+Vlan1191        up      up        Synthetic wireless vlan
+N9K-LAB-01#show vlan brief
+407  APP_VLAN                         active    Eth1/1
+1191 WIRELESS_CLIENTS                 active    Po20
