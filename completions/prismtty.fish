@@ -1,5 +1,6 @@
-complete -c prismtty -s p -l profile -xa "generic juniper cisco versa arista fortinet palo-alto linux-unix" -d "Force a profile"
+complete -c prismtty -s p -l profile -xa "generic juniper cisco arubacx versa arista fortinet palo-alto linux-unix" -d "Force a profile"
 complete -c prismtty -l no-auto-detect -d "Use only generic unless profiles are forced"
+complete -c prismtty -l no-dynamic-profile -d "Disable profile switching inside wrapped interactive shells"
 complete -c prismtty -s c -l config -r -d "Load a ChromaTerm-compatible YAML config"
 complete -c prismtty -l strip-ansi -d "Strip existing ANSI before highlighting"
 complete -c prismtty -l show-profile -d "Print selected profiles to stderr"

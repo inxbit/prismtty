@@ -1,11 +1,12 @@
 #compdef prismtty ptty ct
 
 local -a profiles
-profiles=(generic juniper cisco versa arista fortinet palo-alto linux-unix)
+profiles=(generic juniper cisco arubacx versa arista fortinet palo-alto linux-unix)
 
 _arguments -C \
   '(-p --profile)'{-p,--profile}'[force a profile]:profile:($profiles)' \
   '--no-auto-detect[use only generic unless profiles are forced]' \
+  '--no-dynamic-profile[disable profile switching inside wrapped interactive shells]' \
   '(-c --config)'{-c,--config}'[load a ChromaTerm-compatible YAML config]:config:_files -g "*.yml *.yaml"' \
   '--strip-ansi[strip existing ANSI before highlighting]' \
   '--show-profile[print selected profiles to stderr]' \
