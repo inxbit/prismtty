@@ -1,4 +1,4 @@
-use crate::profiles::ProfileStore;
+use crate::profiles::{ProfileStore, is_generic_profile_set};
 
 const OUTPUT_WINDOW_LIMIT: usize = 64 * 1024;
 
@@ -17,7 +17,7 @@ pub(crate) struct ProfileRuntime {
 
 impl ProfileRuntime {
     pub(crate) fn new(initial_profiles: Vec<String>) -> Self {
-        let baseline_locked = !is_generic_only(&initial_profiles);
+        let baseline_locked = !is_generic_profile_set(&initial_profiles);
         Self {
             active_profiles: initial_profiles.clone(),
             baseline_profiles: initial_profiles,
@@ -75,7 +75,7 @@ impl ProfileRuntime {
         trim_to_recent_chars(&mut self.output_window, OUTPUT_WINDOW_LIMIT);
 
         let detected = store.detect_profiles(&self.output_window);
-        if is_generic_only(&detected) {
+        if is_generic_profile_set(&detected) {
             self.clear_pending_prompt();
             return None;
         }
@@ -152,8 +152,8 @@ impl ProfileRuntime {
     fn should_learn_baseline(&self, detected: &[String], store: &ProfileStore) -> bool {
         !self.baseline_locked
             && self.stack.is_empty()
-            && is_generic_only(&self.active_profiles)
-            && !is_generic_only(detected)
+            && is_generic_profile_set(&self.active_profiles)
+            && !is_generic_profile_set(detected)
             && store.profiles_are_local_baseline(detected)
     }
 
@@ -183,7 +183,7 @@ impl ProfileRuntime {
         if profiles == self.active_profiles {
             return None;
         }
-        if is_generic_only(&profiles) {
+        if is_generic_profile_set(&profiles) {
             return None;
         }
         if self
@@ -222,10 +222,6 @@ impl ProfileRuntime {
         self.pending_prompt_profiles = None;
         self.pending_prompt_hits = 0;
     }
-}
-
-fn is_generic_only(profiles: &[String]) -> bool {
-    profiles.len() == 1 && profiles.first().is_some_and(|profile| profile == "generic")
 }
 
 fn profile_set(profile: &str) -> Vec<String> {

@@ -199,6 +199,9 @@ The CLI entry point is intentionally split into focused internal modules:
 Keep these modules internal to the CLI tree. Parser contract tests intentionally
 preserve current behavior, including `--pcre` as a no-op compatibility flag, so
 future parser migrations can be checked without changing user-facing semantics.
+The data-driven profile refactor did not keep a temporary old/new detector
+compatibility module; instead, the current safety net is the runtime transition
+tests plus byte-for-byte Cisco and Juniper streaming snapshots.
 
 ## Benchmark
 

@@ -10,16 +10,18 @@ use std::fs;
 use std::io::{self, Write};
 use std::process::ExitCode;
 
+use is_terminal::IsTerminal;
 use thiserror::Error;
 
 use crate::config::{PrismConfig, load_profile_file};
 use crate::highlight::Highlighter;
 
-use args::{Action, parse_args, print_help};
+use args::{Action, Options, parse_args, print_help};
 use profile_selection::profile_store;
 use pty::run_command;
-use runtime::request_reload;
-use stream::run_stdin;
+use runtime::{ReloadWatcher, RuntimeRegistration, request_reload};
+use stream::highlight_stream;
+use trace::IoTrace;
 
 #[derive(Debug, Error)]
 pub enum CliError {
@@ -118,6 +120,49 @@ fn run_inner(args: Vec<OsString>) -> Result<ExitCode, CliError> {
             Ok(ExitCode::SUCCESS)
         }
         Action::Stdin => run_stdin(options),
+        Action::Run(command) if command.is_empty() => run_stdin(options),
         Action::Run(command) => run_command(options, command),
+    }
+}
+
+fn run_stdin(options: Options) -> Result<ExitCode, CliError> {
+    let _registration = RuntimeRegistration::register()?;
+    let reload_watcher = Some(ReloadWatcher::new());
+    let trace = IoTrace::open(options.trace_io.as_deref())?;
+    let stdin = io::stdin();
+    let mut stdout = io::stdout();
+    let interactive = stdin_mode_interactive_highlighting(stdout.is_terminal());
+    highlight_stream(
+        stdin.lock(),
+        &mut stdout,
+        &options,
+        interactive,
+        reload_watcher,
+        trace,
+        None,
+    )?;
+    Ok(ExitCode::SUCCESS)
+}
+
+fn stdin_mode_interactive_highlighting(stdout_is_terminal: bool) -> bool {
+    stdout_is_terminal
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn stdin_mode_uses_interactive_highlighting_when_output_is_terminal() {
+        assert!(super::stdin_mode_interactive_highlighting(true));
+        assert!(!super::stdin_mode_interactive_highlighting(false));
+    }
+
+    #[test]
+    fn pty_module_only_imports_highlight_stream_from_stream_module() {
+        let source = include_str!("cli/pty.rs");
+
+        assert!(
+            !source.contains("run_stdin"),
+            "stdin orchestration should stay outside pty.rs"
+        );
     }
 }

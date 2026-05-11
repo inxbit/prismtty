@@ -1,10 +1,7 @@
 use std::cmp::Reverse;
 use std::io::{self, Read, Write};
-use std::process::ExitCode;
 use std::sync::mpsc;
 use std::time::Instant;
-
-use is_terminal::IsTerminal;
 
 use crate::highlight::{BenchmarkReport, Highlighter, StreamingHighlighter, strip_ansi};
 use crate::profile_runtime::ProfileRuntime;
@@ -16,33 +13,10 @@ use super::profile_selection::{
     ProfileReporter, auto_detect_enabled, build_highlighter_for_profiles, dynamic_profile_enabled,
     profile_store, select_profile_names, should_continue_auto_detect,
 };
-use super::runtime::{ReloadWatcher, RuntimeRegistration};
+use super::runtime::ReloadWatcher;
 use super::trace::IoTrace;
 
 const AUTO_DETECT_SAMPLE_LIMIT: usize = 64 * 1024;
-
-pub(super) fn run_stdin(options: Options) -> Result<ExitCode, CliError> {
-    let _registration = RuntimeRegistration::register()?;
-    let reload_watcher = Some(ReloadWatcher::new());
-    let trace = IoTrace::open(options.trace_io.as_deref())?;
-    let stdin = io::stdin();
-    let mut stdout = io::stdout();
-    let interactive = stdin_mode_interactive_highlighting(stdout.is_terminal());
-    highlight_stream(
-        stdin.lock(),
-        &mut stdout,
-        &options,
-        interactive,
-        reload_watcher,
-        trace,
-        None,
-    )?;
-    Ok(ExitCode::SUCCESS)
-}
-
-fn stdin_mode_interactive_highlighting(stdout_is_terminal: bool) -> bool {
-    stdout_is_terminal
-}
 
 pub(super) fn highlight_stream<R: Read, W: Write>(
     mut reader: R,
@@ -309,14 +283,5 @@ fn prepare_chunk(input: &[u8], strip_existing_ansi: bool) -> Vec<u8> {
         strip_ansi(input)
     } else {
         input.to_vec()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn stdin_mode_uses_interactive_highlighting_when_output_is_terminal() {
-        assert!(super::stdin_mode_interactive_highlighting(true));
-        assert!(!super::stdin_mode_interactive_highlighting(false));
     }
 }

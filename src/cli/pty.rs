@@ -23,14 +23,10 @@ use super::CliError;
 use super::args::Options;
 use super::profile_selection::dynamic_profile_enabled;
 use super::runtime::{ReloadWatcher, RuntimeRegistration};
-use super::stream::{highlight_stream, run_stdin};
+use super::stream::highlight_stream;
 use super::trace::IoTrace;
 
 pub(super) fn run_command(options: Options, command: Vec<OsString>) -> Result<ExitCode, CliError> {
-    if command.is_empty() {
-        return run_stdin(options);
-    }
-
     let command_name = command[0].clone();
     let command_args = command[1..].to_vec();
     let pty_system = native_pty_system();

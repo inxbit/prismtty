@@ -5,7 +5,7 @@ use directories::BaseDirs;
 
 use crate::config::{PrismConfig, load_profile_file};
 use crate::highlight::{Highlighter, strip_ansi};
-use crate::profiles::ProfileStore;
+use crate::profiles::{ProfileStore, is_generic_profile_set};
 use crate::style::ColorMode;
 
 use super::CliError;
@@ -123,7 +123,8 @@ impl ProfileReporter {
         if !self.show_profile {
             return None;
         }
-        if self.auto_detect && is_generic_only(profile_names) && self.last_reported.is_none() {
+        if self.auto_detect && is_generic_profile_set(profile_names) && self.last_reported.is_none()
+        {
             return None;
         }
         if self
@@ -139,13 +140,6 @@ impl ProfileReporter {
             profile_names.join(", ")
         ))
     }
-}
-
-fn is_generic_only(profile_names: &[String]) -> bool {
-    profile_names.len() == 1
-        && profile_names
-            .first()
-            .is_some_and(|profile| profile == "generic")
 }
 
 pub(super) fn profile_store() -> Result<ProfileStore, CliError> {

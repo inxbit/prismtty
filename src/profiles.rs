@@ -25,6 +25,10 @@ const BUNDLED_PROFILES: &[(&str, &str)] = &[
 
 pub const USER_PROFILE_RUNTIME_PRIORITY: u16 = 100;
 
+pub(crate) fn is_generic_profile_set(profiles: &[String]) -> bool {
+    profiles.len() == 1 && profiles.first().is_some_and(|profile| profile == "generic")
+}
+
 #[derive(Clone, Debug)]
 pub struct Profile {
     pub name: String,
@@ -707,5 +711,15 @@ mod tests {
                 "{profile} must not be treated as a local-shell baseline"
             );
         }
+    }
+
+    #[test]
+    fn generic_profile_set_helper_matches_only_single_generic() {
+        assert!(super::is_generic_profile_set(&["generic".to_string()]));
+        assert!(!super::is_generic_profile_set(&[
+            "generic".to_string(),
+            "linux-unix".to_string(),
+        ]));
+        assert!(!super::is_generic_profile_set(&["cisco".to_string()]));
     }
 }
