@@ -175,7 +175,11 @@ Interactive dynamic mode keeps built-in vendor selection conservative: after a
 specific profile such as `generic, cisco` or `generic, juniper` is selected,
 normal command output cannot add another vendor profile. Strong login banners can
 still switch profiles, and typed nested remote commands can switch after the next
-strong banner or repeated prompt.
+strong banner or repeated prompt. Fortinet is intentionally more permissive only
+from a local-shell baseline: a single `hostname #` Fortinet prompt can promote to
+`generic, fortinet`, which supports local shell wrappers such as `fw` that do not
+show a FortiOS banner or an explicit `ssh` command. Other prompt-only vendor
+switches still require repeated evidence or a typed remote-jump command.
 
 ## Development Notes
 

@@ -22,6 +22,7 @@ profile:
     - systemd
   runtime:
     priority: 80
+    local_baseline: true
     strong_signals:
       - type: contains_any
         values:

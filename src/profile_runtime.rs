@@ -84,7 +84,7 @@ impl ProfileRuntime {
             return None;
         }
 
-        if self.should_learn_baseline(&detected) {
+        if self.should_learn_baseline(&detected, store) {
             self.baseline_profiles = detected.clone();
             self.active_profiles = detected.clone();
             self.baseline_locked = true;
@@ -101,7 +101,7 @@ impl ProfileRuntime {
             return self.switch_to(profile_set(&profile));
         }
 
-        let at_local_baseline = self.at_local_baseline();
+        let at_local_baseline = self.at_local_baseline(store);
         if (self.remote_candidate || active_profile.is_none() || at_local_baseline)
             && let Some(profile) = store.prompt_transition_profile(&detected, &text, active_profile)
         {
@@ -143,20 +143,18 @@ impl ProfileRuntime {
         }
     }
 
-    fn at_local_baseline(&self) -> bool {
+    fn at_local_baseline(&self, store: &ProfileStore) -> bool {
         self.stack.is_empty()
             && self.active_profiles == self.baseline_profiles
-            && self
-                .active_profiles
-                .iter()
-                .all(|profile| matches!(profile.as_str(), "generic" | "linux-unix"))
+            && store.profiles_are_local_baseline(&self.active_profiles)
     }
 
-    fn should_learn_baseline(&self, detected: &[String]) -> bool {
+    fn should_learn_baseline(&self, detected: &[String], store: &ProfileStore) -> bool {
         !self.baseline_locked
             && self.stack.is_empty()
             && is_generic_only(&self.active_profiles)
-            && detected.iter().any(|profile| profile == "linux-unix")
+            && !is_generic_only(detected)
+            && store.profiles_are_local_baseline(detected)
     }
 
     fn note_prompt_detection(&mut self, detected: Vec<String>) -> Option<Vec<String>> {
@@ -294,6 +292,21 @@ mod tests {
             assert!(
                 !runtime_source.contains(&match_arm),
                 "profile_runtime.rs must not dispatch vendor behavior with a hardcoded {match_arm} arm"
+            );
+            let match_or_pattern = format!("| \"{vendor}\"");
+            assert!(
+                !runtime_source.contains(&match_or_pattern),
+                "profile_runtime.rs must not dispatch vendor behavior with a hardcoded {match_or_pattern} pattern"
+            );
+            let leading_match_or_pattern = format!("\"{vendor}\" |");
+            assert!(
+                !runtime_source.contains(&leading_match_or_pattern),
+                "profile_runtime.rs must not dispatch vendor behavior with a hardcoded {leading_match_or_pattern} pattern"
+            );
+            let equality = format!("== \"{vendor}\"");
+            assert!(
+                !runtime_source.contains(&equality),
+                "profile_runtime.rs must not dispatch vendor behavior with a hardcoded {equality} comparison"
             );
         }
     }

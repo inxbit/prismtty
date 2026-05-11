@@ -39,6 +39,8 @@ pub struct Profile {
 pub struct ProfileRuntimeMeta {
     pub priority: u16,
     #[serde(default)]
+    pub local_baseline: bool,
+    #[serde(default)]
     pub strong_signals: Vec<StrongSignal>,
     pub startup_prompt: PromptMatcherKind,
     pub runtime_prompt: PromptMatcherKind,
@@ -50,6 +52,7 @@ impl Default for ProfileRuntimeMeta {
     fn default() -> Self {
         Self {
             priority: USER_PROFILE_RUNTIME_PRIORITY,
+            local_baseline: false,
             strong_signals: Vec::new(),
             startup_prompt: PromptMatcherKind::None,
             runtime_prompt: PromptMatcherKind::None,
@@ -312,6 +315,18 @@ impl ProfileStore {
                 PromptConfidence::SingleFromBaselineOrRemoteHint => remote_candidate || at_baseline,
             }
         })
+    }
+
+    pub(crate) fn profiles_are_local_baseline(&self, profiles: &[String]) -> bool {
+        profiles
+            .iter()
+            .all(|profile| self.is_local_baseline_profile(profile))
+    }
+
+    pub(crate) fn is_local_baseline_profile(&self, profile_name: &str) -> bool {
+        self.profiles
+            .get(profile_name)
+            .is_some_and(|profile| profile.runtime.local_baseline)
     }
 
     fn ordered_specific_profiles<'a>(&self, profiles: &'a [String]) -> Vec<&'a String> {
@@ -669,5 +684,28 @@ mod tests {
         assert!(PromptMatcherKind::AristaHostMarker.matches_startup("leaf01#", ""));
         assert!(!PromptMatcherKind::PaloAltoUserAtHost.matches_startup("admin@router>", ""));
         assert!(PromptMatcherKind::PaloAltoUserAtHost.matches_startup("admin@pa-edge>", ""));
+    }
+
+    #[test]
+    fn builtin_profiles_mark_only_generic_and_linux_as_local_baseline() {
+        let store = ProfileStore::builtin();
+
+        assert!(store.is_local_baseline_profile("generic"));
+        assert!(store.is_local_baseline_profile("linux-unix"));
+
+        for profile in [
+            "arista",
+            "arubacx",
+            "cisco",
+            "fortinet",
+            "juniper",
+            "palo-alto",
+            "versa",
+        ] {
+            assert!(
+                !store.is_local_baseline_profile(profile),
+                "{profile} must not be treated as a local-shell baseline"
+            );
+        }
     }
 }

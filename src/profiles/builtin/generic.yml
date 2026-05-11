@@ -2,6 +2,7 @@ profile:
   name: generic
   runtime:
     priority: 99
+    local_baseline: true
     strong_signals: []
     startup_prompt: none
     runtime_prompt: none
