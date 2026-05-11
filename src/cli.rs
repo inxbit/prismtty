@@ -1,5 +1,6 @@
 use crate::config::{PrismConfig, load_profile_file};
 use crate::highlight::{BenchmarkReport, Highlighter, StreamingHighlighter, strip_ansi};
+use crate::profile_runtime::ProfileRuntime;
 use crate::profiles::ProfileStore;
 use crate::style::ColorMode;
 use directories::BaseDirs;
@@ -20,6 +21,7 @@ use std::process::ExitCode;
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, Ordering},
+    mpsc,
 };
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
@@ -53,6 +55,7 @@ struct Options {
     benchmark: bool,
     show_profile: bool,
     local_echo: bool,
+    no_dynamic_profile: bool,
     trace_io: Option<PathBuf>,
 }
 
@@ -179,6 +182,10 @@ fn parse_args(args: Vec<OsString>) -> Result<(Options, Action), CliError> {
                 options.no_auto_detect = true;
                 idx += 1;
             }
+            "--no-dynamic-profile" => {
+                options.no_dynamic_profile = true;
+                idx += 1;
+            }
             "--strip-ansi" => {
                 options.strip_ansi = true;
                 idx += 1;
@@ -294,6 +301,7 @@ fn run_stdin(options: Options) -> Result<ExitCode, CliError> {
         interactive,
         reload_watcher,
         trace,
+        None,
     )?;
     Ok(ExitCode::SUCCESS)
 }
@@ -333,6 +341,12 @@ fn run_command(options: Options, command: Vec<OsString>) -> Result<ExitCode, Cli
     };
 
     let trace = IoTrace::open(options.trace_io.as_deref())?;
+    let (profile_input_tx, profile_input_rx) = if dynamic_profile_enabled(&options, interactive) {
+        let (tx, rx) = mpsc::channel();
+        (Some(tx), Some(rx))
+    } else {
+        (None, None)
+    };
 
     if raw_mode.is_some() {
         let mut writer = pair.master.take_writer()?;
@@ -341,7 +355,8 @@ fn run_command(options: Options, command: Vec<OsString>) -> Result<ExitCode, Cli
         thread::spawn(move || {
             let stdin = io::stdin();
             let mut stdin = stdin.lock();
-            let _ = forward_stdin_to_pty(&mut stdin, &mut writer, local_echo, trace);
+            let _ =
+                forward_stdin_to_pty(&mut stdin, &mut writer, local_echo, trace, profile_input_tx);
         });
     }
 
@@ -363,6 +378,7 @@ fn run_command(options: Options, command: Vec<OsString>) -> Result<ExitCode, Cli
         interactive,
         reload_watcher,
         trace,
+        profile_input_rx,
     )?;
 
     let status = child.wait()?;
@@ -456,6 +472,7 @@ fn forward_stdin_to_pty<R: Read, W: Write>(
     writer: &mut W,
     local_echo: bool,
     trace: IoTrace,
+    profile_input: Option<mpsc::Sender<Vec<u8>>>,
 ) -> io::Result<()> {
     let mut buffer = [0_u8; 1024];
     loop {
@@ -465,6 +482,9 @@ fn forward_stdin_to_pty<R: Read, W: Write>(
         }
         let input = &buffer[..read];
         trace.log("IN", input);
+        if let Some(sender) = &profile_input {
+            let _ = sender.send(input.to_vec());
+        }
         writer.write_all(input)?;
         writer.flush()?;
 
@@ -728,6 +748,7 @@ fn highlight_stream<R: Read, W: Write>(
     interactive: bool,
     mut reload_watcher: Option<ReloadWatcher>,
     trace: IoTrace,
+    profile_input_rx: Option<mpsc::Receiver<Vec<u8>>>,
 ) -> Result<(), CliError> {
     let started = Instant::now();
     let mut input_bytes = 0usize;
@@ -746,7 +767,34 @@ fn highlight_stream<R: Read, W: Write>(
     let mut streaming = new_streaming_highlighter(highlighter, interactive, options.benchmark);
     let mut reporter = ProfileReporter::new(options.show_profile, auto_detect_enabled(options));
     reporter.report(&profile_names);
-    let mut auto_detect_pending = should_continue_auto_detect(options, &profile_names);
+    let dynamic_profiles =
+        dynamic_profile_enabled(options, interactive) && profile_input_rx.is_some();
+    let runtime_store = if dynamic_profiles {
+        Some(profile_store()?)
+    } else {
+        None
+    };
+    let mut profile_runtime = if dynamic_profiles {
+        Some(ProfileRuntime::new(profile_names.clone()))
+    } else {
+        None
+    };
+    let mut auto_detect_pending =
+        !dynamic_profiles && should_continue_auto_detect(options, &profile_names);
+    if let Some(next_profile_names) = observe_dynamic_profile(
+        &mut profile_runtime,
+        profile_input_rx.as_ref(),
+        runtime_store.as_ref(),
+        &first_chunk,
+    )
+    .filter(|next_profile_names| next_profile_names != &profile_names)
+    {
+        write_rendered(writer, &trace, streaming.finish())?;
+        profile_names = next_profile_names;
+        let highlighter = build_highlighter_for_profiles(options, &profile_names, interactive)?;
+        streaming = new_streaming_highlighter(highlighter, interactive, options.benchmark);
+        reporter.report(&profile_names);
+    }
     write_rendered(writer, &trace, streaming.push(&first_chunk))?;
     writer.flush()?;
 
@@ -758,6 +806,20 @@ fn highlight_stream<R: Read, W: Write>(
         trace.log("OUT", &buffer[..read]);
         let chunk = prepare_chunk(&buffer[..read], options.strip_ansi);
         input_bytes += chunk.len();
+        if let Some(next_profile_names) = observe_dynamic_profile(
+            &mut profile_runtime,
+            profile_input_rx.as_ref(),
+            runtime_store.as_ref(),
+            &chunk,
+        )
+        .filter(|next_profile_names| next_profile_names != &profile_names)
+        {
+            write_rendered(writer, &trace, streaming.finish())?;
+            profile_names = next_profile_names;
+            let highlighter = build_highlighter_for_profiles(options, &profile_names, interactive)?;
+            streaming = new_streaming_highlighter(highlighter, interactive, options.benchmark);
+            reporter.report(&profile_names);
+        }
         if auto_detect_pending && detection_sample.len() < AUTO_DETECT_SAMPLE_LIMIT {
             detection_sample.extend_from_slice(&chunk);
             let next_profile_names = select_profile_names(options, &detection_sample)?;
@@ -799,6 +861,23 @@ fn highlight_stream<R: Read, W: Write>(
     }
 
     Ok(())
+}
+
+fn observe_dynamic_profile(
+    runtime: &mut Option<ProfileRuntime>,
+    profile_input_rx: Option<&mpsc::Receiver<Vec<u8>>>,
+    store: Option<&ProfileStore>,
+    chunk: &[u8],
+) -> Option<Vec<String>> {
+    let runtime = runtime.as_mut()?;
+    let store = store?;
+    if let Some(receiver) = profile_input_rx {
+        while let Ok(input) = receiver.try_recv() {
+            runtime.observe_input(&input);
+        }
+    }
+    let visible_chunk = strip_ansi(chunk);
+    runtime.observe_output(&visible_chunk, store)
 }
 
 fn write_rendered<W: Write>(writer: &mut W, trace: &IoTrace, rendered: Vec<u8>) -> io::Result<()> {
@@ -923,6 +1002,10 @@ fn build_config_for_profiles(
 
 fn auto_detect_enabled(options: &Options) -> bool {
     options.profiles.is_empty() && !options.no_auto_detect
+}
+
+fn dynamic_profile_enabled(options: &Options, interactive: bool) -> bool {
+    interactive && auto_detect_enabled(options) && !options.no_dynamic_profile
 }
 
 fn should_continue_auto_detect(options: &Options, profile_names: &[String]) -> bool {
@@ -1073,6 +1156,7 @@ USAGE:
 OPTIONS:
   -p, --profile <NAME>     Force a profile; repeat to enable several
       --no-auto-detect     Use only the generic profile unless --profile is set
+      --no-dynamic-profile Disable profile switching inside wrapped interactive shells
   -c, --config <FILE>      Load a ChromaTerm-compatible YAML config
       --strip-ansi         Remove existing ANSI before applying PrismTTY styles
       --show-profile       Print selected profiles to stderr
@@ -1215,5 +1299,30 @@ mod tests {
             reporter.message_for(&["generic".to_string(), "cisco".to_string()]),
             Some("prismtty: profiles selected: generic, cisco".to_string())
         );
+    }
+
+    #[test]
+    fn dynamic_profile_switching_is_default_only_for_interactive_auto_detect() {
+        let options = super::Options::default();
+        assert!(super::dynamic_profile_enabled(&options, true));
+        assert!(!super::dynamic_profile_enabled(&options, false));
+
+        let forced = super::Options {
+            profiles: vec!["juniper".to_string()],
+            ..super::Options::default()
+        };
+        assert!(!super::dynamic_profile_enabled(&forced, true));
+
+        let no_auto = super::Options {
+            no_auto_detect: true,
+            ..super::Options::default()
+        };
+        assert!(!super::dynamic_profile_enabled(&no_auto, true));
+
+        let opt_out = super::Options {
+            no_dynamic_profile: true,
+            ..super::Options::default()
+        };
+        assert!(!super::dynamic_profile_enabled(&opt_out, true));
     }
 }

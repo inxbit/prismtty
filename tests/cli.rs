@@ -283,6 +283,20 @@ fn ptty_alias_supports_stdin_mode() {
 }
 
 #[test]
+fn no_dynamic_profile_flag_is_accepted() {
+    let mut cmd = Command::cargo_bin("ptty").expect("ptty binary exists");
+    cmd.arg("--no-dynamic-profile")
+        .arg("--profile")
+        .arg("generic")
+        .write_stdin("198.51.100.8 up\n");
+
+    cmd.assert()
+        .success()
+        .stdout(predicate::str::contains("198.51.100.8"))
+        .stdout(predicate::str::contains("\u{1b}["));
+}
+
+#[test]
 fn benchmark_reports_per_rule_timings() {
     let mut empty_config = tempfile::NamedTempFile::new().expect("empty config");
     writeln!(empty_config, "rules: []").expect("write empty config");

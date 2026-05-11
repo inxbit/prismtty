@@ -4,6 +4,8 @@ PrismTTY is a fast terminal output highlighter focused on network devices and
 Linux/Unix administration. It is intended as a ChromaTerm-style CLI wrapper with
 network-focused built-in profiles.
 
+Current version: `0.1.0`.
+
 ## Install
 
 Build locally with:
@@ -32,20 +34,43 @@ publishing artifacts.
 ## Usage
 
 ```sh
+ptty /bin/zsh
 ptty ssh router.example.net
-show-tech.txt | prismtty
-prismtty --profile juniper ssh router.example.net
-prismtty --profile cisco profiles test cisco fixtures/cisco.txt
+show-tech.txt | prismtty --profile cisco
+prismtty profiles test cisco fixtures/cisco.txt
 prismtty --reload
+```
+
+The recommended interactive workflow is to start one wrapped shell from your
+terminal profile:
+
+```sh
+ptty /bin/zsh
+```
+
+From inside that shell, run normal `ssh`, `telnet`, or console-wrapper commands.
+PrismTTY dynamically switches profiles from observed login banners and prompts,
+then keeps the selected remote profile locked for the session. Normal command
+output such as interface descriptions cannot churn the profile in the middle of
+the session. Nested remote sessions are still supported: a typed remote-jump
+command arms the next strong banner or repeated prompt to push a new profile, and
+connection-close markers pop back to the previous profile.
+
+Use pipe mode for noninteractive output:
+
+```sh
+show-tech.txt | prismtty --profile cisco
+journalctl -xe | prismtty --profile linux-unix
 ```
 
 Important options:
 
 - `-p, --profile <name>` forces one or more profiles.
 - `--no-auto-detect` uses only `generic` unless profiles are forced.
+- `--no-dynamic-profile` disables profile switching inside wrapped interactive shells.
 - `-c, --config <file>` loads a ChromaTerm-compatible YAML file.
 - `--strip-ansi` removes existing ANSI before PrismTTY styles output.
-- `--show-profile` prints selected profiles to stderr.
+- `--show-profile` prints profile selections and transitions to stderr.
 - `--local-echo` locally echoes printable typed keys for no-echo device sessions.
 - `--trace-io <file>` appends hex-encoded PTY input/output plus rendered-output diagnostics.
 - `-R, --rgb` forces RGB color output.
@@ -124,6 +149,7 @@ tests or isolated sessions.
 - `generic`
 - `juniper`
 - `cisco`
+- `arubacx`
 - `versa`
 - `arista`
 - `fortinet`
@@ -133,6 +159,12 @@ tests or isolated sessions.
 These profiles are clean-room curated rule sets for prompts, interfaces,
 addresses, protocol states, syslog severity, operational status, counters, and
 common vendor terms.
+
+Interactive dynamic mode keeps built-in vendor selection conservative: after a
+specific profile such as `generic, cisco` or `generic, juniper` is selected,
+normal command output cannot add another vendor profile. Strong login banners can
+still switch profiles, and typed nested remote commands can switch after the next
+strong banner or repeated prompt.
 
 ## Benchmark
 

@@ -4,7 +4,7 @@ _prismtty() {
 
   case "$prev" in
     --profile|-p)
-      COMPREPLY=($(compgen -W "generic juniper cisco versa arista fortinet palo-alto linux-unix" -- "$cur"))
+      COMPREPLY=($(compgen -W "generic juniper cisco arubacx versa arista fortinet palo-alto linux-unix" -- "$cur"))
       return
       ;;
     --config|-c)
@@ -22,7 +22,7 @@ _prismtty() {
     return
   fi
 
-  COMPREPLY=($(compgen -W "-p --profile --no-auto-detect -c --config --strip-ansi --show-profile --local-echo --trace-io -R --rgb --pcre -b --benchmark -r --reload -h --help -V -v --version profiles" -- "$cur"))
+  COMPREPLY=($(compgen -W "-p --profile --no-auto-detect --no-dynamic-profile -c --config --strip-ansi --show-profile --local-echo --trace-io -R --rgb --pcre -b --benchmark -r --reload -h --help -V -v --version profiles" -- "$cur"))
 }
 complete -F _prismtty prismtty
 complete -F _prismtty ptty
