@@ -1,0 +1,32 @@
+profile:
+  name: versa
+  inherits: [generic]
+  detection:
+    - versa-
+    - vsh
+    - vni-
+    - tvi-
+    - show orgs org-services
+  runtime:
+    priority: 70
+    strong_signals:
+      - type: contains_any
+        values:
+          - versa-
+          - versa networks
+          - versa director
+    startup_prompt: versa_user_at_host
+    runtime_prompt: versa_user_at_host
+rules:
+  - description: Versa prompt
+    regex: '(?m)^[A-Za-z0-9_.-]+@(versa|voss)[^>#\n]*[>#]'
+    color: f#00bfff
+  - description: Versa object
+    regex: '(?i)\b(vni-\d+|tvi-\d+/\d+|sdwan|tenant|appliance|org|controller|branch)\b'
+    color: f#ff00ff
+  - description: Versa interface
+    regex: '(?i)\b((vni-\d+/\d+)|(tvi-\d+/\d+)|(ptvi-\d+))(\.\d+)?\b'
+    color: f#0099ff
+  - description: Versa BGP state
+    regex: '\b(Idle|Connect|Active|OpenSent|OpenConfirm|Established)\b'
+    color: f#4da6ff bold

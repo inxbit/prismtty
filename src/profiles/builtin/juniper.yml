@@ -1,0 +1,26 @@
+profile:
+  name: juniper
+  inherits: [generic]
+  detection:
+    - junos
+    - commit check
+  runtime:
+    priority: 10
+    strong_signals:
+      - type: contains
+        value: junos
+    startup_prompt: junos_user_at_host
+    runtime_prompt: junos_user_at_host
+rules:
+  - description: Juniper prompt
+    regex: '(?m)^(\w+)(@)([^>%\n]+)([>%])'
+    color: f#00bfff
+  - description: Juniper interface
+    regex: '(?i)\b(((fe|ge|xe|et|gr|ip|lt|lsq|mt|sp|vcp)-\d*/\d*/\d*)|(((b)?me|em|fab|fxp|fti|lo|pp(d|e)?|st|swfab)[0-2]|dsc|gre|ipip|irb|jsrv|lsi|mtun|pimd|pime|tap|vlan|vme|vtep)|((ae|reth)\d*))(\.\d*)?\b'
+    color: f#0099ff
+  - description: Juniper compare added
+    regex: '(?m)^\+ .*$'
+    color: f#00dc1a
+  - description: Juniper compare removed
+    regex: '(?m)^- .*$'
+    color: f#ff3333

@@ -1,0 +1,25 @@
+profile:
+  name: arista
+  inherits: [cisco]
+  detection:
+    - arista
+    - ceoslab
+    - arista ceoslab
+    - arista networks eos
+    - show interfaces status
+  runtime:
+    priority: 40
+    strong_signals:
+      - type: contains_any
+        values:
+          - arista ceoslab
+          - arista networks eos
+    startup_prompt: arista_host_marker
+    runtime_prompt: arista_host_marker
+rules:
+  - description: Arista interface
+    regex: '(?i)\b(Ethernet|Et|Management|Ma|Port-Channel|Po|Vlan|Loopback|Lo)\d+(/\d+)?(\.\d+)?\b'
+    color: f#0099ff
+  - description: MLAG
+    regex: '(?i)\b(mlag|peer-link|peer-address|reload-delay)\b'
+    color: f#ff00ff

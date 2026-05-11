@@ -1,0 +1,30 @@
+profile:
+  name: fortinet
+  inherits: [generic]
+  detection:
+    - fortigate
+    - fortinet
+    - fortios
+    - fgt
+    - diagnose
+    - get system status
+    - config system
+  runtime:
+    priority: 20
+    strong_signals:
+      - type: line_prefix_and_any
+        prefix: "version:"
+        values:
+          - fortigate
+          - fortios
+          - fortinet
+    startup_prompt: fortinet_host_hash
+    runtime_prompt: fortinet_host_hash
+    prompt_confidence: single_from_baseline_or_remote_hint
+rules:
+  - description: Fortinet prompt
+    regex: '(?m)^[A-Za-z0-9_.-]+ #'
+    color: f#ffffff
+  - description: Fortinet terms
+    regex: '(?i)\b(vdom|policyid|srcintf|dstintf|utm|ipsec|phase1|phase2|ha|diagnose|vd-root)\b'
+    color: f#ff00ff

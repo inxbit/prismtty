@@ -1,0 +1,56 @@
+profile:
+  name: linux-unix
+  inherits: [generic]
+  detection:
+    - systemctl
+    - root@
+    - journalctl
+    - sshd
+    - sudo
+    - ubuntu
+    - debian
+    - centos
+    - rocky linux
+    - alma linux
+    - red hat
+    - rhel
+    - fedora
+    - "kernel: linux"
+    - "shell: /"
+    - "terminal: /dev/"
+    - /dev/pts/
+    - systemd
+  runtime:
+    priority: 80
+    strong_signals:
+      - type: contains_any
+        values:
+          - ubuntu
+          - debian
+          - centos
+          - rocky linux
+          - alma linux
+          - red hat
+          - rhel
+          - fedora
+          - "kernel: linux"
+          - "terminal: /dev/"
+          - /dev/pts/
+    startup_prompt: unix_user_at_host_path
+    runtime_prompt: unix_user_at_host_path
+rules:
+  - description: Unix prompt
+    regex: '(?m)^([A-Za-z0-9_.-]+)(@)([A-Za-z0-9_.-]+)(:[^#$\n]*)?([#$])'
+    color: f#ffffff
+  - description: root user
+    regex: '\broot\b'
+    color: f#ff0000 bold
+  - description: systemd states
+    regex: '(?i)\b(active|inactive|failed|dead|running|exited|enabled|disabled|masked|loaded)\b'
+    color: f#00ff00
+  - description: log priority
+    regex: '(?i)\b(emerg|alert|crit|critical|error|err|warning|warn|notice|info|debug)\b'
+    color: f#ffff00
+  - description: port
+    regex: '(?i)\b(tcp|udp)/\d{1,5}\b|((?<=[A-Za-z0-9_.-]{3})|(?<=\])):\d{1,5}\b'
+    color: f#00ffc0

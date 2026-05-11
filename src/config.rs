@@ -1,10 +1,13 @@
-use crate::profiles::ProfileStore;
+use crate::profiles::{ProfileRuntimeMeta, ProfileStore};
 use crate::style::{Style, parse_palette};
 use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
+
+pub const RESERVED_PROFILE_RUNTIME_MESSAGE: &str =
+    "the profile.runtime field is reserved for built-in profiles in this PrismTTY version";
 
 #[derive(Debug, Error)]
 pub enum ConfigError {
@@ -19,6 +22,10 @@ pub enum ConfigError {
     UnknownProfile(String),
     #[error("profile files must include profile.name")]
     MissingProfileName,
+    #[error("bundled profile files must include profile.runtime")]
+    MissingProfileRuntime,
+    #[error("{0}")]
+    ReservedProfileRuntime(&'static str),
     #[error("rule '{description}' has invalid style: {message}")]
     InvalidStyle {
         description: String,
@@ -73,6 +80,8 @@ pub struct ProfileMetaDoc {
     pub inherits: Vec<String>,
     #[serde(default)]
     pub detection: Vec<String>,
+    #[serde(default)]
+    pub(crate) runtime: Option<ProfileRuntimeMeta>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -88,6 +97,7 @@ struct RuleDoc {
 #[derive(Clone, Debug)]
 pub struct LoadedProfileFile {
     pub meta: ProfileMetaDoc,
+    pub runtime: Option<ProfileRuntimeMeta>,
     pub rules: Vec<RuleSpec>,
 }
 
@@ -148,11 +158,41 @@ pub fn load_profile_file(path: impl AsRef<Path>) -> Result<LoadedProfileFile, Co
 }
 
 pub fn parse_profile_yaml(input: &str) -> Result<LoadedProfileFile, ConfigError> {
+    parse_profile_yaml_with_mode(input, ProfileYamlMode::User)
+}
+
+pub(crate) fn parse_builtin_profile_yaml(input: &str) -> Result<LoadedProfileFile, ConfigError> {
+    parse_profile_yaml_with_mode(input, ProfileYamlMode::Bundled)
+}
+
+#[derive(Clone, Copy)]
+enum ProfileYamlMode {
+    User,
+    Bundled,
+}
+
+fn parse_profile_yaml_with_mode(
+    input: &str,
+    mode: ProfileYamlMode,
+) -> Result<LoadedProfileFile, ConfigError> {
     let doc: RulesDoc = serde_yaml::from_str(input)?;
-    let meta = doc.profile.ok_or(ConfigError::MissingProfileName)?;
+    let mut meta = doc.profile.ok_or(ConfigError::MissingProfileName)?;
+    let runtime = meta.runtime.take();
+    match mode {
+        ProfileYamlMode::User if runtime.is_some() => {
+            return Err(ConfigError::ReservedProfileRuntime(
+                RESERVED_PROFILE_RUNTIME_MESSAGE,
+            ));
+        }
+        ProfileYamlMode::Bundled if runtime.is_none() => {
+            return Err(ConfigError::MissingProfileRuntime);
+        }
+        _ => {}
+    }
     let palette = parse_palette(&doc.palette).map_err(ConfigError::InvalidPalette)?;
     Ok(LoadedProfileFile {
         meta,
+        runtime,
         rules: parse_rule_docs(doc.rules, &palette)?,
     })
 }
@@ -250,4 +290,45 @@ fn parse_style(
         description: description.to_string(),
         message,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{RESERVED_PROFILE_RUNTIME_MESSAGE, parse_builtin_profile_yaml, parse_profile_yaml};
+
+    #[test]
+    fn user_profile_runtime_is_reserved() {
+        let yaml = r#"
+profile:
+  name: custom-router
+  runtime:
+    priority: 5
+    startup_prompt: cisco_host_marker
+    runtime_prompt: cisco_host_marker
+    strong_signals: []
+rules: []
+"#;
+
+        let err = parse_profile_yaml(yaml).expect_err("user profile.runtime must be rejected");
+
+        assert_eq!(err.to_string(), RESERVED_PROFILE_RUNTIME_MESSAGE);
+    }
+
+    #[test]
+    fn bundled_profile_runtime_rejects_unknown_prompt_matcher() {
+        let yaml = r#"
+profile:
+  name: broken-builtin
+  runtime:
+    priority: 1
+    startup_prompt: mystery_prompt
+    runtime_prompt: none
+    strong_signals: []
+rules: []
+"#;
+
+        let err = parse_builtin_profile_yaml(yaml).expect_err("unknown prompt matcher should fail");
+
+        assert!(err.to_string().contains("mystery_prompt"));
+    }
 }

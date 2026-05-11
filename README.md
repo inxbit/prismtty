@@ -130,6 +130,12 @@ appear in `profiles list`, can be shown with `profiles show`, can inherit built-
 or other user profiles, and participate in auto-detection through their
 `detection` hints.
 
+Built-in profiles are bundled data-driven profile files compiled into the binary.
+Their private runtime detection metadata is intentionally not part of the public
+user profile schema yet. If a user profile under `profiles.d` includes
+`profile.runtime`, `profiles validate` and normal startup loading reject it as a
+reserved field.
+
 ## Reload
 
 Long-running `ptty /bin/zsh` sessions register themselves in a small runtime
@@ -160,11 +166,35 @@ These profiles are clean-room curated rule sets for prompts, interfaces,
 addresses, protocol states, syslog severity, operational status, counters, and
 common vendor terms.
 
+The built-in rule sets and detection hints live as bundled profile data rather
+than hardcoded vendor branches. Adding or adjusting a built-in profile should
+start from the bundled profile file and its tests, while user profiles continue
+to use the public schema shown above.
+
 Interactive dynamic mode keeps built-in vendor selection conservative: after a
 specific profile such as `generic, cisco` or `generic, juniper` is selected,
 normal command output cannot add another vendor profile. Strong login banners can
 still switch profiles, and typed nested remote commands can switch after the next
 strong banner or repeated prompt.
+
+## Development Notes
+
+The CLI entry point is intentionally split into focused internal modules:
+
+- `src/cli.rs` keeps `run()`, action dispatch, and CLI error handling.
+- `src/cli/args.rs` owns the hand-rolled parser and parser contract tests.
+- `src/cli/profile_selection.rs` loads profile stores, user config, color mode,
+  and profile reporting.
+- `src/cli/pty.rs` owns PTY command execution, raw mode, stdin forwarding, local
+  echo, the iTerm environment guard, and resize polling.
+- `src/cli/stream.rs` owns streaming highlight orchestration, dynamic profile
+  observation, reload handling, benchmarks, and `HighlightSession`.
+- `src/cli/runtime.rs` owns runtime registration and reload markers.
+- `src/cli/trace.rs` owns `--trace-io` formatting.
+
+Keep these modules internal to the CLI tree. Parser contract tests intentionally
+preserve current behavior, including `--pcre` as a no-op compatibility flag, so
+future parser migrations can be checked without changing user-facing semantics.
 
 ## Benchmark
 

@@ -1,16 +1,6 @@
 use crate::profiles::ProfileStore;
 
 const OUTPUT_WINDOW_LIMIT: usize = 64 * 1024;
-const PROFILE_PRIORITY: &[&str] = &[
-    "juniper",
-    "fortinet",
-    "arubacx",
-    "arista",
-    "cisco",
-    "palo-alto",
-    "versa",
-    "linux-unix",
-];
 
 #[derive(Clone, Debug)]
 pub(crate) struct ProfileRuntime {
@@ -103,17 +93,28 @@ impl ProfileRuntime {
             return Some(detected);
         }
 
-        let active_profile = active_specific_profile(&self.active_profiles);
-        if let Some(profile) = strong_transition_profile(&detected, &text, active_profile) {
+        let active_profile = store.active_specific_profile(&self.active_profiles);
+        if let Some(profile) = store.strong_transition_profile(&detected, &text, active_profile) {
             self.remote_candidate = false;
             self.output_window.clear();
             self.clear_pending_prompt();
             return self.switch_to(profile_set(&profile));
         }
 
-        if (self.remote_candidate || active_profile.is_none())
-            && let Some(profile) = prompt_transition_profile(&detected, &text, active_profile)
+        let at_local_baseline = self.at_local_baseline();
+        if (self.remote_candidate || active_profile.is_none() || at_local_baseline)
+            && let Some(profile) = store.prompt_transition_profile(&detected, &text, active_profile)
         {
+            if store.prompt_switches_on_first_detection(
+                &profile,
+                self.remote_candidate,
+                at_local_baseline,
+            ) {
+                self.remote_candidate = false;
+                self.output_window.clear();
+                self.clear_pending_prompt();
+                return self.switch_to(profile_set(&profile));
+            }
             return self.note_prompt_detection(profile_set(&profile));
         }
 
@@ -140,6 +141,15 @@ impl ProfileRuntime {
             self.output_window.clear();
             self.clear_pending_prompt();
         }
+    }
+
+    fn at_local_baseline(&self) -> bool {
+        self.stack.is_empty()
+            && self.active_profiles == self.baseline_profiles
+            && self
+                .active_profiles
+                .iter()
+                .all(|profile| matches!(profile.as_str(), "generic" | "linux-unix"))
     }
 
     fn should_learn_baseline(&self, detected: &[String]) -> bool {
@@ -220,33 +230,8 @@ fn is_generic_only(profiles: &[String]) -> bool {
     profiles.len() == 1 && profiles.first().is_some_and(|profile| profile == "generic")
 }
 
-fn active_specific_profile(profiles: &[String]) -> Option<&str> {
-    ordered_specific_profiles(profiles)
-        .into_iter()
-        .next()
-        .map(String::as_str)
-}
-
 fn profile_set(profile: &str) -> Vec<String> {
     vec!["generic".to_string(), profile.to_string()]
-}
-
-fn ordered_specific_profiles(profiles: &[String]) -> Vec<&String> {
-    let mut ordered = Vec::new();
-    for priority in PROFILE_PRIORITY {
-        if let Some(profile) = profiles
-            .iter()
-            .find(|profile| profile.as_str() == *priority)
-        {
-            ordered.push(profile);
-        }
-    }
-    for profile in profiles {
-        if profile != "generic" && !ordered.contains(&profile) {
-            ordered.push(profile);
-        }
-    }
-    ordered
 }
 
 fn trim_to_recent_chars(text: &mut String, limit: usize) {
@@ -268,160 +253,49 @@ fn contains_close_marker(text: &str) -> bool {
         || lower.lines().any(|line| line.trim() == "logout")
 }
 
-fn strong_transition_profile(
-    detected: &[String],
-    text: &str,
-    active_profile: Option<&str>,
-) -> Option<String> {
-    ordered_specific_profiles(detected)
-        .into_iter()
-        .filter(|profile| Some(profile.as_str()) != active_profile)
-        .find(|profile| has_strong_profile_signal(profile, text))
-        .cloned()
-}
-
-fn prompt_transition_profile(
-    detected: &[String],
-    text: &str,
-    active_profile: Option<&str>,
-) -> Option<String> {
-    ordered_specific_profiles(detected)
-        .into_iter()
-        .filter(|profile| Some(profile.as_str()) != active_profile)
-        .find(|profile| has_prompt_profile_signal(profile, text))
-        .cloned()
-}
-
-fn has_strong_profile_signal(profile: &str, text: &str) -> bool {
-    let lower = text.to_ascii_lowercase();
-    match profile {
-        "juniper" => lower.contains("junos"),
-        "cisco" => {
-            lower.contains("cisco ios")
-                || lower.contains("ios xe")
-                || lower.contains("ios-xe")
-                || lower.contains("asa version")
-                || lower.contains("nx-os")
-                || lower.contains("nexus operating system")
-                || lower.contains("cisco nexus")
-        }
-        "fortinet" => has_strong_fortinet_signal(text),
-        "linux-unix" => {
-            lower.contains("ubuntu")
-                || lower.contains("debian")
-                || lower.contains("centos")
-                || lower.contains("rocky linux")
-                || lower.contains("alma linux")
-                || lower.contains("red hat")
-                || lower.contains("rhel")
-                || lower.contains("fedora")
-                || lower.contains("kernel: linux")
-                || lower.contains("terminal: /dev/")
-                || lower.contains("/dev/pts/")
-        }
-        "arubacx" => {
-            lower.contains("arubaos-cx") || lower.contains("aos-cx") || lower.contains("hpe-restd")
-        }
-        "arista" => lower.contains("arista ceoslab") || lower.contains("arista networks eos"),
-        "palo-alto" => {
-            lower.contains("pan-os") || lower.contains("pa-vm") || lower.contains("palo alto")
-        }
-        "versa" => {
-            lower.contains("versa-")
-                || lower.contains("versa networks")
-                || lower.contains("versa director")
-        }
-        _ => false,
-    }
-}
-
-fn has_strong_fortinet_signal(text: &str) -> bool {
-    text.lines().any(|line| {
-        let line = line.trim();
-        let lower = line.to_ascii_lowercase();
-        lower.starts_with("version:")
-            && (lower.contains("fortigate")
-                || lower.contains("fortios")
-                || lower.contains("fortinet"))
-    })
-}
-
-fn has_prompt_profile_signal(profile: &str, text: &str) -> bool {
-    match profile {
-        "juniper" => text.lines().any(looks_like_juniper_prompt_line),
-        "cisco" | "arista" | "arubacx" => text.lines().any(looks_like_network_prompt_line),
-        "fortinet" => text.lines().any(looks_like_fortinet_prompt_line),
-        "linux-unix" => text.lines().any(looks_like_unix_prompt_line),
-        "palo-alto" | "versa" => text.lines().any(looks_like_network_prompt_line),
-        _ => false,
-    }
-}
-
-fn prompt_token(line: &str) -> &str {
-    line.split_whitespace()
-        .next()
-        .unwrap_or(line)
-        .trim_matches(|ch: char| ch.is_ascii_control())
-}
-
-fn looks_like_juniper_prompt_line(line: &str) -> bool {
-    let token = prompt_token(line);
-    token.contains('@') && (token.ends_with('>') || token.ends_with('%'))
-}
-
-fn looks_like_network_prompt_line(line: &str) -> bool {
-    let token = prompt_token(line);
-    let Some(marker) = token.find(['>', '#']) else {
-        return false;
-    };
-    if marker == 0 {
-        return false;
-    }
-    let body = &token[..marker];
-    !body.contains('@') && !body.contains(':') && body.bytes().all(is_prompt_name_byte)
-}
-
-fn looks_like_fortinet_prompt_line(line: &str) -> bool {
-    let trimmed = line.trim_matches(|ch: char| ch.is_ascii_control());
-    let Some((host, _rest)) = trimmed.split_once(" #") else {
-        return false;
-    };
-    let host = host.trim_end();
-    !host.is_empty()
-        && !host.contains('@')
-        && !host.contains(':')
-        && host.bytes().all(is_prompt_name_byte)
-}
-
-fn looks_like_unix_prompt_line(line: &str) -> bool {
-    let token = prompt_token(line);
-    let Some((user, rest)) = token.split_once('@') else {
-        return false;
-    };
-    let Some((host, tail)) = rest.split_once(':') else {
-        return false;
-    };
-    let marker = tail
-        .bytes()
-        .position(|byte| matches!(byte, b'#' | b'$' | b'%'));
-    !user.is_empty()
-        && !host.is_empty()
-        && marker.is_some()
-        && user.bytes().all(is_prompt_name_byte)
-        && host.bytes().all(is_prompt_name_byte)
-}
-
-fn is_prompt_name_byte(byte: u8) -> bool {
-    byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.')
-}
-
 #[cfg(test)]
 mod tests {
     use super::ProfileRuntime;
     use crate::profiles::ProfileStore;
 
+    const VENDOR_NAMES: &[&str] = &[
+        "arista",
+        "arubacx",
+        "cisco",
+        "fortinet",
+        "juniper",
+        "linux-unix",
+        "palo-alto",
+        "versa",
+    ];
+
     fn names(names: &[&str]) -> Vec<String> {
         names.iter().map(|name| (*name).to_string()).collect()
+    }
+
+    #[test]
+    fn runtime_source_has_no_static_vendor_priority_array() {
+        let source = include_str!("profile_runtime.rs");
+        let runtime_source = source.split("#[cfg(test)]").next().unwrap_or(source);
+
+        assert!(
+            !runtime_source.contains("PROFILE_PRIORITY"),
+            "profile_runtime.rs must get vendor priority from ProfileStore metadata, not a static array"
+        );
+    }
+
+    #[test]
+    fn runtime_source_has_no_vendor_string_match_arms() {
+        let source = include_str!("profile_runtime.rs");
+        let runtime_source = source.split("#[cfg(test)]").next().unwrap_or(source);
+
+        for vendor in VENDOR_NAMES {
+            let match_arm = format!("\"{vendor}\" =>");
+            assert!(
+                !runtime_source.contains(&match_arm),
+                "profile_runtime.rs must not dispatch vendor behavior with a hardcoded {match_arm} arm"
+            );
+        }
     }
 
     #[test]
@@ -448,6 +322,30 @@ mod tests {
 
         assert_eq!(changed, Some(names(&["generic", "juniper"])));
         assert_eq!(runtime.active_profiles(), names(&["generic", "juniper"]));
+    }
+
+    #[test]
+    fn remote_hint_promotes_fortinet_on_first_prompt() {
+        let store = ProfileStore::builtin();
+        let mut runtime = ProfileRuntime::new(names(&["generic", "linux-unix"]));
+
+        runtime.observe_input(b"ssh firewall-a\r");
+        let changed = runtime.observe_output(b"FW-EDGE # ", &store);
+
+        assert_eq!(changed, Some(names(&["generic", "fortinet"])));
+        assert_eq!(runtime.active_profiles(), names(&["generic", "fortinet"]));
+    }
+
+    #[test]
+    fn local_shell_wrapper_command_promotes_fortinet_on_first_prompt() {
+        let store = ProfileStore::builtin();
+        let mut runtime = ProfileRuntime::new(names(&["generic", "linux-unix"]));
+
+        runtime.observe_input(b"fw\r");
+        let changed = runtime.observe_output(b"FW-EDGE # ", &store);
+
+        assert_eq!(changed, Some(names(&["generic", "fortinet"])));
+        assert_eq!(runtime.active_profiles(), names(&["generic", "fortinet"]));
     }
 
     #[test]

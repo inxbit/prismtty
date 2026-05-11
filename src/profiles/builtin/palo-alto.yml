@@ -1,0 +1,27 @@
+profile:
+  name: palo-alto
+  inherits: [generic]
+  detection:
+    - pa-vm
+    - pan-os
+    - palo alto
+  runtime:
+    priority: 60
+    strong_signals:
+      - type: contains_any
+        values:
+          - pan-os
+          - pa-vm
+          - palo alto
+    startup_prompt: palo_alto_user_at_host
+    runtime_prompt: palo_alto_user_at_host
+rules:
+  - description: PAN-OS prompt
+    regex: '(?m)^[A-Za-z0-9_.-]+@[^>#\n]+[>#]'
+    color: f#00bfff
+  - description: PAN-OS interface
+    regex: '(?i)\b(ethernet\d+/\d+(\.\d+)?|tunnel\.\d+|loopback\.\d+)\b'
+    color: f#0099ff
+  - description: PAN-OS terms
+    regex: '(?i)\b(vsys\d*|security-policy|nat-policy|globalprotect|wildfire|threat|url-filtering|ha\d?|panorama)\b'
+    color: f#ff00ff
