@@ -25,4 +25,11 @@ jobs:
           fi
       - run: cargo fmt --check
       - run: cargo test
+      - name: Privacy scan
+        run: |
+          PATTERN='(/Users/[^[:space:]]+/(Desktop|Documents)|Desktop/[A-Za-z0-9_.-]+\.txt)'
+          if rg -n "$PATTERN" . --glob '!target/**' --glob '!Cargo.lock' --glob '!.github/workflows/ci.yml'; then
+            echo "Sensitive real-world capture marker found. Use synthetic fixtures instead."
+            exit 1
+          fi
       - run: cargo build --release

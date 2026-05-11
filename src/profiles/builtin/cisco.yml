@@ -1,0 +1,48 @@
+profile:
+  name: cisco
+  inherits: [generic]
+  detection:
+    - router#
+    - switch#
+    - ios
+    - ios xe
+    - ios-xe
+    - nx-os
+    - nexus operating system
+    - line protocol is
+    - show ip
+    - router ospf
+    - router bgp
+  runtime:
+    priority: 50
+    strong_signals:
+      - type: contains_any
+        values:
+          - cisco ios
+          - ios xe
+          - ios-xe
+          - asa version
+          - nx-os
+          - nexus operating system
+          - cisco nexus
+    startup_prompt: cisco_host_marker
+    runtime_prompt: cisco_host_marker
+rules:
+  - description: Cisco prompt
+    regex: '(?m)^[A-Za-z0-9_.-]+(\([^)]+\))?[>#]'
+    color: f#ffffff
+  - description: Cisco interface
+    regex: '(?i)\b(((Hu(ndredGigabit)?|Fo(rtyGigabit)?|Te(nGigabit)?|Gi(gabit)?|Fa(st)?)(Ethernet)?)|Eth|Se(rial)?|Lo(opback)?|Tu(nnel)?|VL(AN)?|Po(rt-channel)?|Vi(rtual-(Template|Access))?|Mu(ltilink)?|Di(aler)?|(B|N)VI)((\d*/){0,2}\d*)(\.\d*)?\b'
+    color: f#0099ff
+  - description: OSPF state
+    regex: '\b(ATTEMPT|INIT|EXCHANGE|LOADING|2WAY|FULL|DR|BDR|DROTHER)\b'
+    color: f#ffa500
+  - description: BGP state
+    regex: '\b(Idle|Connect|Active|OpenSent|OpenConfirm|Established)\b'
+    color: f#4da6ff bold
+  - description: Cisco Nexus bad interface status
+    regex: '(?i)\b(suspended|notconnec)\b'
+    color: f#ff0000 bold
+  - description: Cisco Nexus warning interface status
+    regex: '\b(xcvrAbsen|noOperMem)\b'
+    color: f#ffa500

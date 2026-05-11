@@ -1,0 +1,30 @@
+profile:
+  name: arubacx
+  inherits: [generic]
+  detection:
+    - arubaos-cx
+    - aos-cx
+    - hpe-restd
+  runtime:
+    priority: 30
+    strong_signals:
+      - type: contains_any
+        values:
+          - arubaos-cx
+          - aos-cx
+          - hpe-restd
+    startup_prompt: none
+    runtime_prompt: cisco_host_marker
+rules:
+  - description: ArubaCX prompt
+    regex: '(?m)^[A-Za-z0-9_.-]+[>#]'
+    color: f#ffffff
+  - description: ArubaCX interface
+    regex: '(?i)\b((\d+/\d+/\d+)|(lag\d+)|(vlan\d+)|(loopback\d+)|(mgmt))(\.\d+)?\b'
+    color: f#0099ff
+  - description: ArubaCX event severity
+    regex: '\bLOG_(EMERG|ALERT|CRIT|ERR|ERROR|WARNING|NOTICE|INFO|DEBUG)\b'
+    color: f#65d7fd
+  - description: ArubaCX platform terms
+    regex: '(?i)\b(arubaos-cx|aos-cx|hpe-restd|vsx|vsf|checkpoint|event)\b'
+    color: f#ff00ff

@@ -599,6 +599,47 @@ fn builtins_highlight_common_network_and_vendor_terms() {
     assert!(output.contains("\x1b["));
 }
 
+fn whole_and_chunked_streaming_output(
+    profile: &str,
+    input: &str,
+    chunk_size: usize,
+) -> (String, String) {
+    let store = ProfileStore::builtin();
+    let config = PrismConfig::from_profiles(&store, &[profile]).expect("built-in profile loads");
+    let highlighter = Highlighter::from_config(config).expect("profile rules compile");
+    let whole = highlighter.highlight_str(input);
+    let mut streaming = StreamingHighlighter::new(highlighter);
+    let mut chunked = String::new();
+
+    for chunk in input.as_bytes().chunks(chunk_size) {
+        chunked.push_str(
+            &String::from_utf8(streaming.push(chunk))
+                .expect("synthetic fixture remains valid UTF-8"),
+        );
+    }
+    chunked.push_str(
+        &String::from_utf8(streaming.finish()).expect("synthetic fixture remains valid UTF-8"),
+    );
+
+    (whole, chunked)
+}
+
+#[test]
+fn cisco_streaming_output_matches_whole_output_byte_for_byte_snapshot() {
+    let input = "Router# show interfaces description\nEth1/1 up up Uplink to CORE\nVlan1191 up up Internal VLAN\n";
+    let (whole, chunked) = whole_and_chunked_streaming_output("cisco", input, 7);
+
+    assert_eq!(chunked.as_bytes(), whole.as_bytes());
+}
+
+#[test]
+fn juniper_streaming_output_matches_whole_output_byte_for_byte_snapshot() {
+    let input = "ge-0/0/0 up up Core uplink\nreth1.816 up up inet\nst0.1078 down down VPN tunnel\n";
+    let (whole, chunked) = whole_and_chunked_streaming_output("juniper", input, 5);
+
+    assert_eq!(chunked.as_bytes(), whole.as_bytes());
+}
+
 #[test]
 fn streaming_highlighter_keeps_split_interface_tokens_consistently_colored() {
     let store = ProfileStore::builtin();
@@ -1444,6 +1485,7 @@ fn every_builtin_profile_highlights_a_representative_fixture() {
             "arista",
             "leaf1# show interfaces Ethernet1 up mlag active\n",
         ),
+        ("arubacx", "LAB-ARUBA-01# show interface 1/1/1 up\n"),
         ("fortinet", "FGT # diagnose vpn tunnel phase1 down\n"),
         ("palo-alto", "admin@PA-VM> show system info vsys1 active\n"),
         (
