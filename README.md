@@ -56,6 +56,10 @@ the session. Nested remote sessions are still supported: a typed remote-jump
 command arms the next strong banner or repeated prompt to push a new profile, and
 connection-close markers pop back to the previous profile.
 
+Interactive mode is designed to preserve shell line editing and typed command
+echo, including zsh prompts that use decorative Unicode prompt markers such as
+`╰─○`, `❯`, or `➜`.
+
 Use pipe mode for noninteractive output:
 
 ```sh
@@ -202,7 +206,7 @@ fi
 The CLI entry point is intentionally split into focused internal modules:
 
 - `src/cli.rs` keeps `run()`, action dispatch, and CLI error handling.
-- `src/cli/args.rs` owns the hand-rolled parser and parser contract tests.
+- `src/cli/args.rs` owns the clap-backed parser and parser contract tests.
 - `src/cli/profile_selection.rs` loads profile stores, user config, color mode,
   and profile reporting.
 - `src/cli/pty.rs` owns PTY command execution, raw mode, stdin forwarding, local
