@@ -39,7 +39,7 @@ jobs:
       - name: Privacy scan
         run: |
           PATTERN='(/Users/[^[:space:]]+/(Desktop|Documents)|Desktop/[A-Za-z0-9_.-]+\.txt)'
-          if rg -n "$PATTERN" . --glob '!target/**' --glob '!Cargo.lock' --glob '!.github/workflows/ci.yml'; then
+          if git grep -n -E "$PATTERN" -- . ':!Cargo.lock' ':!.github/workflows/ci.yml'; then
             echo "Sensitive real-world capture marker found. Use synthetic fixtures instead."
             exit 1
           fi
@@ -52,9 +52,9 @@ jobs:
             printf '%s  prismtty-%s-%s.tar.gz\n' "$checksum" "$version" "$target" > "$tmp/prismtty-${version}-${target}.tar.gz.sha256"
           done
           bash scripts/generate-homebrew-formula.sh "$tmp/prismtty.rb" "$tmp"
-          rg "version \"${version}\"" "$tmp/prismtty.rb"
-          rg "linux-x86_64" "$tmp/prismtty.rb"
-          if rg -n "REPLACE_WITH|linux-aarch64" "$tmp/prismtty.rb"; then
+          grep -F "version \"${version}\"" "$tmp/prismtty.rb"
+          grep -F "linux-x86_64" "$tmp/prismtty.rb"
+          if grep -n -E "REPLACE_WITH|linux-aarch64" "$tmp/prismtty.rb"; then
             echo "Generated Homebrew formula has placeholder checksums or unsupported artifacts."
             exit 1
           fi

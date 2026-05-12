@@ -21,3 +21,5 @@ All notable changes to PrismTTY are documented here.
   stale formula with placeholder SHA-256 values.
 - Stop advertising unsupported Linux ARM Homebrew artifacts until the release
   workflow builds them.
+- Avoid requiring `ripgrep` on GitHub-hosted runners for CI formula and privacy
+  checks.
