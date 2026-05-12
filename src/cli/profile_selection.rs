@@ -91,11 +91,7 @@ pub(super) fn dynamic_profile_enabled(options: &Options, interactive: bool) -> b
 }
 
 pub(super) fn should_continue_auto_detect(options: &Options, profile_names: &[String]) -> bool {
-    auto_detect_enabled(options)
-        && profile_names.len() == 1
-        && profile_names
-            .first()
-            .is_some_and(|profile| profile == "generic")
+    auto_detect_enabled(options) && is_generic_profile_set(profile_names)
 }
 
 pub(super) struct ProfileReporter {
