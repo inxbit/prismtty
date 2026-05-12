@@ -218,15 +218,17 @@ fn streaming_highlighter_bypasses_alternate_screen_apps() {
     let mut streaming = StreamingHighlighter::new(highlighter);
     let htop_like = "\x1b[?1049h\x1b[38;2;77;166;255m192.0.2.1 down\x1b[0m\x1b[?1049l";
 
-    let output = streaming.push_str(&format!("before 10.0.0.1 {htop_like} after 10.0.0.2"));
+    let output = streaming.push_str(&format!(
+        "before 198.51.100.10 {htop_like} after 198.51.100.11"
+    ));
     let output = format!(
         "{output}{}",
         String::from_utf8(streaming.finish()).expect("output remains UTF-8")
     );
 
-    assert!(output.contains("\x1b[38;2;0;255;255m10.0.0.1\x1b[0m"));
+    assert!(output.contains("\x1b[38;2;0;255;255m198.51.100.10\x1b[0m"));
     assert!(output.contains(htop_like));
-    assert!(output.contains("\x1b[38;2;0;255;255m10.0.0.2\x1b[0m"));
+    assert!(output.contains("\x1b[38;2;0;255;255m198.51.100.11\x1b[0m"));
     assert!(!output.contains("\x1b[38;2;0;255;255m192.0.2.1"));
 }
 
@@ -239,14 +241,14 @@ fn streaming_highlighter_keeps_alternate_screen_bypass_across_chunks() {
 
     let first = streaming.push_str("\x1b[?1049h\x1b[38;2;77;166;255m192.0.");
     let second = streaming.push_str("2.1 down\x1b[0m");
-    let third = streaming.push_str("\x1b[?1049l 10.0.0.2");
+    let third = streaming.push_str("\x1b[?1049l 198.51.100.11");
     let output = format!(
         "{first}{second}{third}{}",
         String::from_utf8(streaming.finish()).expect("output remains UTF-8")
     );
 
     assert!(output.contains("\x1b[38;2;77;166;255m192.0.2.1 down\x1b[0m"));
-    assert!(output.contains("\x1b[38;2;0;255;255m10.0.0.2\x1b[0m"));
+    assert!(output.contains("\x1b[38;2;0;255;255m198.51.100.11\x1b[0m"));
     assert!(!output.contains("\x1b[38;2;0;255;255m192.0.2.1"));
 }
 
@@ -666,7 +668,7 @@ fn streaming_highlighter_keeps_char_split_ipv4_addresses_colored() {
     let mut streaming = StreamingHighlighter::new(highlighter);
 
     let mut output = String::new();
-    for byte in "router-id 10.96.0.22\r\nnetwork 10.80.0.0 0.7.255.255 area 0\r\n".bytes() {
+    for byte in "router-id 192.0.2.22\r\nnetwork 198.51.100.0 0.0.0.255 area 0\r\n".bytes() {
         output.push_str(
             &String::from_utf8(streaming.push(&[byte]))
                 .expect("ASCII test input remains valid UTF-8"),
@@ -676,9 +678,9 @@ fn streaming_highlighter_keeps_char_split_ipv4_addresses_colored() {
         &String::from_utf8(streaming.finish()).expect("ASCII test input remains valid UTF-8"),
     );
 
-    assert!(output.contains("\x1b[38;2;0;255;255m10.96.0.22\x1b[0m"));
-    assert!(output.contains("\x1b[38;2;0;255;255m10.80.0.0\x1b[0m"));
-    assert!(output.contains("\x1b[38;2;0;255;255m0.7.255.255\x1b[0m"));
+    assert!(output.contains("\x1b[38;2;0;255;255m192.0.2.22\x1b[0m"));
+    assert!(output.contains("\x1b[38;2;0;255;255m198.51.100.0\x1b[0m"));
+    assert!(output.contains("\x1b[38;2;0;255;255m0.0.0.255\x1b[0m"));
 }
 
 #[test]
@@ -1254,10 +1256,10 @@ fn interactive_streaming_highlighter_does_not_treat_juniper_route_marker_as_prom
     let highlighter = Highlighter::from_config(config).expect("rules compile");
     let mut streaming = StreamingHighlighter::new_interactive(highlighter);
 
-    let first = streaming.push_str("10.67.4.0/23\n>");
+    let first = streaming.push_str("203.0.113.0/24\n>");
     let second = streaming.push_str(" to 192.0.2.1 via st0.1055\n");
     let output = format!("{first}{second}");
-    let visible = "10.67.4.0/23\n> to 192.0.2.1 via st0.1055\n";
+    let visible = "203.0.113.0/24\n> to 192.0.2.1 via st0.1055\n";
 
     assert_eq!(strip_ansi(output.as_bytes()), visible.as_bytes());
     assert!(
@@ -1295,13 +1297,13 @@ fn interactive_streaming_highlighter_does_not_leak_split_ansi16_prefix_as_text()
     let highlighter = Highlighter::from_config(config).expect("rules compile");
     let mut streaming = StreamingHighlighter::new_interactive(highlighter);
 
-    let first = streaming.push_str("\x1b[96m10");
-    let second = streaming.push_str(".96.2.132/31\n");
+    let first = streaming.push_str("\x1b[96m192");
+    let second = streaming.push_str(".0.2.132/31\n");
     let output = format!("{first}{second}");
 
     assert_eq!(strip_ansi(first.as_bytes()), b"");
-    assert_eq!(strip_ansi(second.as_bytes()), b"10.96.2.132/31\n");
-    assert_eq!(strip_ansi(output.as_bytes()), b"10.96.2.132/31\n");
+    assert_eq!(strip_ansi(second.as_bytes()), b"192.0.2.132/31\n");
+    assert_eq!(strip_ansi(output.as_bytes()), b"192.0.2.132/31\n");
 }
 
 #[test]
@@ -1311,13 +1313,13 @@ fn interactive_streaming_highlighter_does_not_leak_split_truecolor_prefix_as_tex
     let highlighter = Highlighter::from_config(config).expect("rules compile");
     let mut streaming = StreamingHighlighter::new_interactive(highlighter);
 
-    let first = streaming.push_str("\x1b[38;2;0;255;255m10");
-    let second = streaming.push_str(".96.2.132/31\n");
+    let first = streaming.push_str("\x1b[38;2;0;255;255m192");
+    let second = streaming.push_str(".0.2.132/31\n");
     let output = format!("{first}{second}");
 
     assert_eq!(strip_ansi(first.as_bytes()), b"");
-    assert_eq!(strip_ansi(second.as_bytes()), b"10.96.2.132/31\n");
-    assert_eq!(strip_ansi(output.as_bytes()), b"10.96.2.132/31\n");
+    assert_eq!(strip_ansi(second.as_bytes()), b"192.0.2.132/31\n");
+    assert_eq!(strip_ansi(output.as_bytes()), b"192.0.2.132/31\n");
 }
 
 #[test]
@@ -1432,11 +1434,11 @@ fn interactive_streaming_highlighter_resets_overlay_after_linux_root_prompt_befo
 
     let mut output = String::new();
     output.push_str(&streaming.push_str("root@server:~# "));
-    output.push_str(&streaming.push_str("ping 1.1.1.1"));
+    output.push_str(&streaming.push_str("ping 192.0.2.53"));
 
     assert_eq!(
         strip_ansi(output.as_bytes()),
-        b"root@server:~# ping 1.1.1.1"
+        b"root@server:~# ping 192.0.2.53"
     );
     assert_all_token_occurrences_have_no_foreground(&output, "ping");
 }
