@@ -19,7 +19,7 @@ jobs:
         include:
           - os: macos-14
             target_name: darwin-aarch64
-          - os: macos-13
+          - os: macos-15-intel
             target_name: darwin-x86_64
           - os: ubuntu-24.04
             target_name: linux-x86_64
