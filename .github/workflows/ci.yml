@@ -25,6 +25,10 @@ jobs:
           fi
       - run: cargo fmt --check
       - run: cargo test
+      - name: Verify generated completions
+        run: |
+          cargo run --features completion-generation --bin gen-completions
+          git diff --exit-code completions/
       - name: Privacy scan
         run: |
           PATTERN='(/Users/[^[:space:]]+/(Desktop|Documents)|Desktop/[A-Za-z0-9_.-]+\.txt)'

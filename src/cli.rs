@@ -23,6 +23,10 @@ use runtime::{ReloadWatcher, RuntimeRegistration, request_reload};
 use stream::highlight_stream;
 use trace::IoTrace;
 
+#[cfg(feature = "completion-generation")]
+#[doc(hidden)]
+pub use args::completion_command;
+
 #[derive(Debug, Error)]
 pub enum CliError {
     #[error("{0}")]

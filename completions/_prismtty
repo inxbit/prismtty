@@ -1,35 +1,133 @@
 #compdef prismtty ptty ct
 
-local -a profiles
-profiles=(generic juniper cisco arubacx versa arista fortinet palo-alto linux-unix)
+autoload -U is-at-least
 
-_arguments -C \
-  '(-p --profile)'{-p,--profile}'[force a profile]:profile:($profiles)' \
-  '--no-auto-detect[use only generic unless profiles are forced]' \
-  '--no-dynamic-profile[disable profile switching inside wrapped interactive shells]' \
-  '(-c --config)'{-c,--config}'[load a ChromaTerm-compatible YAML config]:config:_files -g "*.yml *.yaml"' \
-  '--strip-ansi[strip existing ANSI before highlighting]' \
-  '--show-profile[print selected profiles to stderr]' \
-  '--local-echo[locally echo typed printable keys for no-echo device sessions]' \
-  '--trace-io[append hex-encoded PTY input/output diagnostics]:trace file:_files' \
-  '(-R --rgb)'{-R,--rgb}'[force RGB color output]' \
-  '--pcre[accepted for ChromaTerm compatibility]' \
-  '(-b --benchmark)'{-b,--benchmark}'[print per-rule benchmark timings]' \
-  '(-r --reload)'{-r,--reload}'[reload running PrismTTY sessions]' \
-  '(-h --help)'{-h,--help}'[show help]' \
-  '(-V -v --version)'{-V,-v,--version}'[show version]' \
-  '1: :->command' \
-  '*:: :->args'
+_prismtty() {
+    typeset -A opt_args
+    typeset -a _arguments_options
+    local ret=1
 
-case $state in
-  command)
-    _values 'command' profiles
-    ;;
-  args)
-    if [[ $words[2] == profiles ]]; then
-      _values 'profiles subcommand' list show validate test
+    if is-at-least 5.2; then
+        _arguments_options=(-s -S -C)
     else
-      _normal
+        _arguments_options=(-s -C)
     fi
+
+    local context curcontext="$curcontext" state line
+    _arguments "${_arguments_options[@]}" : \
+'--trace-io=[Append hex-encoded PTY input/output diagnostics]:FILE:_files' \
+'*-p+[Force a profile; repeat to enable several]:NAME:_default' \
+'*--profile=[Force a profile; repeat to enable several]:NAME:_default' \
+'-c+[Load a ChromaTerm-compatible YAML config]:FILE:_files' \
+'--config=[Load a ChromaTerm-compatible YAML config]:FILE:_files' \
+'-h[Show help]' \
+'--help[Show help]' \
+'-V[Show version]' \
+'-v[Show version]' \
+'--version[Show version]' \
+'-b[Print per-rule timing and match-count data to stderr]' \
+'--benchmark[Print per-rule timing and match-count data to stderr]' \
+'-r[Ask running PrismTTY sessions to reload config]' \
+'--reload[Ask running PrismTTY sessions to reload config]' \
+'-R[Force RGB color output]' \
+'--rgb[Force RGB color output]' \
+'--pcre[Accepted for ChromaTerm compatibility; PCRE2 is always used]' \
+'--no-auto-detect[Use only the generic profile unless --profile is set]' \
+'--no-dynamic-profile[Disable profile switching inside wrapped interactive shells]' \
+'--strip-ansi[Remove existing ANSI before applying PrismTTY styles]' \
+'--show-profile[Print selected profiles to stderr]' \
+'--local-echo[Locally echo typed printable keys for no-echo device sessions]' \
+'::command:_default' \
+":: :_prismtty_commands" \
+"*::: :->prismtty" \
+&& ret=0
+    case $state in
+    (prismtty)
+        words=($line[2] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:prismtty-command-$line[2]:"
+        case $line[2] in
+            (profiles)
+_arguments "${_arguments_options[@]}" : \
+":: :_prismtty__subcmd__profiles_commands" \
+"*::: :->profiles" \
+&& ret=0
+
+    case $state in
+    (profiles)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:prismtty-profiles-command-$line[1]:"
+        case $line[1] in
+            (list)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(show)
+_arguments "${_arguments_options[@]}" : \
+':PROFILE:_default' \
+&& ret=0
+;;
+(validate)
+_arguments "${_arguments_options[@]}" : \
+':FILE:_default' \
+&& ret=0
+;;
+(test)
+_arguments "${_arguments_options[@]}" : \
+':PROFILE:_default' \
+':FILE:_default' \
+&& ret=0
+;;
+        esac
     ;;
 esac
+;;
+        esac
+    ;;
+esac
+}
+
+(( $+functions[_prismtty_commands] )) ||
+_prismtty_commands() {
+    local commands; commands=(
+'profiles:Manage profiles' \
+    )
+    _describe -t commands 'prismtty commands' commands "$@"
+}
+(( $+functions[_prismtty__subcmd__profiles_commands] )) ||
+_prismtty__subcmd__profiles_commands() {
+    local commands; commands=(
+'list:List available profiles' \
+'show:Show a profile' \
+'validate:Validate a profile file' \
+'test:Highlight a fixture with a profile' \
+    )
+    _describe -t commands 'prismtty profiles commands' commands "$@"
+}
+(( $+functions[_prismtty__subcmd__profiles__subcmd__list_commands] )) ||
+_prismtty__subcmd__profiles__subcmd__list_commands() {
+    local commands; commands=()
+    _describe -t commands 'prismtty profiles list commands' commands "$@"
+}
+(( $+functions[_prismtty__subcmd__profiles__subcmd__show_commands] )) ||
+_prismtty__subcmd__profiles__subcmd__show_commands() {
+    local commands; commands=()
+    _describe -t commands 'prismtty profiles show commands' commands "$@"
+}
+(( $+functions[_prismtty__subcmd__profiles__subcmd__test_commands] )) ||
+_prismtty__subcmd__profiles__subcmd__test_commands() {
+    local commands; commands=()
+    _describe -t commands 'prismtty profiles test commands' commands "$@"
+}
+(( $+functions[_prismtty__subcmd__profiles__subcmd__validate_commands] )) ||
+_prismtty__subcmd__profiles__subcmd__validate_commands() {
+    local commands; commands=()
+    _describe -t commands 'prismtty profiles validate commands' commands "$@"
+}
+
+if [ "$funcstack[1]" = "_prismtty" ]; then
+    _prismtty "$@"
+else
+    compdef _prismtty prismtty
+fi

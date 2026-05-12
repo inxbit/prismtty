@@ -20,6 +20,40 @@ fn generated_help_lists_core_flags_and_profile_commands() {
 }
 
 #[test]
+fn checked_in_completion_files_cover_command_names_and_core_flags() {
+    let bash = include_str!("../completions/prismtty.bash");
+    let fish = include_str!("../completions/prismtty.fish");
+    let zsh = include_str!("../completions/_prismtty");
+
+    for (name, completion) in [("bash", bash), ("fish", fish), ("zsh", zsh)] {
+        for needle in ["prismtty", "ptty", "ct", "profiles"] {
+            assert!(
+                completion.contains(needle),
+                "{name} completion did not include {needle:?}"
+            );
+        }
+    }
+
+    for needle in ["--profile", "--version", "--reload"] {
+        assert!(
+            bash.contains(needle),
+            "bash completion did not include {needle:?}"
+        );
+        assert!(
+            zsh.contains(needle),
+            "zsh completion did not include {needle:?}"
+        );
+    }
+
+    for needle in ["-l profile", "-l version", "-l reload"] {
+        assert!(
+            fish.contains(needle),
+            "fish completion did not include {needle:?}"
+        );
+    }
+}
+
+#[test]
 fn cli_usage_errors_include_context_without_pinning_clap_wording() {
     let cases: &[(&[&str], &str)] = &[
         (&["--profile"], "--profile"),

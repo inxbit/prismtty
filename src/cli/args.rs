@@ -39,6 +39,7 @@ pub(super) enum Action {
     about = "Fast terminal output highlighter focused on network devices and Unix systems",
     disable_help_flag = true,
     disable_version_flag = true,
+    disable_help_subcommand = true,
     trailing_var_arg = true,
     after_help = "\
 PROFILE COMMANDS:
@@ -188,6 +189,33 @@ pub(super) fn print_help() {
     let mut command = RawArgs::command();
     command.print_help().expect("help writes to stdout");
     println!();
+}
+
+#[cfg(feature = "completion-generation")]
+#[doc(hidden)]
+pub fn completion_command() -> clap::Command {
+    RawArgs::command().subcommand(
+        clap::Command::new("profiles")
+            .about("Manage profiles")
+            .disable_help_subcommand(true)
+            .subcommand(clap::Command::new("list").about("List available profiles"))
+            .subcommand(
+                clap::Command::new("show")
+                    .about("Show a profile")
+                    .arg(clap::Arg::new("PROFILE").required(true)),
+            )
+            .subcommand(
+                clap::Command::new("validate")
+                    .about("Validate a profile file")
+                    .arg(clap::Arg::new("FILE").required(true)),
+            )
+            .subcommand(
+                clap::Command::new("test")
+                    .about("Highlight a fixture with a profile")
+                    .arg(clap::Arg::new("PROFILE").required(true))
+                    .arg(clap::Arg::new("FILE").required(true)),
+            ),
+    )
 }
 
 #[cfg(test)]
