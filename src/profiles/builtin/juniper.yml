@@ -9,6 +9,19 @@ profile:
     strong_signals:
       - type: contains
         value: junos
+    negative_signals:
+      - type: contains
+        value: pan-os
+      - type: contains
+        value: pa-vm
+      - type: contains
+        value: palo alto
+      - type: contains
+        value: versa-
+      - type: contains
+        value: versa networks
+      - type: contains
+        value: versa director
     startup_prompt: junos_user_at_host
     runtime_prompt: junos_user_at_host
 rules:

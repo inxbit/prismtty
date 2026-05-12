@@ -169,7 +169,10 @@ common vendor terms.
 The built-in rule sets and detection hints live as bundled profile data rather
 than hardcoded vendor branches. Adding or adjusting a built-in profile should
 start from the bundled profile file and its tests, while user profiles continue
-to use the public schema shown above.
+to use the public schema shown above. Bundled runtime metadata can also include
+private `negative_signals` that block only startup prompt matcher detection; weak
+`detection` hints, strong banner signals, and runtime prompt transitions are not
+blocked by those exclusions.
 
 Interactive dynamic mode keeps built-in vendor selection conservative: after a
 specific profile such as `generic, cisco` or `generic, juniper` is selected,

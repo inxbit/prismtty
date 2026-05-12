@@ -46,6 +46,8 @@ pub struct ProfileRuntimeMeta {
     pub local_baseline: bool,
     #[serde(default)]
     pub strong_signals: Vec<StrongSignal>,
+    #[serde(default)]
+    pub negative_signals: Vec<StrongSignal>,
     pub startup_prompt: PromptMatcherKind,
     pub runtime_prompt: PromptMatcherKind,
     #[serde(default)]
@@ -58,6 +60,7 @@ impl Default for ProfileRuntimeMeta {
             priority: USER_PROFILE_RUNTIME_PRIORITY,
             local_baseline: false,
             strong_signals: Vec::new(),
+            negative_signals: Vec::new(),
             startup_prompt: PromptMatcherKind::None,
             runtime_prompt: PromptMatcherKind::None,
             prompt_confidence: PromptConfidence::default(),
@@ -368,12 +371,23 @@ impl Profile {
             .iter()
             .any(|hint| lower.contains(&hint.to_ascii_lowercase()))
             || self.matches_strong_signal(sample)
-            || self.runtime.startup_prompt.matches_startup(sample, lower)
+            || self.matches_startup_prompt(sample)
     }
 
     fn matches_strong_signal(&self, text: &str) -> bool {
         self.runtime
             .strong_signals
+            .iter()
+            .any(|signal| signal.matches(text))
+    }
+
+    fn matches_startup_prompt(&self, sample: &str) -> bool {
+        self.runtime.startup_prompt.matches_startup(sample) && !self.matches_negative_signal(sample)
+    }
+
+    fn matches_negative_signal(&self, text: &str) -> bool {
+        self.runtime
+            .negative_signals
             .iter()
             .any(|signal| signal.matches(text))
     }
@@ -384,24 +398,11 @@ impl Profile {
 }
 
 impl PromptMatcherKind {
-    fn matches_startup(self, sample: &str, lower: &str) -> bool {
+    fn matches_startup(self, sample: &str) -> bool {
         match self {
             PromptMatcherKind::None => false,
-            PromptMatcherKind::JunosUserAtHost => {
-                looks_like_juniper_prompt(sample)
-                    && !contains_case_insensitive(lower, "pan-os")
-                    && !contains_case_insensitive(lower, "pa-vm")
-                    && !contains_case_insensitive(lower, "palo alto")
-                    && !contains_case_insensitive(lower, "versa-")
-                    && !contains_case_insensitive(lower, "versa networks")
-                    && !contains_case_insensitive(lower, "versa director")
-            }
-            PromptMatcherKind::CiscoHostMarker => {
-                looks_like_cisco_prompt(sample)
-                    && !contains_case_insensitive(lower, "arubaos-cx")
-                    && !contains_case_insensitive(lower, "aos-cx")
-                    && !contains_case_insensitive(lower, "hpe-restd")
-            }
+            PromptMatcherKind::JunosUserAtHost => looks_like_juniper_prompt(sample),
+            PromptMatcherKind::CiscoHostMarker => looks_like_cisco_prompt(sample),
             PromptMatcherKind::AristaHostMarker => looks_like_arista_prompt(sample),
             PromptMatcherKind::FortinetHostHash => looks_like_fortinet_prompt(sample),
             PromptMatcherKind::UnixUserAtHostPath => looks_like_unix_prompt(sample),
@@ -683,11 +684,52 @@ mod tests {
 
     #[test]
     fn prompt_matchers_keep_vendor_specific_behavior() {
-        assert!(PromptMatcherKind::CiscoHostMarker.matches_startup("Router(config-if)#", ""));
-        assert!(!PromptMatcherKind::AristaHostMarker.matches_startup("Router(config-if)#", ""));
-        assert!(PromptMatcherKind::AristaHostMarker.matches_startup("leaf01#", ""));
-        assert!(!PromptMatcherKind::PaloAltoUserAtHost.matches_startup("admin@router>", ""));
-        assert!(PromptMatcherKind::PaloAltoUserAtHost.matches_startup("admin@pa-edge>", ""));
+        assert!(PromptMatcherKind::CiscoHostMarker.matches_startup("Router(config-if)#"));
+        assert!(!PromptMatcherKind::AristaHostMarker.matches_startup("Router(config-if)#"));
+        assert!(PromptMatcherKind::AristaHostMarker.matches_startup("leaf01#"));
+        assert!(!PromptMatcherKind::PaloAltoUserAtHost.matches_startup("admin@router>"));
+        assert!(PromptMatcherKind::PaloAltoUserAtHost.matches_startup("admin@pa-edge>"));
+    }
+
+    #[test]
+    fn prompt_matchers_do_not_embed_cross_vendor_negative_signals() {
+        assert!(
+            PromptMatcherKind::JunosUserAtHost
+                .matches_startup("admin@mx480>\nPAN-OS 11.1\nVersa Director\n",)
+        );
+        assert!(
+            PromptMatcherKind::CiscoHostMarker
+                .matches_startup("CoreSW#\nArubaOS-CX Version 10.13\nhpe-restd\n",)
+        );
+    }
+
+    #[test]
+    fn bundled_negative_signals_block_only_startup_prompt_detection() {
+        let store = ProfileStore::builtin();
+
+        let juniper_from_prompt = store.detect_profiles("admin@mx480>\nPAN-OS 11.1\n");
+        assert!(
+            !juniper_from_prompt.contains(&"juniper".to_string()),
+            "Juniper prompt startup detection should be blocked by bundled PAN-OS negative signal"
+        );
+
+        let cisco_from_prompt = store.detect_profiles("CoreSW#\nArubaOS-CX Version 10.13\n");
+        assert!(
+            !cisco_from_prompt.contains(&"cisco".to_string()),
+            "Cisco prompt startup detection should be blocked by bundled ArubaCX negative signal"
+        );
+
+        let juniper_from_weak_hint = store.detect_profiles("commit check\nPAN-OS 11.1\n");
+        assert!(
+            juniper_from_weak_hint.contains(&"juniper".to_string()),
+            "Negative signals must not block weak detection hints"
+        );
+
+        let cisco_from_weak_hint = store.detect_profiles("line protocol is up\nArubaOS-CX\n");
+        assert!(
+            cisco_from_weak_hint.contains(&"cisco".to_string()),
+            "Negative signals must not block weak detection hints"
+        );
     }
 
     #[test]

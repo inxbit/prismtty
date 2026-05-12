@@ -25,6 +25,13 @@ profile:
           - nx-os
           - nexus operating system
           - cisco nexus
+    negative_signals:
+      - type: contains
+        value: arubaos-cx
+      - type: contains
+        value: aos-cx
+      - type: contains
+        value: hpe-restd
     startup_prompt: cisco_host_marker
     runtime_prompt: cisco_host_marker
 rules:
