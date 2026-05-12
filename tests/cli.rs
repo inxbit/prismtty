@@ -334,6 +334,75 @@ rules:
 }
 
 #[test]
+fn profiles_validate_rejects_self_inheritance_cycle() {
+    let mut file = tempfile::NamedTempFile::new().expect("temp file");
+    writeln!(
+        file,
+        r##"
+profile:
+  name: loop-os
+  inherits: [loop-os]
+rules:
+  - description: loop token
+    regex: loop-token
+    color: f#00ffff
+"##
+    )
+    .expect("write temp profile");
+
+    let mut cmd = Command::cargo_bin("prismtty").expect("binary exists");
+    cmd.arg("profiles").arg("validate").arg(file.path());
+
+    cmd.assert().failure().stderr(predicate::str::contains(
+        "cyclic profile inheritance: loop-os -> loop-os",
+    ));
+}
+
+#[test]
+fn profiles_validate_rejects_indirect_inheritance_cycle() {
+    let xdg = tempfile::tempdir().expect("temp xdg config");
+    let profiles_dir = xdg.path().join("prismtty").join("profiles.d");
+    fs::create_dir_all(&profiles_dir).expect("create profiles.d");
+    fs::write(
+        profiles_dir.join("parent.yml"),
+        r##"
+profile:
+  name: parent-os
+  inherits: [child-os]
+rules:
+  - description: parent token
+    regex: parent-token
+    color: f#00ffff
+"##,
+    )
+    .expect("write parent profile");
+    let mut child = tempfile::NamedTempFile::new().expect("temp profile");
+    writeln!(
+        child,
+        r##"
+profile:
+  name: child-os
+  inherits: [parent-os]
+rules:
+  - description: child token
+    regex: child-token
+    color: f#ff00ff
+"##
+    )
+    .expect("write child profile");
+
+    let mut cmd = Command::cargo_bin("prismtty").expect("binary exists");
+    cmd.env("XDG_CONFIG_HOME", xdg.path())
+        .arg("profiles")
+        .arg("validate")
+        .arg(child.path());
+
+    cmd.assert().failure().stderr(predicate::str::contains(
+        "cyclic profile inheritance: child-os -> parent-os -> child-os",
+    ));
+}
+
+#[test]
 fn profiles_test_highlights_a_fixture_file() {
     let mut file = tempfile::NamedTempFile::new().expect("temp file");
     writeln!(file, "Gi0/1 is down 192.0.2.1").expect("write fixture");

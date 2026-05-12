@@ -247,8 +247,27 @@ impl ProfileStore {
         loaded: &mut BTreeSet<String>,
         rules: &mut Vec<RuleSpec>,
     ) -> Result<(), ConfigError> {
+        let mut resolving = Vec::new();
+        self.append_profile_rules_inner(profile_name, loaded, &mut resolving, rules)
+    }
+
+    fn append_profile_rules_inner(
+        &self,
+        profile_name: &str,
+        loaded: &mut BTreeSet<String>,
+        resolving: &mut Vec<String>,
+        rules: &mut Vec<RuleSpec>,
+    ) -> Result<(), ConfigError> {
         if loaded.contains(profile_name) {
             return Ok(());
+        }
+        if let Some(cycle_start) = resolving
+            .iter()
+            .position(|resolving_name| resolving_name.as_str() == profile_name)
+        {
+            let mut cycle = resolving[cycle_start..].to_vec();
+            cycle.push(profile_name.to_string());
+            return Err(ConfigError::CyclicProfileInheritance(cycle.join(" -> ")));
         }
 
         let profile = self
@@ -256,9 +275,11 @@ impl ProfileStore {
             .get(profile_name)
             .ok_or_else(|| ConfigError::UnknownProfile(profile_name.to_string()))?;
 
+        resolving.push(profile_name.to_string());
         for parent in &profile.inherits {
-            self.append_profile_rules(parent, loaded, rules)?;
+            self.append_profile_rules_inner(parent, loaded, resolving, rules)?;
         }
+        resolving.pop();
 
         loaded.insert(profile.name.clone());
         rules.extend(profile.rules.clone());

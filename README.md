@@ -4,7 +4,7 @@ PrismTTY is a fast terminal output highlighter focused on network devices and
 Linux/Unix administration. It is intended as a ChromaTerm-style CLI wrapper with
 network-focused built-in profiles.
 
-Current version: `0.2.0`.
+Current version: `0.2.1`.
 
 ## Install
 
@@ -27,9 +27,9 @@ scripts/package-release.sh darwin-aarch64
 ```
 
 The package contains binaries, license/readme files, example profiles, shell
-completions, and a `.tar.gz.sha256` checksum. A Homebrew formula template lives
-under `packaging/homebrew/prismtty.rb`; update the release URLs/checksums after
-publishing artifacts.
+completions, and a `.tar.gz.sha256` checksum. The release workflow generates a
+Homebrew formula from the actual release checksums and uploads it as
+`prismtty.rb` with the release artifacts.
 
 ## Usage
 

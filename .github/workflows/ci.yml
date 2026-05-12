@@ -4,6 +4,9 @@ on:
   push:
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
   test:
     name: Test
@@ -13,8 +16,12 @@ jobs:
       matrix:
         os: [macos-latest, ubuntu-latest]
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
+        with:
+          toolchain: stable
       - name: Install PCRE2
         run: |
           if [[ "${{ runner.os }}" == "macOS" ]]; then
@@ -34,6 +41,21 @@ jobs:
           PATTERN='(/Users/[^[:space:]]+/(Desktop|Documents)|Desktop/[A-Za-z0-9_.-]+\.txt)'
           if rg -n "$PATTERN" . --glob '!target/**' --glob '!Cargo.lock' --glob '!.github/workflows/ci.yml'; then
             echo "Sensitive real-world capture marker found. Use synthetic fixtures instead."
+            exit 1
+          fi
+      - name: Verify Homebrew formula generator
+        run: |
+          tmp="$(mktemp -d)"
+          version="$(awk -F '"' '/^version = / { print $2; exit }' Cargo.toml)"
+          checksum="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+          for target in darwin-aarch64 darwin-x86_64 linux-x86_64; do
+            printf '%s  prismtty-%s-%s.tar.gz\n' "$checksum" "$version" "$target" > "$tmp/prismtty-${version}-${target}.tar.gz.sha256"
+          done
+          bash scripts/generate-homebrew-formula.sh "$tmp/prismtty.rb" "$tmp"
+          rg "version \"${version}\"" "$tmp/prismtty.rb"
+          rg "linux-x86_64" "$tmp/prismtty.rb"
+          if rg -n "REPLACE_WITH|linux-aarch64" "$tmp/prismtty.rb"; then
+            echo "Generated Homebrew formula has placeholder checksums or unsupported artifacts."
             exit 1
           fi
       - run: cargo build --release

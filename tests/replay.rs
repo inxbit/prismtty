@@ -114,7 +114,7 @@ fn load_expectations() -> ReplayExpectations {
     let path = fixture_path("expectations.yml");
     let input = fs::read_to_string(&path)
         .unwrap_or_else(|err| panic!("failed to read {}: {err}", path.display()));
-    serde_yaml::from_str(&input)
+    serde_norway::from_str(&input)
         .unwrap_or_else(|err| panic!("failed to parse {}: {err}", path.display()))
 }
 

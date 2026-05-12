@@ -17,9 +17,11 @@ pub enum ConfigError {
         source: std::io::Error,
     },
     #[error("failed to parse YAML: {0}")]
-    Yaml(#[from] serde_yaml::Error),
+    Yaml(#[from] serde_norway::Error),
     #[error("unknown profile '{0}'")]
     UnknownProfile(String),
+    #[error("cyclic profile inheritance: {0}")]
+    CyclicProfileInheritance(String),
     #[error("profile files must include profile.name")]
     MissingProfileName,
     #[error("bundled profile files must include profile.runtime")]
@@ -89,7 +91,7 @@ struct RuleDoc {
     #[serde(default)]
     description: String,
     regex: String,
-    color: serde_yaml::Value,
+    color: serde_norway::Value,
     #[serde(default)]
     exclusive: bool,
 }
@@ -103,7 +105,7 @@ pub struct LoadedProfileFile {
 
 impl PrismConfig {
     pub fn from_chromaterm_yaml(input: &str) -> Result<Self, ConfigError> {
-        let doc: RulesDoc = serde_yaml::from_str(input)?;
+        let doc: RulesDoc = serde_norway::from_str(input)?;
         let palette = parse_palette(&doc.palette).map_err(ConfigError::InvalidPalette)?;
         Ok(Self {
             rules: parse_rule_docs(doc.rules, &palette)?,
@@ -175,7 +177,7 @@ fn parse_profile_yaml_with_mode(
     input: &str,
     mode: ProfileYamlMode,
 ) -> Result<LoadedProfileFile, ConfigError> {
-    let doc: RulesDoc = serde_yaml::from_str(input)?;
+    let doc: RulesDoc = serde_norway::from_str(input)?;
     let mut meta = doc.profile.ok_or(ConfigError::MissingProfileName)?;
     let runtime = meta.runtime.take();
     match mode {
@@ -223,14 +225,14 @@ fn parse_rule_docs(
 
 fn parse_color_doc(
     description: &str,
-    color: serde_yaml::Value,
+    color: serde_norway::Value,
     palette: &BTreeMap<String, crate::style::Rgb>,
 ) -> Result<RuleStyle, ConfigError> {
     match color {
-        serde_yaml::Value::String(spec) => {
+        serde_norway::Value::String(spec) => {
             Ok(RuleStyle::Whole(parse_style(description, &spec, palette)?))
         }
-        serde_yaml::Value::Mapping(captures) => {
+        serde_norway::Value::Mapping(captures) => {
             let mut parsed = BTreeMap::new();
             for (group, spec) in captures {
                 let group = parse_capture_ref(description, group)?;
@@ -251,10 +253,10 @@ fn parse_color_doc(
 
 fn parse_capture_ref(
     description: &str,
-    value: serde_yaml::Value,
+    value: serde_norway::Value,
 ) -> Result<CaptureRef, ConfigError> {
     match value {
-        serde_yaml::Value::Number(number) => {
+        serde_norway::Value::Number(number) => {
             let Some(group) = number.as_u64() else {
                 return Err(ConfigError::InvalidCaptureKey {
                     description: description.to_string(),
@@ -263,14 +265,14 @@ fn parse_capture_ref(
             };
             Ok(CaptureRef::Index(group as usize))
         }
-        serde_yaml::Value::String(name) if name.bytes().all(|byte| byte.is_ascii_digit()) => name
+        serde_norway::Value::String(name) if name.bytes().all(|byte| byte.is_ascii_digit()) => name
             .parse::<usize>()
             .map(CaptureRef::Index)
             .map_err(|_| ConfigError::InvalidCaptureKey {
                 description: description.to_string(),
                 key: name,
             }),
-        serde_yaml::Value::String(name) if !name.trim().is_empty() => {
+        serde_norway::Value::String(name) if !name.trim().is_empty() => {
             Ok(CaptureRef::Name(name.to_string()))
         }
         other => Err(ConfigError::InvalidCaptureKey {

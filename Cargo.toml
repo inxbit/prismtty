@@ -1,6 +1,6 @@
 [package]
 name = "prismtty"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 license = "MIT"
 description = "Fast terminal output highlighter focused on network devices and Unix systems"
@@ -18,7 +18,7 @@ nix = { version = "0.28", features = ["term"] }
 pcre2 = "0.2"
 portable-pty = "0.9"
 serde = { version = "1.0", features = ["derive"] }
-serde_yaml = "0.9"
+serde_norway = "0.9.42"
 thiserror = "2.0"
 
 [dev-dependencies]
