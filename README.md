@@ -184,6 +184,19 @@ from a local-shell baseline: a single `hostname #` Fortinet prompt can promote t
 show a FortiOS banner or an explicit `ssh` command. Other prompt-only vendor
 switches still require repeated evidence or a typed remote-jump command.
 
+When PrismTTY is launched as an iTerm profile command, it strips iTerm's native
+shell-integration variables from the child shell to avoid nested integration
+marks. The stripped values are preserved under `PRISMTTY_PARENT_*` names for
+dotfiles that need session or profile context. For example:
+
+```sh
+_iterm_session_id="${ITERM_SESSION_ID:-${PRISMTTY_PARENT_ITERM_SESSION_ID:-}}"
+
+if [[ $_iterm_session_id =~ w[0-9]+t0p0 ]]; then
+    fastfetch
+fi
+```
+
 ## Development Notes
 
 The CLI entry point is intentionally split into focused internal modules:

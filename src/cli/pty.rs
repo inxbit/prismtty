@@ -26,6 +26,15 @@ use super::runtime::{ReloadWatcher, RuntimeRegistration};
 use super::stream::highlight_stream;
 use super::trace::IoTrace;
 
+const STRIPPED_ITERM_ENV: [&str; 6] = [
+    "TERM_PROGRAM",
+    "TERM_PROGRAM_VERSION",
+    "LC_TERMINAL",
+    "LC_TERMINAL_VERSION",
+    "ITERM_SESSION_ID",
+    "ITERM_PROFILE",
+];
+
 pub(super) fn run_command(options: Options, command: Vec<OsString>) -> Result<ExitCode, CliError> {
     let command_name = command[0].clone();
     let command_args = command[1..].to_vec();
@@ -115,17 +124,20 @@ fn apply_iterm_shell_integration_guard(
         return;
     }
 
-    for key in [
-        "TERM_PROGRAM",
-        "TERM_PROGRAM_VERSION",
-        "LC_TERMINAL",
-        "LC_TERMINAL_VERSION",
-        "ITERM_SESSION_ID",
-        "ITERM_PROFILE",
-    ] {
+    for key in STRIPPED_ITERM_ENV {
+        if let Some(value) = builder
+            .get_env(key)
+            .map(OsString::from)
+            .or_else(|| std::env::var_os(key))
+        {
+            builder.env(format!("PRISMTTY_PARENT_{key}"), value);
+        }
         builder.env_remove(key);
     }
 
+    // iTerm shell-integration scripts key off the original names. The
+    // PRISMTTY_PARENT_* copies keep user dotfile context without re-enabling
+    // nested integration marks in the child shell.
     builder.env("ITERM_SHELL_INTEGRATION_INSTALLED", "prismtty");
     builder.env("ITERM2_SQUELCH_MARK", "1");
     builder.env("PRISMTTY_NESTED_ITERM", "1");
@@ -347,6 +359,21 @@ mod tests {
         ] {
             assert!(builder.get_env(key).is_none(), "{key} should be removed");
         }
+        for (key, value) in [
+            ("TERM_PROGRAM", "iTerm.app"),
+            ("TERM_PROGRAM_VERSION", "3.6.0"),
+            ("LC_TERMINAL", "iTerm.app"),
+            ("LC_TERMINAL_VERSION", "3.6.0"),
+            ("ITERM_SESSION_ID", "w0t0p0"),
+            ("ITERM_PROFILE", "Default"),
+        ] {
+            let parent_key = format!("PRISMTTY_PARENT_{key}");
+            assert_eq!(
+                builder.get_env(&parent_key),
+                Some(std::ffi::OsStr::new(value)),
+                "{parent_key} should preserve {key}"
+            );
+        }
         assert_eq!(
             builder.get_env("ITERM2_SQUELCH_MARK"),
             Some(std::ffi::OsStr::new("1"))
@@ -365,17 +392,30 @@ mod tests {
     fn iterm_shell_integration_guard_keeps_environment_for_non_iterm_or_noninteractive() {
         let mut builder = portable_pty::CommandBuilder::new("/bin/zsh");
         builder.env("TERM_PROGRAM", "iTerm.app");
+        builder.env("ITERM_SESSION_ID", "w0t0p0");
 
         super::apply_iterm_shell_integration_guard(&mut builder, true, false);
         assert_eq!(
             builder.get_env("TERM_PROGRAM"),
             Some(std::ffi::OsStr::new("iTerm.app"))
         );
+        assert!(builder.get_env("PRISMTTY_PARENT_TERM_PROGRAM").is_none());
+        assert!(
+            builder
+                .get_env("PRISMTTY_PARENT_ITERM_SESSION_ID")
+                .is_none()
+        );
 
         super::apply_iterm_shell_integration_guard(&mut builder, false, true);
         assert_eq!(
             builder.get_env("TERM_PROGRAM"),
             Some(std::ffi::OsStr::new("iTerm.app"))
+        );
+        assert!(builder.get_env("PRISMTTY_PARENT_TERM_PROGRAM").is_none());
+        assert!(
+            builder
+                .get_env("PRISMTTY_PARENT_ITERM_SESSION_ID")
+                .is_none()
         );
     }
 }
