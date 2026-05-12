@@ -130,16 +130,13 @@ impl StrongSignal {
             StrongSignal::ContainsAny { values } => values
                 .iter()
                 .any(|value| contains_case_insensitive(text, value)),
-            StrongSignal::LinePrefixAndAny { prefix, values } => {
-                let prefix = prefix.to_ascii_lowercase();
-                text.lines().any(|line| {
-                    let lower = line.trim().to_ascii_lowercase();
-                    lower.starts_with(&prefix)
-                        && values
-                            .iter()
-                            .any(|value| lower.contains(&value.to_ascii_lowercase()))
-                })
-            }
+            StrongSignal::LinePrefixAndAny { prefix, values } => text.lines().any(|line| {
+                let trimmed = line.trim();
+                starts_with_case_insensitive(trimmed, prefix)
+                    && values
+                        .iter()
+                        .any(|value| contains_case_insensitive(trimmed, value))
+            }),
         }
     }
 }
@@ -430,9 +427,26 @@ impl PromptMatcherKind {
 }
 
 fn contains_case_insensitive(haystack: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    let needle_len = needle.len();
+    if needle_len > haystack.len() {
+        return false;
+    }
+    haystack.char_indices().any(|(start, _)| {
+        let end = start + needle_len;
+        end <= haystack.len()
+            && haystack.is_char_boundary(end)
+            && haystack.as_bytes()[start..end].eq_ignore_ascii_case(needle.as_bytes())
+    })
+}
+
+fn starts_with_case_insensitive(haystack: &str, needle: &str) -> bool {
     haystack
-        .to_ascii_lowercase()
-        .contains(&needle.to_ascii_lowercase())
+        .as_bytes()
+        .get(..needle.len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(needle.as_bytes()))
 }
 
 fn prompt_token(line: &str) -> &str {
@@ -763,5 +777,32 @@ mod tests {
             "linux-unix".to_string(),
         ]));
         assert!(!super::is_generic_profile_set(&["cisco".to_string()]));
+    }
+
+    #[test]
+    fn case_insensitive_signal_helpers_match_without_lowercase_allocations() {
+        assert!(super::contains_case_insensitive(
+            "Version: FortiGate-VM64 v7.4",
+            "fortigate"
+        ));
+        assert!(super::contains_case_insensitive("cafe PAN-OS", "PAN-os"));
+        assert!(!super::contains_case_insensitive("JUNOS", "ios"));
+        assert!(super::starts_with_case_insensitive(
+            "Version: FortiGate-VM64 v7.4",
+            "version:"
+        ));
+
+        let source = include_str!("profiles.rs");
+        let helper_source = source
+            .split("fn contains_case_insensitive")
+            .nth(1)
+            .expect("contains_case_insensitive helper exists")
+            .split("fn prompt_token")
+            .next()
+            .expect("helper source ends before prompt_token");
+        assert!(
+            !helper_source.contains("to_ascii_lowercase"),
+            "case-insensitive signal helpers should avoid lowercase String allocations"
+        );
     }
 }
