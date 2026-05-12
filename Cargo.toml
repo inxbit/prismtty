@@ -7,6 +7,7 @@ description = "Fast terminal output highlighter focused on network devices and U
 
 [dependencies]
 anyhow = "1.0"
+clap = { version = "4.5", features = ["derive"] }
 directories = "6.0"
 is-terminal = "0.4"
 nix = { version = "0.28", features = ["term"] }

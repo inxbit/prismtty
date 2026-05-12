@@ -1,6 +1,8 @@
 use std::ffi::OsString;
 use std::path::PathBuf;
 
+use clap::{ArgAction, CommandFactory, Parser};
+
 use super::CliError;
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -30,87 +32,109 @@ pub(super) enum Action {
     Version,
 }
 
-pub(super) fn parse_args(args: Vec<OsString>) -> Result<(Options, Action), CliError> {
-    let mut options = Options::default();
-    let mut idx = 0;
+#[derive(Debug, Parser)]
+#[command(
+    name = "prismtty",
+    version,
+    about = "Fast terminal output highlighter focused on network devices and Unix systems",
+    disable_help_flag = true,
+    disable_version_flag = true,
+    trailing_var_arg = true,
+    after_help = "\
+PROFILE COMMANDS:
+  prismtty profiles list
+  prismtty profiles show <PROFILE>
+  prismtty profiles validate <FILE>
+  prismtty profiles test <PROFILE> <FILE>"
+)]
+struct RawArgs {
+    #[arg(short = 'h', long = "help", action = ArgAction::SetTrue, help = "Show help")]
+    help: bool,
+    #[arg(
+        short = 'V',
+        visible_short_alias = 'v',
+        long = "version",
+        action = ArgAction::SetTrue,
+        help = "Show version"
+    )]
+    version: bool,
+    #[arg(short = 'b', long = "benchmark", action = ArgAction::SetTrue, help = "Print per-rule timing and match-count data to stderr")]
+    benchmark: bool,
+    #[arg(short = 'r', long = "reload", action = ArgAction::SetTrue, help = "Ask running PrismTTY sessions to reload config")]
+    reload: bool,
+    #[arg(short = 'R', long = "rgb", action = ArgAction::SetTrue, help = "Force RGB color output")]
+    force_rgb: bool,
+    #[arg(long = "pcre", action = ArgAction::SetTrue, help = "Accepted for ChromaTerm compatibility; PCRE2 is always used")]
+    pcre: bool,
+    #[arg(long = "no-auto-detect", action = ArgAction::SetTrue, help = "Use only the generic profile unless --profile is set")]
+    no_auto_detect: bool,
+    #[arg(long = "no-dynamic-profile", action = ArgAction::SetTrue, help = "Disable profile switching inside wrapped interactive shells")]
+    no_dynamic_profile: bool,
+    #[arg(long = "strip-ansi", action = ArgAction::SetTrue, help = "Remove existing ANSI before applying PrismTTY styles")]
+    strip_ansi: bool,
+    #[arg(long = "show-profile", action = ArgAction::SetTrue, help = "Print selected profiles to stderr")]
+    show_profile: bool,
+    #[arg(long = "local-echo", action = ArgAction::SetTrue, help = "Locally echo typed printable keys for no-echo device sessions")]
+    local_echo: bool,
+    #[arg(
+        long = "trace-io",
+        value_name = "FILE",
+        help = "Append hex-encoded PTY input/output diagnostics"
+    )]
+    trace_io: Option<PathBuf>,
+    #[arg(short = 'p', long = "profile", value_name = "NAME", action = ArgAction::Append, help = "Force a profile; repeat to enable several")]
+    profiles: Vec<String>,
+    #[arg(
+        short = 'c',
+        long = "config",
+        value_name = "FILE",
+        help = "Load a ChromaTerm-compatible YAML config"
+    )]
+    config: Option<PathBuf>,
+    #[arg(value_name = "COMMAND", trailing_var_arg = true)]
+    command: Vec<OsString>,
+}
 
-    while idx < args.len() {
-        let arg = args[idx].to_string_lossy();
-        match arg.as_ref() {
-            "-h" | "--help" => return Ok((options, Action::Help)),
-            "-V" | "-v" | "--version" => return Ok((options, Action::Version)),
-            "-b" | "--benchmark" => {
-                options.benchmark = true;
-                idx += 1;
-            }
-            "-r" | "--reload" => return Ok((options, Action::Reload)),
-            "-R" | "--rgb" => {
-                options.force_rgb = true;
-                idx += 1;
-            }
-            "--pcre" => {
-                idx += 1;
-            }
-            "--no-auto-detect" => {
-                options.no_auto_detect = true;
-                idx += 1;
-            }
-            "--no-dynamic-profile" => {
-                options.no_dynamic_profile = true;
-                idx += 1;
-            }
-            "--strip-ansi" => {
-                options.strip_ansi = true;
-                idx += 1;
-            }
-            "--show-profile" => {
-                options.show_profile = true;
-                idx += 1;
-            }
-            "--local-echo" => {
-                options.local_echo = true;
-                idx += 1;
-            }
-            "--trace-io" => {
-                idx += 1;
-                let path = args
-                    .get(idx)
-                    .ok_or_else(|| CliError::Usage("--trace-io requires a path".to_string()))?;
-                options.trace_io = Some(PathBuf::from(path));
-                idx += 1;
-            }
-            "-p" | "--profile" => {
-                idx += 1;
-                let profile = args
-                    .get(idx)
-                    .ok_or_else(|| CliError::Usage("--profile requires a value".to_string()))?;
-                options.profiles.push(profile.to_string_lossy().to_string());
-                idx += 1;
-            }
-            "-c" | "--config" => {
-                idx += 1;
-                let path = args
-                    .get(idx)
-                    .ok_or_else(|| CliError::Usage("--config requires a path".to_string()))?;
-                options.config = Some(PathBuf::from(path));
-                idx += 1;
-            }
-            "profiles" => return parse_profiles_command(options, &args[idx + 1..]),
-            "--" => {
-                let command = args[idx + 1..].to_vec();
-                if command.is_empty() {
-                    return Ok((options, Action::Stdin));
-                }
-                return Ok((options, Action::Run(command)));
-            }
-            _ if arg.starts_with('-') => {
-                return Err(CliError::Usage(format!("unknown option '{arg}'")));
-            }
-            _ => return Ok((options, Action::Run(args[idx..].to_vec()))),
-        }
+pub(super) fn parse_args(args: Vec<OsString>) -> Result<(Options, Action), CliError> {
+    let raw = RawArgs::try_parse_from(std::iter::once(OsString::from("prismtty")).chain(args))
+        .map_err(|error| CliError::Usage(error.to_string()))?;
+
+    if raw.help {
+        return Ok((Options::default(), Action::Help));
+    }
+    if raw.version {
+        return Ok((Options::default(), Action::Version));
+    }
+    if raw.reload {
+        return Ok((Options::default(), Action::Reload));
     }
 
-    Ok((options, Action::Stdin))
+    // ChromaTerm compatibility: PCRE2 is always used, so this flag has no
+    // representation in Options and must remain a parser-only no-op.
+    let _ = raw.pcre;
+
+    let options = Options {
+        profiles: raw.profiles,
+        no_auto_detect: raw.no_auto_detect,
+        config: raw.config,
+        strip_ansi: raw.strip_ansi,
+        force_rgb: raw.force_rgb,
+        benchmark: raw.benchmark,
+        show_profile: raw.show_profile,
+        local_echo: raw.local_echo,
+        no_dynamic_profile: raw.no_dynamic_profile,
+        trace_io: raw.trace_io,
+    };
+
+    if raw.command.first().is_some_and(|arg| arg == "profiles") {
+        return parse_profiles_command(options, &raw.command[1..]);
+    }
+
+    if raw.command.is_empty() {
+        return Ok((options, Action::Stdin));
+    }
+
+    Ok((options, Action::Run(raw.command)))
 }
 
 fn parse_profiles_command(
@@ -126,7 +150,7 @@ fn parse_profiles_command(
         "list" => Ok((options, Action::ProfilesList)),
         "show" => {
             let profile = args.get(1).ok_or_else(|| {
-                CliError::Usage("profiles show requires a profile name".to_string())
+                CliError::Usage("profiles show required value: profile name".to_string())
             })?;
             Ok((
                 options,
@@ -135,16 +159,16 @@ fn parse_profiles_command(
         }
         "validate" => {
             let path = args.get(1).ok_or_else(|| {
-                CliError::Usage("profiles validate requires a profile path".to_string())
+                CliError::Usage("profiles validate required value: profile path".to_string())
             })?;
             Ok((options, Action::ProfilesValidate(PathBuf::from(path))))
         }
         "test" => {
             let profile = args.get(1).ok_or_else(|| {
-                CliError::Usage("profiles test requires a profile name".to_string())
+                CliError::Usage("profiles test required value: profile name".to_string())
             })?;
             let fixture = args.get(2).ok_or_else(|| {
-                CliError::Usage("profiles test requires a fixture path".to_string())
+                CliError::Usage("profiles test required value: fixture path".to_string())
             })?;
             Ok((
                 options,
@@ -161,36 +185,9 @@ fn parse_profiles_command(
 }
 
 pub(super) fn print_help() {
-    println!(
-        "\
-PrismTTY {}
-
-USAGE:
-  prismtty [OPTIONS] [COMMAND...]
-  command | prismtty [OPTIONS]
-  prismtty profiles list
-  prismtty profiles show <PROFILE>
-  prismtty profiles validate <FILE>
-  prismtty profiles test <PROFILE> <FILE>
-
-OPTIONS:
-  -p, --profile <NAME>     Force a profile; repeat to enable several
-      --no-auto-detect     Use only the generic profile unless --profile is set
-      --no-dynamic-profile Disable profile switching inside wrapped interactive shells
-  -c, --config <FILE>      Load a ChromaTerm-compatible YAML config
-      --strip-ansi         Remove existing ANSI before applying PrismTTY styles
-      --show-profile       Print selected profiles to stderr
-      --local-echo         Locally echo typed printable keys for no-echo device sessions
-      --trace-io <FILE>    Append hex-encoded PTY input/output diagnostics
-  -R, --rgb                Force RGB color output
-      --pcre               Accepted for ChromaTerm compatibility; PCRE2 is always used
-  -b, --benchmark          Print per-rule timing and match-count data to stderr
-  -r, --reload             Ask running PrismTTY sessions to reload config
-  -h, --help               Show this help
-  -V, -v, --version        Show version
-",
-        env!("CARGO_PKG_VERSION")
-    );
+    let mut command = RawArgs::command();
+    command.print_help().expect("help writes to stdout");
+    println!();
 }
 
 #[cfg(test)]
@@ -199,6 +196,14 @@ mod tests {
 
     fn os_args(args: &[&str]) -> Vec<OsString> {
         args.iter().map(OsString::from).collect()
+    }
+
+    fn usage_message(args: &[&str]) -> String {
+        match super::parse_args(os_args(args)) {
+            Err(super::CliError::Usage(message)) => message,
+            Ok((_options, action)) => panic!("expected usage error, got action {action:?}"),
+            Err(error) => panic!("expected usage error, got {error}"),
+        }
     }
 
     #[test]
@@ -284,5 +289,50 @@ mod tests {
             vec!["generic".to_string(), "juniper".to_string()]
         );
         assert_eq!(action, super::Action::Stdin);
+    }
+
+    #[test]
+    fn parser_contract_reload_short_circuits_and_ignores_later_args() {
+        let (options, action) =
+            super::parse_args(os_args(&["-r", "--profile", "cisco", "ssh", "router"]))
+                .expect("reload parses");
+
+        assert_eq!(options, super::Options::default());
+        assert_eq!(action, super::Action::Reload);
+    }
+
+    #[test]
+    fn parser_contract_missing_profile_value_is_usage_error_for_profile_flag() {
+        let message = usage_message(&["--profile"]);
+
+        assert!(message.contains("--profile"));
+    }
+
+    #[test]
+    fn parser_contract_missing_config_value_is_usage_error_for_config_flag() {
+        let message = usage_message(&["--config"]);
+
+        assert!(message.contains("--config"));
+    }
+
+    #[test]
+    fn parser_contract_missing_trace_io_value_is_usage_error_for_trace_io_flag() {
+        let message = usage_message(&["--trace-io"]);
+
+        assert!(message.contains("--trace-io"));
+    }
+
+    #[test]
+    fn parser_contract_unknown_flag_is_usage_error_for_unknown_flag() {
+        let message = usage_message(&["--not-a-real-flag"]);
+
+        assert!(message.contains("--not-a-real-flag"));
+    }
+
+    #[test]
+    fn parser_contract_profiles_show_without_name_is_usage_error_for_show() {
+        let message = usage_message(&["profiles", "show"]);
+
+        assert!(message.contains("profiles show"));
     }
 }

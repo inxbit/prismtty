@@ -7,6 +7,54 @@ use std::thread;
 use std::time::Duration;
 
 #[test]
+fn generated_help_lists_core_flags_and_profile_commands() {
+    let mut cmd = Command::cargo_bin("prismtty").expect("binary exists");
+    cmd.arg("--help");
+
+    cmd.assert()
+        .success()
+        .stdout(predicate::str::contains("Usage:"))
+        .stdout(predicate::str::contains("--profile"))
+        .stdout(predicate::str::contains("--no-dynamic-profile"))
+        .stdout(predicate::str::contains("profiles show <PROFILE>"));
+}
+
+#[test]
+fn cli_usage_errors_include_context_without_pinning_clap_wording() {
+    let cases: &[(&[&str], &str)] = &[
+        (&["--profile"], "--profile"),
+        (&["--config"], "--config"),
+        (&["--trace-io"], "--trace-io"),
+        (&["--not-a-real-flag"], "--not-a-real-flag"),
+        (&["profiles", "show"], "profiles show"),
+    ];
+    let expected_words = ["value", "required", "expected", "unexpected", "unknown"];
+
+    for (args, context) in cases {
+        let output = Command::cargo_bin("prismtty")
+            .expect("binary exists")
+            .args(*args)
+            .output()
+            .expect("command runs");
+        assert!(
+            !output.status.success(),
+            "expected {args:?} to fail, stdout: {:?}, stderr: {:?}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains(context),
+            "stderr for {args:?} did not include context {context:?}: {stderr:?}"
+        );
+        assert!(
+            expected_words.iter().any(|word| stderr.contains(word)),
+            "stderr for {args:?} did not include any expected error word: {stderr:?}"
+        );
+    }
+}
+
+#[test]
 fn stdin_mode_highlights_with_forced_profile() {
     let mut cmd = Command::cargo_bin("prismtty").expect("binary exists");
     cmd.arg("--profile")
