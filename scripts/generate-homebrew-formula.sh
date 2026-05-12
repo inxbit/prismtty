@@ -43,6 +43,8 @@ class Prismtty < Formula
   version "${version}"
   license "MIT"
 
+  depends_on "pcre2"
+
   on_macos do
     if Hardware::CPU.arm?
       url "${repo_url}/releases/download/v#{version}/prismtty-#{version}-darwin-aarch64.tar.gz"

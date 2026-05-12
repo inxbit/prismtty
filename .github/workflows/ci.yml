@@ -53,6 +53,7 @@ jobs:
           done
           bash scripts/generate-homebrew-formula.sh "$tmp/prismtty.rb" "$tmp"
           grep -F "version \"${version}\"" "$tmp/prismtty.rb"
+          grep -F 'depends_on "pcre2"' "$tmp/prismtty.rb"
           grep -F "linux-x86_64" "$tmp/prismtty.rb"
           if grep -n -E "REPLACE_WITH|linux-aarch64" "$tmp/prismtty.rb"; then
             echo "Generated Homebrew formula has placeholder checksums or unsupported artifacts."
