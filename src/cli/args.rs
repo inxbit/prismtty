@@ -194,6 +194,7 @@ pub(super) fn print_help() {
 #[cfg(feature = "completion-generation")]
 #[doc(hidden)]
 pub fn completion_command() -> clap::Command {
+    // Keep this completion-only profiles command in sync with parse_profiles_command.
     RawArgs::command().subcommand(
         clap::Command::new("profiles")
             .about("Manage profiles")
