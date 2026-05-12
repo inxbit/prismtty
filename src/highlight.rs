@@ -4,6 +4,8 @@ use pcre2::bytes::{Regex, RegexBuilder};
 use std::time::{Duration, Instant};
 use thiserror::Error;
 
+const UNICODE_PROMPT_MARKERS: &[&str] = &["○", "●", "❯", "❮", "❱", "›", "»", "➜", "➤", "λ"];
+
 #[derive(Debug, Error)]
 pub enum HighlightError {
     #[error("rule '{description}' failed to compile: {source}")]
@@ -717,7 +719,7 @@ fn prompt_echo_sgr_bounds(
     }
 
     for prompt_end in 1..line.len() {
-        if !matches!(line[prompt_end - 1], b'>' | b'#' | b'$' | b'%') {
+        if !is_prompt_tail_candidate_end(&line[..prompt_end]) {
             continue;
         }
         if !looks_like_prompt_echo_prefix(&line[..prompt_end]) {
@@ -746,18 +748,58 @@ fn looks_like_prompt_tail(line: &[u8]) -> bool {
     if trimmed.windows(2).any(|window| window == b"->") {
         return false;
     }
-    let has_prompt_body = if trimmed.len() == 1 {
-        matches!(last, b'$' | b'%')
-    } else {
-        trimmed[..trimmed.len() - 1]
-            .iter()
-            .any(|byte| byte.is_ascii_alphanumeric())
+    if matches!(last, b'>' | b'#' | b'$' | b'%') {
+        let has_prompt_body = if trimmed.len() == 1 {
+            matches!(last, b'$' | b'%')
+        } else {
+            trimmed[..trimmed.len() - 1]
+                .iter()
+                .any(|byte| byte.is_ascii_alphanumeric())
+        };
+        return has_prompt_body
+            && trimmed
+                .iter()
+                .all(|byte| byte.is_ascii_graphic() || *byte == b' ');
+    }
+
+    looks_like_unicode_prompt_tail(trimmed)
+}
+
+fn looks_like_unicode_prompt_tail(trimmed: &[u8]) -> bool {
+    let Ok(text) = std::str::from_utf8(trimmed) else {
+        return false;
     };
-    matches!(last, b'>' | b'#' | b'$' | b'%')
-        && has_prompt_body
-        && trimmed
-            .iter()
-            .all(|byte| byte.is_ascii_graphic() || *byte == b' ')
+    if !text.chars().all(|ch| !ch.is_control()) {
+        return false;
+    }
+
+    let Some(marker) = UNICODE_PROMPT_MARKERS
+        .iter()
+        .copied()
+        .find(|marker| text.ends_with(marker))
+    else {
+        return false;
+    };
+
+    let body = &text[..text.len() - marker.len()];
+    body.is_empty()
+        || body.chars().any(|ch| ch.is_alphanumeric())
+        || body.chars().any(is_prompt_decoration_char)
+}
+
+fn is_prompt_decoration_char(ch: char) -> bool {
+    ch.is_whitespace()
+        || matches!(
+            ch,
+            '\u{2500}'..='\u{257f}' | '\u{2580}'..='\u{259f}' | '\u{e0b0}'..='\u{e0bf}'
+        )
+}
+
+fn is_prompt_tail_candidate_end(bytes: &[u8]) -> bool {
+    let Some(last) = bytes.last() else {
+        return false;
+    };
+    matches!(last, b'>' | b'#' | b'$' | b'%') || looks_like_unicode_prompt_tail(bytes)
 }
 
 fn trim_ascii_whitespace_end(bytes: &[u8]) -> &[u8] {
@@ -905,7 +947,7 @@ fn contains_prompt_echo_before_lf(bytes: &[u8]) -> bool {
 
 fn contains_prompt_echo_in_visible_line(line: &[u8]) -> bool {
     for prompt_end in 1..line.len() {
-        if !matches!(line[prompt_end - 1], b'>' | b'#' | b'$' | b'%') {
+        if !is_prompt_tail_candidate_end(&line[..prompt_end]) {
             continue;
         }
         if !looks_like_prompt_echo_prefix(&line[..prompt_end]) {

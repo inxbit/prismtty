@@ -4,3 +4,4 @@
 *.profdata
 *.log
 .DS_Store
+/.codex-security-scans/

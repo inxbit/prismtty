@@ -710,6 +710,77 @@ fn interactive_streaming_highlighter_does_not_buffer_coalesced_typed_echoes() {
 }
 
 #[test]
+fn interactive_streaming_highlighter_does_not_buffer_unicode_prompt_typed_echoes() {
+    let store = ProfileStore::builtin();
+    let config = PrismConfig::from_profiles(&store, &["generic"]).expect("generic loads");
+    let highlighter = Highlighter::from_config(config).expect("rules compile");
+    let mut streaming = StreamingHighlighter::new_interactive(highlighter);
+
+    assert_eq!(streaming.push_str("○ "), "○ ");
+    assert_eq!(streaming.push_str("m"), "m");
+    assert_eq!(streaming.push_str("v"), "v");
+    assert_eq!(
+        streaming.push_str(" ISAD-61576-Security_Switches"),
+        " ISAD-61576-Security_Switches"
+    );
+    assert_eq!(
+        streaming.push_str("_Le_Bourget-Hartfors-v1.1.docx"),
+        "_Le_Bourget-Hartfors-v1.1.docx"
+    );
+    assert!(streaming.finish().is_empty());
+}
+
+#[test]
+fn interactive_streaming_highlighter_does_not_buffer_decorative_unicode_prompt_typed_echoes() {
+    let store = ProfileStore::builtin();
+    let config = PrismConfig::from_profiles(&store, &["generic"]).expect("generic loads");
+    let highlighter = Highlighter::from_config(config).expect("rules compile");
+    let mut streaming = StreamingHighlighter::new_interactive(highlighter);
+
+    assert_eq!(
+        streaming.push_str("\r╭─user at host in ~\r\n╰─○ "),
+        "\r╭─user at host in ~\r\n╰─○ "
+    );
+    assert_eq!(streaming.push_str("m"), "m");
+    assert_eq!(streaming.push_str("v"), "v");
+    assert_eq!(
+        streaming.push_str(" ISAD-61576-Security_Switches"),
+        " ISAD-61576-Security_Switches"
+    );
+    assert!(streaming.finish().is_empty());
+}
+
+#[test]
+fn interactive_streaming_highlighter_keeps_decorative_unicode_prompt_echo_after_line_edit_redraw() {
+    let store = ProfileStore::builtin();
+    let config = PrismConfig::from_profiles(&store, &["generic"]).expect("generic loads");
+    let highlighter = Highlighter::from_config(config).expect("rules compile");
+    let mut streaming = StreamingHighlighter::new_interactive(highlighter);
+
+    assert_eq!(streaming.push_str("╰─○ "), "╰─○ ");
+    assert_eq!(streaming.push_str("mv old new"), "mv old new");
+
+    let redraw = "\x1b[10Dold-renamed\x1b[7D";
+    assert_eq!(streaming.push_str(redraw), redraw);
+    assert_eq!(streaming.push_str("s"), "s");
+    assert_eq!(streaming.push_str("a"), "a");
+    assert!(streaming.finish().is_empty());
+}
+
+#[test]
+fn interactive_streaming_highlighter_does_not_buffer_coalesced_unicode_prompt_echoes() {
+    let store = ProfileStore::builtin();
+    let config = PrismConfig::from_profiles(&store, &["generic"]).expect("generic loads");
+    let highlighter = Highlighter::from_config(config).expect("rules compile");
+    let mut streaming = StreamingHighlighter::new_interactive(highlighter);
+
+    let input = "○ mv ISAD-61576-Security_Switches_Le_Bourget-Hartfors-v1.1.docx ISAD-61576-Security_Switches";
+
+    assert_eq!(streaming.push_str(input), input);
+    assert!(streaming.finish().is_empty());
+}
+
+#[test]
 fn interactive_streaming_highlighter_does_not_highlight_coalesced_prompt_and_echo_before_enter() {
     let store = ProfileStore::builtin();
     let config = PrismConfig::from_profiles(&store, &["generic"]).expect("generic loads");
