@@ -4,7 +4,7 @@ PrismTTY is a fast terminal output highlighter focused on network devices and
 Linux/Unix administration. It is intended as a ChromaTerm-style CLI wrapper with
 network-focused built-in profiles.
 
-Current version: `0.1.0`.
+Current version: `0.2.0`.
 
 ## Install
 

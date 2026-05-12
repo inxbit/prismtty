@@ -1,6 +1,6 @@
 [package]
 name = "prismtty"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 license = "MIT"
 description = "Fast terminal output highlighter focused on network devices and Unix systems"
