@@ -3,7 +3,7 @@ set -euo pipefail
 
 output="${1:-packaging/homebrew/prismtty.rb}"
 dist_dir="${2:-dist}"
-repo_url="${PRISMTTY_REPO_URL:-https://github.com/nzkller/prismtty}"
+repo_url="${PRISMTTY_REPO_URL:-https://github.com/inxbit/prismtty}"
 version="${PRISMTTY_VERSION:-$(awk -F '"' '/^version = / { print $2; exit }' Cargo.toml)}"
 
 if [[ -z "${version}" ]]; then
