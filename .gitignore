@@ -1,7 +1,5 @@
 /target/
 /dist/
-/handoff.md
-/docs/superpowers/
 *.profraw
 *.profdata
 *.log
