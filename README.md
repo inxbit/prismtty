@@ -1,7 +1,7 @@
 # PrismTTY
 
 <p align="center">
-  <img src=".github/assets/prismtty-logo.svg" alt="PrismTTY" width="760">
+  <img src=".github/assets/prismtty-logo.svg?v=20260513" alt="PrismTTY" width="760">
 </p>
 
 <p align="center">
@@ -21,9 +21,9 @@ Current version: `0.2.1`.
 
 Synthetic terminal previews using documentation-only hostnames and addresses:
 
-![Highlighted PrismTTY terminal output](.github/assets/prismtty-terminal-preview.svg)
+![Highlighted PrismTTY terminal output](.github/assets/prismtty-terminal-preview.svg?v=20260513)
 
-![Dynamic PrismTTY profile switching](.github/assets/prismtty-profile-switching.svg)
+![Dynamic PrismTTY profile switching](.github/assets/prismtty-profile-switching.svg?v=20260513)
 
 ## Install
 
