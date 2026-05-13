@@ -1,7 +1,7 @@
 # PrismTTY
 
 <p align="center">
-  <img src=".github/assets/prismtty-logo.svg?v=20260513" alt="PrismTTY" width="760">
+  <img src=".github/assets/prismtty-logo.svg?v=20260513b" alt="PrismTTY" width="760">
 </p>
 
 <p align="center">
