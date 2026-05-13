@@ -1,4 +1,4 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="1120" height="260" viewBox="0 0 1120 260" role="img" aria-labelledby="title desc">
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="260" viewBox="0 0 1280 260" role="img" aria-labelledby="title desc">
   <title id="title">PrismTTY logo</title>
   <desc id="desc">A prism-shaped terminal prompt mark next to the PrismTTY wordmark.</desc>
   <defs>
@@ -24,8 +24,8 @@
       <stop offset="1" stop-color="#020617"/>
     </linearGradient>
   </defs>
-  <rect width="1120" height="260" rx="32" fill="#020617"/>
-  <rect x="18" y="18" width="1084" height="224" rx="24" fill="#0f172a" stroke="#1e293b" stroke-width="2"/>
+  <rect width="1280" height="260" rx="32" fill="#020617"/>
+  <rect x="18" y="18" width="1244" height="224" rx="24" fill="#0f172a" stroke="#1e293b" stroke-width="2"/>
 
   <path d="M254 89 L435 50 L435 82 L254 112 Z" fill="url(#beam-cyan)"/>
   <path d="M258 123 L450 117 L450 147 L258 146 Z" fill="url(#beam-green)"/>
@@ -42,13 +42,13 @@
   <path d="M127 153 L144 141 L127 129" fill="none" stroke="#22d3ee" stroke-width="7" stroke-linecap="round" stroke-linejoin="round"/>
   <path d="M157 160 H196" stroke="#a3e635" stroke-width="7" stroke-linecap="round"/>
 
-  <text x="476" y="126" fill="#f8fafc" font-family="Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="70" font-weight="800" letter-spacing="0">
+  <text x="430" y="126" fill="#f8fafc" font-family="Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="60" font-weight="800" letter-spacing="0">
     Prism<tspan fill="#22d3ee">TTY</tspan>
   </text>
-  <text x="480" y="166" fill="#94a3b8" font-family="Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="24" letter-spacing="0">
-    terminal highlighting for network devices and Unix shells
+  <text x="434" y="166" fill="#94a3b8" font-family="Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="20" letter-spacing="0">
+    terminal output highlighting
   </text>
-  <text x="480" y="202" fill="#64748b" font-family="SFMono-Regular, Consolas, Liberation Mono, Menlo, monospace" font-size="18" letter-spacing="0">
-    cisco / juniper / fortinet / arista / palo-alto / linux-unix
+  <text x="434" y="202" fill="#64748b" font-family="SFMono-Regular, Consolas, Liberation Mono, Menlo, monospace" font-size="16" letter-spacing="0">
+    network / unix profiles
   </text>
 </svg>
