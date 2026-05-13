@@ -9,6 +9,7 @@ test('GitHub Pages site has the expected static contract', () => {
   assert.equal(existsSync('docs/styles.css'), true);
   assert.equal(existsSync('docs/script.js'), true);
   assert.equal(existsSync('docs/.nojekyll'), true);
+  assert.equal(read('docs/CNAME').trim(), 'prismtty.com');
   assert.equal(existsSync('docs/assets/prismtty-logo.svg'), true);
   assert.equal(existsSync('docs/assets/prismtty-terminal-preview.svg'), true);
   assert.equal(existsSync('docs/assets/prismtty-profile-switching.svg'), true);
@@ -26,5 +27,5 @@ test('GitHub Pages site has the expected static contract', () => {
   assert.match(css, /#f472b6/);
 
   const readme = read('README.md');
-  assert.match(readme, /https:\/\/inxbit\.github\.io\/prismtty\//);
+  assert.match(readme, /https:\/\/prismtty\.com\//);
 });
