@@ -2,6 +2,7 @@
 name = "prismtty"
 version = "0.2.1"
 edition = "2024"
+rust-version = "1.85"
 license = "MIT"
 description = "Fast terminal output highlighter focused on network devices and Unix systems"
 repository = "https://github.com/inxbit/prismtty"

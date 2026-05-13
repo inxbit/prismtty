@@ -1,0 +1,42 @@
+name: Feature request
+description: Suggest an improvement for PrismTTY
+title: "Feature: "
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What workflow or limitation should this improve?
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: Describe the behavior, CLI shape, profile change, or packaging change you want.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: What workarounds or other designs did you consider?
+
+  - type: textarea
+    id: examples
+    attributes:
+      label: Synthetic examples
+      description: Include synthetic terminal output, config, or command examples if useful.
+      render: shell
+
+  - type: checkboxes
+    id: scope
+    attributes:
+      label: Scope check
+      options:
+        - label: This request does not require private terminal captures or sensitive infrastructure details.
+          required: true
+

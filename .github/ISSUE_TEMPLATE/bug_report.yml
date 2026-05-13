@@ -1,0 +1,73 @@
+name: Bug report
+description: Report a reproducible PrismTTY bug
+title: "Bug: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a bug. Please use synthetic examples only; do not paste private terminal captures, credentials, customer names, or sensitive hostnames.
+
+  - type: input
+    id: version
+    attributes:
+      label: PrismTTY version
+      description: Run `prismtty --version` or provide the commit SHA.
+      placeholder: "prismtty 0.2.1"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: mode
+    attributes:
+      label: Mode
+      options:
+        - stdin pipeline
+        - wrapped PTY command
+        - profile command
+        - completion generation
+        - packaging/release
+        - other
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: Minimal reproduction
+      description: Include the smallest synthetic command, input, config, or profile that reproduces the issue.
+      render: shell
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      description: What should PrismTTY have done?
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      description: What happened instead? Include stderr/stdout snippets when useful.
+    validations:
+      required: true
+
+  - type: input
+    id: environment
+    attributes:
+      label: Environment
+      description: OS, terminal, shell, and install method.
+      placeholder: "macOS 15, iTerm2, zsh, release tarball"
+
+  - type: checkboxes
+    id: sensitive-data
+    attributes:
+      label: Sensitive data check
+      options:
+        - label: I reduced this report to synthetic examples and did not include private captures, credentials, or sensitive infrastructure details.
+          required: true
+
