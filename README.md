@@ -8,13 +8,51 @@ Current version: `0.2.1`.
 
 ## Install
 
-Build locally with:
+### Homebrew
+
+Install the latest release from the PrismTTY Homebrew tap:
+
+```sh
+brew install inxbit/tap/prismtty
+```
+
+The Homebrew formula installs `prismtty`, `ptty`, `ct`, bundled profiles, and
+shell completions.
+
+### Cargo
+
+Install from crates.io:
+
+```sh
+cargo install prismtty
+```
+
+Cargo builds PrismTTY from source and installs the command binaries. You need
+Rust 1.85 or newer plus PCRE2 and `pkg-config` available on your system.
+
+On macOS with Homebrew, install the native build dependencies with:
+
+```sh
+brew install pcre2 pkg-config
+```
+
+### GitHub Release
+
+Prebuilt release archives and checksums are available on the
+[v0.2.1 release page](https://github.com/inxbit/prismtty/releases/tag/v0.2.1).
+
+Each release archive contains the binaries, license/readme files, example
+profiles, shell completions, and a `.tar.gz.sha256` checksum.
+
+### Build Locally
+
+Build from a checkout with:
 
 ```sh
 cargo build --release
 ```
 
-The project builds three binaries:
+The project builds these user-facing binaries:
 
 - `prismtty`
 - `ptty`
@@ -26,10 +64,10 @@ Release packages can be built with:
 scripts/package-release.sh darwin-aarch64
 ```
 
-The package contains binaries, license/readme files, example profiles, shell
-completions, and a `.tar.gz.sha256` checksum. The release workflow generates a
-Homebrew formula from the actual release checksums and uploads it as
-`prismtty.rb` with the release artifacts.
+The release workflow generates a Homebrew formula from the actual release
+checksums and uploads it as `prismtty.rb` with the release artifacts. The
+published tap formula lives in
+[inxbit/homebrew-tap](https://github.com/inxbit/homebrew-tap).
 
 ## Usage
 
