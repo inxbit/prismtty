@@ -1,0 +1,54 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1120" height="260" viewBox="0 0 1120 260" role="img" aria-labelledby="title desc">
+  <title id="title">PrismTTY logo</title>
+  <desc id="desc">A prism-shaped terminal prompt mark next to the PrismTTY wordmark.</desc>
+  <defs>
+    <linearGradient id="beam-cyan" x1="0" x2="1" y1="0" y2="0">
+      <stop offset="0" stop-color="#22d3ee" stop-opacity="0.9"/>
+      <stop offset="1" stop-color="#22d3ee" stop-opacity="0"/>
+    </linearGradient>
+    <linearGradient id="beam-green" x1="0" x2="1" y1="0" y2="0">
+      <stop offset="0" stop-color="#a3e635" stop-opacity="0.85"/>
+      <stop offset="1" stop-color="#a3e635" stop-opacity="0"/>
+    </linearGradient>
+    <linearGradient id="beam-pink" x1="0" x2="1" y1="0" y2="0">
+      <stop offset="0" stop-color="#f472b6" stop-opacity="0.78"/>
+      <stop offset="1" stop-color="#f472b6" stop-opacity="0"/>
+    </linearGradient>
+    <linearGradient id="prism" x1="70" x2="250" y1="45" y2="215" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#f8fafc"/>
+      <stop offset="0.45" stop-color="#67e8f9"/>
+      <stop offset="1" stop-color="#a78bfa"/>
+    </linearGradient>
+    <linearGradient id="terminal" x1="0" x2="1" y1="0" y2="1">
+      <stop offset="0" stop-color="#1f2937"/>
+      <stop offset="1" stop-color="#020617"/>
+    </linearGradient>
+  </defs>
+  <rect width="1120" height="260" rx="32" fill="#020617"/>
+  <rect x="18" y="18" width="1084" height="224" rx="24" fill="#0f172a" stroke="#1e293b" stroke-width="2"/>
+
+  <path d="M254 89 L435 50 L435 82 L254 112 Z" fill="url(#beam-cyan)"/>
+  <path d="M258 123 L450 117 L450 147 L258 146 Z" fill="url(#beam-green)"/>
+  <path d="M254 158 L435 206 L435 176 L254 136 Z" fill="url(#beam-pink)"/>
+
+  <path d="M88 202 L166 54 L252 202 Z" fill="none" stroke="url(#prism)" stroke-width="14" stroke-linejoin="round"/>
+  <path d="M166 54 L166 202" stroke="#67e8f9" stroke-width="6" stroke-linecap="round" opacity="0.9"/>
+  <path d="M88 202 L166 132 L252 202" fill="none" stroke="#c084fc" stroke-width="6" stroke-linecap="round" stroke-linejoin="round" opacity="0.85"/>
+
+  <rect x="104" y="111" width="116" height="72" rx="10" fill="url(#terminal)" stroke="#334155" stroke-width="3"/>
+  <circle cx="122" cy="128" r="4" fill="#ef4444"/>
+  <circle cx="136" cy="128" r="4" fill="#f59e0b"/>
+  <circle cx="150" cy="128" r="4" fill="#22c55e"/>
+  <path d="M127 153 L144 141 L127 129" fill="none" stroke="#22d3ee" stroke-width="7" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M157 160 H196" stroke="#a3e635" stroke-width="7" stroke-linecap="round"/>
+
+  <text x="476" y="126" fill="#f8fafc" font-family="Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="70" font-weight="800" letter-spacing="0">
+    Prism<tspan fill="#22d3ee">TTY</tspan>
+  </text>
+  <text x="480" y="166" fill="#94a3b8" font-family="Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="24" letter-spacing="0">
+    terminal highlighting for network devices and Unix shells
+  </text>
+  <text x="480" y="202" fill="#64748b" font-family="SFMono-Regular, Consolas, Liberation Mono, Menlo, monospace" font-size="18" letter-spacing="0">
+    cisco / juniper / fortinet / arista / palo-alto / linux-unix
+  </text>
+</svg>
