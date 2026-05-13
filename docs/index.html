@@ -1,0 +1,218 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>PrismTTY - Terminal Output Highlighting</title>
+    <meta
+      name="description"
+      content="PrismTTY is a fast terminal output highlighter for network devices and Unix systems, with built-in profiles and dynamic profile switching."
+    >
+    <meta property="og:title" content="PrismTTY">
+    <meta property="og:description" content="Readable network output, live in your terminal.">
+    <meta property="og:type" content="website">
+    <meta property="og:image" content="assets/prismtty-terminal-preview.svg">
+    <link rel="canonical" href="https://inxbit.github.io/prismtty/">
+    <link rel="preload" as="image" href="assets/prismtty-terminal-preview.svg">
+    <link rel="stylesheet" href="styles.css">
+    <script src="script.js" defer></script>
+  </head>
+  <body>
+    <header class="site-header" data-site-header>
+      <a class="brand" href="#top" aria-label="PrismTTY home">
+        <span class="brand-mark" aria-hidden="true"></span>
+        <span>PrismTTY</span>
+      </a>
+      <nav class="site-nav" aria-label="Primary navigation">
+        <a href="#preview">Preview</a>
+        <a href="#profiles">Profiles</a>
+        <a href="#install">Install</a>
+        <a href="https://github.com/inxbit/prismtty">GitHub</a>
+      </nav>
+    </header>
+
+    <main id="top">
+      <section class="hero" aria-labelledby="hero-title">
+        <div class="hero-beams" aria-hidden="true">
+          <span></span>
+          <span></span>
+          <span></span>
+        </div>
+        <div class="hero-copy">
+          <img class="hero-logo" src="assets/prismtty-logo.svg" alt="PrismTTY">
+          <p class="eyebrow">Network and Unix terminal highlighting</p>
+          <h1 id="hero-title">Readable network output, live in your terminal.</h1>
+          <p class="hero-lede">
+            PrismTTY wraps shells, SSH sessions, pipes, and logs with fast PCRE2-powered
+            highlighting tuned for network devices and Unix administration.
+          </p>
+          <div class="hero-actions" aria-label="Primary actions">
+            <a class="button primary" href="#install">Install PrismTTY</a>
+            <a class="button secondary" href="https://github.com/inxbit/prismtty">View on GitHub</a>
+          </div>
+          <dl class="hero-facts" aria-label="Project highlights">
+            <div>
+              <dt>Profiles</dt>
+              <dd>9 built in</dd>
+            </div>
+            <div>
+              <dt>Current</dt>
+              <dd>v0.2.1</dd>
+            </div>
+            <div>
+              <dt>Engine</dt>
+              <dd>PCRE2</dd>
+            </div>
+          </dl>
+        </div>
+        <figure class="hero-preview" id="preview">
+          <img
+            src="assets/prismtty-terminal-preview.svg"
+            alt="Synthetic terminal output highlighted by PrismTTY, showing interfaces, addresses, status, and syslog severity."
+          >
+        </figure>
+      </section>
+
+      <section class="command-band" aria-label="Common PrismTTY commands">
+        <div class="command-line">
+          <span class="prompt">$</span>
+          <code>ptty ssh router.example.net</code>
+        </div>
+        <div class="command-line">
+          <span class="prompt">$</span>
+          <code>show-tech.txt | prismtty --profile cisco</code>
+        </div>
+        <div class="command-line">
+          <span class="prompt">$</span>
+          <code>prismtty --reload</code>
+        </div>
+      </section>
+
+      <section class="section section-grid" aria-labelledby="features-title">
+        <div class="section-heading">
+          <p class="eyebrow">Built for real terminal work</p>
+          <h2 id="features-title">Color where operators need signal.</h2>
+        </div>
+        <div class="feature-grid">
+          <article class="feature-card">
+            <span class="feature-kicker">01</span>
+            <h3>Network-aware profiles</h3>
+            <p>
+              Clean-room rules highlight interfaces, addresses, operational state,
+              counters, prompts, syslog severity, and common vendor terms.
+            </p>
+          </article>
+          <article class="feature-card">
+            <span class="feature-kicker">02</span>
+            <h3>Interactive shell wrapping</h3>
+            <p>
+              Start one wrapped shell with <code>ptty /bin/zsh</code>, then use normal
+              SSH, telnet, and console workflows without changing habits.
+            </p>
+          </article>
+          <article class="feature-card">
+            <span class="feature-kicker">03</span>
+            <h3>ChromaTerm-compatible rules</h3>
+            <p>
+              Load existing YAML rules, add native profiles, validate profile files,
+              and reload long-running sessions after config changes.
+            </p>
+          </article>
+        </div>
+      </section>
+
+      <section class="section split-section" id="profiles" aria-labelledby="profiles-title">
+        <div class="media-panel">
+          <img
+            src="assets/prismtty-profile-switching.svg"
+            alt="Synthetic session showing PrismTTY switching from linux-unix to fortinet and then juniper profiles."
+          >
+        </div>
+        <div class="section-copy">
+          <p class="eyebrow">Dynamic profile switching</p>
+          <h2 id="profiles-title">One wrapped shell follows changing device context.</h2>
+          <p>
+            PrismTTY observes login banners, prompts, and typed remote-jump commands.
+            It can move from a local Unix shell into network device sessions while keeping
+            normal command output from churning the selected profile.
+          </p>
+          <div class="profile-list" aria-label="Built-in profiles">
+            <span>generic</span>
+            <span>linux-unix</span>
+            <span>cisco</span>
+            <span>juniper</span>
+            <span>fortinet</span>
+            <span>palo-alto</span>
+            <span>arista</span>
+            <span>arubacx</span>
+            <span>versa</span>
+          </div>
+        </div>
+      </section>
+
+      <section class="section install-section" id="install" aria-labelledby="install-title">
+        <div class="section-heading compact">
+          <p class="eyebrow">Install</p>
+          <h2 id="install-title">Get PrismTTY from Homebrew, Cargo, or GitHub releases.</h2>
+        </div>
+        <div class="install-grid">
+          <article class="install-card">
+            <div class="install-card-header">
+              <h3>Homebrew</h3>
+              <button class="copy-button" type="button" data-copy="brew install inxbit/tap/prismtty">Copy</button>
+            </div>
+            <pre><code>brew install inxbit/tap/prismtty</code></pre>
+          </article>
+          <article class="install-card">
+            <div class="install-card-header">
+              <h3>Cargo</h3>
+              <button class="copy-button" type="button" data-copy="cargo install prismtty">Copy</button>
+            </div>
+            <pre><code>cargo install prismtty</code></pre>
+          </article>
+          <article class="install-card">
+            <div class="install-card-header">
+              <h3>Start a wrapped shell</h3>
+              <button class="copy-button" type="button" data-copy="ptty /bin/zsh">Copy</button>
+            </div>
+            <pre><code>ptty /bin/zsh</code></pre>
+          </article>
+        </div>
+        <div class="install-links">
+          <a href="https://crates.io/crates/prismtty">crates.io package</a>
+          <a href="https://github.com/inxbit/prismtty/releases">GitHub releases</a>
+          <a href="https://github.com/inxbit/homebrew-tap">Homebrew tap</a>
+        </div>
+      </section>
+
+      <section class="section workflow-section" aria-labelledby="workflow-title">
+        <div class="section-heading compact">
+          <p class="eyebrow">Workflow</p>
+          <h2 id="workflow-title">Designed to sit between you and noisy output.</h2>
+        </div>
+        <div class="workflow">
+          <div class="workflow-step">
+            <span class="step-number">1</span>
+            <h3>Wrap the session</h3>
+            <p>Run <code>ptty</code> around a shell, SSH command, or console tool.</p>
+          </div>
+          <div class="workflow-step">
+            <span class="step-number">2</span>
+            <h3>Detect context</h3>
+            <p>Use built-in profile hints to recognize Unix and vendor prompts.</p>
+          </div>
+          <div class="workflow-step">
+            <span class="step-number">3</span>
+            <h3>Highlight output</h3>
+            <p>Render addresses, interfaces, state, counters, and severity in place.</p>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <footer class="site-footer">
+      <span>PrismTTY is MIT licensed.</span>
+      <a href="https://github.com/inxbit/prismtty/blob/main/README.md">Read the docs</a>
+    </footer>
+  </body>
+</html>

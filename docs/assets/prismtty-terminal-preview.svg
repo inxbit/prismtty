@@ -1,0 +1,81 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="980" height="540" viewBox="0 0 980 540" role="img" aria-labelledby="title desc">
+  <title id="title">PrismTTY highlighted terminal preview</title>
+  <desc id="desc">Synthetic terminal output showing PrismTTY highlighting network device commands, interfaces, addresses, and status.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" x2="1" y1="0" y2="1">
+      <stop offset="0" stop-color="#0f172a"/>
+      <stop offset="1" stop-color="#020617"/>
+    </linearGradient>
+    <linearGradient id="bar" x1="0" x2="1" y1="0" y2="0">
+      <stop offset="0" stop-color="#22d3ee"/>
+      <stop offset="0.5" stop-color="#a3e635"/>
+      <stop offset="1" stop-color="#f472b6"/>
+    </linearGradient>
+    <style>
+      .mono { font-family: SFMono-Regular, Consolas, Liberation Mono, Menlo, monospace; font-size: 22px; }
+      .small { font-family: SFMono-Regular, Consolas, Liberation Mono, Menlo, monospace; font-size: 17px; }
+      .muted { fill: #64748b; }
+      .dim { fill: #94a3b8; }
+      .fg { fill: #e5e7eb; }
+      .cyan { fill: #22d3ee; }
+      .green { fill: #a3e635; }
+      .yellow { fill: #facc15; }
+      .red { fill: #fb7185; }
+      .magenta { fill: #f472b6; }
+      .blue { fill: #60a5fa; }
+    </style>
+  </defs>
+  <rect width="980" height="540" rx="24" fill="#020617"/>
+  <rect x="24" y="24" width="932" height="492" rx="18" fill="url(#bg)" stroke="#1e293b" stroke-width="2"/>
+  <rect x="24" y="24" width="932" height="48" rx="18" fill="#111827"/>
+  <rect x="24" y="56" width="932" height="18" fill="#111827"/>
+  <circle cx="52" cy="48" r="7" fill="#ef4444"/>
+  <circle cx="76" cy="48" r="7" fill="#f59e0b"/>
+  <circle cx="100" cy="48" r="7" fill="#22c55e"/>
+  <text x="130" y="55" class="small dim">ptty ssh edge-sw1.example.net</text>
+  <rect x="24" y="72" width="932" height="3" fill="url(#bar)"/>
+
+  <text x="54" y="112" class="mono muted">$</text>
+  <text x="82" y="112" class="mono fg">ptty ssh edge-sw1.example.net</text>
+  <text x="54" y="150" class="small cyan">profile</text>
+  <text x="144" y="150" class="small dim">generic -&gt; </text>
+  <text x="270" y="150" class="small green">cisco</text>
+
+  <text x="54" y="196" class="mono green">edge-sw1#</text>
+  <text x="174" y="196" class="mono fg">show interfaces status</text>
+
+  <text x="54" y="238" class="small muted">Port</text>
+  <text x="210" y="238" class="small muted">Name</text>
+  <text x="450" y="238" class="small muted">Status</text>
+  <text x="596" y="238" class="small muted">Vlan</text>
+  <text x="690" y="238" class="small muted">Speed</text>
+
+  <text x="54" y="274" class="small yellow">Gi1/0/1</text>
+  <text x="210" y="274" class="small fg">core-uplink</text>
+  <text x="450" y="274" class="small green">connected</text>
+  <text x="596" y="274" class="small blue">10</text>
+  <text x="690" y="274" class="small cyan">10G</text>
+
+  <text x="54" y="310" class="small yellow">Gi1/0/2</text>
+  <text x="210" y="310" class="small fg">access-lab</text>
+  <text x="450" y="310" class="small red">notconnect</text>
+  <text x="596" y="310" class="small blue">20</text>
+  <text x="690" y="310" class="small cyan">1G</text>
+
+  <text x="54" y="356" class="mono green">edge-sw1#</text>
+  <text x="174" y="356" class="mono fg">ping </text>
+  <text x="236" y="356" class="mono blue">192.0.2.10</text>
+  <text x="54" y="398" class="small fg">Success rate is </text>
+  <text x="214" y="398" class="small green">100 percent</text>
+  <text x="346" y="398" class="small fg">, round-trip min/avg/max = </text>
+  <text x="650" y="398" class="small cyan">1/2/4 ms</text>
+
+  <text x="54" y="444" class="small magenta">%LINK-3-UPDOWN:</text>
+  <text x="224" y="444" class="small fg"> Interface </text>
+  <text x="334" y="444" class="small yellow">Gi1/0/1</text>
+  <text x="430" y="444" class="small fg"> changed state to </text>
+  <text x="620" y="444" class="small green">up</text>
+
+  <text x="54" y="486" class="mono green">edge-sw1#</text>
+  <rect x="174" y="469" width="12" height="24" fill="#e5e7eb" opacity="0.8"/>
+</svg>
