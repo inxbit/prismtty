@@ -1,4 +1,4 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="980" height="430" viewBox="0 0 980 430" role="img" aria-labelledby="title desc">
+<svg xmlns="http://www.w3.org/2000/svg" width="980" height="500" viewBox="0 0 980 500" role="img" aria-labelledby="title desc">
   <title id="title">PrismTTY dynamic profile switching preview</title>
   <desc id="desc">Synthetic terminal session showing PrismTTY switching from a Unix shell to Fortinet and Juniper device profiles.</desc>
   <defs>
@@ -21,38 +21,39 @@
       .blue { fill: #60a5fa; }
     </style>
   </defs>
-  <rect width="980" height="430" rx="24" fill="#020617"/>
-  <rect x="24" y="24" width="932" height="382" rx="18" fill="url(#panel)" stroke="#1e293b" stroke-width="2"/>
+  <rect width="980" height="500" rx="24" fill="#020617"/>
+  <rect x="24" y="24" width="932" height="452" rx="18" fill="url(#panel)" stroke="#1e293b" stroke-width="2"/>
   <text x="54" y="62" class="label fg">One wrapped shell, automatic profile context</text>
 
-  <rect x="54" y="88" width="160" height="48" rx="12" fill="#0f172a" stroke="#1e293b"/>
-  <text x="134" y="119" text-anchor="middle" class="small cyan">linux-unix</text>
-  <path d="M238 112 H308" stroke="#334155" stroke-width="3" stroke-linecap="round"/>
-  <path d="M298 102 L312 112 L298 122" fill="none" stroke="#334155" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+  <rect x="54" y="88" width="190" height="48" rx="12" fill="#0f172a" stroke="#1e293b"/>
+  <text x="149" y="119" text-anchor="middle" class="small cyan">linux-unix</text>
+  <path d="M268 112 H348" stroke="#334155" stroke-width="3" stroke-linecap="round"/>
+  <path d="M338 102 L352 112 L338 122" fill="none" stroke="#334155" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
 
-  <rect x="334" y="88" width="160" height="48" rx="12" fill="#0f172a" stroke="#1e293b"/>
-  <text x="414" y="119" text-anchor="middle" class="small green">fortinet</text>
-  <path d="M518 112 H588" stroke="#334155" stroke-width="3" stroke-linecap="round"/>
-  <path d="M578 102 L592 112 L578 122" fill="none" stroke="#334155" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+  <rect x="374" y="88" width="190" height="48" rx="12" fill="#0f172a" stroke="#1e293b"/>
+  <text x="469" y="119" text-anchor="middle" class="small green">fortinet</text>
+  <path d="M588 112 H668" stroke="#334155" stroke-width="3" stroke-linecap="round"/>
+  <path d="M658 102 L672 112 L658 122" fill="none" stroke="#334155" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
 
-  <rect x="614" y="88" width="160" height="48" rx="12" fill="#0f172a" stroke="#1e293b"/>
-  <text x="694" y="119" text-anchor="middle" class="small purple">juniper</text>
+  <rect x="694" y="88" width="190" height="48" rx="12" fill="#0f172a" stroke="#1e293b"/>
+  <text x="789" y="119" text-anchor="middle" class="small purple">juniper</text>
 
-  <text x="54" y="176" class="mono green">devbox%</text>
-  <text x="150" y="176" class="mono fg">ptty /bin/zsh</text>
-  <text x="54" y="214" class="mono green">devbox%</text>
-  <text x="150" y="214" class="mono fg">ssh fw-edge.example.net</text>
-  <text x="54" y="250" class="small cyan">profile</text>
-  <text x="144" y="250" class="small dim">generic, linux-unix -&gt; </text>
-  <text x="420" y="250" class="small green">generic, fortinet</text>
+  <text x="54" y="178" class="mono green">devbox%</text>
+  <text x="150" y="178" class="mono fg">ptty /bin/zsh</text>
+  <text x="54" y="216" class="mono green">devbox%</text>
+  <text x="150" y="216" class="mono fg">ssh fw-edge.example.net</text>
+  <text x="54" y="254" class="small cyan">profile</text>
+  <text x="144" y="254" class="small dim">generic, linux-unix -&gt; </text>
+  <text x="420" y="254" class="small green">generic, fortinet</text>
 
-  <text x="54" y="292" class="mono yellow">fw-edge #</text>
-  <text x="174" y="292" class="mono fg">get system status</text>
-  <text x="54" y="328" class="small pink">Version:</text>
-  <text x="142" y="328" class="small fg"> FortiGate synthetic output</text>
-  <text x="54" y="370" class="mono yellow">fw-edge #</text>
-  <text x="174" y="370" class="mono fg">ssh core-rtr.example.net</text>
-  <text x="54" y="394" class="small cyan">profile</text>
-  <text x="144" y="394" class="small dim">fortinet -&gt; </text>
-  <text x="274" y="394" class="small purple">juniper</text>
+  <text x="54" y="300" class="mono yellow">fw-edge #</text>
+  <text x="174" y="300" class="mono fg">get system status</text>
+  <text x="54" y="338" class="small pink">Version:</text>
+  <text x="142" y="338" class="small fg"> FortiGate synthetic output</text>
+  <text x="54" y="384" class="mono yellow">fw-edge #</text>
+  <text x="174" y="384" class="mono fg">ssh core-rtr.example.net</text>
+  <text x="54" y="422" class="small cyan">profile</text>
+  <text x="144" y="422" class="small dim">fortinet -&gt; </text>
+  <text x="274" y="422" class="small purple">juniper</text>
+  <text x="54" y="462" class="mono purple">user@core-rtr&gt;</text>
 </svg>

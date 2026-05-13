@@ -23,7 +23,7 @@ Synthetic terminal previews using documentation-only hostnames and addresses:
 
 ![Highlighted PrismTTY terminal output](.github/assets/prismtty-terminal-preview.svg?v=20260513)
 
-![Dynamic PrismTTY profile switching](.github/assets/prismtty-profile-switching.svg?v=20260513)
+![Dynamic PrismTTY profile switching](.github/assets/prismtty-profile-switching.svg?v=20260513b)
 
 ## Install
 
