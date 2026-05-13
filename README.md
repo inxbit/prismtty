@@ -5,7 +5,7 @@
 </p>
 
 <p align="center">
-  <a href="https://inxbit.github.io/prismtty/"><img alt="website" src="https://img.shields.io/badge/website-prismtty-22d3ee?style=flat-square"></a>
+  <a href="https://prismtty.com/"><img alt="website" src="https://img.shields.io/badge/website-prismtty-22d3ee?style=flat-square"></a>
   <a href="https://crates.io/crates/prismtty"><img alt="crates.io" src="https://img.shields.io/crates/v/prismtty?style=flat-square"></a>
   <a href="https://github.com/inxbit/prismtty/actions/workflows/ci.yml"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/inxbit/prismtty/ci.yml?branch=main&amp;style=flat-square"></a>
   <a href="https://github.com/inxbit/prismtty/releases"><img alt="release" src="https://img.shields.io/github/v/release/inxbit/prismtty?style=flat-square"></a>
@@ -16,7 +16,7 @@ PrismTTY is a fast terminal output highlighter focused on network devices and
 Linux/Unix administration. It is intended as a ChromaTerm-style CLI wrapper with
 network-focused built-in profiles.
 
-Website: [inxbit.github.io/prismtty](https://inxbit.github.io/prismtty/).
+Website: [prismtty.com](https://prismtty.com/).
 
 Current version: `0.2.1`.
 
