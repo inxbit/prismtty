@@ -17,7 +17,7 @@ brew install inxbit/tap/prismtty
 ```
 
 The Homebrew formula installs `prismtty`, `ptty`, `ct`, bundled profiles, and
-shell completions.
+shell completions. It also installs the required PCRE2 runtime dependency.
 
 ### Cargo
 
@@ -30,10 +30,16 @@ cargo install prismtty
 Cargo builds PrismTTY from source and installs the command binaries. You need
 Rust 1.85 or newer plus PCRE2 and `pkg-config` available on your system.
 
-On macOS with Homebrew, install the native build dependencies with:
+For `cargo install` on macOS, install the native build dependencies first:
 
 ```sh
 brew install pcre2 pkg-config
+```
+
+For `cargo install` on Debian/Ubuntu, install:
+
+```sh
+sudo apt-get install libpcre2-dev pkg-config
 ```
 
 ### GitHub Release
