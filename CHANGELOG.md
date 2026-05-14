@@ -2,6 +2,26 @@
 
 All notable changes to PrismTTY are documented here.
 
+## 0.2.3 - 2026-05-14
+
+### Security and Reliability
+
+- Keep runtime registration and reload marker files under a private
+  user-owned runtime directory, tighten runtime file permissions on Unix, and
+  reject non-file runtime entries or symlink targets before reading or writing
+  them.
+- Write `--trace-io` diagnostics with owner-only permissions on Unix so trace
+  files created in shared locations are not left world-readable.
+- Bound streaming output buffering for unterminated ANSI, OSC, and DCS escape
+  sequences by neutralizing oversized incomplete controls before they can hold
+  later output indefinitely.
+
+### Tests
+
+- Add regression coverage for private runtime paths, trace file permissions,
+  runtime symlink rejection, oversized unterminated escape buffering, and split
+  terminated OSC preservation.
+
 ## 0.2.2 - 2026-05-13
 
 ### Interactive Rendering

@@ -5,6 +5,7 @@ use std::time::{Duration, Instant};
 use thiserror::Error;
 
 const UNICODE_PROMPT_MARKERS: &[&str] = &["○", "●", "❯", "❮", "❱", "›", "»", "➜", "➤", "λ"];
+const MAX_INCOMPLETE_ESCAPE_BYTES: usize = 16 * 1024;
 
 #[derive(Debug, Error)]
 pub enum HighlightError {
@@ -261,6 +262,7 @@ impl StreamingHighlighter {
     pub fn push(&mut self, input: &[u8]) -> Vec<u8> {
         let mut combined = std::mem::take(&mut self.pending);
         combined.extend_from_slice(input);
+        neutralize_oversized_incomplete_escape(&mut combined);
         let alternate_screen_chunk =
             self.alternate_screen || contains_alternate_screen_enable(&combined);
 
@@ -1684,9 +1686,24 @@ fn interactive_split_at(
 }
 
 fn incomplete_escape_start(bytes: &[u8]) -> Option<usize> {
-    let start = bytes.iter().rposition(|byte| *byte == 0x1b)?;
+    let mut search_start = 0usize;
+    while search_start < bytes.len() {
+        let start = search_start
+            + bytes[search_start..]
+                .iter()
+                .position(|byte| *byte == 0x1b)?;
+        if escape_is_incomplete_at(bytes, start) {
+            return Some(start);
+        }
+        search_start = ansi_sequence_end(bytes, start).max(start + 1);
+    }
+
+    None
+}
+
+fn escape_is_incomplete_at(bytes: &[u8], start: usize) -> bool {
     if start + 1 >= bytes.len() {
-        return Some(start);
+        return true;
     }
 
     match bytes[start + 1] {
@@ -1694,7 +1711,7 @@ fn incomplete_escape_start(bytes: &[u8]) -> Option<usize> {
             .iter()
             .any(|byte| (0x40..=0x7e).contains(byte))
             .then_some(())
-            .map_or(Some(start), |_| None),
+            .is_none(),
         b']' => {
             let complete = bytes[start + 2..]
                 .iter()
@@ -1703,18 +1720,31 @@ fn incomplete_escape_start(bytes: &[u8]) -> Option<usize> {
                 || bytes[start + 2..]
                     .windows(2)
                     .any(|window| window == b"\x1b\\");
-            if complete { None } else { Some(start) }
+            !complete
         }
         b'P' | b'X' | b'^' | b'_' => {
             let complete = bytes[start + 2..]
                 .windows(2)
                 .any(|window| window == b"\x1b\\");
-            if complete { None } else { Some(start) }
+            !complete
         }
-        b'(' | b')' | b'*' | b'+' | b'-' | b'.' | b'/' | b'#' | b'%' => {
-            (start + 2 >= bytes.len()).then_some(start)
+        b'(' | b')' | b'*' | b'+' | b'-' | b'.' | b'/' | b'#' | b'%' => start + 2 >= bytes.len(),
+        _ => false,
+    }
+}
+
+fn neutralize_oversized_incomplete_escape(bytes: &mut [u8]) {
+    let mut search_start = 0usize;
+    while search_start < bytes.len() {
+        let Some(relative_start) = incomplete_escape_start(&bytes[search_start..]) else {
+            break;
+        };
+        let start = search_start + relative_start;
+        if bytes.len().saturating_sub(start) <= MAX_INCOMPLETE_ESCAPE_BYTES {
+            break;
         }
-        _ => None,
+        bytes[start] = b'^';
+        search_start = start + 1;
     }
 }
 
