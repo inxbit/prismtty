@@ -684,6 +684,90 @@ fn streaming_highlighter_keeps_char_split_ipv4_addresses_colored() {
 }
 
 #[test]
+fn streaming_highlighter_flushes_oversized_unterminated_escape_as_visible_text() {
+    let config = PrismConfig::default();
+    let highlighter = Highlighter::from_config(config).expect("empty config compiles");
+
+    for (prefix, fill) in [
+        (b"\x1b]52;".as_slice(), b'A'),
+        (b"\x1b[".as_slice(), b'1'),
+        (b"\x1bP".as_slice(), b'A'),
+    ] {
+        let mut streaming = StreamingHighlighter::new(highlighter.clone());
+        let mut input = prefix.to_vec();
+        input.extend(std::iter::repeat_n(fill, 20_000));
+
+        let output = streaming.push(&input);
+
+        assert!(
+            !output.is_empty(),
+            "oversized incomplete escape stayed buffered for prefix {prefix:?}"
+        );
+        assert!(
+            !output.contains(&0x1b),
+            "oversized incomplete escape emitted a raw ESC byte for prefix {prefix:?}"
+        );
+        assert!(streaming.finish().is_empty());
+    }
+}
+
+#[test]
+fn streaming_highlighter_neutralizes_earliest_oversized_unterminated_escape() {
+    let config = PrismConfig::default();
+    let highlighter = Highlighter::from_config(config).expect("empty config compiles");
+    let mut streaming = StreamingHighlighter::new(highlighter);
+    let mut input = b"\x1b]52;".to_vec();
+    input.extend(std::iter::repeat_n(b'A', 17_000));
+    input.extend(b"\x1b]52;");
+    input.extend(std::iter::repeat_n(b'B', 1_000));
+
+    let output = streaming.push(&input);
+
+    assert!(!output.is_empty());
+    assert!(
+        !output.contains(&0x1b),
+        "raw ESC from the first oversized unterminated OSC was emitted"
+    );
+}
+
+#[test]
+fn streaming_highlighter_neutralizes_all_oversized_unterminated_escapes_in_large_direct_push() {
+    let config = PrismConfig::default();
+    let highlighter = Highlighter::from_config(config).expect("empty config compiles");
+    let mut streaming = StreamingHighlighter::new(highlighter);
+    let mut input = Vec::new();
+    for idx in 0..20u8 {
+        input.extend(b"\x1b]52;");
+        input.extend(std::iter::repeat_n(b'A' + (idx % 26), 17_000));
+    }
+
+    let output = streaming.push(&input);
+
+    assert_eq!(output.len(), input.len());
+    assert!(
+        !output.contains(&0x1b),
+        "large direct push emitted raw ESC bytes from later unterminated OSC sequences"
+    );
+    assert!(streaming.finish().is_empty());
+}
+
+#[test]
+fn streaming_highlighter_preserves_split_terminated_osc_sequence() {
+    let config = PrismConfig::default();
+    let highlighter = Highlighter::from_config(config).expect("empty config compiles");
+    let mut streaming = StreamingHighlighter::new(highlighter);
+
+    let first = streaming.push(b"\x1b]0;router");
+    let second = streaming.push(b"\x07ready\n");
+    let mut output = first;
+    output.extend(second);
+    output.extend(streaming.finish());
+
+    assert_eq!(output.as_slice(), b"\x1b]0;router\x07ready\n");
+    assert_eq!(strip_ansi(&output), b"ready\n");
+}
+
+#[test]
 fn interactive_streaming_highlighter_does_not_buffer_slow_typed_echoes() {
     let store = ProfileStore::builtin();
     let config = PrismConfig::from_profiles(&store, &["generic"]).expect("generic loads");
