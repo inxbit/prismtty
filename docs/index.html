@@ -11,9 +11,9 @@
     <meta property="og:title" content="PrismTTY">
     <meta property="og:description" content="Readable network output, live in your terminal.">
     <meta property="og:type" content="website">
-    <meta property="og:image" content="assets/prismtty-terminal-preview.svg">
+    <meta property="og:image" content="assets/prismtty-terminal-demo.svg">
     <link rel="canonical" href="https://prismtty.com/">
-    <link rel="preload" as="image" href="assets/prismtty-terminal-preview.svg">
+    <link rel="preload" as="image" href="assets/prismtty-terminal-demo.svg">
     <link rel="stylesheet" href="styles.css">
     <script src="script.js" defer></script>
   </head>
@@ -25,7 +25,9 @@
       </a>
       <nav class="site-nav" aria-label="Primary navigation">
         <a href="#preview">Preview</a>
+        <a href="#scope">Scope</a>
         <a href="#profiles">Profiles</a>
+        <a href="#feedback">Feedback</a>
         <a href="#install">Install</a>
         <a href="https://github.com/inxbit/prismtty">GitHub</a>
       </nav>
@@ -67,8 +69,8 @@
         </div>
         <figure class="hero-preview" id="preview">
           <img
-            src="assets/prismtty-terminal-preview.svg"
-            alt="Synthetic terminal output highlighted by PrismTTY, showing interfaces, addresses, status, and syslog severity."
+            src="assets/prismtty-terminal-demo.svg"
+            alt="Animated synthetic terminal session highlighted by PrismTTY, showing profile detection, interfaces, addresses, status, and syslog severity."
           >
         </figure>
       </section>
@@ -85,6 +87,31 @@
         <div class="command-line">
           <span class="prompt">$</span>
           <code>prismtty --reload</code>
+        </div>
+      </section>
+
+      <section class="section scope-section" id="scope" aria-labelledby="scope-title">
+        <div class="section-heading compact">
+          <p class="eyebrow">Scope</p>
+          <h2 id="scope-title">Live terminal highlighting, not device management.</h2>
+        </div>
+        <div class="scope-grid">
+          <article class="scope-panel">
+            <h3>What this is</h3>
+            <p>
+              PrismTTY highlights output already flowing through shells, SSH sessions,
+              pipes, and logs. It adds terminal color for prompts, interfaces, addresses,
+              protocol state, counters, severity, and common vendor terms.
+            </p>
+          </article>
+          <article class="scope-panel">
+            <h3>What this is not</h3>
+            <p>
+              It is not an NMS, a configuration management tool, a source of truth,
+              a SIEM, a log platform, or a device inventory system. It does not log in,
+              collect inventory, push configuration, or store operational data.
+            </p>
+          </article>
         </div>
       </section>
 
@@ -147,6 +174,28 @@
             <span>arubacx</span>
             <span>versa</span>
           </div>
+        </div>
+      </section>
+
+      <section class="section feedback-section" id="feedback" aria-labelledby="feedback-title">
+        <div class="section-heading compact">
+          <p class="eyebrow">Feedback wanted</p>
+          <h2 id="feedback-title">Profile coverage gets better with real-world testing.</h2>
+        </div>
+        <p class="feedback-copy">
+          Testing help is especially useful across the built-in profile set and custom
+          profile files for other vendors, appliances, and terminal workflows.
+        </p>
+        <div class="feedback-list" aria-label="Profiles and vendors wanted for testing">
+          <span>Cisco IOS / IOS XE / IOS XR / NX-OS / ASA</span>
+          <span>Juniper Junos</span>
+          <span>Fortinet FortiGate / FortiOS</span>
+          <span>Palo Alto PAN-OS</span>
+          <span>Arista EOS</span>
+          <span>Aruba CX</span>
+          <span>Versa</span>
+          <span>Linux / Unix</span>
+          <span>Custom vendor profiles</span>
         </div>
       </section>
 

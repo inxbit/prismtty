@@ -1,36 +1,57 @@
+//! Style parser and ANSI color rendering utilities.
+
 use std::collections::BTreeMap;
 
+/// Terminal style attributes applied to highlighted spans.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Style {
+    /// Optional foreground color.
     pub foreground: Option<Rgb>,
+    /// Optional background color.
     pub background: Option<Rgb>,
+    /// Emit bold SGR when true.
     pub bold: bool,
+    /// Emit blink SGR when true.
     pub blink: bool,
+    /// Emit inverse-video SGR when true.
     pub invert: bool,
+    /// Emit italic SGR when true.
     pub italic: bool,
+    /// Emit strikethrough SGR when true.
     pub strike: bool,
+    /// Emit underline SGR when true.
     pub underline: bool,
 }
 
+/// RGB color value.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Rgb {
+    /// Red channel.
     pub r: u8,
+    /// Green channel.
     pub g: u8,
+    /// Blue channel.
     pub b: u8,
 }
 
+/// ANSI color depth used when emitting styles.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ColorMode {
+    /// Approximate RGB colors to the 16-color ANSI palette.
     Ansi16,
+    /// Emit true-color `38;2` and `48;2` sequences.
     TrueColor,
+    /// Approximate RGB colors to the xterm 256-color palette.
     Xterm256,
 }
 
 impl Style {
+    /// Parses a style specification without a named palette.
     pub fn parse(spec: &str) -> Result<Self, String> {
         Self::parse_with_palette(spec, None)
     }
 
+    /// Parses a style specification with optional named palette colors.
     pub fn parse_with_palette(
         spec: &str,
         palette: Option<&BTreeMap<String, Rgb>>,
@@ -71,6 +92,7 @@ impl Style {
         Ok(style)
     }
 
+    /// Returns true when no color or text attribute is set.
     pub fn is_empty(&self) -> bool {
         self.foreground.is_none()
             && self.background.is_none()
@@ -82,6 +104,7 @@ impl Style {
             && !self.underline
     }
 
+    /// Merges another style, replacing colors and OR-ing text attributes.
     pub fn merge_from(&mut self, other: &Self) {
         if other.foreground.is_some() {
             self.foreground = other.foreground;
@@ -97,10 +120,12 @@ impl Style {
         self.underline |= other.underline;
     }
 
+    /// Emits a true-color ANSI SGR start sequence for this style.
     pub fn ansi_start(&self) -> String {
         self.ansi_start_with_mode(ColorMode::TrueColor)
     }
 
+    /// Emits an ANSI SGR start sequence using the requested color mode.
     pub fn ansi_start_with_mode(&self, mode: ColorMode) -> String {
         let mut parts = Vec::new();
         if self.bold {
@@ -214,6 +239,7 @@ fn ansi16_fg_code(color: Rgb) -> u8 {
     37
 }
 
+/// Parses a named color palette from `#rrggbb` string values.
 pub fn parse_palette(input: &BTreeMap<String, String>) -> Result<BTreeMap<String, Rgb>, String> {
     let mut palette = BTreeMap::new();
     for (name, value) in input {

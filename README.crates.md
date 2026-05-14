@@ -18,6 +18,10 @@ network-focused built-in profiles.
 
 Website: [prismtty.com](https://prismtty.com/).
 
+## Quick Demo
+
+![Animated PrismTTY terminal demo](https://prismtty.com/assets/prismtty-terminal-demo.svg)
+
 ## Preview
 
 Synthetic terminal previews using documentation-only hostnames and addresses:
@@ -25,6 +29,17 @@ Synthetic terminal previews using documentation-only hostnames and addresses:
 ![Highlighted PrismTTY terminal output](https://prismtty.com/assets/prismtty-terminal-preview.svg)
 
 ![Dynamic PrismTTY profile switching](https://prismtty.com/assets/prismtty-profile-switching.svg)
+
+## What This Is / What This Is Not
+
+PrismTTY is live terminal output highlighting for shells, SSH sessions, pipes,
+and logs. It sits in the terminal stream and adds color to prompts, interfaces,
+addresses, protocol state, counters, severity, and common vendor terms.
+
+PrismTTY is not an NMS, a configuration management tool, a source of truth, a
+SIEM, a log platform, or a device inventory system. It does not log in to
+devices by itself, collect inventory, push configuration, or store operational
+data. It only highlights the terminal output already flowing through it.
 
 ## Install
 
@@ -164,6 +179,12 @@ Profiles under `~/.config/prismtty/profiles.d/` are first-class profiles: they
 appear in `profiles list`, can be shown with `profiles show`, can inherit
 built-in or other user profiles, and participate in auto-detection through their
 `detection` hints.
+
+## Feedback Wanted
+
+Testing feedback is especially useful for Cisco, Juniper, Fortinet, Palo Alto,
+Arista, Aruba CX, Versa, Linux/Unix, and custom profile files for other vendors,
+appliances, and terminal workflows.
 
 ## More Information
 

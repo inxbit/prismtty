@@ -1,0 +1,140 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="980" height="600" viewBox="0 0 980 600" role="img" aria-labelledby="title desc">
+  <title id="title">Animated PrismTTY terminal demo</title>
+  <desc id="desc">Synthetic terminal session cycling through live PrismTTY highlighting for Unix, Cisco, and Juniper command output.</desc>
+  <defs>
+    <linearGradient id="demo-bg" x1="0" x2="1" y1="0" y2="1">
+      <stop offset="0" stop-color="#111827"/>
+      <stop offset="1" stop-color="#020617"/>
+    </linearGradient>
+    <linearGradient id="demo-bar" x1="0" x2="1" y1="0" y2="0">
+      <stop offset="0" stop-color="#22d3ee"/>
+      <stop offset="0.5" stop-color="#a3e635"/>
+      <stop offset="1" stop-color="#f472b6"/>
+    </linearGradient>
+    <style>
+      .mono { font-family: SFMono-Regular, Consolas, Liberation Mono, Menlo, monospace; font-size: 22px; }
+      .small { font-family: SFMono-Regular, Consolas, Liberation Mono, Menlo, monospace; font-size: 16px; }
+      .label { font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif; font-size: 18px; font-weight: 800; }
+      .muted { fill: #64748b; }
+      .dim { fill: #94a3b8; }
+      .fg { fill: #e5e7eb; }
+      .cyan { fill: #22d3ee; }
+      .green { fill: #a3e635; }
+      .yellow { fill: #facc15; }
+      .red { fill: #fb7185; }
+      .magenta { fill: #f472b6; }
+      .blue { fill: #60a5fa; }
+      .purple { fill: #c084fc; }
+      .panel { fill: #0f172a; fill-opacity: 0.92; stroke: #1e293b; }
+    </style>
+  </defs>
+
+  <rect width="980" height="600" rx="24" fill="#020617"/>
+  <rect x="24" y="24" width="932" height="552" rx="18" fill="url(#demo-bg)" stroke="#1e293b" stroke-width="2"/>
+  <rect x="24" y="24" width="932" height="48" rx="18" fill="#111827"/>
+  <rect x="24" y="56" width="932" height="18" fill="#111827"/>
+  <circle cx="52" cy="48" r="7" fill="#ef4444"/>
+  <circle cx="76" cy="48" r="7" fill="#f59e0b"/>
+  <circle cx="100" cy="48" r="7" fill="#22c55e"/>
+  <text x="130" y="55" class="small dim">ptty /bin/zsh</text>
+  <rect x="24" y="72" width="932" height="3" fill="url(#demo-bar)"/>
+
+  <g opacity="1">
+    <animate attributeName="opacity" dur="10s" repeatCount="indefinite" values="1;1;0;0;0;0;1" keyTimes="0;0.2;0.25;0.7;0.75;0.94;1"/>
+    <text x="54" y="124" class="mono green">ops@workstation%</text>
+    <text x="282" y="124" class="mono fg">ptty /bin/zsh</text>
+    <text x="54" y="164" class="mono green">ops@workstation%</text>
+    <text x="282" y="164" class="mono fg">ssh edge-sw1.example.net</text>
+    <rect x="608" y="144" width="12" height="25" fill="#e5e7eb">
+      <animate attributeName="opacity" dur="0.8s" repeatCount="indefinite" values="1;1;0;0;1" keyTimes="0;0.45;0.5;0.95;1"/>
+    </rect>
+    <rect x="54" y="204" width="430" height="42" rx="8" class="panel"/>
+    <text x="74" y="231" class="small cyan">profile</text>
+    <text x="164" y="231" class="small dim">generic, linux-unix</text>
+  </g>
+
+  <g opacity="0">
+    <animate attributeName="opacity" dur="10s" repeatCount="indefinite" values="0;0;1;1;0;0" keyTimes="0;0.22;0.27;0.48;0.54;1"/>
+    <text x="54" y="124" class="mono green">edge-sw1#</text>
+    <text x="174" y="124" class="mono fg">show ip interface brief</text>
+    <rect x="54" y="164" width="650" height="42" rx="8" class="panel"/>
+    <text x="74" y="191" class="small cyan">profile</text>
+    <text x="164" y="191" class="small dim">generic, linux-unix -&gt; </text>
+    <text x="412" y="191" class="small green">generic, cisco</text>
+    <text x="54" y="244" class="small muted">Interface</text>
+    <text x="254" y="244" class="small muted">IP-Address</text>
+    <text x="454" y="244" class="small muted">Status</text>
+    <text x="614" y="244" class="small muted">Protocol</text>
+    <text x="54" y="282" class="small yellow">Gi1/0/1</text>
+    <text x="254" y="282" class="small blue">192.0.2.10</text>
+    <text x="454" y="282" class="small green">up</text>
+    <text x="614" y="282" class="small green">up</text>
+    <text x="54" y="320" class="small yellow">Gi1/0/2</text>
+    <text x="254" y="320" class="small blue">198.51.100.42</text>
+    <text x="454" y="320" class="small red">down</text>
+    <text x="614" y="320" class="small red">down</text>
+    <text x="54" y="358" class="small yellow">Vlan10</text>
+    <text x="254" y="358" class="small blue">203.0.113.1</text>
+    <text x="454" y="358" class="small green">up</text>
+    <text x="614" y="358" class="small green">up</text>
+    <text x="54" y="414" class="mono green">edge-sw1#</text>
+    <text x="174" y="414" class="mono fg">show logging | include LINK</text>
+    <text x="54" y="454" class="small magenta">%LINK-3-UPDOWN:</text>
+    <text x="224" y="454" class="small fg"> Interface </text>
+    <text x="326" y="454" class="small yellow">Gi1/0/1</text>
+    <text x="414" y="454" class="small fg"> changed state to </text>
+    <text x="590" y="454" class="small green">up</text>
+  </g>
+
+  <g opacity="0">
+    <animate attributeName="opacity" dur="10s" repeatCount="indefinite" values="0;0;1;1;0;0" keyTimes="0;0.5;0.56;0.72;0.78;1"/>
+    <text x="54" y="124" class="mono green">edge-sw1#</text>
+    <text x="174" y="124" class="mono fg">ssh core-rtr.example.net</text>
+    <rect x="54" y="164" width="568" height="42" rx="8" class="panel"/>
+    <text x="74" y="191" class="small cyan">profile</text>
+    <text x="164" y="191" class="small dim">generic, cisco -&gt; </text>
+    <text x="372" y="191" class="small purple">generic, juniper</text>
+    <text x="54" y="244" class="mono purple">netops@core-rtr&gt;</text>
+    <text x="274" y="244" class="mono fg">show interfaces terse</text>
+    <text x="54" y="286" class="small muted">Interface</text>
+    <text x="242" y="286" class="small muted">Admin</text>
+    <text x="342" y="286" class="small muted">Link</text>
+    <text x="442" y="286" class="small muted">Proto</text>
+    <text x="54" y="324" class="small yellow">ge-0/0/0</text>
+    <text x="242" y="324" class="small green">up</text>
+    <text x="342" y="324" class="small green">up</text>
+    <text x="442" y="324" class="small cyan">inet</text>
+    <text x="516" y="324" class="small blue">192.0.2.2/31</text>
+    <text x="54" y="362" class="small yellow">ae0.0</text>
+    <text x="242" y="362" class="small green">up</text>
+    <text x="342" y="362" class="small green">up</text>
+    <text x="442" y="362" class="small cyan">inet</text>
+    <text x="516" y="362" class="small blue">203.0.113.9/30</text>
+    <text x="54" y="418" class="mono purple">netops@core-rtr&gt;</text>
+    <text x="274" y="418" class="mono fg">show route 198.51.100.0/24</text>
+    <text x="54" y="458" class="small blue">198.51.100.0/24</text>
+    <text x="214" y="458" class="small fg"> *[BGP/170] via </text>
+    <text x="370" y="458" class="small blue">192.0.2.1</text>
+    <text x="54" y="496" class="small yellow">AS path:</text>
+    <text x="142" y="496" class="small fg"> 64512 64496 I</text>
+  </g>
+
+  <g opacity="0">
+    <animate attributeName="opacity" dur="10s" repeatCount="indefinite" values="0;0;1;1;0" keyTimes="0;0.74;0.8;0.94;1"/>
+    <text x="54" y="124" class="mono purple">netops@core-rtr&gt;</text>
+    <text x="274" y="124" class="mono fg">show log messages | match BGP</text>
+    <text x="54" y="184" class="small magenta">rpd[1842]:</text>
+    <text x="166" y="184" class="small fg"> BGP peer </text>
+    <text x="272" y="184" class="small blue">192.0.2.1</text>
+    <text x="374" y="184" class="small fg"> state changed to </text>
+    <text x="548" y="184" class="small green">Established</text>
+    <text x="54" y="236" class="small magenta">rpd[1842]:</text>
+    <text x="166" y="236" class="small fg"> imported </text>
+    <text x="262" y="236" class="small cyan">42</text>
+    <text x="296" y="236" class="small fg"> routes from neighbor </text>
+    <text x="508" y="236" class="small blue">192.0.2.1</text>
+    <rect x="54" y="304" width="820" height="78" rx="8" class="panel"/>
+    <text x="74" y="333" class="label fg">Live highlighting only</text>
+    <text x="74" y="363" class="small dim">No device login, inventory, config push, source of truth, or log storage.</text>
+  </g>
+</svg>
