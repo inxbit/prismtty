@@ -2,6 +2,22 @@
 
 All notable changes to PrismTTY are documented here.
 
+## 0.2.4 - 2026-05-14
+
+### Documentation
+
+- Add an animated terminal demo to the GitHub README and website.
+- Clarify what PrismTTY is and is not across the README, crates.io README, and
+  website.
+- Add feedback-wanted guidance for built-in vendor profiles and custom profile
+  files.
+- Add public rustdoc coverage for the crate API so docs.rs presents documented
+  modules, types, fields, variants, and functions.
+
+### Website
+
+- Update the homepage preview, scope, and feedback sections for promotion.
+
 ## 0.2.3 - 2026-05-14
 
 ### Security and Reliability
