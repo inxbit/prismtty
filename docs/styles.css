@@ -377,7 +377,8 @@ h1 {
 
 .feature-card,
 .install-card,
-.workflow-step {
+.workflow-step,
+.scope-panel {
   min-width: 0;
   border: 1px solid rgba(148, 163, 184, 0.2);
   border-radius: 8px;
@@ -447,6 +448,60 @@ h1 {
   font-size: 13px;
 }
 
+.scope-section,
+.feedback-section {
+  border-top: 1px solid rgba(148, 163, 184, 0.14);
+}
+
+.scope-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 14px;
+  margin-top: 30px;
+}
+
+.scope-panel {
+  padding: 24px;
+}
+
+.scope-panel h3 {
+  margin: 0;
+  font-size: 22px;
+}
+
+.scope-panel p,
+.feedback-copy {
+  color: #cbd5e1;
+  line-height: 1.7;
+}
+
+.scope-panel p {
+  margin: 16px 0 0;
+}
+
+.feedback-copy {
+  max-width: 760px;
+  margin: 20px 0 0;
+  font-size: 17px;
+}
+
+.feedback-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 28px;
+}
+
+.feedback-list span {
+  padding: 9px 11px;
+  border: 1px solid rgba(148, 163, 184, 0.24);
+  border-radius: 8px;
+  background: rgba(15, 23, 42, 0.78);
+  color: #dbeafe;
+  font-size: 14px;
+  font-weight: 800;
+}
+
 .install-section {
   border-top: 1px solid rgba(148, 163, 184, 0.14);
   border-bottom: 1px solid rgba(148, 163, 184, 0.14);
@@ -500,7 +555,9 @@ pre code {
 }
 
 #preview,
+#scope,
 #profiles,
+#feedback,
 #install {
   scroll-margin-top: 90px;
 }
@@ -585,7 +642,8 @@ pre code {
   }
 
   .section-grid,
-  .split-section {
+  .split-section,
+  .scope-grid {
     grid-template-columns: 1fr;
   }
 

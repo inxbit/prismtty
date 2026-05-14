@@ -20,6 +20,10 @@ Website: [prismtty.com](https://prismtty.com/).
 
 Current version: `0.2.3`.
 
+## Quick Demo
+
+![Animated PrismTTY terminal demo](.github/assets/prismtty-terminal-demo.svg?v=20260514)
+
 ## Preview
 
 Synthetic terminal previews using documentation-only hostnames and addresses:
@@ -27,6 +31,17 @@ Synthetic terminal previews using documentation-only hostnames and addresses:
 ![Highlighted PrismTTY terminal output](.github/assets/prismtty-terminal-preview.svg?v=20260513)
 
 ![Dynamic PrismTTY profile switching](.github/assets/prismtty-profile-switching.svg?v=20260513b)
+
+## What This Is / What This Is Not
+
+PrismTTY is live terminal output highlighting for shells, SSH sessions, pipes,
+and logs. It sits in the terminal stream and adds color to prompts, interfaces,
+addresses, protocol state, counters, severity, and common vendor terms.
+
+PrismTTY is not an NMS, a configuration management tool, a source of truth, a
+SIEM, a log platform, or a device inventory system. It does not log in to
+devices by itself, collect inventory, push configuration, or store operational
+data. It only highlights the terminal output already flowing through it.
 
 ## Install
 
@@ -266,6 +281,20 @@ if [[ $_iterm_session_id =~ w[0-9]+t0p0 ]]; then
     fastfetch
 fi
 ```
+
+## Feedback Wanted
+
+Testing feedback is especially useful for the built-in profile coverage:
+
+- Cisco IOS, IOS XE, IOS XR, NX-OS, and ASA-style output
+- Juniper Junos
+- Fortinet FortiGate and FortiOS shells
+- Palo Alto PAN-OS
+- Arista EOS
+- Aruba CX
+- Versa
+- Linux and Unix administration output
+- Custom profile files for other vendors, appliances, and terminal workflows
 
 ## Development Notes
 

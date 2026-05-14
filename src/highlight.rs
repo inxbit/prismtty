@@ -1,3 +1,9 @@
+//! Terminal highlighting engines.
+//!
+//! `Highlighter` applies compiled rules to complete byte slices or strings.
+//! `StreamingHighlighter` keeps enough state to highlight chunked terminal
+//! output without breaking ANSI escapes or interactive command echo.
+
 use crate::config::{CaptureRef, PrismConfig, RuleSpec, RuleStyle};
 use crate::style::{ColorMode, Style};
 use pcre2::bytes::{Regex, RegexBuilder};
@@ -7,29 +13,40 @@ use thiserror::Error;
 const UNICODE_PROMPT_MARKERS: &[&str] = &["○", "●", "❯", "❮", "❱", "›", "»", "➜", "➤", "λ"];
 const MAX_INCOMPLETE_ESCAPE_BYTES: usize = 16 * 1024;
 
+/// Errors returned while compiling highlighting rules.
 #[derive(Debug, Error)]
 pub enum HighlightError {
+    /// A PCRE2 rule failed to compile.
     #[error("rule '{description}' failed to compile: {source}")]
     Regex {
+        /// Human-readable rule description.
         description: String,
+        /// PCRE2 compilation error.
         source: pcre2::Error,
     },
 }
 
+/// Compiled highlighter for complete terminal output chunks.
 #[derive(Clone, Debug)]
 pub struct Highlighter {
     rules: Vec<CompiledRule>,
     color_mode: ColorMode,
 }
 
+/// Visible text span matched by a highlight rule.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StyledSpan {
+    /// Matched visible text.
     pub text: String,
+    /// Start byte offset in the ANSI-stripped visible input.
     pub start: usize,
+    /// End byte offset in the ANSI-stripped visible input.
     pub end: usize,
+    /// Style that would be applied to this span.
     pub style: Style,
 }
 
+/// Stateful highlighter for chunked terminal streams.
 #[derive(Clone, Debug)]
 pub struct StreamingHighlighter {
     highlighter: Highlighter,
@@ -43,23 +60,30 @@ pub struct StreamingHighlighter {
     benchmark: Option<BenchmarkReport>,
 }
 
+/// Aggregate timing and match data collected in benchmark mode.
 #[derive(Clone, Debug, Default)]
 pub struct BenchmarkReport {
     rules: Vec<RuleBenchmark>,
 }
 
+/// Timing and match count for one rule description.
 #[derive(Clone, Debug, Default)]
 pub struct RuleBenchmark {
+    /// Rule description from the source configuration.
     pub description: String,
+    /// Total matching time spent on this rule.
     pub duration: Duration,
+    /// Number of matches found for this rule.
     pub match_count: usize,
 }
 
 impl BenchmarkReport {
+    /// Returns per-rule benchmark records in first-observed order.
     pub fn rules(&self) -> &[RuleBenchmark] {
         &self.rules
     }
 
+    /// Returns the total matching time across all recorded rules.
     pub fn total_duration(&self) -> Duration {
         self.rules
             .iter()
@@ -115,10 +139,12 @@ impl Token {
 }
 
 impl Highlighter {
+    /// Compiles a highlighter with true-color ANSI output.
     pub fn from_config(config: PrismConfig) -> Result<Self, HighlightError> {
         Self::from_config_with_color_mode(config, ColorMode::TrueColor)
     }
 
+    /// Compiles a highlighter with an explicit terminal color mode.
     pub fn from_config_with_color_mode(
         config: PrismConfig,
         color_mode: ColorMode,
@@ -132,15 +158,18 @@ impl Highlighter {
         Ok(Self { rules, color_mode })
     }
 
+    /// Highlights a UTF-8 string and returns UTF-8 output with ANSI styling.
     pub fn highlight_str(&self, input: &str) -> String {
         String::from_utf8(self.highlight_bytes(input.as_bytes()))
             .expect("highlighted UTF-8 input remains UTF-8")
     }
 
+    /// Highlights bytes and returns bytes with ANSI styling.
     pub fn highlight_bytes(&self, input: &[u8]) -> Vec<u8> {
         self.highlight_bytes_with_benchmark(input, None)
     }
 
+    /// Returns visible styled spans without emitting ANSI escape sequences.
     pub fn style_spans(&self, input: &[u8]) -> Vec<StyledSpan> {
         let tokens = tokenize_ansi(input);
         let visible = visible_bytes(&tokens);
@@ -194,6 +223,7 @@ impl Highlighter {
 }
 
 impl StreamingHighlighter {
+    /// Creates a streaming highlighter for noninteractive output.
     pub fn new(highlighter: Highlighter) -> Self {
         Self {
             highlighter,
@@ -208,6 +238,7 @@ impl StreamingHighlighter {
         }
     }
 
+    /// Creates a streaming highlighter tuned for interactive PTY output.
     pub fn new_interactive(highlighter: Highlighter) -> Self {
         Self {
             highlighter,
@@ -222,6 +253,7 @@ impl StreamingHighlighter {
         }
     }
 
+    /// Creates a noninteractive streaming highlighter with benchmark collection enabled.
     pub fn new_with_benchmark(highlighter: Highlighter) -> Self {
         Self {
             highlighter,
@@ -236,6 +268,7 @@ impl StreamingHighlighter {
         }
     }
 
+    /// Creates an interactive streaming highlighter with benchmark collection enabled.
     pub fn new_interactive_with_benchmark(highlighter: Highlighter) -> Self {
         Self {
             highlighter,
@@ -250,15 +283,18 @@ impl StreamingHighlighter {
         }
     }
 
+    /// Returns benchmark data when this stream was created in benchmark mode.
     pub fn benchmark_report(&self) -> Option<&BenchmarkReport> {
         self.benchmark.as_ref()
     }
 
+    /// Pushes a UTF-8 chunk and returns highlighted UTF-8 output ready to display.
     pub fn push_str(&mut self, input: &str) -> String {
         String::from_utf8(self.push(input.as_bytes()))
             .expect("highlighted UTF-8 input remains UTF-8")
     }
 
+    /// Pushes a byte chunk and returns highlighted output ready to display.
     pub fn push(&mut self, input: &[u8]) -> Vec<u8> {
         let mut combined = std::mem::take(&mut self.pending);
         combined.extend_from_slice(input);
@@ -338,6 +374,7 @@ impl StreamingHighlighter {
         output
     }
 
+    /// Flushes any buffered partial terminal sequence or token.
     pub fn finish(&mut self) -> Vec<u8> {
         let pending = std::mem::take(&mut self.pending);
         self.highlight_output_bytes(&pending)
@@ -1752,6 +1789,7 @@ fn is_token_continuation(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'/' | b'.')
 }
 
+/// Removes ANSI escape sequences and returns only visible bytes.
 pub fn strip_ansi(input: &[u8]) -> Vec<u8> {
     let mut stripped = Vec::new();
     for token in tokenize_ansi(input) {

@@ -1,3 +1,8 @@
+//! Command-line entry point for the PrismTTY binaries.
+//!
+//! The public surface is intentionally small: `run` performs argument parsing,
+//! dispatches the requested CLI action, and returns the process exit code.
+
 mod args;
 mod profile_selection;
 mod pty;
@@ -27,22 +32,30 @@ use trace::IoTrace;
 #[doc(hidden)]
 pub use args::completion_command;
 
+/// Errors that can be reported by the command-line runner.
 #[derive(Debug, Error)]
 pub enum CliError {
+    /// The user supplied invalid or incomplete command-line arguments.
     #[error("{0}")]
     Usage(String),
+    /// Loading or parsing configuration failed.
     #[error(transparent)]
     Config(#[from] crate::config::ConfigError),
+    /// Highlight rule compilation failed.
     #[error(transparent)]
     Highlight(#[from] crate::highlight::HighlightError),
+    /// A filesystem, stream, or terminal I/O operation failed.
     #[error("I/O error: {0}")]
     Io(#[from] io::Error),
+    /// PTY creation or command execution failed.
     #[error("PTY error: {0}")]
     Pty(#[from] anyhow::Error),
+    /// Switching terminal modes failed.
     #[error("terminal mode error: {0}")]
     Terminal(#[from] nix::errno::Errno),
 }
 
+/// Runs the CLI using process arguments and returns the desired exit code.
 pub fn run() -> ExitCode {
     match run_inner(std::env::args_os().skip(1).collect()) {
         Ok(code) => code,

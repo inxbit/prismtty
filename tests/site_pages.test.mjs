@@ -11,15 +11,19 @@ test('GitHub Pages site has the expected static contract', () => {
   assert.equal(existsSync('docs/.nojekyll'), true);
   assert.equal(read('docs/CNAME').trim(), 'prismtty.com');
   assert.equal(existsSync('docs/assets/prismtty-logo.svg'), true);
+  assert.equal(existsSync('docs/assets/prismtty-terminal-demo.svg'), true);
   assert.equal(existsSync('docs/assets/prismtty-terminal-preview.svg'), true);
   assert.equal(existsSync('docs/assets/prismtty-profile-switching.svg'), true);
 
   const html = read('docs/index.html');
   assert.match(html, /<title>PrismTTY - Terminal Output Highlighting<\/title>/);
   assert.match(html, /Readable network output, live in your terminal\./);
+  assert.match(html, /Live terminal highlighting, not device management\./);
+  assert.match(html, /Feedback wanted/);
   assert.match(html, /href="https:\/\/github\.com\/inxbit\/prismtty"/);
   assert.match(html, /href="https:\/\/crates\.io\/crates\/prismtty"/);
-  assert.match(html, /href="assets\/prismtty-terminal-preview\.svg"/);
+  assert.match(html, /href="assets\/prismtty-terminal-demo\.svg"/);
+  assert.match(html, /src="assets\/prismtty-terminal-demo\.svg"/);
 
   const css = read('docs/styles.css');
   assert.match(css, /#22d3ee/);
@@ -28,4 +32,7 @@ test('GitHub Pages site has the expected static contract', () => {
 
   const readme = read('README.md');
   assert.match(readme, /https:\/\/prismtty\.com\//);
+  assert.match(readme, /\.github\/assets\/prismtty-terminal-demo\.svg/);
+  assert.match(readme, /What This Is \/ What This Is Not/);
+  assert.match(readme, /Feedback Wanted/);
 });

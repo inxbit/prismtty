@@ -1,3 +1,8 @@
+//! Built-in profile store and startup detection helpers.
+//!
+//! Profiles group highlighting rules with inheritance, startup detection hints,
+//! and private runtime metadata used by interactive profile switching.
+
 use crate::config::{ConfigError, RuleSpec, parse_builtin_profile_yaml};
 use serde::{Deserialize, Deserializer, de};
 use std::collections::{BTreeMap, BTreeSet};
@@ -23,33 +28,48 @@ const BUNDLED_PROFILES: &[(&str, &str)] = &[
     ),
 ];
 
+/// Default runtime priority assigned to user-loaded profiles.
 pub const USER_PROFILE_RUNTIME_PRIORITY: u16 = 100;
 
 pub(crate) fn is_generic_profile_set(profiles: &[String]) -> bool {
     profiles.len() == 1 && profiles.first().is_some_and(|profile| profile == "generic")
 }
 
+/// Registered profile with resolved rule and detection metadata.
 #[derive(Clone, Debug)]
 pub struct Profile {
+    /// Profile name used on the command line and in configuration.
     pub name: String,
+    /// Parent profiles loaded before this profile.
     pub inherits: Vec<String>,
+    /// Case-insensitive startup detection hints.
     pub detection: Vec<String>,
+    /// Runtime metadata used for interactive profile transitions.
     pub runtime: ProfileRuntimeMeta,
+    /// Highlight rules owned by this profile.
     pub rules: Vec<RuleSpec>,
 }
 
+/// Runtime-only profile metadata used by bundled profiles.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ProfileRuntimeMeta {
+    /// Lower values are considered before higher values during profile ordering.
     pub priority: u16,
+    /// Whether this profile can represent the local starting shell context.
     #[serde(default)]
     pub local_baseline: bool,
+    /// Signals strong enough to switch profiles from a banner or command output.
     #[serde(default)]
     pub strong_signals: Vec<StrongSignal>,
+    /// Signals that block startup prompt detection for this profile.
     #[serde(default)]
     pub negative_signals: Vec<StrongSignal>,
+    /// Prompt matcher used at session startup.
     pub startup_prompt: PromptMatcherKind,
+    /// Prompt matcher used after the session has enough remote-context evidence.
     pub runtime_prompt: PromptMatcherKind,
+    /// Evidence threshold for prompt-only transitions.
     #[serde(default)]
     pub prompt_confidence: PromptConfidence,
 }
@@ -68,11 +88,26 @@ impl Default for ProfileRuntimeMeta {
     }
 }
 
+/// Strong profile detection signal matched against visible text.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum StrongSignal {
-    Contains { value: String },
-    ContainsAny { values: Vec<String> },
-    LinePrefixAndAny { prefix: String, values: Vec<String> },
+    /// Match when the sample contains one value.
+    Contains {
+        /// Case-insensitive substring to search for.
+        value: String,
+    },
+    /// Match when the sample contains any listed value.
+    ContainsAny {
+        /// Case-insensitive substrings accepted as matches.
+        values: Vec<String>,
+    },
+    /// Match when a line has the given prefix and contains any listed value.
+    LinePrefixAndAny {
+        /// Required line prefix.
+        prefix: String,
+        /// Case-insensitive substrings accepted after the prefix matches.
+        values: Vec<String>,
+    },
 }
 
 impl<'de> Deserialize<'de> for StrongSignal {
@@ -141,34 +176,49 @@ impl StrongSignal {
     }
 }
 
+/// Built-in prompt matcher used by runtime profile detection.
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum PromptMatcherKind {
+    /// No prompt matcher.
     None,
+    /// Junos-style `user@host>` prompt.
     JunosUserAtHost,
+    /// Cisco-style host prompt ending in `>` or `#`.
     CiscoHostMarker,
+    /// Arista-style host prompt ending in `>` or `#`.
     AristaHostMarker,
+    /// Fortinet-style host prompt ending in `#`.
     FortinetHostHash,
+    /// Unix-style `user@host` prompt with an optional path.
     UnixUserAtHostPath,
+    /// PAN-OS-style `user@host>` prompt.
     PaloAltoUserAtHost,
+    /// Versa-style `user@host>` prompt.
     VersaUserAtHost,
 }
 
+/// Required prompt evidence before a profile transition is accepted.
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum PromptConfidence {
+    /// Require repeated prompt evidence.
     #[default]
     Repeated,
+    /// Accept a single prompt after a typed remote-session hint.
     SingleAfterRemoteHint,
+    /// Accept a single prompt from a local baseline or after a remote-session hint.
     SingleFromBaselineOrRemoteHint,
 }
 
+/// Collection of built-in and user-registered profiles.
 #[derive(Clone, Debug, Default)]
 pub struct ProfileStore {
     profiles: BTreeMap<String, Profile>,
 }
 
 impl ProfileStore {
+    /// Loads the bundled built-in profiles.
     pub fn builtin() -> Self {
         let mut store = Self::default();
         for (_file_name, contents) in BUNDLED_PROFILES {
@@ -197,14 +247,17 @@ impl ProfileStore {
             .collect()
     }
 
+    /// Returns profile names in deterministic sorted order.
     pub fn names(&self) -> Vec<&str> {
         self.profiles.keys().map(String::as_str).collect()
     }
 
+    /// Looks up a registered profile by name.
     pub fn profile(&self, name: &str) -> Option<&Profile> {
         self.profiles.get(name)
     }
 
+    /// Registers a user profile with default runtime metadata.
     pub fn insert_profile(
         &mut self,
         name: String,
@@ -224,6 +277,7 @@ impl ProfileStore {
         );
     }
 
+    /// Detects likely profiles from a startup sample, always including `generic`.
     pub fn detect_profiles(&self, sample: &str) -> Vec<String> {
         let lower = sample.to_ascii_lowercase();
         let mut detected: Vec<String> = self
@@ -241,6 +295,7 @@ impl ProfileStore {
         with_generic
     }
 
+    /// Appends inherited rules for a profile while detecting inheritance cycles.
     pub fn append_profile_rules(
         &self,
         profile_name: &str,

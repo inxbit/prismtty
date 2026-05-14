@@ -1,3 +1,8 @@
+//! Configuration and profile-file parsing.
+//!
+//! PrismTTY accepts ChromaTerm-style YAML rule files and native profile files
+//! that add profile metadata such as inheritance and detection hints.
+
 use crate::profiles::{ProfileRuntimeMeta, ProfileStore};
 use crate::style::{Style, parse_palette};
 use serde::Deserialize;
@@ -6,62 +11,97 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
+/// Error message returned when user profile files include reserved runtime metadata.
 pub const RESERVED_PROFILE_RUNTIME_MESSAGE: &str =
     "the profile.runtime field is reserved for built-in profiles in this PrismTTY version";
 
+/// Errors returned while loading, parsing, or resolving PrismTTY configuration.
 #[derive(Debug, Error)]
 pub enum ConfigError {
+    /// A configuration or profile file could not be read.
     #[error("failed to read {path}: {source}")]
     Read {
+        /// Path that failed to load.
         path: PathBuf,
+        /// Underlying filesystem error.
         source: std::io::Error,
     },
+    /// YAML decoding failed.
     #[error("failed to parse YAML: {0}")]
     Yaml(#[from] serde_norway::Error),
+    /// A requested profile name was not registered.
     #[error("unknown profile '{0}'")]
     UnknownProfile(String),
+    /// Profile inheritance loops back to a profile already being resolved.
     #[error("cyclic profile inheritance: {0}")]
     CyclicProfileInheritance(String),
+    /// A native profile file omitted `profile.name`.
     #[error("profile files must include profile.name")]
     MissingProfileName,
+    /// A bundled built-in profile omitted its private runtime metadata.
     #[error("bundled profile files must include profile.runtime")]
     MissingProfileRuntime,
+    /// A user profile attempted to set reserved runtime metadata.
     #[error("{0}")]
     ReservedProfileRuntime(&'static str),
+    /// A rule style string or capture style mapping is invalid.
     #[error("rule '{description}' has invalid style: {message}")]
     InvalidStyle {
+        /// Human-readable rule description.
         description: String,
+        /// Style parser error text.
         message: String,
     },
+    /// The palette section contains an invalid color name or value.
     #[error("palette has invalid color: {0}")]
     InvalidPalette(String),
+    /// A capture style key was neither a group index nor a group name.
     #[error("rule '{description}' has invalid capture key: {key}")]
-    InvalidCaptureKey { description: String, key: String },
+    InvalidCaptureKey {
+        /// Human-readable rule description.
+        description: String,
+        /// Invalid capture key as it appeared in YAML.
+        key: String,
+    },
 }
 
+/// Fully resolved highlighting configuration.
 #[derive(Clone, Debug, Default)]
 pub struct PrismConfig {
+    /// Rule list in application order.
     pub rules: Vec<RuleSpec>,
+    /// Profiles that contributed rules to this configuration.
     pub enabled_profiles: Vec<String>,
 }
 
+/// One highlight rule before PCRE2 compilation.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RuleSpec {
+    /// Human-readable rule name used in errors and benchmark reports.
     pub description: String,
+    /// PCRE2 regular expression matched against visible terminal text.
     pub regex: String,
+    /// Style applied to the whole match or selected capture groups.
     pub style: RuleStyle,
+    /// Whether this rule prevents later rules from changing the same span.
     pub exclusive: bool,
 }
 
+/// Capture group reference used by capture-specific styles.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum CaptureRef {
+    /// Numeric capture group index, including `0` for the whole match.
     Index(usize),
+    /// Named capture group.
     Name(String),
 }
 
+/// Style target for a highlight rule.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RuleStyle {
+    /// Apply one style to the whole regex match.
     Whole(Style),
+    /// Apply individual styles to capture groups.
     Captures(BTreeMap<CaptureRef, Style>),
 }
 
@@ -75,11 +115,15 @@ struct RulesDoc {
     rules: Vec<RuleDoc>,
 }
 
+/// Metadata declared in a native profile YAML file.
 #[derive(Clone, Debug, Deserialize)]
 pub struct ProfileMetaDoc {
+    /// Profile name used on the command line and in inheritance lists.
     pub name: String,
+    /// Parent profiles loaded before this profile.
     #[serde(default)]
     pub inherits: Vec<String>,
+    /// Startup detection hints used for auto-detection.
     #[serde(default)]
     pub detection: Vec<String>,
     #[serde(default)]
@@ -96,14 +140,19 @@ struct RuleDoc {
     exclusive: bool,
 }
 
+/// Parsed native profile file, including metadata and rules.
 #[derive(Clone, Debug)]
 pub struct LoadedProfileFile {
+    /// Public profile metadata from the `profile` YAML section.
     pub meta: ProfileMetaDoc,
+    /// Runtime metadata for bundled profiles, or `None` for user profiles.
     pub runtime: Option<ProfileRuntimeMeta>,
+    /// Parsed highlighting rules from the file.
     pub rules: Vec<RuleSpec>,
 }
 
 impl PrismConfig {
+    /// Parses a ChromaTerm-style YAML document into highlighting rules.
     pub fn from_chromaterm_yaml(input: &str) -> Result<Self, ConfigError> {
         let doc: RulesDoc = serde_norway::from_str(input)?;
         let palette = parse_palette(&doc.palette).map_err(ConfigError::InvalidPalette)?;
@@ -113,6 +162,7 @@ impl PrismConfig {
         })
     }
 
+    /// Reads and parses a ChromaTerm-style YAML file.
     pub fn from_chromaterm_file(path: impl AsRef<Path>) -> Result<Self, ConfigError> {
         let path = path.as_ref();
         let input = fs::read_to_string(path).map_err(|source| ConfigError::Read {
@@ -122,6 +172,7 @@ impl PrismConfig {
         Self::from_chromaterm_yaml(&input)
     }
 
+    /// Builds a configuration from registered profiles and their inherited rules.
     pub fn from_profiles(
         store: &ProfileStore,
         profile_names: &[&str],
@@ -139,6 +190,7 @@ impl PrismConfig {
         })
     }
 
+    /// Appends another configuration, preserving unique enabled-profile names.
     pub fn merge(mut self, mut other: Self) -> Self {
         self.rules.append(&mut other.rules);
         for profile in other.enabled_profiles {
@@ -150,6 +202,7 @@ impl PrismConfig {
     }
 }
 
+/// Reads and parses a native PrismTTY profile YAML file.
 pub fn load_profile_file(path: impl AsRef<Path>) -> Result<LoadedProfileFile, ConfigError> {
     let path = path.as_ref();
     let input = fs::read_to_string(path).map_err(|source| ConfigError::Read {
@@ -159,6 +212,7 @@ pub fn load_profile_file(path: impl AsRef<Path>) -> Result<LoadedProfileFile, Co
     parse_profile_yaml(&input)
 }
 
+/// Parses native PrismTTY profile YAML from a string.
 pub fn parse_profile_yaml(input: &str) -> Result<LoadedProfileFile, ConfigError> {
     parse_profile_yaml_with_mode(input, ProfileYamlMode::User)
 }
