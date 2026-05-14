@@ -994,6 +994,100 @@ fn interactive_streaming_highlighter_preserves_zsh_redraws_before_enter() {
 }
 
 #[test]
+fn interactive_streaming_highlighter_does_not_buffer_echoes_after_completion_redraw() {
+    let store = ProfileStore::builtin();
+    let config = PrismConfig::from_profiles(&store, &["linux-unix"]).expect("linux profile loads");
+    let highlighter = Highlighter::from_config(config).expect("rules compile");
+    let mut streaming = StreamingHighlighter::new_interactive(highlighter);
+
+    assert_eq!(streaming.push_str("❯ "), "❯ ");
+    assert_eq!(streaming.push_str("dig ptt"), "dig ptt");
+
+    let redraw = "\r\r\n[host]\r\nalpha  beta\r\n\x1b[J\x1b[2A\r\x1b[2Cdig ptt";
+    assert_eq!(streaming.push_str(redraw), redraw);
+    assert_eq!(streaming.push_str("m"), "m");
+    assert_eq!(streaming.push_str("m"), "m");
+
+    let promptless_redraw = "\r\r\n[host]\r\nalpha  beta\r\n\x1b[J\x1b[2A\r\x1b[2Cdig maneki\x1b[K";
+    assert_eq!(streaming.push_str(promptless_redraw), promptless_redraw);
+
+    let line_edit_repaint = "\x08\x08\x08\x1b[24mm\x1b[24ma\x1b[24mn";
+    assert_eq!(streaming.push_str(line_edit_repaint), line_edit_repaint);
+
+    assert_eq!(streaming.push_str("m"), "m");
+    assert_eq!(streaming.push_str("h"), "h");
+    assert!(streaming.finish().is_empty());
+}
+
+#[test]
+fn interactive_streaming_highlighter_rearms_echo_after_promptless_completion_redraw() {
+    let store = ProfileStore::builtin();
+    let config = PrismConfig::from_profiles(&store, &["linux-unix"]).expect("linux profile loads");
+    let highlighter = Highlighter::from_config(config).expect("rules compile");
+    let mut streaming = StreamingHighlighter::new_interactive(highlighter);
+
+    assert_eq!(streaming.push_str("❯ "), "❯ ");
+    assert_eq!(streaming.push_str("ssh man"), "ssh man");
+
+    let menu = "\r\r\n[remote host name]\r\nalpha  beta\r\n";
+    assert_eq!(streaming.push_str(menu), menu);
+
+    let promptless_redraw = "\x1b[J\x1b[2A\r\x1b[2Cssh manen\x1b[K";
+    assert_eq!(streaming.push_str(promptless_redraw), promptless_redraw);
+
+    assert_eq!(streaming.push_str("k"), "k");
+    assert_eq!(streaming.push_str("i"), "i");
+    assert!(streaming.finish().is_empty());
+}
+
+#[test]
+fn interactive_streaming_highlighter_keeps_echo_after_cursor_only_completion_repaint() {
+    let store = ProfileStore::builtin();
+    let config = PrismConfig::from_profiles(&store, &["linux-unix"]).expect("linux profile loads");
+    let highlighter = Highlighter::from_config(config).expect("rules compile");
+    let mut streaming = StreamingHighlighter::new_interactive(highlighter);
+
+    assert_eq!(streaming.push_str("❯ "), "❯ ");
+    assert_eq!(streaming.push_str("ping j"), "ping j");
+
+    let completion_redraw =
+        "\r\r\n[host]\r\nalpha  beta\r\n\x1b[J\x1b[3A\r\x1b[2C\x1b[32mping\x1b[39m j";
+    assert_eq!(streaming.push_str(completion_redraw), completion_redraw);
+    assert_eq!(streaming.push_str("i"), "i");
+
+    let cursor_only_repaint = "\r\r\n\x1b[J\x1b[A\x1b[9C";
+    assert_eq!(streaming.push_str(cursor_only_repaint), cursor_only_repaint);
+
+    assert_eq!(streaming.push_str("m"), "m");
+    assert_eq!(streaming.push_str("m"), "m");
+    assert!(streaming.finish().is_empty());
+}
+
+#[test]
+fn interactive_streaming_highlighter_recovers_highlighting_after_progress_cursor_positioning() {
+    let store = ProfileStore::builtin();
+    let config = PrismConfig::from_profiles(&store, &["linux-unix"]).expect("linux profile loads");
+    let highlighter = Highlighter::from_config(config).expect("rules compile");
+    let mut streaming = StreamingHighlighter::new_interactive(highlighter);
+
+    // Multi-line progress output that ends with cursor-up + non-prompt text on
+    // the trailing line (e.g., `git pack-objects`-style progress refreshing the
+    // top line). The promptless-redraw heuristic may flag this and arm
+    // prompt-echo passthrough; verify the next \n-terminated chunk recovers and
+    // ordinary highlighting resumes.
+    let progress = "Resolving deltas:  10% (123/1234)\x1b[1A";
+    let _ = streaming.push_str(progress);
+    let _ = streaming.push_str("\n");
+
+    let recovered = streaming.push_str("192.0.2.1 OK\n");
+    assert!(
+        recovered.contains("\x1b[38;2;0;255;255m192.0.2.1"),
+        "expected IP highlighting to recover after cursor-positioning progress chunk, got: {recovered:?}"
+    );
+    assert!(streaming.finish().is_empty());
+}
+
+#[test]
 fn interactive_streaming_highlighter_bypasses_fastfetch_cursor_painting() {
     let store = ProfileStore::builtin();
     let config = PrismConfig::from_profiles(&store, &["linux-unix"]).expect("linux profile loads");

@@ -491,6 +491,19 @@ impl StreamingHighlighter {
             return;
         }
 
+        if contains_bracketed_paste_disable(input) {
+            self.prompt_echo_passthrough = false;
+        }
+
+        let redraws_prompt_echo = redraws_prompt_echo_line_without_prompt(input);
+        let preserves_prompt_echo = self.prompt_echo_passthrough
+            && contains_cursor_positioning_sequence(input)
+            && has_no_printable_visible_bytes(input);
+
+        if preserves_prompt_echo {
+            return;
+        }
+
         for byte in strip_ansi(input) {
             match byte {
                 b'\r' => {
@@ -513,6 +526,11 @@ impl StreamingHighlighter {
                     }
                 }
             }
+        }
+
+        if redraws_prompt_echo {
+            self.prompt_echo_passthrough = true;
+            return;
         }
 
         if looks_like_prompt_tail(&self.visible_line_tail)
@@ -987,6 +1005,31 @@ fn redraws_interactive_prompt_line(bytes: &[u8]) -> bool {
     looks_like_prompt_tail(line) || contains_prompt_echo_in_visible_line(line)
 }
 
+fn redraws_prompt_echo_line_without_prompt(input: &[u8]) -> bool {
+    contains_cursor_positioning_sequence(input) && promptless_line_tail(input)
+}
+
+fn has_no_printable_visible_bytes(input: &[u8]) -> bool {
+    strip_ansi(input)
+        .iter()
+        .all(|byte| matches!(*byte, b'\r' | b'\n' | 0x08))
+}
+
+fn promptless_line_tail(input: &[u8]) -> bool {
+    let visible = strip_ansi(input);
+    let line_start = visible
+        .iter()
+        .rposition(|byte| matches!(*byte, b'\r' | b'\n'))
+        .map(|idx| idx + 1)
+        .unwrap_or(0);
+    let line = trim_ascii_whitespace_end(&visible[line_start..]);
+
+    !line.is_empty()
+        && line.iter().any(|byte| !byte.is_ascii_whitespace())
+        && !looks_like_prompt_tail(line)
+        && !contains_prompt_echo_in_visible_line(line)
+}
+
 fn compile_rule(rule: RuleSpec) -> Result<CompiledRule, HighlightError> {
     let description = rule.description;
     let regex = RegexBuilder::new()
@@ -1188,6 +1231,13 @@ fn alternate_screen_command(bytes: &[u8]) -> Option<bool> {
 fn contains_cursor_positioning_sequence(input: &[u8]) -> bool {
     tokenize_ansi(input).into_iter().any(|token| match token {
         Token::Ansi(bytes) => is_cursor_positioning_sequence(&bytes),
+        Token::Text(_) => false,
+    })
+}
+
+fn contains_bracketed_paste_disable(input: &[u8]) -> bool {
+    tokenize_ansi(input).into_iter().any(|token| match token {
+        Token::Ansi(bytes) => bytes == b"\x1b[?2004l",
         Token::Text(_) => false,
     })
 }

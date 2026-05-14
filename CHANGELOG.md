@@ -2,6 +2,28 @@
 
 All notable changes to PrismTTY are documented here.
 
+## Unreleased
+
+### Interactive Rendering
+
+- Recognise zsh's promptless line-edit redraws (cursor positioning combined
+  with a non-prompt line tail) and re-arm prompt-echo passthrough so
+  single-byte typed echoes after a completion menu are not held in the
+  streaming splitter's pending buffer until a space arrives.
+- Retire prompt-echo passthrough explicitly on bracketed-paste-disable
+  (`CSI ?2004l`) emitted by zsh before each command runs, instead of relying
+  on the `\r`/`\n` reset path.
+- Add regression coverage for typed echoes after completion redraws, promptless
+  redraws, cursor-only repaints, and recovery of ordinary highlighting after
+  cursor-positioning progress output without a recognised prompt marker.
+
+### Diagnostics
+
+- `--trace-io` now prefixes every line with the monotonic elapsed time
+  (`SECS.USECS`) since the trace was opened, so IN→OUT and OUT→RENDER gaps can
+  be measured directly. Parsers that consumed the previous
+  `DIRECTION HEX...` format need to skip the leading timestamp column.
+
 ## 0.2.1 - 2026-05-12
 
 ### Security and Reliability
