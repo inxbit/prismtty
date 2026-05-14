@@ -2,7 +2,7 @@
 
 All notable changes to PrismTTY are documented here.
 
-## Unreleased
+## 0.2.2 - 2026-05-13
 
 ### Interactive Rendering
 
