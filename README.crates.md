@@ -7,6 +7,7 @@
 <p align="center">
   <a href="https://prismtty.com/"><img alt="website" src="https://img.shields.io/badge/website-prismtty-22d3ee?style=flat-square"></a>
   <a href="https://crates.io/crates/prismtty"><img alt="crates.io" src="https://img.shields.io/crates/v/prismtty?style=flat-square"></a>
+  <a href="https://docs.rs/prismtty"><img alt="docs.rs" src="https://img.shields.io/docsrs/prismtty?style=flat-square"></a>
   <a href="https://github.com/inxbit/prismtty/actions/workflows/ci.yml"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/inxbit/prismtty/ci.yml?branch=main&style=flat-square"></a>
   <a href="https://github.com/inxbit/prismtty/releases"><img alt="release" src="https://img.shields.io/github/v/release/inxbit/prismtty?style=flat-square"></a>
   <a href="https://github.com/inxbit/prismtty/blob/main/LICENSE"><img alt="license" src="https://img.shields.io/github/license/inxbit/prismtty?style=flat-square"></a>
@@ -32,14 +33,30 @@ Synthetic terminal previews using documentation-only hostnames and addresses:
 
 ## What This Is / What This Is Not
 
-PrismTTY is live terminal output highlighting for shells, SSH sessions, pipes,
-and logs. It sits in the terminal stream and adds color to prompts, interfaces,
-addresses, protocol state, counters, severity, and common vendor terms.
+PrismTTY is a live terminal-output highlighter for shells, SSH sessions, pipes,
+and logs.
 
-PrismTTY is not an NMS, a configuration management tool, a source of truth, a
-SIEM, a log platform, or a device inventory system. It does not log in to
-devices by itself, collect inventory, push configuration, or store operational
-data. It only highlights the terminal output already flowing through it.
+It highlights output that is already flowing through your terminal, including:
+
+- prompts
+- interfaces
+- IP addresses
+- protocol state
+- counters
+- severity
+- common vendor terms
+
+PrismTTY is not:
+
+- an NMS
+- a configuration-management tool
+- a source of truth
+- a SIEM
+- a log platform
+- a device inventory system
+
+It does not log in to devices by itself, collect inventory, push configuration,
+or store operational data.
 
 ## Install
 

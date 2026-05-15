@@ -213,6 +213,29 @@ pub fn load_profile_file(path: impl AsRef<Path>) -> Result<LoadedProfileFile, Co
 }
 
 /// Parses native PrismTTY profile YAML from a string.
+///
+/// # Example
+///
+/// ```
+/// use prismtty::config::parse_profile_yaml;
+///
+/// let profile = parse_profile_yaml(r##"
+/// profile:
+///   name: custom-router
+///   inherits: [generic]
+///   detection:
+///     - CustomOS
+/// rules:
+///   - description: management IPv4 addresses
+///     regex: '\b192\.0\.2\.\d+\b'
+///     color: f#00ffff
+/// "##)
+/// .expect("profile parses");
+///
+/// assert_eq!(profile.meta.name, "custom-router");
+/// assert_eq!(profile.meta.inherits, vec!["generic".to_string()]);
+/// assert_eq!(profile.rules.len(), 1);
+/// ```
 pub fn parse_profile_yaml(input: &str) -> Result<LoadedProfileFile, ConfigError> {
     parse_profile_yaml_with_mode(input, ProfileYamlMode::User)
 }

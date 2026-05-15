@@ -140,6 +140,25 @@ impl Token {
 
 impl Highlighter {
     /// Compiles a highlighter with true-color ANSI output.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use prismtty::{Highlighter, PrismConfig};
+    ///
+    /// let config = PrismConfig::from_chromaterm_yaml(r##"
+    /// rules:
+    ///   - description: documentation IPv4 addresses
+    ///     regex: '\b192\.0\.2\.\d+\b'
+    ///     color: f#00ffff
+    /// "##)
+    /// .expect("configuration parses");
+    ///
+    /// let highlighter = Highlighter::from_config(config).expect("rules compile");
+    /// let output = highlighter.highlight_str("peer 192.0.2.1 up\n");
+    ///
+    /// assert!(output.contains("\x1b[38;2;0;255;255m192.0.2.1\x1b[0m"));
+    /// ```
     pub fn from_config(config: PrismConfig) -> Result<Self, HighlightError> {
         Self::from_config_with_color_mode(config, ColorMode::TrueColor)
     }
@@ -159,6 +178,27 @@ impl Highlighter {
     }
 
     /// Highlights a UTF-8 string and returns UTF-8 output with ANSI styling.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use prismtty::highlight::strip_ansi;
+    /// use prismtty::{Highlighter, PrismConfig};
+    ///
+    /// let config = PrismConfig::from_chromaterm_yaml(r##"
+    /// rules:
+    ///   - description: operational state
+    ///     regex: '\b(up|down)\b'
+    ///     color: f#00ff00 bold
+    /// "##)
+    /// .expect("configuration parses");
+    /// let highlighter = Highlighter::from_config(config).expect("rules compile");
+    ///
+    /// let output = highlighter.highlight_str("status up\n");
+    ///
+    /// assert_eq!(strip_ansi(output.as_bytes()), b"status up\n");
+    /// assert!(output.contains("\x1b[1;38;2;0;255;0mup\x1b[0m"));
+    /// ```
     pub fn highlight_str(&self, input: &str) -> String {
         String::from_utf8(self.highlight_bytes(input.as_bytes()))
             .expect("highlighted UTF-8 input remains UTF-8")
@@ -289,6 +329,31 @@ impl StreamingHighlighter {
     }
 
     /// Pushes a UTF-8 chunk and returns highlighted UTF-8 output ready to display.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use prismtty::highlight::strip_ansi;
+    /// use prismtty::{Highlighter, PrismConfig, StreamingHighlighter};
+    ///
+    /// let config = PrismConfig::from_chromaterm_yaml(r##"
+    /// rules:
+    ///   - description: documentation IPv4 addresses
+    ///     regex: '\b192\.0\.2\.\d+\b'
+    ///     color: f#00ffff
+    /// "##)
+    /// .expect("configuration parses");
+    /// let highlighter = Highlighter::from_config(config).expect("rules compile");
+    /// let mut stream = StreamingHighlighter::new(highlighter);
+    ///
+    /// let mut output = String::new();
+    /// output.push_str(&stream.push_str("peer 192.0."));
+    /// output.push_str(&stream.push_str("2.1 up\n"));
+    /// output.push_str(&String::from_utf8(stream.finish()).expect("finish output is UTF-8"));
+    ///
+    /// assert_eq!(strip_ansi(output.as_bytes()), b"peer 192.0.2.1 up\n");
+    /// assert!(output.contains("192.0.2.1"));
+    /// ```
     pub fn push_str(&mut self, input: &str) -> String {
         String::from_utf8(self.push(input.as_bytes()))
             .expect("highlighted UTF-8 input remains UTF-8")
