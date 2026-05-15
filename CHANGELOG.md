@@ -2,6 +2,17 @@
 
 All notable changes to PrismTTY are documented here.
 
+## 0.2.5 - 2026-05-15
+
+### Documentation
+
+- Add Rustdoc examples for `Highlighter::from_config`,
+  `Highlighter::highlight_str`, `StreamingHighlighter::push_str`, and
+  `config::parse_profile_yaml` so docs.rs shows concrete public API usage.
+- Add a docs.rs badge to the GitHub and crates.io README badge rows.
+- Rework the "What This Is / What This Is Not" README section into skimmable
+  lists for community-review traffic.
+
 ## 0.2.4 - 2026-05-14
 
 ### Documentation
