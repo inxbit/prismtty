@@ -13,7 +13,7 @@ body:
     attributes:
       label: PrismTTY version
       description: Run `prismtty --version` or provide the commit SHA.
-      placeholder: "prismtty 0.2.4"
+      placeholder: "prismtty 0.2.5"
     validations:
       required: true
 
