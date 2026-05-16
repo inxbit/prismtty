@@ -18,6 +18,6 @@ cp completions/prismtty.bash completions/prismtty.fish completions/_prismtty "${
 cp profiles/custom-router.example.yml "${stage}/profiles/"
 
 tar -C "${dist_dir}" -czf "${dist_dir}/${package}.tar.gz" "${package}"
-shasum -a 256 "${dist_dir}/${package}.tar.gz" > "${dist_dir}/${package}.tar.gz.sha256"
+(cd "${dist_dir}" && shasum -a 256 "${package}.tar.gz") > "${dist_dir}/${package}.tar.gz.sha256"
 
 printf '%s\n' "${dist_dir}/${package}.tar.gz"
