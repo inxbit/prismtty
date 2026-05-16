@@ -1,0 +1,34 @@
+[graph]
+all-features = true
+
+[advisories]
+yanked = "deny"
+ignore = []
+
+[licenses]
+allow = [
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-2-Clause",
+  "MIT",
+  "MPL-2.0",
+  "Unicode-3.0",
+]
+confidence-threshold = 0.93
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+skip = [
+  { crate = "bitflags@1.3.2", reason = "portable-pty has not moved to bitflags 2.x yet" },
+  { crate = "cfg_aliases@0.1.1", reason = "portable-pty pulls nix 0.28, which still builds with cfg_aliases 0.1" },
+  { crate = "getrandom@0.2.17", reason = "redox_users has not moved to getrandom 0.3 yet" },
+  { crate = "nix@0.28.0", reason = "portable-pty has not moved to nix 0.31 yet" },
+  { crate = "thiserror@1.0.69", reason = "filedescriptor has not moved to thiserror 2.x yet" },
+  { crate = "thiserror-impl@1.0.69", reason = "matches the skipped thiserror 1.x dependency" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

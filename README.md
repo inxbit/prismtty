@@ -13,13 +13,13 @@
   <a href="LICENSE"><img alt="license" src="https://img.shields.io/github/license/inxbit/prismtty?style=flat-square"></a>
 </p>
 
-PrismTTY is a fast terminal output highlighter focused on network devices and
-Linux/Unix administration. It is intended as a ChromaTerm-style CLI wrapper with
+PrismTTY makes dense SSH, network-device, and Unix/Linux terminal output easier
+to scan in real time. It is a fast ChromaTerm-style CLI wrapper with
 network-focused built-in profiles.
 
 Website: [prismtty.com](https://prismtty.com/).
 
-Current version: `0.2.5`.
+Current version: `0.2.6`.
 
 ## Quick Demo
 
@@ -99,7 +99,7 @@ sudo apt-get install libpcre2-dev pkg-config
 ### GitHub Release
 
 Prebuilt release archives and checksums are available on the
-[v0.2.5 release page](https://github.com/inxbit/prismtty/releases/tag/v0.2.5).
+[v0.2.6 release page](https://github.com/inxbit/prismtty/releases/tag/v0.2.6).
 
 Each release archive contains the binaries, license/readme files, example
 profiles, shell completions, and a `.tar.gz.sha256` checksum.
@@ -134,7 +134,7 @@ published tap formula lives in
 ```sh
 ptty /bin/zsh
 ptty ssh router.example.net
-show-tech.txt | prismtty --profile cisco
+prismtty --profile cisco < show-tech.txt
 prismtty profiles test cisco fixtures/cisco.txt
 prismtty --reload
 ```
@@ -158,10 +158,10 @@ Interactive mode is designed to preserve shell line editing and typed command
 echo, including zsh prompts that use decorative Unicode prompt markers such as
 `╰─○`, `❯`, or `➜`.
 
-Use pipe mode for noninteractive output:
+Use stdin mode for noninteractive output from files or pipes:
 
 ```sh
-show-tech.txt | prismtty --profile cisco
+prismtty --profile cisco < show-tech.txt
 journalctl -xe | prismtty --profile linux-unix
 ```
 
@@ -347,7 +347,7 @@ The example runs router dump, syslog, and mixed-ANSI samples. Runtime benchmark
 mode is available in normal use:
 
 ```sh
-show-tech.txt | prismtty --benchmark --profile cisco >/dev/null
+prismtty --benchmark --profile cisco < show-tech.txt >/dev/null
 ```
 
 ## Replay Fixtures

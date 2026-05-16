@@ -14,6 +14,7 @@ test('GitHub Pages site has the expected static contract', () => {
   assert.equal(existsSync('docs/assets/prismtty-terminal-demo.svg'), true);
   assert.equal(existsSync('docs/assets/prismtty-terminal-preview.svg'), true);
   assert.equal(existsSync('docs/assets/prismtty-profile-switching.svg'), true);
+  assert.equal(existsSync('docs/assets/prismtty-social-card.png'), true);
 
   const html = read('docs/index.html');
   assert.match(html, /<title>PrismTTY - Terminal Output Highlighting<\/title>/);
@@ -22,8 +23,10 @@ test('GitHub Pages site has the expected static contract', () => {
   assert.match(html, /Feedback wanted/);
   assert.match(html, /href="https:\/\/github\.com\/inxbit\/prismtty"/);
   assert.match(html, /href="https:\/\/crates\.io\/crates\/prismtty"/);
+  assert.match(html, /https:\/\/prismtty\.com\/assets\/prismtty-social-card\.png/);
   assert.match(html, /href="assets\/prismtty-terminal-demo\.svg"/);
   assert.match(html, /src="assets\/prismtty-terminal-demo\.svg"/);
+  assert.doesNotMatch(html, /show-tech\.txt \| prismtty/);
 
   const css = read('docs/styles.css');
   assert.match(css, /#22d3ee/);
@@ -35,4 +38,10 @@ test('GitHub Pages site has the expected static contract', () => {
   assert.match(readme, /\.github\/assets\/prismtty-terminal-demo\.svg/);
   assert.match(readme, /What This Is \/ What This Is Not/);
   assert.match(readme, /Feedback Wanted/);
+  assert.doesNotMatch(readme, /show-tech\.txt \| prismtty/);
+
+  const cratesReadme = read('README.crates.md');
+  assert.match(cratesReadme, /Installed commands:/);
+  assert.match(cratesReadme, /Runtime Reload/);
+  assert.doesNotMatch(cratesReadme, /show-tech\.txt \| prismtty/);
 });

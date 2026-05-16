@@ -312,12 +312,19 @@ fn rgb_to_xterm256(color: Rgb) -> u8 {
     const RGB_STEPS: [u8; 6] = [0, 95, 135, 175, 215, 255];
 
     fn nearest(value: u8, steps: &[u8]) -> usize {
-        steps
-            .iter()
-            .enumerate()
-            .min_by_key(|(_, step)| value.abs_diff(**step))
-            .map(|(idx, _)| idx)
-            .expect("steps are non-empty")
+        let Some((first, rest)) = steps.split_first() else {
+            return 0;
+        };
+        let mut nearest_idx = 0;
+        let mut nearest_diff = value.abs_diff(*first);
+        for (idx, step) in rest.iter().enumerate() {
+            let diff = value.abs_diff(*step);
+            if diff < nearest_diff {
+                nearest_idx = idx + 1;
+                nearest_diff = diff;
+            }
+        }
+        nearest_idx
     }
 
     fn distance(a: Rgb, b: Rgb) -> u32 {

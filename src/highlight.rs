@@ -12,6 +12,7 @@ use thiserror::Error;
 
 const UNICODE_PROMPT_MARKERS: &[&str] = &["○", "●", "❯", "❮", "❱", "›", "»", "➜", "➤", "λ"];
 const MAX_INCOMPLETE_ESCAPE_BYTES: usize = 16 * 1024;
+const PCRE2_JIT_STACK_LIMIT_BYTES: usize = 32 * 1024;
 
 /// Errors returned while compiling highlighting rules.
 #[derive(Debug, Error)]
@@ -1140,6 +1141,7 @@ fn compile_rule(rule: RuleSpec) -> Result<CompiledRule, HighlightError> {
         .multi_line(true)
         .crlf(true)
         .jit_if_available(true)
+        .max_jit_stack_size(Some(PCRE2_JIT_STACK_LIMIT_BYTES))
         .build(&rule.regex)
         .map_err(|source| HighlightError::Regex {
             description: description.clone(),

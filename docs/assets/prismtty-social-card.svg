@@ -1,0 +1,74 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="630" viewBox="0 0 1200 630" role="img" aria-labelledby="title desc">
+  <title id="title">PrismTTY social preview</title>
+  <desc id="desc">PrismTTY terminal output highlighting preview for network and Unix operations.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" x2="1" y1="0" y2="1">
+      <stop offset="0" stop-color="#111827"/>
+      <stop offset="0.56" stop-color="#020617"/>
+      <stop offset="1" stop-color="#07111f"/>
+    </linearGradient>
+    <linearGradient id="beam" x1="0" x2="1" y1="0" y2="0">
+      <stop offset="0" stop-color="#22d3ee"/>
+      <stop offset="0.5" stop-color="#a3e635"/>
+      <stop offset="1" stop-color="#f472b6"/>
+    </linearGradient>
+    <style>
+      .sans { font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif; }
+      .mono { font-family: SFMono-Regular, Consolas, Liberation Mono, Menlo, monospace; }
+      .title { fill: #f8fafc; font-size: 84px; font-weight: 900; letter-spacing: 0; }
+      .lede { fill: #cbd5e1; font-size: 32px; font-weight: 700; letter-spacing: 0; }
+      .small { fill: #94a3b8; font-size: 22px; font-weight: 700; letter-spacing: 0; }
+      .term { fill: #0f172a; stroke: #334155; stroke-width: 2; }
+      .bar { fill: #111827; }
+      .cyan { fill: #22d3ee; }
+      .green { fill: #a3e635; }
+      .yellow { fill: #facc15; }
+      .red { fill: #fb7185; }
+      .purple { fill: #c084fc; }
+      .fg { fill: #e5e7eb; }
+      .muted { fill: #64748b; }
+    </style>
+  </defs>
+
+  <rect width="1200" height="630" fill="url(#bg)"/>
+  <path d="M610 70h660v78H610z" fill="#22d3ee" opacity="0.10" transform="skewX(-16)"/>
+  <path d="M520 192h760v64H520z" fill="#a3e635" opacity="0.12" transform="skewX(-16)"/>
+  <path d="M650 306h640v58H650z" fill="#f472b6" opacity="0.10" transform="skewX(-16)"/>
+
+  <g class="sans">
+    <text x="70" y="138" class="title">PrismTTY</text>
+    <text x="74" y="192" class="lede">Readable SSH, network-device, and Unix output.</text>
+    <text x="74" y="234" class="small">Live terminal highlighting for operators.</text>
+  </g>
+
+  <g transform="translate(70 285)">
+    <rect width="1060" height="270" rx="20" class="term"/>
+    <rect width="1060" height="52" rx="20" class="bar"/>
+    <rect y="34" width="1060" height="18" class="bar"/>
+    <circle cx="30" cy="26" r="8" fill="#ef4444"/>
+    <circle cx="58" cy="26" r="8" fill="#f59e0b"/>
+    <circle cx="86" cy="26" r="8" fill="#22c55e"/>
+    <text x="122" y="35" class="mono small">ptty ssh edge-sw1.example.net</text>
+    <rect y="52" width="1060" height="4" fill="url(#beam)"/>
+
+    <text x="32" y="98" class="mono green" font-size="24">edge-sw1#</text>
+    <text x="166" y="98" class="mono fg" font-size="24">show ip interface brief</text>
+    <text x="32" y="140" class="mono muted" font-size="19">Interface</text>
+    <text x="260" y="140" class="mono muted" font-size="19">IP-Address</text>
+    <text x="500" y="140" class="mono muted" font-size="19">Status</text>
+    <text x="680" y="140" class="mono muted" font-size="19">Protocol</text>
+    <text x="32" y="180" class="mono yellow" font-size="22">Gi1/0/1</text>
+    <text x="260" y="180" class="mono cyan" font-size="22">192.0.2.10</text>
+    <text x="500" y="180" class="mono green" font-size="22">up</text>
+    <text x="680" y="180" class="mono green" font-size="22">up</text>
+    <text x="32" y="220" class="mono yellow" font-size="22">Gi1/0/2</text>
+    <text x="260" y="220" class="mono cyan" font-size="22">198.51.100.42</text>
+    <text x="500" y="220" class="mono red" font-size="22">down</text>
+    <text x="680" y="220" class="mono red" font-size="22">down</text>
+    <text x="32" y="258" class="mono purple" font-size="22">%LINK-3-UPDOWN:</text>
+    <text x="250" y="258" class="mono fg" font-size="22">Interface </text>
+    <text x="378" y="258" class="mono yellow" font-size="22">Gi1/0/2</text>
+    <text x="492" y="258" class="mono fg" font-size="22"> changed state to </text>
+    <text x="736" y="258" class="mono red" font-size="22">down</text>
+  </g>
+</svg>

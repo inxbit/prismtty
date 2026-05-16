@@ -2,6 +2,38 @@
 
 All notable changes to PrismTTY are documented here.
 
+## 0.2.6 - 2026-05-16
+
+### Security and Reliability
+
+- Add a `cargo-deny` policy and enforce advisory, license, bans, and source
+  checks alongside `cargo audit` in CI and the release workflow.
+- Harden `--trace-io` on Unix by rejecting symlink targets, non-regular files,
+  non-current-user files, and existing trace files without owner-only
+  permissions.
+- Bound dynamic-profile stdin observation with a fixed-size queue and
+  drop-on-full behavior so silent remote sessions cannot accumulate unbounded
+  profile-observation input.
+- Make the PCRE2 JIT stack limit explicit at the upstream default until the
+  Rust `pcre2` wrapper exposes match/depth limit setters.
+- Expand the privacy scan to catch Linux home-directory captures, private-ish
+  hostnames, and non-documentation IPv4 addresses while preserving synthetic
+  fixture ranges.
+
+### Release
+
+- Reorder the release workflow so artifacts are downloaded, validated,
+  Homebrew formula generation succeeds, and release artifacts are attested
+  before publishing to crates.io.
+- Add release artifact provenance through GitHub artifact attestations.
+- Replace misleading pinned-toolchain workflow comments with stable-toolchain
+  wording.
+
+### Documentation
+
+- Refresh the GitHub, crates.io, and website copy around stdin usage, installed
+  commands, built-in profiles, runtime reload, and social sharing metadata.
+
 ## 0.2.5 - 2026-05-15
 
 ### Documentation
