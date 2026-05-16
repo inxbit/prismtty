@@ -8,6 +8,26 @@ permissions:
   contents: read
 
 jobs:
+  supply-chain:
+    name: Supply chain
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      checks: write
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: cargo audit
+        uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+      - name: cargo deny
+        uses: EmbarkStudios/cargo-deny-action@6c8f9facfa5047ec02d8485b6bf52b587b7777d1 # v2.0.18
+        with:
+          rust-version: "1.85"
+          command: check advisories licenses bans sources
+
   test:
     name: Test
     runs-on: ${{ matrix.os }}
@@ -19,7 +39,7 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # stable toolchain
         with:
           toolchain: stable
       - name: Install PCRE2
@@ -37,12 +57,7 @@ jobs:
           cargo run --features completion-generation --bin gen-completions
           git diff --exit-code completions/
       - name: Privacy scan
-        run: |
-          PATTERN='(/Users/[^[:space:]]+/(Desktop|Documents)|Desktop/[A-Za-z0-9_.-]+\.txt)'
-          if git grep -n -E "$PATTERN" -- . ':!Cargo.lock' ':!.github/workflows/ci.yml'; then
-            echo "Sensitive real-world capture marker found. Use synthetic fixtures instead."
-            exit 1
-          fi
+        run: bash scripts/privacy-scan.sh
       - name: Verify Homebrew formula generator
         run: |
           tmp="$(mktemp -d)"

@@ -7,7 +7,7 @@ use std::process::ExitCode;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
-    mpsc,
+    mpsc::{self, SyncSender},
 };
 use std::thread;
 use std::time::Duration;
@@ -34,6 +34,7 @@ const STRIPPED_ITERM_ENV: [&str; 6] = [
     "ITERM_SESSION_ID",
     "ITERM_PROFILE",
 ];
+const PROFILE_INPUT_QUEUE_CAPACITY: usize = 1024;
 
 pub(super) fn run_command(options: Options, command: Vec<OsString>) -> Result<ExitCode, CliError> {
     let command_name = command[0].clone();
@@ -63,7 +64,7 @@ pub(super) fn run_command(options: Options, command: Vec<OsString>) -> Result<Ex
 
     let trace = IoTrace::open(options.trace_io.as_deref())?;
     let (profile_input_tx, profile_input_rx) = if dynamic_profile_enabled(&options, interactive) {
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = mpsc::sync_channel(PROFILE_INPUT_QUEUE_CAPACITY);
         (Some(tx), Some(rx))
     } else {
         (None, None)
@@ -196,7 +197,7 @@ fn forward_stdin_to_pty<R: Read, W: Write>(
     writer: &mut W,
     local_echo: bool,
     trace: IoTrace,
-    profile_input: Option<mpsc::Sender<Vec<u8>>>,
+    profile_input: Option<SyncSender<Vec<u8>>>,
 ) -> io::Result<()> {
     let mut buffer = [0_u8; 1024];
     loop {
@@ -207,7 +208,7 @@ fn forward_stdin_to_pty<R: Read, W: Write>(
         let input = &buffer[..read];
         trace.log("IN", input);
         if let Some(sender) = &profile_input {
-            let _ = sender.send(input.to_vec());
+            let _ = sender.try_send(input.to_vec());
         }
         writer.write_all(input)?;
         writer.flush()?;
@@ -309,6 +310,8 @@ fn poll_pty_size(master: Box<dyn portable_pty::MasterPty + Send>, stop: Arc<Atom
 
 #[cfg(test)]
 mod tests {
+    use std::io::Cursor;
+
     use nix::sys::termios::{InputFlags, LocalFlags, OutputFlags};
 
     #[test]
@@ -335,6 +338,19 @@ mod tests {
             super::local_echo_bytes(b"show\x7f route\r\x1b[A"),
             b"show\x08 \x08 route\r\n"
         );
+    }
+
+    #[test]
+    fn profile_input_observation_drops_when_queue_is_full() {
+        let (tx, _rx) = std::sync::mpsc::sync_channel(0);
+        let mut input = Cursor::new(b"show version\n".to_vec());
+        let mut output = Vec::new();
+        let trace = super::IoTrace::open(None).expect("trace disabled");
+
+        super::forward_stdin_to_pty(&mut input, &mut output, false, trace, Some(tx))
+            .expect("stdin forwards even when profile input queue is full");
+
+        assert_eq!(output, b"show version\n");
     }
 
     #[test]

@@ -5,9 +5,10 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 #[cfg(unix)]
-use std::fs;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+
 #[cfg(unix)]
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use nix::libc;
 
 #[derive(Clone)]
 pub(super) struct IoTrace {
@@ -55,8 +56,34 @@ fn open_trace_file(path: &Path) -> io::Result<File> {
         .create(true)
         .append(true)
         .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
         .open(path)?;
-    file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    let metadata = file.metadata()?;
+    if !metadata.file_type().is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("trace path is not a regular file: {}", path.display()),
+        ));
+    }
+    if metadata.uid() != unsafe { libc::getuid() } {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "trace file is not owned by the current user: {}",
+                path.display()
+            ),
+        ));
+    }
+    let mode = metadata.permissions().mode() & 0o777;
+    if mode != 0o600 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "trace file permissions must be 0600, found {mode:03o}: {}",
+                path.display()
+            ),
+        ));
+    }
     Ok(file)
 }
 
@@ -79,7 +106,7 @@ fn trace_hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     #[cfg(unix)]
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::{PermissionsExt, symlink};
 
     #[test]
     fn trace_hex_encodes_bytes_for_diagnostics() {
@@ -102,5 +129,41 @@ mod tests {
             .mode()
             & 0o777;
         assert_eq!(mode, 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn trace_file_rejects_symlink_target() {
+        let dir = tempfile::tempdir().expect("tempdir creates");
+        let target = dir.path().join("target.log");
+        let path = dir.path().join("trace.log");
+        std::fs::write(&target, "original\n").expect("target writes");
+        symlink(&target, &path).expect("trace symlink creates");
+
+        let error = super::IoTrace::open(Some(&path))
+            .err()
+            .expect("trace symlink should be rejected");
+
+        assert_ne!(error.kind(), std::io::ErrorKind::NotFound);
+        assert_eq!(
+            std::fs::read_to_string(&target).expect("target reads"),
+            "original\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn trace_file_rejects_existing_loose_permissions() {
+        let dir = tempfile::tempdir().expect("tempdir creates");
+        let path = dir.path().join("trace.log");
+        std::fs::write(&path, "existing\n").expect("trace writes");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+            .expect("trace mode set");
+
+        let error = super::IoTrace::open(Some(&path))
+            .err()
+            .expect("loose trace permissions should be rejected");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
     }
 }

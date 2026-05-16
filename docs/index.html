@@ -6,12 +6,16 @@
     <title>PrismTTY - Terminal Output Highlighting</title>
     <meta
       name="description"
-      content="PrismTTY is a fast terminal output highlighter for network devices and Unix systems, with built-in profiles and dynamic profile switching."
+      content="PrismTTY makes dense SSH, network-device, and Unix/Linux terminal output easier to scan in real time."
     >
     <meta property="og:title" content="PrismTTY">
     <meta property="og:description" content="Readable network output, live in your terminal.">
     <meta property="og:type" content="website">
-    <meta property="og:image" content="assets/prismtty-terminal-demo.svg">
+    <meta property="og:image" content="https://prismtty.com/assets/prismtty-social-card.png">
+    <meta property="og:image:width" content="1200">
+    <meta property="og:image:height" content="630">
+    <meta name="twitter:card" content="summary_large_image">
+    <meta name="twitter:image" content="https://prismtty.com/assets/prismtty-social-card.png">
     <link rel="canonical" href="https://prismtty.com/">
     <link rel="preload" as="image" href="assets/prismtty-terminal-demo.svg">
     <link rel="stylesheet" href="styles.css">
@@ -59,7 +63,7 @@
             </div>
             <div>
               <dt>Current</dt>
-              <dd>v0.2.5</dd>
+              <dd>v0.2.6</dd>
             </div>
             <div>
               <dt>Engine</dt>
@@ -82,7 +86,7 @@
         </div>
         <div class="command-line">
           <span class="prompt">$</span>
-          <code>show-tech.txt | prismtty --profile cisco</code>
+          <code>prismtty --profile cisco &lt; show-tech.txt</code>
         </div>
         <div class="command-line">
           <span class="prompt">$</span>
