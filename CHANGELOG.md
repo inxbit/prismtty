@@ -27,6 +27,8 @@ All notable changes to PrismTTY are documented here.
   before publishing to crates.io.
 - Write release checksums with the published asset filename so validation,
   GitHub release assets, and Homebrew formula generation use the same names.
+- Keep downloaded release artifacts outside the Git checkout so crates.io
+  publishing runs from a clean working tree.
 - Add release artifact provenance through GitHub artifact attestations.
 - Replace misleading pinned-toolchain workflow comments with stable-toolchain
   wording.
