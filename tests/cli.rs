@@ -579,7 +579,7 @@ fn reload_flag_requests_reload_without_reading_stdin() {
 
 #[test]
 fn wrapped_command_output_is_highlighted() {
-    let mut cmd = Command::cargo_bin("prismtty").expect("binary exists");
+    let mut cmd = Command::cargo_bin("ptty").expect("ptty binary exists");
     cmd.arg("--profile")
         .arg("generic")
         .arg("printf")
