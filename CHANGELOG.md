@@ -2,6 +2,16 @@
 
 All notable changes to PrismTTY are documented here.
 
+## 0.2.7 - 2026-05-19
+
+### Internal Reliability
+
+- Make the dynamic-profile input queue regression test exercise the actual
+  full-queue path while keeping the receiver alive, so the bounded observation
+  behavior stays covered without changing stdin forwarding.
+- Avoid per-byte temporary `String` allocations when formatting `--trace-io`
+  hex diagnostics.
+
 ## 0.2.6 - 2026-05-16
 
 ### Security and Reliability

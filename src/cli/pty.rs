@@ -342,7 +342,13 @@ mod tests {
 
     #[test]
     fn profile_input_observation_drops_when_queue_is_full() {
-        let (tx, _rx) = std::sync::mpsc::sync_channel(0);
+        let (tx, _rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(1);
+        tx.try_send(Vec::new())
+            .expect("queue accepts the first send up to capacity");
+        // _rx is alive and the queue is full, so the production try_send
+        // exercises Err(TrySendError::Full), the drop-on-full path H3
+        // introduced, rather than Err(Disconnected).
+
         let mut input = Cursor::new(b"show version\n".to_vec());
         let mut output = Vec::new();
         let trace = super::IoTrace::open(None).expect("trace disabled");

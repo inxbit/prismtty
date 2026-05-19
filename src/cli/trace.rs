@@ -93,12 +93,14 @@ fn open_trace_file(path: &Path) -> io::Result<File> {
 }
 
 fn trace_hex(bytes: &[u8]) -> String {
+    use std::fmt::Write;
+
     let mut output = String::with_capacity(bytes.len().saturating_mul(3).saturating_sub(1));
     for (idx, byte) in bytes.iter().enumerate() {
         if idx > 0 {
             output.push(' ');
         }
-        output.push_str(&format!("{byte:02x}"));
+        let _ = write!(output, "{byte:02x}");
     }
     output
 }
