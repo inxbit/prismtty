@@ -1,6 +1,10 @@
 use crate::profiles::{ProfileStore, is_generic_profile_set};
 
 const OUTPUT_WINDOW_LIMIT: usize = 64 * 1024;
+const INPUT_LINE_LIMIT: usize = 4096;
+const CLOSE_MARKER_WINDOW_LIMIT: usize = 256;
+const DETECTION_BYTE_INTERVAL: usize = 4096;
+const PROFILE_STACK_LIMIT: usize = 8;
 
 #[derive(Clone, Debug)]
 pub(crate) struct ProfileRuntime {
@@ -8,6 +12,8 @@ pub(crate) struct ProfileRuntime {
     baseline_profiles: Vec<String>,
     stack: Vec<Vec<String>>,
     output_window: String,
+    output_window_lower: String,
+    output_bytes_since_detection: usize,
     input_line: String,
     remote_candidate: bool,
     baseline_locked: bool,
@@ -23,6 +29,8 @@ impl ProfileRuntime {
             baseline_profiles: initial_profiles,
             stack: Vec::new(),
             output_window: String::new(),
+            output_window_lower: String::new(),
+            output_bytes_since_detection: 0,
             input_line: String::new(),
             remote_candidate: false,
             baseline_locked,
@@ -36,6 +44,11 @@ impl ProfileRuntime {
         self.active_profiles.clone()
     }
 
+    #[cfg(test)]
+    pub(crate) fn stack_len(&self) -> usize {
+        self.stack.len()
+    }
+
     pub(crate) fn observe_input(&mut self, input: &[u8]) {
         for byte in input {
             match byte {
@@ -46,9 +59,12 @@ impl ProfileRuntime {
                 0x08 | 0x7f => {
                     self.input_line.pop();
                 }
-                byte if byte.is_ascii_graphic() || *byte == b' ' || *byte == b'\t' => {
+                byte if (byte.is_ascii_graphic() || *byte == b' ' || *byte == b'\t')
+                    && self.input_line.len() < INPUT_LINE_LIMIT =>
+                {
                     self.input_line.push(*byte as char);
                 }
+                byte if byte.is_ascii_graphic() || *byte == b' ' || *byte == b'\t' => {}
                 _ => {}
             }
         }
@@ -64,17 +80,31 @@ impl ProfileRuntime {
             return None;
         }
 
-        if contains_close_marker(&text) {
-            self.output_window.clear();
+        self.output_window.push_str(&text);
+        self.output_window_lower
+            .push_str(&text.to_ascii_lowercase());
+        trim_to_recent_chars(&mut self.output_window, OUTPUT_WINDOW_LIMIT);
+        trim_to_recent_chars(&mut self.output_window_lower, OUTPUT_WINDOW_LIMIT);
+        self.output_bytes_since_detection =
+            self.output_bytes_since_detection.saturating_add(text.len());
+
+        if contains_close_marker(recent_chars(
+            &self.output_window_lower,
+            CLOSE_MARKER_WINDOW_LIMIT,
+        )) {
+            self.clear_output_window();
             self.remote_candidate = false;
             self.clear_pending_prompt();
             return self.pop_profile();
         }
 
-        self.output_window.push_str(&text);
-        trim_to_recent_chars(&mut self.output_window, OUTPUT_WINDOW_LIMIT);
+        if !self.should_detect_profiles(&text) {
+            return None;
+        }
+        self.output_bytes_since_detection = 0;
 
-        let detected = store.detect_profiles(&self.output_window);
+        let detected =
+            store.detect_profiles_with_lowercase(&self.output_window, &self.output_window_lower);
         if is_generic_profile_set(&detected) {
             self.clear_pending_prompt();
             return None;
@@ -88,22 +118,25 @@ impl ProfileRuntime {
             self.baseline_profiles = detected.clone();
             self.active_profiles = detected.clone();
             self.baseline_locked = true;
-            self.output_window.clear();
+            self.clear_output_window();
             self.clear_pending_prompt();
             return Some(detected);
         }
 
         let active_profile = store.active_specific_profile(&self.active_profiles);
-        if let Some(profile) = store.strong_transition_profile(&detected, &text, active_profile) {
+        if let Some(profile) =
+            store.strong_transition_profile(&detected, &self.output_window, active_profile)
+        {
             self.remote_candidate = false;
-            self.output_window.clear();
+            self.clear_output_window();
             self.clear_pending_prompt();
             return self.switch_to(profile_set(&profile));
         }
 
         let at_local_baseline = self.at_local_baseline(store);
         if (self.remote_candidate || active_profile.is_none() || at_local_baseline)
-            && let Some(profile) = store.prompt_transition_profile(&detected, &text, active_profile)
+            && let Some(profile) =
+                store.prompt_transition_profile(&detected, &self.output_window, active_profile)
         {
             if store.prompt_switches_on_first_detection(
                 &profile,
@@ -111,7 +144,7 @@ impl ProfileRuntime {
                 at_local_baseline,
             ) {
                 self.remote_candidate = false;
-                self.output_window.clear();
+                self.clear_output_window();
                 self.clear_pending_prompt();
                 return self.switch_to(profile_set(&profile));
             }
@@ -119,7 +152,7 @@ impl ProfileRuntime {
         }
 
         if active_profile.is_some() {
-            self.output_window.clear();
+            self.clear_output_window();
         }
         self.clear_pending_prompt();
         None
@@ -138,9 +171,16 @@ impl ProfileRuntime {
         ) {
             self.remote_candidate = true;
             self.baseline_locked = true;
-            self.output_window.clear();
+            self.clear_output_window();
             self.clear_pending_prompt();
         }
+    }
+
+    fn should_detect_profiles(&self, text: &str) -> bool {
+        self.remote_candidate
+            || self.output_bytes_since_detection >= DETECTION_BYTE_INTERVAL
+            || text.bytes().any(|byte| matches!(byte, b'\r' | b'\n'))
+            || looks_like_prompt_detection_boundary(text)
     }
 
     fn at_local_baseline(&self, store: &ProfileStore) -> bool {
@@ -171,7 +211,7 @@ impl ProfileRuntime {
 
         if self.pending_prompt_hits >= 2 {
             self.remote_candidate = false;
-            self.output_window.clear();
+            self.clear_output_window();
             self.clear_pending_prompt();
             self.switch_to(detected)
         } else {
@@ -186,12 +226,9 @@ impl ProfileRuntime {
         if is_generic_profile_set(&profiles) {
             return None;
         }
-        if self
-            .stack
-            .last()
-            .is_some_and(|previous| previous == &profiles)
-        {
-            self.active_profiles = self.stack.pop().expect("last checked as present");
+        if let Some(stack_index) = self.stack.iter().position(|previous| previous == &profiles) {
+            self.stack.truncate(stack_index);
+            self.active_profiles = profiles;
             return Some(self.active_profiles.clone());
         }
         if profiles == self.baseline_profiles {
@@ -200,6 +237,10 @@ impl ProfileRuntime {
             return Some(self.active_profiles.clone());
         }
 
+        if self.stack.len() >= PROFILE_STACK_LIMIT {
+            let remove_index = usize::from(self.stack.len() > 1);
+            self.stack.remove(remove_index);
+        }
         self.stack.push(self.active_profiles.clone());
         self.active_profiles = profiles;
         Some(self.active_profiles.clone())
@@ -222,6 +263,12 @@ impl ProfileRuntime {
         self.pending_prompt_profiles = None;
         self.pending_prompt_hits = 0;
     }
+
+    fn clear_output_window(&mut self) {
+        self.output_window.clear();
+        self.output_window_lower.clear();
+        self.output_bytes_since_detection = 0;
+    }
 }
 
 fn profile_set(profile: &str) -> Vec<String> {
@@ -240,11 +287,26 @@ fn trim_to_recent_chars(text: &mut String, limit: usize) {
 }
 
 fn contains_close_marker(text: &str) -> bool {
-    let lower = text.to_ascii_lowercase();
-    lower.contains("closed by remote host")
-        || lower.contains("connection closed")
-        || (lower.contains("connection to ") && lower.contains(" closed"))
-        || lower.lines().any(|line| line.trim() == "logout")
+    text.contains("closed by remote host")
+        || text.contains("connection closed")
+        || (text.contains("connection to ") && text.contains(" closed"))
+        || text.lines().any(|line| line.trim() == "logout")
+}
+
+fn looks_like_prompt_detection_boundary(text: &str) -> bool {
+    let trimmed = text.trim_end();
+    matches!(trimmed.as_bytes().last(), Some(b'#' | b'>' | b'$' | b'%'))
+}
+
+fn recent_chars(text: &str, limit: usize) -> &str {
+    if text.len() <= limit {
+        return text;
+    }
+    let mut start = text.len() - limit;
+    while !text.is_char_boundary(start) {
+        start += 1;
+    }
+    &text[start..]
 }
 
 #[cfg(test)]
@@ -331,6 +393,91 @@ mod tests {
 
         assert_eq!(changed, Some(names(&["generic", "juniper"])));
         assert_eq!(runtime.active_profiles(), names(&["generic", "juniper"]));
+    }
+
+    #[test]
+    fn strong_banner_cycle_unwinds_existing_profiles_instead_of_growing_stack() {
+        let store = ProfileStore::builtin();
+        let mut runtime = ProfileRuntime::new(names(&["generic", "linux-unix"]));
+
+        runtime.observe_input(b"ssh router-a\r");
+        assert_eq!(
+            runtime.observe_output(b"Cisco IOS Software\n", &store),
+            Some(names(&["generic", "cisco"]))
+        );
+        assert_eq!(
+            runtime.observe_output(b"--- JUNOS 22.4R3 Kernel 64-bit\n", &store),
+            Some(names(&["generic", "juniper"]))
+        );
+        assert_eq!(
+            runtime.observe_output(b"Version: FortiGate v7.2.8\n", &store),
+            Some(names(&["generic", "fortinet"]))
+        );
+
+        for _ in 0..4 {
+            assert_eq!(
+                runtime.observe_output(b"Cisco IOS Software\n", &store),
+                Some(names(&["generic", "cisco"]))
+            );
+            assert_eq!(
+                runtime.observe_output(b"--- JUNOS 22.4R3 Kernel 64-bit\n", &store),
+                Some(names(&["generic", "juniper"]))
+            );
+            assert_eq!(
+                runtime.observe_output(b"Version: FortiGate v7.2.8\n", &store),
+                Some(names(&["generic", "fortinet"]))
+            );
+        }
+
+        assert!(
+            runtime.stack_len() <= 3,
+            "cycling through known strong profiles should not grow the profile stack without bound"
+        );
+    }
+
+    #[test]
+    fn dynamic_detection_defers_small_banner_chunks_until_newline() {
+        let store = ProfileStore::builtin();
+        let mut runtime = ProfileRuntime::new(names(&["generic", "linux-unix"]));
+
+        assert_eq!(
+            runtime.observe_output(b"Cisco Nexus Operating System (NX-OS) Software", &store),
+            None
+        );
+        assert_eq!(runtime.active_profiles(), names(&["generic", "linux-unix"]));
+
+        assert_eq!(
+            runtime.observe_output(b"\n", &store),
+            Some(names(&["generic", "cisco"]))
+        );
+        assert_eq!(runtime.active_profiles(), names(&["generic", "cisco"]));
+    }
+
+    #[test]
+    fn input_line_is_bounded_before_newline() {
+        let mut runtime = ProfileRuntime::new(names(&["generic", "linux-unix"]));
+
+        runtime.observe_input(&vec![b'a'; 8192]);
+
+        assert_eq!(runtime.input_line.len(), 4096);
+    }
+
+    #[test]
+    fn split_close_marker_pops_remote_profile() {
+        let store = ProfileStore::builtin();
+        let mut runtime = ProfileRuntime::new(names(&["generic", "linux-unix"]));
+
+        runtime.observe_input(b"ssh router-a\r");
+        assert_eq!(
+            runtime.observe_output(b"--- JUNOS 22.4R3 Kernel 64-bit\n", &store),
+            Some(names(&["generic", "juniper"]))
+        );
+
+        assert_eq!(runtime.observe_output(b"Connection clo", &store), None);
+        let changed = runtime.observe_output(b"sed\r\n", &store);
+
+        assert_eq!(changed, Some(names(&["generic", "linux-unix"])));
+        assert_eq!(runtime.active_profiles(), names(&["generic", "linux-unix"]));
     }
 
     #[test]

@@ -3,15 +3,16 @@ use std::io::{self, Read, Write};
 use std::sync::mpsc;
 use std::time::Instant;
 
-use crate::highlight::{BenchmarkReport, Highlighter, StreamingHighlighter, strip_ansi};
+use crate::highlight::{AnsiChunk, BenchmarkReport, Highlighter, StreamingHighlighter, strip_ansi};
 use crate::profile_runtime::ProfileRuntime;
 use crate::profiles::ProfileStore;
 
 use super::CliError;
 use super::args::Options;
 use super::profile_selection::{
-    ProfileReporter, auto_detect_enabled, build_highlighter_for_profiles, dynamic_profile_enabled,
-    profile_store, select_profile_names, should_continue_auto_detect,
+    ProfileReporter, auto_detect_enabled, build_highlighter_for_profiles_with_store,
+    dynamic_profile_enabled, profile_store, select_profile_names_with_store,
+    should_continue_auto_detect,
 };
 use super::runtime::ReloadWatcher;
 use super::trace::IoTrace;
@@ -37,18 +38,14 @@ pub(super) fn highlight_stream<R: Read, W: Write>(
 
     trace.log("OUT", &buffer[..read]);
     let first_chunk = prepare_chunk(&buffer[..read], options.strip_ansi);
-    let mut detection_sample = first_chunk.clone();
-    input_bytes += first_chunk.len();
-    let profile_names = select_profile_names(options, &detection_sample)?;
-    let mut session = HighlightSession::new(options, interactive, profile_names)?;
+    let mut detection_sample = first_chunk.bytes().to_vec();
+    input_bytes += first_chunk.bytes().len();
+    let store = profile_store()?;
+    let profile_names = select_profile_names_with_store(options, &store, &detection_sample)?;
+    let mut session = HighlightSession::new(options, &store, interactive, profile_names)?;
     session.report_current();
     let dynamic_profiles =
         dynamic_profile_enabled(options, interactive) && profile_input_rx.is_some();
-    let runtime_store = if dynamic_profiles {
-        Some(profile_store()?)
-    } else {
-        None
-    };
     let mut profile_runtime = if dynamic_profiles {
         Some(ProfileRuntime::new(session.profile_names().to_vec()))
     } else {
@@ -59,7 +56,7 @@ pub(super) fn highlight_stream<R: Read, W: Write>(
     if let Some(next_profile_names) = observe_dynamic_profile(
         &mut profile_runtime,
         profile_input_rx.as_ref(),
-        runtime_store.as_ref(),
+        dynamic_profiles.then_some(&store),
         &first_chunk,
     ) {
         session.switch_profiles(writer, &trace, next_profile_names)?;
@@ -74,18 +71,19 @@ pub(super) fn highlight_stream<R: Read, W: Write>(
         }
         trace.log("OUT", &buffer[..read]);
         let chunk = prepare_chunk(&buffer[..read], options.strip_ansi);
-        input_bytes += chunk.len();
+        input_bytes += chunk.bytes().len();
         if let Some(next_profile_names) = observe_dynamic_profile(
             &mut profile_runtime,
             profile_input_rx.as_ref(),
-            runtime_store.as_ref(),
+            dynamic_profiles.then_some(&store),
             &chunk,
         ) {
             session.switch_profiles(writer, &trace, next_profile_names)?;
         }
         if auto_detect_pending && detection_sample.len() < AUTO_DETECT_SAMPLE_LIMIT {
-            detection_sample.extend_from_slice(&chunk);
-            let next_profile_names = select_profile_names(options, &detection_sample)?;
+            detection_sample.extend_from_slice(chunk.bytes());
+            let next_profile_names =
+                select_profile_names_with_store(options, &store, &detection_sample)?;
             if next_profile_names.as_slice() != session.profile_names() {
                 session.switch_profiles(writer, &trace, next_profile_names)?;
                 auto_detect_pending = should_continue_auto_detect(options, session.profile_names());
@@ -121,6 +119,7 @@ pub(super) fn highlight_stream<R: Read, W: Write>(
 
 struct HighlightSession<'a> {
     options: &'a Options,
+    store: &'a ProfileStore,
     interactive: bool,
     profile_names: Vec<String>,
     streaming: StreamingHighlighter,
@@ -130,13 +129,15 @@ struct HighlightSession<'a> {
 impl<'a> HighlightSession<'a> {
     fn new(
         options: &'a Options,
+        store: &'a ProfileStore,
         interactive: bool,
         profile_names: Vec<String>,
     ) -> Result<Self, CliError> {
-        let streaming = Self::streaming_for(options, &profile_names, interactive)?;
+        let streaming = Self::streaming_for(options, store, &profile_names, interactive)?;
         let reporter = ProfileReporter::new(options.show_profile, auto_detect_enabled(options));
         Ok(Self {
             options,
+            store,
             interactive,
             profile_names,
             streaming,
@@ -172,9 +173,9 @@ impl<'a> HighlightSession<'a> {
         &mut self,
         writer: &mut W,
         trace: &IoTrace,
-        chunk: &[u8],
+        chunk: &AnsiChunk,
     ) -> Result<(), CliError> {
-        write_rendered(writer, trace, self.streaming.push(chunk))?;
+        write_rendered(writer, trace, self.streaming.push_chunk(chunk))?;
         Ok(())
     }
 
@@ -196,7 +197,12 @@ impl<'a> HighlightSession<'a> {
     ) -> Result<(), CliError> {
         self.finish(writer, trace)?;
         self.profile_names = profile_names;
-        self.streaming = Self::streaming_for(self.options, &self.profile_names, self.interactive)?;
+        self.streaming = Self::streaming_for(
+            self.options,
+            self.store,
+            &self.profile_names,
+            self.interactive,
+        )?;
         if report {
             self.report_current();
         }
@@ -205,10 +211,12 @@ impl<'a> HighlightSession<'a> {
 
     fn streaming_for(
         options: &Options,
+        store: &ProfileStore,
         profile_names: &[String],
         interactive: bool,
     ) -> Result<StreamingHighlighter, CliError> {
-        let highlighter = build_highlighter_for_profiles(options, profile_names, interactive)?;
+        let highlighter =
+            build_highlighter_for_profiles_with_store(options, store, profile_names, interactive)?;
         Ok(new_streaming_highlighter(
             highlighter,
             interactive,
@@ -221,7 +229,7 @@ fn observe_dynamic_profile(
     runtime: &mut Option<ProfileRuntime>,
     profile_input_rx: Option<&mpsc::Receiver<Vec<u8>>>,
     store: Option<&ProfileStore>,
-    chunk: &[u8],
+    chunk: &AnsiChunk,
 ) -> Option<Vec<String>> {
     let runtime = runtime.as_mut()?;
     let store = store?;
@@ -230,8 +238,7 @@ fn observe_dynamic_profile(
             runtime.observe_input(&input);
         }
     }
-    let visible_chunk = strip_ansi(chunk);
-    runtime.observe_output(&visible_chunk, store)
+    runtime.observe_output(chunk.visible_bytes(), store)
 }
 
 fn write_rendered<W: Write>(writer: &mut W, trace: &IoTrace, rendered: Vec<u8>) -> io::Result<()> {
@@ -278,10 +285,22 @@ fn print_benchmark_report(report: Option<&BenchmarkReport>, input_bytes: usize, 
     eprintln!("Processed {input_bytes} bytes in {elapsed_secs:.3}s");
 }
 
-fn prepare_chunk(input: &[u8], strip_existing_ansi: bool) -> Vec<u8> {
+fn prepare_chunk(input: &[u8], strip_existing_ansi: bool) -> AnsiChunk {
     if strip_existing_ansi {
-        strip_ansi(input)
+        AnsiChunk::new(strip_ansi(input))
     } else {
-        input.to_vec()
+        AnsiChunk::from_slice(input)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn dynamic_profile_observation_reuses_prepared_visible_chunk() {
+        let source = include_str!("stream.rs");
+        let runtime_source = source.split("#[cfg(test)]").next().unwrap_or(source);
+
+        assert!(!runtime_source.contains("let visible_chunk = strip_ansi(chunk)"));
+        assert!(runtime_source.contains("visible_bytes()"));
     }
 }

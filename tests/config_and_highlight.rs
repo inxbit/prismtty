@@ -1,5 +1,5 @@
 use prismtty::highlight::strip_ansi;
-use prismtty::style::{ColorMode, Style};
+use prismtty::style::{ColorMode, Rgb, Style};
 use prismtty::{Highlighter, PrismConfig, ProfileStore, StreamingHighlighter};
 
 #[test]
@@ -462,6 +462,54 @@ fn cisco_nexus_interface_status_highlights_operational_reason_codes() {
     assert!(
         output.contains("\x1b[38;2;255;165;0mnoOperMem\x1b[0m"),
         "{output:?}"
+    );
+}
+
+#[test]
+fn cisco_nexus_mac_table_keeps_mac_and_interface_colors_with_plus_line_rule() {
+    let store = ProfileStore::builtin();
+    let config = PrismConfig::from_profiles(&store, &["cisco"])
+        .expect("cisco loads")
+        .merge(
+            PrismConfig::from_chromaterm_yaml(
+                r##"
+rules:
+  - description: added line
+    regex: '(?m)^\+ .*$'
+    color: f#00dc1a
+"##,
+            )
+            .expect("custom line rule parses"),
+        );
+    let highlighter = Highlighter::from_config(config).expect("rules compile");
+
+    let spans = highlighter
+        .style_spans(b"+   2      0018.2302.e255   dynamic   NA          F      F    Po27\n");
+
+    let mac = spans
+        .iter()
+        .find(|span| span.text == "0018.2302.e255")
+        .expect("MAC address span is highlighted");
+    let port = spans
+        .iter()
+        .find(|span| span.text == "Po27")
+        .expect("Nexus port-channel span is highlighted");
+
+    assert_eq!(
+        mac.style.foreground,
+        Some(Rgb {
+            r: 255,
+            g: 154,
+            b: 255
+        })
+    );
+    assert_eq!(
+        port.style.foreground,
+        Some(Rgb {
+            r: 0,
+            g: 153,
+            b: 255
+        })
     );
 }
 
@@ -995,6 +1043,32 @@ fn interactive_streaming_highlighter_highlights_question_mark_help_prompt_withou
         !output.contains("\x1b[1;38;2;255;255;255mLAB-N9K-01#"),
         "{output:?}"
     );
+}
+
+#[test]
+fn interactive_streaming_highlighter_keeps_cisco_help_redraw_command_tail_visible() {
+    let store = ProfileStore::builtin();
+    let config = PrismConfig::from_profiles(&store, &["cisco"]).expect("cisco loads");
+    let highlighter = Highlighter::from_config(config).expect("rules compile");
+    let mut streaming = StreamingHighlighter::new_interactive(highlighter);
+
+    let _ = streaming.push_str("DORCA-023-DR03A# ");
+    assert_eq!(streaming.push_str("sh mac"), "sh mac");
+
+    let help_redraw = concat!(
+        "?\r\n",
+        "  mac       MAC configuration commands\r\n",
+        "  mac-list  Show mac-lists\r\n",
+        "  mac-move  Display mac-move policy\r\n",
+        "\r\n",
+        "\x1b[23D\x1b[J\rDORCA-023-DR03A# sh mac",
+    );
+
+    let output = streaming.push_str(help_redraw);
+    let visible = strip_ansi(output.as_bytes());
+
+    assert!(visible.ends_with(b"DORCA-023-DR03A# sh mac"), "{output:?}");
+    assert!(streaming.finish().is_empty());
 }
 
 #[test]
