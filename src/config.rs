@@ -180,7 +180,7 @@ impl PrismConfig {
         let mut rules = Vec::new();
         let mut loaded = BTreeSet::new();
 
-        for profile_name in profile_names {
+        for profile_name in store.top_level_profile_names(profile_names)? {
             store.append_profile_rules(profile_name, &mut loaded, &mut rules)?;
         }
 

@@ -298,6 +298,9 @@ fn parse_rgb(hex: &str) -> Result<Rgb, String> {
     if hex.len() != 6 {
         return Err(format!("expected 6 hex digits in '#{hex}'"));
     }
+    if !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(format!("invalid hex color '#{hex}'"));
+    }
     let r = parse_channel(&hex[0..2])?;
     let g = parse_channel(&hex[2..4])?;
     let b = parse_channel(&hex[4..6])?;
@@ -310,6 +313,10 @@ fn parse_channel(hex: &str) -> Result<u8, String> {
 
 fn rgb_to_xterm256(color: Rgb) -> u8 {
     const RGB_STEPS: [u8; 6] = [0, 95, 135, 175, 215, 255];
+    const GRAY_STEPS: [u8; 24] = [
+        8, 18, 28, 38, 48, 58, 68, 78, 88, 98, 108, 118, 128, 138, 148, 158, 168, 178, 188, 198,
+        208, 218, 228, 238,
+    ];
 
     fn nearest(value: u8, steps: &[u8]) -> usize {
         let Some((first, rest)) = steps.split_first() else {
@@ -345,12 +352,11 @@ fn rgb_to_xterm256(color: Rgb) -> u8 {
         b: RGB_STEPS[rgb_index[2]],
     };
 
-    let gray_steps: Vec<u8> = (8..=238).step_by(10).collect();
     let gray_index = nearest(
         ((u16::from(color.r) + u16::from(color.g) + u16::from(color.b)) / 3) as u8,
-        &gray_steps,
+        &GRAY_STEPS,
     );
-    let gray = gray_steps[gray_index];
+    let gray = GRAY_STEPS[gray_index];
     let gray_color = Rgb {
         r: gray,
         g: gray,
@@ -362,4 +368,29 @@ fn rgb_to_xterm256(color: Rgb) -> u8 {
     }
 
     16 + (36 * rgb_index[0] as u8) + (6 * rgb_index[1] as u8) + rgb_index[2] as u8
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Style;
+
+    #[test]
+    fn xterm256_gray_steps_do_not_allocate_on_each_lookup() {
+        let source = include_str!("style.rs");
+        let function_source = source
+            .split("fn rgb_to_xterm256")
+            .nth(1)
+            .expect("function exists");
+
+        assert!(function_source.contains("const GRAY_STEPS"));
+        assert!(!function_source.contains("collect::<Vec"));
+    }
+
+    #[test]
+    fn malformed_non_ascii_rgb_color_returns_error_without_panic() {
+        let result = std::panic::catch_unwind(|| Style::parse("f#€€"));
+
+        assert!(result.is_ok(), "malformed local style should not panic");
+        assert!(result.expect("parse completed").is_err());
+    }
 }

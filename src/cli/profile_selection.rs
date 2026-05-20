@@ -11,12 +11,13 @@ use crate::style::ColorMode;
 use super::CliError;
 use super::args::Options;
 
-pub(super) fn build_highlighter_for_profiles(
+pub(super) fn build_highlighter_for_profiles_with_store(
     options: &Options,
+    store: &ProfileStore,
     profile_names: &[String],
     interactive: bool,
 ) -> Result<Highlighter, CliError> {
-    let config = build_config_for_profiles(options, profile_names)?;
+    let config = build_config_for_profiles_with_store(options, store, profile_names)?;
     Ok(Highlighter::from_config_with_color_mode(
         config,
         color_mode(options, interactive),
@@ -45,11 +46,11 @@ fn terminal_supports_truecolor() -> bool {
         .unwrap_or(false)
 }
 
-pub(super) fn select_profile_names(
+pub(super) fn select_profile_names_with_store(
     options: &Options,
+    store: &ProfileStore,
     sample: &[u8],
 ) -> Result<Vec<String>, CliError> {
-    let store = profile_store()?;
     Ok(if !options.profiles.is_empty() {
         options.profiles.clone()
     } else if options.no_auto_detect {
@@ -61,13 +62,13 @@ pub(super) fn select_profile_names(
     })
 }
 
-pub(super) fn build_config_for_profiles(
+pub(super) fn build_config_for_profiles_with_store(
     options: &Options,
+    store: &ProfileStore,
     profile_names: &[String],
 ) -> Result<PrismConfig, CliError> {
-    let store = profile_store()?;
     let profile_refs: Vec<&str> = profile_names.iter().map(String::as_str).collect();
-    let mut config = PrismConfig::from_profiles(&store, &profile_refs)?;
+    let mut config = PrismConfig::from_profiles(store, &profile_refs)?;
 
     if let Some(path) = &options.config {
         config = config.merge(PrismConfig::from_chromaterm_file(path)?);
@@ -169,10 +170,16 @@ fn default_config_paths() -> Vec<PathBuf> {
 }
 
 fn load_profiles_d() -> Result<Vec<crate::config::LoadedProfileFile>, CliError> {
-    let mut profiles = Vec::new();
     let Some(config_dir) = config_base_dir() else {
-        return Ok(profiles);
+        return Ok(Vec::new());
     };
+    load_profiles_d_from_config_dir(&config_dir)
+}
+
+fn load_profiles_d_from_config_dir(
+    config_dir: &Path,
+) -> Result<Vec<crate::config::LoadedProfileFile>, CliError> {
+    let mut profiles = Vec::new();
     let dir = config_dir.join("prismtty").join("profiles.d");
     if !dir.exists() {
         return Ok(profiles);
@@ -182,7 +189,7 @@ fn load_profiles_d() -> Result<Vec<crate::config::LoadedProfileFile>, CliError> 
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
         let path = entry.path();
-        if is_yaml(&path) {
+        if entry.file_type()?.is_file() && is_yaml(&path) {
             entries.push(path);
         }
     }
@@ -214,6 +221,8 @@ fn is_yaml(path: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
     #[test]
     fn interactive_color_mode_keeps_truecolor_when_terminal_supports_it() {
         let options = super::Options::default();
@@ -270,5 +279,30 @@ mod tests {
             ..super::Options::default()
         };
         assert!(!super::dynamic_profile_enabled(&opt_out, true));
+    }
+
+    #[test]
+    fn load_profiles_d_skips_yaml_named_directories() {
+        let temp = tempfile::tempdir().expect("tempdir creates");
+        let profiles_dir = temp.path().join("prismtty").join("profiles.d");
+        fs::create_dir_all(profiles_dir.join("backup.yaml")).expect("yaml directory creates");
+        fs::write(
+            profiles_dir.join("router.yml"),
+            r##"
+profile:
+  name: router
+rules:
+  - description: router prompt
+    regex: '^router#'
+    color: f#ffffff
+"##,
+        )
+        .expect("profile writes");
+
+        let profiles =
+            super::load_profiles_d_from_config_dir(temp.path()).expect("profiles.d loads");
+
+        assert_eq!(profiles.len(), 1);
+        assert_eq!(profiles[0].meta.name, "router");
     }
 }

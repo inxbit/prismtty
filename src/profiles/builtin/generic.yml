@@ -13,6 +13,7 @@ rules:
   - description: MAC address
     regex: '(?i)\b((?<!:)([\da-f]{1,2}:){5}[\da-f]{1,2}(?!:)|(?<!\.)([\da-f]{4}\.){2}[\da-f]{4}(?!\.))\b'
     color: f#ff9aff
+    exclusive: true
   - description: bad operational state
     regex: '(?i)\b(password|abnormal(ly)?|down|los(t|s|ing)|err(or(s)?)?|den(y|ies|ied)?|reject(ing|ed)?|drop(ped|s)?|fail(s|ed|ure)?|disconnect(ed)?|unreachable|invalid|bad|notconnect|unusable|blocking|blocked|collision(s)?|unsynchronized|mismatch|runts|CRC|resets)\b'
     color: f#ff0000 bold

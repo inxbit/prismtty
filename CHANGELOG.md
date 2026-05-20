@@ -2,6 +2,35 @@
 
 All notable changes to PrismTTY are documented here.
 
+## 1.0.0 - 2026-05-20
+
+### Security and Reliability
+
+- Harden release publishing by rerunning the privacy scan in the publish job
+  and rejecting unsupported package targets before release paths are built.
+- Bound dynamic profile state and detection buffers so repeated remote output
+  cannot grow profile switching state without limit.
+- Move raw-mode signal cleanup out of signal-handler context and keep PTY
+  resize handling tied to terminal resize notifications.
+- Harden malformed ANSI and local RGB style parsing so invalid input is
+  neutralized or rejected without leaking styling state or panicking.
+- Make runtime PID registration, reload bookkeeping, and legacy runtime layout
+  compatibility more robust.
+
+### Performance
+
+- Reuse loaded profile stores, indexed benchmark lookups, prepared stream
+  chunks, and static xterm-256 gray steps to reduce repeated allocation and
+  parsing work.
+
+### Profiles and Highlighting
+
+- Keep child profile rules ahead of inherited parent rules, skip profile
+  directories named with YAML extensions, and preserve interactive
+  non-foreground attributes such as underline and background colors.
+- Improve prompt and close-marker detection across split terminal chunks,
+  macOS/zsh prompts, and local echo escape sequences.
+
 ## 0.2.7 - 2026-05-19
 
 ### Internal Reliability

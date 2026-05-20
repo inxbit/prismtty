@@ -7,6 +7,7 @@
 use crate::config::{CaptureRef, PrismConfig, RuleSpec, RuleStyle};
 use crate::style::{ColorMode, Style};
 use pcre2::bytes::{Regex, RegexBuilder};
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 use thiserror::Error;
 
@@ -65,6 +66,7 @@ pub struct StreamingHighlighter {
 #[derive(Clone, Debug, Default)]
 pub struct BenchmarkReport {
     rules: Vec<RuleBenchmark>,
+    rule_index: HashMap<String, usize>,
 }
 
 /// Timing and match count for one rule description.
@@ -93,21 +95,20 @@ impl BenchmarkReport {
     }
 
     fn record(&mut self, description: &str, duration: Duration, match_count: usize) {
-        if let Some(rule) = self
-            .rules
-            .iter_mut()
-            .find(|rule| rule.description == description)
-        {
-            rule.duration += duration;
-            rule.match_count += match_count;
-            return;
+        if let Some(index) = self.rule_index.get(description).copied() {
+            if let Some(rule) = self.rules.get_mut(index) {
+                rule.duration += duration;
+                rule.match_count += match_count;
+            }
+        } else {
+            let index = self.rules.len();
+            self.rules.push(RuleBenchmark {
+                description: description.to_string(),
+                duration,
+                match_count,
+            });
+            self.rule_index.insert(description.to_string(), index);
         }
-
-        self.rules.push(RuleBenchmark {
-            description: description.to_string(),
-            duration,
-            match_count,
-        });
     }
 }
 
@@ -125,6 +126,13 @@ enum Token {
     Text(Vec<u8>),
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct AnsiChunk {
+    bytes: Vec<u8>,
+    tokens: Vec<Token>,
+    visible: Vec<u8>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ResetMode {
     Full,
@@ -136,6 +144,45 @@ impl Token {
         match self {
             Token::Ansi(bytes) | Token::Text(bytes) => bytes,
         }
+    }
+}
+
+impl AnsiChunk {
+    pub(crate) fn new(bytes: Vec<u8>) -> Self {
+        let tokens = tokenize_ansi(&bytes);
+        let visible = visible_bytes(&tokens);
+        Self {
+            bytes,
+            tokens,
+            visible,
+        }
+    }
+
+    pub(crate) fn from_slice(bytes: &[u8]) -> Self {
+        Self::new(bytes.to_vec())
+    }
+
+    pub(crate) fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    pub(crate) fn visible_bytes(&self) -> &[u8] {
+        &self.visible
+    }
+
+    fn retokenize(&mut self) {
+        self.tokens = tokenize_ansi(&self.bytes);
+        self.visible = visible_bytes(&self.tokens);
+    }
+
+    fn neutralize_oversized_incomplete_escape(&mut self) {
+        if neutralize_oversized_incomplete_escape(&mut self.bytes) {
+            self.retokenize();
+        }
+    }
+
+    fn prefix(&self, len: usize) -> Self {
+        Self::new(self.bytes[..len].to_vec())
     }
 }
 
@@ -249,17 +296,38 @@ impl Highlighter {
         emit_highlighted(&tokens, &styles, self.color_mode, reset_mode, native_sgr)
     }
 
-    fn highlight_bytes_with_interactive_overlay(
+    fn highlight_chunk_with_native_sgr(
         &self,
-        input: &[u8],
+        chunk: &AnsiChunk,
+        benchmark: Option<&mut BenchmarkReport>,
+        reset_mode: ResetMode,
+        native_sgr: &mut NativeSgrState,
+    ) -> Vec<u8> {
+        let styles = self.match_styles(chunk.visible_bytes(), benchmark);
+        emit_highlighted(
+            &chunk.tokens,
+            &styles,
+            self.color_mode,
+            reset_mode,
+            native_sgr,
+        )
+    }
+
+    fn highlight_chunk_with_interactive_overlay(
+        &self,
+        chunk: &AnsiChunk,
         benchmark: Option<&mut BenchmarkReport>,
         native_sgr: &mut NativeSgrState,
         overlay_style: &mut Option<Style>,
     ) -> Vec<u8> {
-        let tokens = tokenize_ansi(input);
-        let visible = visible_bytes(&tokens);
-        let styles = self.match_styles(&visible, benchmark);
-        emit_interactive_highlighted(&tokens, &styles, self.color_mode, native_sgr, overlay_style)
+        let styles = self.match_styles(chunk.visible_bytes(), benchmark);
+        emit_interactive_highlighted(
+            &chunk.tokens,
+            &styles,
+            self.color_mode,
+            native_sgr,
+            overlay_style,
+        )
     }
 }
 
@@ -362,11 +430,23 @@ impl StreamingHighlighter {
 
     /// Pushes a byte chunk and returns highlighted output ready to display.
     pub fn push(&mut self, input: &[u8]) -> Vec<u8> {
+        let chunk = AnsiChunk::from_slice(input);
+        self.push_chunk(&chunk)
+    }
+
+    pub(crate) fn push_chunk(&mut self, chunk: &AnsiChunk) -> Vec<u8> {
         let mut combined = std::mem::take(&mut self.pending);
-        combined.extend_from_slice(input);
-        neutralize_oversized_incomplete_escape(&mut combined);
+        if combined.is_empty() {
+            return self.push_combined_chunk(chunk.clone());
+        }
+        combined.extend_from_slice(chunk.bytes());
+        self.push_combined_chunk(AnsiChunk::new(combined))
+    }
+
+    fn push_combined_chunk(&mut self, mut combined: AnsiChunk) -> Vec<u8> {
+        combined.neutralize_oversized_incomplete_escape();
         let alternate_screen_chunk =
-            self.alternate_screen || contains_alternate_screen_enable(&combined);
+            self.alternate_screen || contains_alternate_screen_enable_tokens(&combined.tokens);
 
         if alternate_screen_chunk {
             self.prompt_echo_passthrough = false;
@@ -375,67 +455,68 @@ impl StreamingHighlighter {
         if self.passthrough_single_byte_chunks
             && !alternate_screen_chunk
             && !self.prompt_echo_passthrough
-            && (contains_prompt_echo_before_lf(&combined)
-                || prompt_echo_has_active_source_sgr(&combined, &self.visible_line_tail))
+            && (contains_prompt_echo_before_lf_visible(combined.visible_bytes())
+                || prompt_echo_has_active_source_sgr(combined.bytes(), &self.visible_line_tail))
         {
-            let Some(prefix_len) = prompt_echo_line_prefix_len(&combined, &self.visible_line_tail)
+            let Some(prefix_len) =
+                prompt_echo_line_prefix_len(combined.bytes(), &self.visible_line_tail)
             else {
-                let output = self.emit_prompt_echo_passthrough(&combined);
-                self.observe_interactive_visible_bytes(&combined);
+                let output = self.emit_prompt_echo_passthrough(combined.bytes());
+                self.observe_interactive_visible_chunk(&AnsiChunk::new(output.clone()));
                 self.prompt_echo_passthrough = true;
                 return output;
             };
 
-            let mut remainder = combined.split_off(prefix_len);
-            let mut output = self.emit_prompt_echo_passthrough(&combined);
-            self.observe_interactive_visible_bytes(&output);
+            let prompt = combined.prefix(prefix_len);
+            let mut remainder = AnsiChunk::new(combined.bytes[prefix_len..].to_vec());
+            let mut output = self.emit_prompt_echo_passthrough(prompt.bytes());
+            self.observe_interactive_visible_chunk(&AnsiChunk::new(output.clone()));
 
-            let split_at = streaming_split_at(&remainder);
-            let pending = remainder.split_off(split_at);
-            self.pending = pending;
+            let split_at = interactive_split_at_chunk(&remainder, false, self.alternate_screen);
+            let processed = split_prepared_pending(&mut remainder, split_at, &mut self.pending);
 
-            output.extend(self.highlight_output_bytes(&remainder));
-            self.observe_interactive_visible_bytes(&remainder);
+            output.extend(self.highlight_output_chunk(&processed));
+            self.observe_interactive_visible_chunk(&processed);
             self.reset_interactive_overlay_after_prompt_tail(&mut output);
             return output;
         }
 
         if self.passthrough_single_byte_chunks && self.prompt_echo_passthrough {
-            let Some(prefix_len) = prompt_echo_line_prefix_len(&combined, &self.visible_line_tail)
+            let Some(prefix_len) =
+                prompt_echo_line_prefix_len(combined.bytes(), &self.visible_line_tail)
             else {
-                let output = self.emit_prompt_echo_passthrough(&combined);
-                self.observe_interactive_visible_bytes(&combined);
+                let output = self.emit_prompt_echo_passthrough(combined.bytes());
+                self.observe_interactive_visible_chunk(&AnsiChunk::new(output.clone()));
                 return output;
             };
 
-            let mut remainder = combined.split_off(prefix_len);
-            let mut output = self.emit_prompt_echo_passthrough(&combined);
-            self.observe_interactive_visible_bytes(&output);
+            let prompt = combined.prefix(prefix_len);
+            let mut remainder = AnsiChunk::new(combined.bytes[prefix_len..].to_vec());
+            let mut output = self.emit_prompt_echo_passthrough(prompt.bytes());
+            self.observe_interactive_visible_chunk(&AnsiChunk::new(output.clone()));
 
-            let split_at = streaming_split_at(&remainder);
-            let pending = remainder.split_off(split_at);
-            self.pending = pending;
+            let split_at = interactive_split_at_chunk(&remainder, false, self.alternate_screen);
+            let processed = split_prepared_pending(&mut remainder, split_at, &mut self.pending);
 
-            output.extend(self.highlight_output_bytes(&remainder));
-            self.observe_interactive_visible_bytes(&remainder);
+            output.extend(self.highlight_output_chunk(&processed));
+            self.observe_interactive_visible_chunk(&processed);
             self.reset_interactive_overlay_after_prompt_tail(&mut output);
             return output;
         }
 
         let split_at = if self.passthrough_single_byte_chunks {
-            interactive_split_at(
+            interactive_split_at_chunk(
                 &combined,
                 self.prompt_echo_passthrough,
                 self.alternate_screen,
             )
         } else {
-            streaming_split_at(&combined)
+            streaming_split_at(combined.bytes())
         };
-        let pending = combined.split_off(split_at);
-        self.pending = pending;
+        let processed = split_prepared_pending(&mut combined, split_at, &mut self.pending);
 
-        let mut output = self.highlight_output_bytes(&combined);
-        self.observe_interactive_visible_bytes(&combined);
+        let mut output = self.highlight_output_chunk(&processed);
+        self.observe_interactive_visible_chunk(&processed);
         self.reset_interactive_overlay_after_prompt_tail(&mut output);
         output
     }
@@ -443,21 +524,22 @@ impl StreamingHighlighter {
     /// Flushes any buffered partial terminal sequence or token.
     pub fn finish(&mut self) -> Vec<u8> {
         let pending = std::mem::take(&mut self.pending);
-        self.highlight_output_bytes(&pending)
+        let pending = AnsiChunk::new(pending);
+        self.highlight_output_chunk(&pending)
     }
 
-    fn highlight_output_bytes(&mut self, input: &[u8]) -> Vec<u8> {
+    fn highlight_output_chunk(&mut self, input: &AnsiChunk) -> Vec<u8> {
         if self.passthrough_single_byte_chunks {
-            self.highlight_interactive_output_bytes(input)
+            self.highlight_interactive_output_chunk(input)
         } else {
-            self.highlight_streaming_bytes(input)
+            self.highlight_streaming_chunk(input)
         }
     }
 
-    fn highlight_interactive_output_bytes(&mut self, input: &[u8]) -> Vec<u8> {
+    fn highlight_interactive_output_chunk(&mut self, input: &AnsiChunk) -> Vec<u8> {
         if !self.alternate_screen
-            && !contains_alternate_screen_enable(input)
-            && contains_cursor_positioning_sequence(input)
+            && !contains_alternate_screen_enable_tokens(&input.tokens)
+            && contains_cursor_positioning_sequence_tokens(&input.tokens)
         {
             return self.emit_cursor_positioning_passthrough(input);
         }
@@ -465,12 +547,13 @@ impl StreamingHighlighter {
         let mut output = Vec::new();
         let mut segment_start = 0;
         let mut idx = 0;
+        let bytes = input.bytes();
 
-        while idx < input.len() {
-            if matches!(input[idx], b'\r' | b'\n') {
-                self.emit_interactive_line_segment(&input[segment_start..idx], &mut output);
-                output.push(input[idx]);
-                if input[idx] == b'\r' && input.get(idx + 1) == Some(&b'\n') {
+        while idx < bytes.len() {
+            if matches!(bytes[idx], b'\r' | b'\n') {
+                self.emit_interactive_line_segment(&bytes[segment_start..idx], &mut output);
+                output.push(bytes[idx]);
+                if bytes[idx] == b'\r' && bytes.get(idx + 1) == Some(&b'\n') {
                     output.push(b'\n');
                     idx += 1;
                 }
@@ -479,31 +562,30 @@ impl StreamingHighlighter {
             idx += 1;
         }
 
-        if segment_start < input.len() {
-            self.emit_interactive_line_segment(&input[segment_start..], &mut output);
+        if segment_start < bytes.len() {
+            self.emit_interactive_line_segment(&bytes[segment_start..], &mut output);
         }
 
         output
     }
 
     fn emit_interactive_line_segment(&mut self, segment: &[u8], output: &mut Vec<u8>) {
-        output.extend(self.highlight_streaming_bytes(segment));
+        output.extend(self.highlight_streaming_chunk(&AnsiChunk::from_slice(segment)));
     }
 
-    fn highlight_streaming_bytes(&mut self, input: &[u8]) -> Vec<u8> {
+    fn highlight_streaming_chunk(&mut self, input: &AnsiChunk) -> Vec<u8> {
         if self.passthrough_single_byte_chunks
             && !self.alternate_screen
-            && !contains_alternate_screen_enable(input)
-            && contains_cursor_positioning_sequence(input)
+            && !contains_alternate_screen_enable_tokens(&input.tokens)
+            && contains_cursor_positioning_sequence_tokens(&input.tokens)
         {
             return self.emit_cursor_positioning_passthrough(input);
         }
 
-        let tokens = tokenize_ansi(input);
         let mut output = Vec::new();
         let mut highlightable = Vec::new();
 
-        for token in tokens {
+        for token in &input.tokens {
             match &token {
                 Token::Ansi(bytes) if is_alternate_screen_enable(bytes) => {
                     self.flush_highlightable(&mut highlightable, &mut output);
@@ -553,64 +635,66 @@ impl StreamingHighlighter {
             return;
         }
 
+        let chunk = AnsiChunk::new(std::mem::take(input));
         if self.passthrough_single_byte_chunks {
-            output.extend(self.highlighter.highlight_bytes_with_interactive_overlay(
-                input,
+            output.extend(self.highlighter.highlight_chunk_with_interactive_overlay(
+                &chunk,
                 self.benchmark.as_mut(),
                 &mut self.native_sgr,
                 &mut self.interactive_overlay,
             ));
         } else {
-            output.extend(
-                self.highlighter
-                    .highlight_bytes_with_benchmark(input, self.benchmark.as_mut()),
-            );
+            output.extend(self.highlighter.highlight_chunk_with_native_sgr(
+                &chunk,
+                self.benchmark.as_mut(),
+                ResetMode::Full,
+                &mut NativeSgrState::default(),
+            ));
         }
-        input.clear();
     }
 
     fn emit_prompt_echo_passthrough(&mut self, input: &[u8]) -> Vec<u8> {
         let output = neutralize_prompt_echo_source_sgr(input, &self.visible_line_tail);
-        self.observe_native_sgr(&output);
+        self.observe_native_sgr_chunk(&AnsiChunk::new(output.clone()));
         output
     }
 
-    fn emit_cursor_positioning_passthrough(&mut self, input: &[u8]) -> Vec<u8> {
+    fn emit_cursor_positioning_passthrough(&mut self, input: &AnsiChunk) -> Vec<u8> {
         let mut output = Vec::new();
         self.reset_interactive_overlay(&mut output);
-        self.observe_native_sgr(input);
-        output.extend_from_slice(input);
+        self.observe_native_sgr_chunk(input);
+        output.extend_from_slice(input.bytes());
         output
     }
 
-    fn observe_native_sgr(&mut self, input: &[u8]) {
-        for token in tokenize_ansi(input) {
+    fn observe_native_sgr_chunk(&mut self, input: &AnsiChunk) {
+        for token in &input.tokens {
             if let Token::Ansi(bytes) = token {
-                self.native_sgr.apply_sequence(&bytes);
+                self.native_sgr.apply_sequence(bytes);
             }
         }
     }
 
-    fn observe_interactive_visible_bytes(&mut self, input: &[u8]) {
+    fn observe_interactive_visible_chunk(&mut self, input: &AnsiChunk) {
         if !self.passthrough_single_byte_chunks {
             return;
         }
 
-        if contains_bracketed_paste_disable(input) {
+        if contains_bracketed_paste_disable_tokens(&input.tokens) {
             self.prompt_echo_passthrough = false;
         }
 
-        let redraws_prompt_echo = redraws_prompt_echo_line_without_prompt(input);
+        let redraws_prompt_echo = redraws_prompt_echo_line_without_prompt_chunk(input);
         let preserves_prompt_echo = self.prompt_echo_passthrough
-            && contains_cursor_positioning_sequence(input)
-            && has_no_printable_visible_bytes(input);
+            && contains_cursor_positioning_sequence_tokens(&input.tokens)
+            && has_no_printable_visible_bytes(input.visible_bytes());
 
         if preserves_prompt_echo {
             return;
         }
 
-        for byte in strip_ansi(input) {
-            match byte {
+        for byte in input.visible_bytes() {
+            match *byte {
                 b'\r' => {
                     let command_echo_was_submitted =
                         contains_prompt_echo_in_visible_line(&self.visible_line_tail);
@@ -1059,8 +1143,7 @@ fn prompt_echo_lf_prefix_len(bytes: &[u8], previous_visible_tail: &[u8]) -> Opti
     None
 }
 
-fn contains_prompt_echo_before_lf(bytes: &[u8]) -> bool {
-    let visible = strip_ansi(bytes);
+fn contains_prompt_echo_before_lf_visible(visible: &[u8]) -> bool {
     let line_end = visible
         .iter()
         .position(|byte| *byte == b'\n')
@@ -1110,18 +1193,18 @@ fn redraws_interactive_prompt_line(bytes: &[u8]) -> bool {
     looks_like_prompt_tail(line) || contains_prompt_echo_in_visible_line(line)
 }
 
-fn redraws_prompt_echo_line_without_prompt(input: &[u8]) -> bool {
-    contains_cursor_positioning_sequence(input) && promptless_line_tail(input)
+fn redraws_prompt_echo_line_without_prompt_chunk(input: &AnsiChunk) -> bool {
+    contains_cursor_positioning_sequence_tokens(&input.tokens)
+        && promptless_line_tail_visible(input.visible_bytes())
 }
 
 fn has_no_printable_visible_bytes(input: &[u8]) -> bool {
-    strip_ansi(input)
+    input
         .iter()
         .all(|byte| matches!(*byte, b'\r' | b'\n' | 0x08))
 }
 
-fn promptless_line_tail(input: &[u8]) -> bool {
-    let visible = strip_ansi(input);
+fn promptless_line_tail_visible(visible: &[u8]) -> bool {
     let line_start = visible
         .iter()
         .rposition(|byte| matches!(*byte, b'\r' | b'\n'))
@@ -1310,9 +1393,9 @@ fn is_alternate_screen_disable(bytes: &[u8]) -> bool {
     alternate_screen_command(bytes) == Some(false)
 }
 
-fn contains_alternate_screen_enable(input: &[u8]) -> bool {
-    tokenize_ansi(input).into_iter().any(|token| match token {
-        Token::Ansi(bytes) => is_alternate_screen_enable(&bytes),
+fn contains_alternate_screen_enable_tokens(tokens: &[Token]) -> bool {
+    tokens.iter().any(|token| match token {
+        Token::Ansi(bytes) => is_alternate_screen_enable(bytes),
         Token::Text(_) => false,
     })
 }
@@ -1334,15 +1417,15 @@ fn alternate_screen_command(bytes: &[u8]) -> Option<bool> {
     has_alternate_screen_mode.then_some(enable)
 }
 
-fn contains_cursor_positioning_sequence(input: &[u8]) -> bool {
-    tokenize_ansi(input).into_iter().any(|token| match token {
-        Token::Ansi(bytes) => is_cursor_positioning_sequence(&bytes),
+fn contains_cursor_positioning_sequence_tokens(tokens: &[Token]) -> bool {
+    tokens.iter().any(|token| match token {
+        Token::Ansi(bytes) => is_cursor_positioning_sequence(bytes),
         Token::Text(_) => false,
     })
 }
 
-fn contains_bracketed_paste_disable(input: &[u8]) -> bool {
-    tokenize_ansi(input).into_iter().any(|token| match token {
+fn contains_bracketed_paste_disable_tokens(tokens: &[Token]) -> bool {
+    tokens.iter().any(|token| match token {
         Token::Ansi(bytes) => bytes == b"\x1b[?2004l",
         Token::Text(_) => false,
     })
@@ -1508,8 +1591,8 @@ fn style_for_reset_mode(style: Style, reset_mode: ResetMode) -> Style {
     match reset_mode {
         ResetMode::Full => style,
         ResetMode::Minimal => Style {
-            foreground: style.foreground,
-            ..Style::default()
+            bold: false,
+            ..style
         },
     }
 }
@@ -1625,15 +1708,16 @@ impl NativeSgrState {
                 49 => self.background = None,
                 38 | 48 => {
                     let is_foreground = codes[idx] == 38;
-                    if let Some((code, consumed)) = parse_extended_color(&codes[idx..]) {
+                    let parsed = parse_extended_color(&codes[idx..]);
+                    if let Some(code) = parsed.code {
                         if is_foreground {
                             self.foreground = Some(code);
                         } else {
                             self.background = Some(code);
                         }
-                        idx += consumed;
-                        continue;
                     }
+                    idx += parsed.consumed;
+                    continue;
                 }
                 _ => {}
             }
@@ -1703,6 +1787,8 @@ impl NativeSgrState {
             && let Some(background) = &self.background
         {
             parts.push(background.clone());
+        } else if style.background.is_some() {
+            parts.push("49".to_string());
         }
 
         if parts.is_empty() {
@@ -1717,17 +1803,53 @@ impl NativeSgrState {
     }
 }
 
-fn parse_extended_color(codes: &[u16]) -> Option<(String, usize)> {
-    match codes {
-        [target @ (38 | 48), 5, color, ..] if *color <= 255 => {
-            Some((format!("{target};5;{color}"), 3))
+struct ExtendedColorParse {
+    code: Option<String>,
+    consumed: usize,
+}
+
+fn parse_extended_color(codes: &[u16]) -> ExtendedColorParse {
+    let Some(target @ (38 | 48)) = codes.first().copied() else {
+        return ExtendedColorParse {
+            code: None,
+            consumed: 1,
+        };
+    };
+
+    match codes.get(1).copied() {
+        Some(5) => {
+            let code = codes
+                .get(2)
+                .copied()
+                .filter(|color| *color <= 255)
+                .map(|color| format!("{target};5;{color}"));
+            ExtendedColorParse {
+                code,
+                consumed: codes.len().min(3),
+            }
         }
-        [target @ (38 | 48), 2, red, green, blue, ..]
-            if *red <= 255 && *green <= 255 && *blue <= 255 =>
-        {
-            Some((format!("{target};2;{red};{green};{blue}"), 5))
+        Some(2) => {
+            let code = match (codes.get(2), codes.get(3), codes.get(4)) {
+                (Some(red), Some(green), Some(blue))
+                    if *red <= 255 && *green <= 255 && *blue <= 255 =>
+                {
+                    Some(format!("{target};2;{red};{green};{blue}"))
+                }
+                _ => None,
+            };
+            ExtendedColorParse {
+                code,
+                consumed: codes.len().min(5),
+            }
         }
-        _ => None,
+        Some(_) => ExtendedColorParse {
+            code: None,
+            consumed: 2,
+        },
+        None => ExtendedColorParse {
+            code: None,
+            consumed: 1,
+        },
     }
 }
 
@@ -1773,36 +1895,39 @@ fn ansi_sequence_end_containing(bytes: &[u8], index: usize) -> Option<usize> {
     None
 }
 
-fn interactive_split_at(
-    bytes: &[u8],
+fn split_prepared_pending(
+    chunk: &mut AnsiChunk,
+    split_at: usize,
+    pending: &mut Vec<u8>,
+) -> AnsiChunk {
+    if split_at >= chunk.bytes.len() {
+        pending.clear();
+        return chunk.clone();
+    }
+
+    *pending = chunk.bytes[split_at..].to_vec();
+    chunk.prefix(split_at)
+}
+
+fn interactive_split_at_chunk(
+    chunk: &AnsiChunk,
     prompt_echo_passthrough: bool,
     alternate_screen: bool,
 ) -> usize {
     if alternate_screen
-        || contains_alternate_screen_enable(bytes)
-        || contains_cursor_positioning_sequence(bytes)
+        || contains_alternate_screen_enable_tokens(&chunk.tokens)
+        || contains_cursor_positioning_sequence_tokens(&chunk.tokens)
         || prompt_echo_passthrough
     {
-        incomplete_escape_start(bytes).unwrap_or(bytes.len())
+        incomplete_escape_start(chunk.bytes()).unwrap_or(chunk.bytes.len())
     } else {
-        streaming_split_at(bytes)
+        streaming_split_at(chunk.bytes())
     }
 }
 
 fn incomplete_escape_start(bytes: &[u8]) -> Option<usize> {
-    let mut search_start = 0usize;
-    while search_start < bytes.len() {
-        let start = search_start
-            + bytes[search_start..]
-                .iter()
-                .position(|byte| *byte == 0x1b)?;
-        if escape_is_incomplete_at(bytes, start) {
-            return Some(start);
-        }
-        search_start = ansi_sequence_end(bytes, start).max(start + 1);
-    }
-
-    None
+    let start = bytes.iter().rposition(|byte| *byte == 0x1b)?;
+    escape_is_incomplete_at(bytes, start).then_some(start)
 }
 
 fn escape_is_incomplete_at(bytes: &[u8], start: usize) -> bool {
@@ -1837,18 +1962,94 @@ fn escape_is_incomplete_at(bytes: &[u8], start: usize) -> bool {
     }
 }
 
-fn neutralize_oversized_incomplete_escape(bytes: &mut [u8]) {
-    let mut search_start = 0usize;
-    while search_start < bytes.len() {
-        let Some(relative_start) = incomplete_escape_start(&bytes[search_start..]) else {
+enum EscapeScan {
+    Complete(usize),
+    IncompleteWithinLimit,
+    IncompleteOversized,
+}
+
+fn neutralize_oversized_incomplete_escape(bytes: &mut [u8]) -> bool {
+    let mut changed = false;
+    let mut idx = 0usize;
+    while idx < bytes.len() {
+        let Some(relative_start) = bytes[idx..].iter().position(|byte| *byte == 0x1b) else {
             break;
         };
-        let start = search_start + relative_start;
-        if bytes.len().saturating_sub(start) <= MAX_INCOMPLETE_ESCAPE_BYTES {
-            break;
+        let start = idx + relative_start;
+        match scan_escape_for_neutralization(bytes, start) {
+            EscapeScan::Complete(end) => idx = end.max(start + 1),
+            EscapeScan::IncompleteWithinLimit => break,
+            EscapeScan::IncompleteOversized => {
+                bytes[start] = b'^';
+                changed = true;
+                idx = start + 1;
+            }
         }
-        bytes[start] = b'^';
-        search_start = start + 1;
+    }
+    changed
+}
+
+fn scan_escape_for_neutralization(bytes: &[u8], start: usize) -> EscapeScan {
+    if start + 1 >= bytes.len() {
+        return incomplete_escape_scan_result(bytes, start);
+    }
+
+    match bytes[start + 1] {
+        b'[' => scan_csi_for_neutralization(bytes, start),
+        b']' => scan_st_terminated_for_neutralization(bytes, start, true),
+        b'P' | b'X' | b'^' | b'_' => scan_st_terminated_for_neutralization(bytes, start, false),
+        b'(' | b')' | b'*' | b'+' | b'-' | b'.' | b'/' | b'#' | b'%' => {
+            if start + 3 <= bytes.len() {
+                EscapeScan::Complete(start + 3)
+            } else {
+                incomplete_escape_scan_result(bytes, start)
+            }
+        }
+        _ => EscapeScan::Complete((start + 2).min(bytes.len())),
+    }
+}
+
+fn scan_csi_for_neutralization(bytes: &[u8], start: usize) -> EscapeScan {
+    let mut idx = start + 2;
+    while idx < bytes.len() {
+        if idx.saturating_sub(start) > MAX_INCOMPLETE_ESCAPE_BYTES {
+            return EscapeScan::IncompleteOversized;
+        }
+        let byte = bytes[idx];
+        idx += 1;
+        if (0x40..=0x7e).contains(&byte) {
+            return EscapeScan::Complete(idx);
+        }
+    }
+    incomplete_escape_scan_result(bytes, start)
+}
+
+fn scan_st_terminated_for_neutralization(
+    bytes: &[u8],
+    start: usize,
+    allows_bel: bool,
+) -> EscapeScan {
+    let mut idx = start + 2;
+    while idx < bytes.len() {
+        if idx.saturating_sub(start) > MAX_INCOMPLETE_ESCAPE_BYTES {
+            return EscapeScan::IncompleteOversized;
+        }
+        if allows_bel && bytes[idx] == 0x07 {
+            return EscapeScan::Complete(idx + 1);
+        }
+        if bytes[idx] == 0x1b && idx + 1 < bytes.len() && bytes[idx + 1] == b'\\' {
+            return EscapeScan::Complete(idx + 2);
+        }
+        idx += 1;
+    }
+    incomplete_escape_scan_result(bytes, start)
+}
+
+fn incomplete_escape_scan_result(bytes: &[u8], start: usize) -> EscapeScan {
+    if bytes.len().saturating_sub(start) > MAX_INCOMPLETE_ESCAPE_BYTES {
+        EscapeScan::IncompleteOversized
+    } else {
+        EscapeScan::IncompleteWithinLimit
     }
 }
 
@@ -1865,4 +2066,95 @@ pub fn strip_ansi(input: &[u8]) -> Vec<u8> {
         }
     }
     stripped
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Highlighter, NativeSgrState, StreamingHighlighter, incomplete_escape_start};
+    use crate::PrismConfig;
+
+    #[test]
+    fn interactive_minimal_reset_keeps_text_attributes_and_backgrounds() {
+        let config = PrismConfig::from_chromaterm_yaml(
+            r##"
+rules:
+  - description: rich state
+    regex: '\bup\b'
+    color: f#00ff00 b#0000ff bold underline
+"##,
+        )
+        .expect("config parses");
+        let highlighter = Highlighter::from_config(config).expect("highlighter builds");
+        let mut streaming = StreamingHighlighter::new_interactive(highlighter);
+
+        let output = String::from_utf8(streaming.push(b"up down\n")).expect("output is utf8");
+
+        assert!(output.contains("\x1b[4;38;2;0;255;0;48;2;0;0;255mup"));
+        assert!(output.contains("\x1b[24;39;49m"));
+    }
+
+    #[test]
+    fn malformed_extended_sgr_color_parameters_are_not_reinterpreted_as_attributes() {
+        let mut state = NativeSgrState::default();
+
+        state.apply_sequence(b"\x1b[38;5m");
+        assert_eq!(state.ansi_start(), None);
+
+        state.apply_sequence(b"\x1b[48;2;3;4m");
+        assert_eq!(state.ansi_start(), None);
+    }
+
+    #[test]
+    fn incomplete_escape_scan_checks_the_suffix_candidate() {
+        assert_eq!(incomplete_escape_start(b"ok\x1b[31mstill\x1b["), Some(12));
+        assert_eq!(incomplete_escape_start(b"ok\x1b[31m"), None);
+    }
+
+    #[test]
+    fn incomplete_escape_scan_uses_reverse_search() {
+        let source = include_str!("highlight.rs");
+        let function_source = source
+            .split("fn incomplete_escape_start")
+            .nth(1)
+            .expect("function exists")
+            .split("fn escape_is_incomplete_at")
+            .next()
+            .expect("function ends before next helper");
+
+        assert!(function_source.contains("rposition"));
+        assert!(!function_source.contains("search_start"));
+        assert!(!function_source.contains(".position(|byte| *byte == 0x1b)"));
+    }
+
+    #[test]
+    fn oversized_escape_neutralization_does_not_repeat_full_incomplete_scans() {
+        let source = include_str!("highlight.rs");
+        let function_source = source
+            .rsplit("fn neutralize_oversized_incomplete_escape")
+            .next()
+            .expect("function exists")
+            .split("fn is_token_continuation")
+            .next()
+            .expect("function ends before next helper");
+
+        assert!(
+            !function_source.contains("while let Some(start) = incomplete_escape_start(bytes)")
+        );
+    }
+
+    #[test]
+    fn streaming_hot_path_reuses_tokenized_helper_checks() {
+        let source = include_str!("highlight.rs");
+        let runtime_source = source.split("#[cfg(test)]").next().unwrap_or(source);
+        let function_source = runtime_source
+            .split("fn highlight_streaming_chunk")
+            .nth(1)
+            .expect("function exists")
+            .split("fn flush_highlightable")
+            .next()
+            .expect("function ends before next helper");
+
+        assert!(!function_source.contains("contains_alternate_screen_enable(input)"));
+        assert!(!function_source.contains("contains_cursor_positioning_sequence(input)"));
+    }
 }

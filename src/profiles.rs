@@ -280,11 +280,15 @@ impl ProfileStore {
     /// Detects likely profiles from a startup sample, always including `generic`.
     pub fn detect_profiles(&self, sample: &str) -> Vec<String> {
         let lower = sample.to_ascii_lowercase();
+        self.detect_profiles_with_lowercase(sample, &lower)
+    }
+
+    pub(crate) fn detect_profiles_with_lowercase(&self, sample: &str, lower: &str) -> Vec<String> {
         let mut detected: Vec<String> = self
             .profiles
             .iter()
             .filter(|(name, profile)| {
-                name.as_str() != "generic" && profile.matches_startup_detection(sample, &lower)
+                name.as_str() != "generic" && profile.matches_startup_detection(sample, lower)
             })
             .map(|(name, _profile)| name.clone())
             .collect();
@@ -304,6 +308,59 @@ impl ProfileStore {
     ) -> Result<(), ConfigError> {
         let mut resolving = Vec::new();
         self.append_profile_rules_inner(profile_name, loaded, &mut resolving, rules)
+    }
+
+    pub(crate) fn top_level_profile_names<'a>(
+        &self,
+        profile_names: &'a [&str],
+    ) -> Result<Vec<&'a str>, ConfigError> {
+        let mut top_level = Vec::new();
+        for candidate in profile_names {
+            let inherited_by_selected = profile_names
+                .iter()
+                .filter(|other| *other != candidate)
+                .try_fold(false, |inherited, other| {
+                    if inherited {
+                        Ok(true)
+                    } else {
+                        self.profile_inherits_profile(other, candidate)
+                    }
+                })?;
+            if !inherited_by_selected {
+                top_level.push(*candidate);
+            }
+        }
+        Ok(top_level)
+    }
+
+    fn profile_inherits_profile(
+        &self,
+        profile_name: &str,
+        ancestor: &str,
+    ) -> Result<bool, ConfigError> {
+        let mut seen = BTreeSet::new();
+        self.profile_inherits_profile_inner(profile_name, ancestor, &mut seen)
+    }
+
+    fn profile_inherits_profile_inner(
+        &self,
+        profile_name: &str,
+        ancestor: &str,
+        seen: &mut BTreeSet<String>,
+    ) -> Result<bool, ConfigError> {
+        if !seen.insert(profile_name.to_string()) {
+            return Ok(false);
+        }
+        let profile = self
+            .profiles
+            .get(profile_name)
+            .ok_or_else(|| ConfigError::UnknownProfile(profile_name.to_string()))?;
+        for parent in &profile.inherits {
+            if parent == ancestor || self.profile_inherits_profile_inner(parent, ancestor, seen)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     fn append_profile_rules_inner(
@@ -331,13 +388,17 @@ impl ProfileStore {
             .ok_or_else(|| ConfigError::UnknownProfile(profile_name.to_string()))?;
 
         resolving.push(profile_name.to_string());
+        let rule_start = rules.len();
+        rules.extend(profile.rules.clone());
         for parent in &profile.inherits {
-            self.append_profile_rules_inner(parent, loaded, resolving, rules)?;
+            if let Err(error) = self.append_profile_rules_inner(parent, loaded, resolving, rules) {
+                rules.truncate(rule_start);
+                resolving.pop();
+                return Err(error);
+            }
         }
         resolving.pop();
-
         loaded.insert(profile.name.clone());
-        rules.extend(profile.rules.clone());
         Ok(())
     }
 
@@ -618,21 +679,36 @@ fn looks_like_unix_prompt(sample: &str) -> bool {
 }
 
 fn looks_like_unix_prompt_line(line: &str) -> bool {
-    let prompt = prompt_token(line);
-    let Some((user, rest)) = prompt.split_once('@') else {
+    let prompt = line
+        .trim_matches(|ch: char| ch.is_ascii_control())
+        .trim_end();
+    let Some(marker) = prompt.rfind(['#', '$', '%']) else {
         return false;
     };
-    let Some((host, tail)) = rest.split_once(':') else {
+    if marker == 0 || marker + 1 != prompt.len() {
+        return false;
+    }
+
+    let marker_byte = prompt.as_bytes()[marker];
+    let body = prompt[..marker].trim_end();
+    let Some(at) = body.rfind('@') else {
         return false;
     };
-    let marker = tail
-        .bytes()
-        .position(|byte| matches!(byte, b'#' | b'$' | b'%'));
+    let user = body[..at].split_whitespace().last().unwrap_or_default();
+    let rest = &body[at + 1..];
+    let host_end = rest
+        .find(|ch: char| ch == ':' || ch.is_ascii_whitespace())
+        .unwrap_or(rest.len());
+    let host = &rest[..host_end];
+    let separator = rest[host_end..].chars().next();
+
     !user.is_empty()
         && !host.is_empty()
-        && marker.is_some()
         && user.bytes().all(is_prompt_name_byte)
         && host.bytes().all(is_prompt_name_byte)
+        && (marker_byte != b'%'
+            || matches!(separator, Some(':'))
+            || rest[host_end..].chars().any(|ch| ch.is_ascii_whitespace()))
 }
 
 fn looks_like_juniper_prompt(sample: &str) -> bool {
@@ -725,7 +801,9 @@ fn is_cisco_prompt_byte(byte: u8) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{ProfileStore, PromptMatcherKind};
+    use crate::config::{PrismConfig, RuleSpec, RuleStyle};
     use crate::highlight::Highlighter;
+    use crate::style::{Rgb, Style};
     use std::collections::BTreeSet;
     use std::fs;
     use std::path::Path;
@@ -779,6 +857,43 @@ mod tests {
         assert!(PromptMatcherKind::AristaHostMarker.matches_startup("leaf01#"));
         assert!(!PromptMatcherKind::PaloAltoUserAtHost.matches_startup("admin@router>"));
         assert!(PromptMatcherKind::PaloAltoUserAtHost.matches_startup("admin@pa-edge>"));
+        assert!(PromptMatcherKind::UnixUserAtHostPath.matches_startup("cdassy@MacBook-Pro ~ %"));
+        assert!(!PromptMatcherKind::UnixUserAtHostPath.matches_startup("admin@mx480%"));
+    }
+
+    #[test]
+    fn child_profile_rules_take_precedence_over_inherited_exclusive_rules() {
+        let mut store = ProfileStore::default();
+        store.insert_profile(
+            "base".to_string(),
+            Vec::new(),
+            Vec::new(),
+            vec![RuleSpec {
+                description: "base catch-all".to_string(),
+                regex: r"\b\w+\b".to_string(),
+                style: RuleStyle::Whole(Style::parse("f#ff0000").expect("base style parses")),
+                exclusive: true,
+            }],
+        );
+        store.insert_profile(
+            "router".to_string(),
+            vec!["base".to_string()],
+            Vec::new(),
+            vec![RuleSpec {
+                description: "router keyword".to_string(),
+                regex: r"\brouter\b".to_string(),
+                style: RuleStyle::Whole(Style::parse("f#0000ff").expect("child style parses")),
+                exclusive: true,
+            }],
+        );
+
+        let config = PrismConfig::from_profiles(&store, &["base", "router"])
+            .expect("profile inheritance resolves");
+        let highlighter = Highlighter::from_config(config).expect("highlighter builds");
+        let spans = highlighter.style_spans(b"router");
+
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].style.foreground, Some(Rgb { r: 0, g: 0, b: 255 }));
     }
 
     #[test]

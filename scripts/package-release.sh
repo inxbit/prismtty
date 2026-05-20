@@ -2,6 +2,13 @@
 set -euo pipefail
 
 target_name="${1:-$(uname -s | tr '[:upper:]' '[:lower:]')-$(uname -m)}"
+case "${target_name}" in
+  darwin-aarch64|darwin-x86_64|linux-x86_64) ;;
+  *)
+    printf 'unsupported release target: %s\n' "${target_name}" >&2
+    exit 1
+    ;;
+esac
 version="$(cargo pkgid | sed 's/.*#//')"
 package="prismtty-${version}-${target_name}"
 dist_dir="dist"
