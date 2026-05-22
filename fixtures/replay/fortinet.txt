@@ -9,3 +9,34 @@ name: port2   mode: dhcp     ip: 0.0.0.0 0.0.0.0            status: down
 FGT-LAB-01 # get router info routing-table all
 S*      0.0.0.0/0 [10/0] via 192.0.2.1, port1
 O       198.51.100.0/24 [110/20] via 192.0.2.2, port1
+FGT-LAB-01 # show firewall policy 1001
+config firewall policy
+    edit 1001
+        set name "allow-docs-to-app"
+        set srcintf "port1"
+        set dstintf "port3"
+        set srcaddr "DOCS-NET"
+        set dstaddr "APP-NET"
+        set action accept
+        set schedule "always"
+        set service "HTTPS"
+        set logtraffic all
+        set nat enable
+    next
+end
+FGT-LAB-01 # get vpn ipsec tunnel summary
+'corp-vpn' 203.0.113.10:4500 selectors(total,up): 1/1 rx(pkt,err): 2048/0 tx(pkt,err): 1980/0
+FGT-LAB-01 # diagnose vpn tunnel list name corp-vpn
+name=corp-vpn ver=2 serial=7 203.0.113.10:4500->198.51.100.20:4500 phase2=corp-vpn-p2
+proxyid_num=1 child_num=1 refcnt=5 ilast=6 olast=4
+stat: rxp=2048 txp=1980 rxb=1452032 txb=1208810
+FGT-LAB-01 # get system ha status
+HA Health Status: OK
+Model: FortiGate-VM64
+Mode: HA A-P
+Group: 7
+Primary: FGT-LAB-01, HA uptime: 12 days
+Secondary: FGT-LAB-02, HA uptime: 12 days
+FGT-LAB-01 # execute log display
+date=2026-05-22 time=20:08:14 devname="FGT-LAB-01" type="traffic" subtype="forward" level="notice" vd="vd-root" srcip=192.0.2.25 dstip=198.51.100.50 policyid=1001 action="accept" service="HTTPS" sentbyte=12640 rcvdbyte=8312
+date=2026-05-22 time=20:08:45 devname="FGT-LAB-01" type="utm" subtype="webfilter" level="warning" vd="vd-root" srcip=192.0.2.26 dstip=203.0.113.77 policyid=1001 action="blocked" msg="synthetic web category block"
