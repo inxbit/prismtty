@@ -35,6 +35,16 @@ fixtures:
       - text: "FortiGate-VM64"
       - text: "192.0.2.10"
         foreground: "#00ffff"
+      - text: "srcintf"
+        foreground: "#ff00ff"
+      - text: "phase2"
+        foreground: "#ff00ff"
+      - text: "utm"
+        foreground: "#ff00ff"
+      - text: "203.0.113.77"
+        foreground: "#00ffff"
+      - text: "blocked"
+        foreground: "#ff0000"
   linux-unix.txt:
     synthetic: true
     expected_profiles: ["generic", "linux-unix"]
