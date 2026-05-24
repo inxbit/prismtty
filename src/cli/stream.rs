@@ -190,19 +190,19 @@ impl<'a> HighlightSession<'a> {
 
     fn rebuild<W: Write>(
         &mut self,
-        writer: &mut W,
-        trace: &IoTrace,
+        _writer: &mut W,
+        _trace: &IoTrace,
         profile_names: Vec<String>,
         report: bool,
     ) -> Result<(), CliError> {
-        self.finish(writer, trace)?;
         self.profile_names = profile_names;
-        self.streaming = Self::streaming_for(
+        let highlighter = build_highlighter_for_profiles_with_store(
             self.options,
             self.store,
             &self.profile_names,
             self.interactive,
         )?;
+        self.streaming.replace_highlighter(highlighter);
         if report {
             self.report_current();
         }
@@ -221,6 +221,7 @@ impl<'a> HighlightSession<'a> {
             highlighter,
             interactive,
             options.benchmark,
+            options.no_minimal_reset,
         ))
     }
 }
@@ -250,8 +251,9 @@ fn new_streaming_highlighter(
     highlighter: Highlighter,
     interactive: bool,
     benchmark: bool,
+    no_minimal_reset: bool,
 ) -> StreamingHighlighter {
-    if interactive && benchmark {
+    let mut streaming = if interactive && benchmark {
         StreamingHighlighter::new_interactive_with_benchmark(highlighter)
     } else if interactive {
         StreamingHighlighter::new_interactive(highlighter)
@@ -259,7 +261,11 @@ fn new_streaming_highlighter(
         StreamingHighlighter::new_with_benchmark(highlighter)
     } else {
         StreamingHighlighter::new(highlighter)
+    };
+    if no_minimal_reset {
+        streaming.set_no_minimal_resets(true);
     }
+    streaming
 }
 
 fn print_benchmark_report(report: Option<&BenchmarkReport>, input_bytes: usize, elapsed_secs: f64) {

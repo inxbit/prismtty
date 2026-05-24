@@ -34,6 +34,7 @@ _prismtty() {
 '--pcre[Accepted for ChromaTerm compatibility; PCRE2 is always used]' \
 '--no-auto-detect[Use only the generic profile unless --profile is set]' \
 '--no-dynamic-profile[Disable profile switching inside wrapped interactive shells]' \
+'--no-minimal-reset[Use full SGR resets instead of minimal foreground/background resets in interactive streams]' \
 '--strip-ansi[Remove existing ANSI before applying PrismTTY styles]' \
 '--show-profile[Print selected profiles to stderr]' \
 '--local-echo[Locally echo typed printable keys for no-echo device sessions]' \

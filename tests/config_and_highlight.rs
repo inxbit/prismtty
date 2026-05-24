@@ -2,6 +2,12 @@ use prismtty::highlight::strip_ansi;
 use prismtty::style::{ColorMode, Rgb, Style};
 use prismtty::{Highlighter, PrismConfig, ProfileStore, StreamingHighlighter};
 
+fn new_interactive_streaming(highlighter: Highlighter) -> StreamingHighlighter {
+    let mut streaming = StreamingHighlighter::new_interactive(highlighter);
+    streaming.set_no_minimal_resets(false);
+    streaming
+}
+
 #[test]
 fn loads_chromaterm_yaml_with_lookarounds_and_capture_styles() {
     let yaml = r##"
@@ -257,7 +263,7 @@ fn interactive_streaming_highlighter_does_not_token_buffer_alternate_screen_chun
     let store = ProfileStore::builtin();
     let config = PrismConfig::from_profiles(&store, &["generic"]).expect("generic loads");
     let highlighter = Highlighter::from_config(config).expect("rules compile");
-    let mut streaming = StreamingHighlighter::new_interactive(highlighter);
+    let mut streaming = new_interactive_streaming(highlighter);
 
     let enter = "\x1b[?1049hPID USER Command";
     let redraw = "\x1b[H1234 admin running";
@@ -271,7 +277,7 @@ fn interactive_streaming_highlighter_buffers_only_incomplete_alternate_screen_es
     let store = ProfileStore::builtin();
     let config = PrismConfig::from_profiles(&store, &["generic"]).expect("generic loads");
     let highlighter = Highlighter::from_config(config).expect("rules compile");
-    let mut streaming = StreamingHighlighter::new_interactive(highlighter);
+    let mut streaming = new_interactive_streaming(highlighter);
 
     let first = streaming.push_str("\x1b[?1049hCPU%\x1b[");
     let second = streaming.push_str("39mPID USER Command");
@@ -285,7 +291,7 @@ fn interactive_streaming_highlighter_preserves_htop_header_sgr_in_alternate_scre
     let store = ProfileStore::builtin();
     let config = PrismConfig::from_profiles(&store, &["generic"]).expect("generic loads");
     let highlighter = Highlighter::from_config(config).expect("rules compile");
-    let mut streaming = StreamingHighlighter::new_interactive(highlighter);
+    let mut streaming = new_interactive_streaming(highlighter);
 
     let enter = "\x1b[?1049h\x1b[1;40r\x1b(B\x1b[m\x1b[4l\x1b[?7h\x1b[?1h\x1b=";
     assert_eq!(streaming.push_str(enter), enter);
@@ -314,7 +320,7 @@ rules:
     )
     .expect("chromaterm config loads");
     let highlighter = Highlighter::from_config(config).expect("rules compile");
-    let mut streaming = StreamingHighlighter::new_interactive(highlighter);
+    let mut streaming = new_interactive_streaming(highlighter);
 
     let enter = "\x1b[?1049h\x1b[1;40r\x1b(B\x1b[m\x1b[?7h";
     assert_eq!(streaming.push_str(enter), enter);
@@ -342,7 +348,7 @@ rules:
     )
     .expect("chromaterm config loads");
     let highlighter = Highlighter::from_config(config).expect("rules compile");
-    let mut streaming = StreamingHighlighter::new_interactive(highlighter);
+    let mut streaming = new_interactive_streaming(highlighter);
 
     let enter = "\x1b[?1049h\x1b[1;40r\x1b(B\x1b[m\x1b[?7h";
     assert_eq!(streaming.push_str(enter), enter);
@@ -820,7 +826,7 @@ fn interactive_streaming_highlighter_does_not_buffer_slow_typed_echoes() {
     let store = ProfileStore::builtin();
     let config = PrismConfig::from_profiles(&store, &["generic"]).expect("generic loads");
     let highlighter = Highlighter::from_config(config).expect("rules compile");
-    let mut streaming = StreamingHighlighter::new_interactive(highlighter);
+    let mut streaming = new_interactive_streaming(highlighter);
 
     assert_eq!(streaming.push_str("router# "), "router# ");
     assert_eq!(streaming.push_str("s"), "s");
@@ -835,7 +841,7 @@ fn interactive_streaming_highlighter_does_not_buffer_coalesced_typed_echoes() {
     let store = ProfileStore::builtin();
     let config = PrismConfig::from_profiles(&store, &["generic"]).expect("generic loads");
     let highlighter = Highlighter::from_config(config).expect("rules compile");
-    let mut streaming = StreamingHighlighter::new_interactive(highlighter);
+    let mut streaming = new_interactive_streaming(highlighter);
 
     assert_eq!(streaming.push_str("router# "), "router# ");
     assert_eq!(streaming.push_str("show"), "show");
@@ -848,7 +854,7 @@ fn interactive_streaming_highlighter_does_not_buffer_unicode_prompt_typed_echoes
     let store = ProfileStore::builtin();
     let config = PrismConfig::from_profiles(&store, &["generic"]).expect("generic loads");
     let highlighter = Highlighter::from_config(config).expect("rules compile");
-    let mut streaming = StreamingHighlighter::new_interactive(highlighter);
+    let mut streaming = new_interactive_streaming(highlighter);
 
     assert_eq!(streaming.push_str("○ "), "○ ");
     assert_eq!(streaming.push_str("m"), "m");
@@ -869,7 +875,7 @@ fn interactive_streaming_highlighter_does_not_buffer_decorative_unicode_prompt_t
     let store = ProfileStore::builtin();
     let config = PrismConfig::from_profiles(&store, &["generic"]).expect("generic loads");
     let highlighter = Highlighter::from_config(config).expect("rules compile");
-    let mut streaming = StreamingHighlighter::new_interactive(highlighter);
+    let mut streaming = new_interactive_streaming(highlighter);
 
     assert_eq!(
         streaming.push_str("\r╭─user at host in ~\r\n╰─○ "),
@@ -889,7 +895,7 @@ fn interactive_streaming_highlighter_keeps_decorative_unicode_prompt_echo_after_
     let store = ProfileStore::builtin();
     let config = PrismConfig::from_profiles(&store, &["generic"]).expect("generic loads");
     let highlighter = Highlighter::from_config(config).expect("rules compile");
-    let mut streaming = StreamingHighlighter::new_interactive(highlighter);
+    let mut streaming = new_interactive_streaming(highlighter);
 
     assert_eq!(streaming.push_str("╰─○ "), "╰─○ ");
     assert_eq!(streaming.push_str("mv old new"), "mv old new");
@@ -906,7 +912,7 @@ fn interactive_streaming_highlighter_does_not_buffer_coalesced_unicode_prompt_ec
     let store = ProfileStore::builtin();
     let config = PrismConfig::from_profiles(&store, &["generic"]).expect("generic loads");
     let highlighter = Highlighter::from_config(config).expect("rules compile");
-    let mut streaming = StreamingHighlighter::new_interactive(highlighter);
+    let mut streaming = new_interactive_streaming(highlighter);
 
     let input = "○ mv ISAD-61576-Security_Switches_Le_Bourget-Hartfors-v1.1.docx ISAD-61576-Security_Switches";
 
@@ -919,7 +925,7 @@ fn interactive_streaming_highlighter_does_not_highlight_coalesced_prompt_and_ech
     let store = ProfileStore::builtin();
     let config = PrismConfig::from_profiles(&store, &["generic"]).expect("generic loads");
     let highlighter = Highlighter::from_config(config).expect("rules compile");
-    let mut streaming = StreamingHighlighter::new_interactive(highlighter);
+    let mut streaming = new_interactive_streaming(highlighter);
 
     let input = "router# show interfaces up down";
     let output = streaming.push_str(input);
@@ -933,7 +939,7 @@ fn interactive_streaming_highlighter_does_not_highlight_long_pasted_echo_before_
     let store = ProfileStore::builtin();
     let config = PrismConfig::from_profiles(&store, &["generic"]).expect("generic loads");
     let highlighter = Highlighter::from_config(config).expect("rules compile");
-    let mut streaming = StreamingHighlighter::new_interactive(highlighter);
+    let mut streaming = new_interactive_streaming(highlighter);
     let paste = "show interfaces up down ".repeat(16);
 
     assert_eq!(streaming.push_str("router# "), "router# ");
@@ -946,7 +952,7 @@ fn interactive_streaming_highlighter_does_not_highlight_ansi_line_edit_echo_befo
     let store = ProfileStore::builtin();
     let config = PrismConfig::from_profiles(&store, &["generic"]).expect("generic loads");
     let highlighter = Highlighter::from_config(config).expect("rules compile");
-    let mut streaming = StreamingHighlighter::new_interactive(highlighter);
+    let mut streaming = new_interactive_streaming(highlighter);
 
     assert_eq!(streaming.push_str("router# "), "router# ");
     let output = streaming.push_str("\x1b[Kup down");
@@ -962,7 +968,7 @@ fn interactive_streaming_highlighter_does_not_highlight_cr_redraw_echo_before_en
     let store = ProfileStore::builtin();
     let config = PrismConfig::from_profiles(&store, &["generic"]).expect("generic loads");
     let highlighter = Highlighter::from_config(config).expect("rules compile");
-    let mut streaming = StreamingHighlighter::new_interactive(highlighter);
+    let mut streaming = new_interactive_streaming(highlighter);
 
     assert_eq!(streaming.push_str("router# "), "router# ");
     let redraw = "\r\x1b[Kup down";
@@ -977,7 +983,7 @@ fn interactive_streaming_highlighter_highlights_device_prompts_without_bold_or_f
     let store = ProfileStore::builtin();
     let config = PrismConfig::from_profiles(&store, &["cisco"]).expect("cisco loads");
     let highlighter = Highlighter::from_config(config).expect("rules compile");
-    let mut streaming = StreamingHighlighter::new_interactive(highlighter);
+    let mut streaming = new_interactive_streaming(highlighter);
 
     let output = streaming.push_str("LAB-N9K-01#");
 
@@ -992,7 +998,7 @@ fn interactive_streaming_highlighter_highlights_trailing_device_prompt_without_f
     let store = ProfileStore::builtin();
     let config = PrismConfig::from_profiles(&store, &["cisco"]).expect("cisco loads");
     let highlighter = Highlighter::from_config(config).expect("rules compile");
-    let mut streaming = StreamingHighlighter::new_interactive(highlighter);
+    let mut streaming = new_interactive_streaming(highlighter);
 
     let output = streaming.push_str("Vlan1107    Plant 3 Shopfloor Device Vlan\nLAB-N9K-01#");
 
@@ -1014,7 +1020,7 @@ fn interactive_streaming_highlighter_highlights_repeated_device_prompts_without_
     let store = ProfileStore::builtin();
     let config = PrismConfig::from_profiles(&store, &["cisco"]).expect("cisco loads");
     let highlighter = Highlighter::from_config(config).expect("rules compile");
-    let mut streaming = StreamingHighlighter::new_interactive(highlighter);
+    let mut streaming = new_interactive_streaming(highlighter);
 
     let output = streaming.push_str("\r\nLAB-N9K-01#\r\nLAB-N9K-01#\r\nLAB-N9K-01#");
 
@@ -1032,7 +1038,7 @@ fn interactive_streaming_highlighter_highlights_question_mark_help_prompt_withou
     let store = ProfileStore::builtin();
     let config = PrismConfig::from_profiles(&store, &["cisco"]).expect("cisco loads");
     let highlighter = Highlighter::from_config(config).expect("rules compile");
-    let mut streaming = StreamingHighlighter::new_interactive(highlighter);
+    let mut streaming = new_interactive_streaming(highlighter);
 
     let output = streaming.push_str("% Type 'show ?' for a list of subcommands\r\nLAB-N9K-01#");
 
@@ -1050,7 +1056,7 @@ fn interactive_streaming_highlighter_keeps_cisco_help_redraw_command_tail_visibl
     let store = ProfileStore::builtin();
     let config = PrismConfig::from_profiles(&store, &["cisco"]).expect("cisco loads");
     let highlighter = Highlighter::from_config(config).expect("rules compile");
-    let mut streaming = StreamingHighlighter::new_interactive(highlighter);
+    let mut streaming = new_interactive_streaming(highlighter);
 
     let _ = streaming.push_str("DORCA-023-DR03A# ");
     assert_eq!(streaming.push_str("sh mac"), "sh mac");
@@ -1072,11 +1078,172 @@ fn interactive_streaming_highlighter_keeps_cisco_help_redraw_command_tail_visibl
 }
 
 #[test]
+fn interactive_streaming_highlighter_keeps_cisco_help_redraw_command_tail_visible_split() {
+    let store = ProfileStore::builtin();
+    let config = PrismConfig::from_profiles(&store, &["cisco"]).expect("cisco loads");
+    let highlighter = Highlighter::from_config(config).expect("rules compile");
+    let mut streaming = new_interactive_streaming(highlighter);
+
+    let _ = streaming.push_str("DORCA-023-DR03A# ");
+    assert_eq!(streaming.push_str("sh mac"), "sh mac");
+
+    // Push the help menu part
+    let help_menu = "?\r\n  mac       MAC configuration commands\r\n  mac-list  Show mac-lists\r\n  mac-move  Display mac-move policy\r\n\r\n";
+    let out1 = streaming.push_str(help_menu);
+    assert_eq!(strip_ansi(out1.as_bytes()), help_menu.as_bytes());
+
+    // Push the cursor positioning sequence
+    let cursor_pos = "\x1b[23D\x1b[J\r";
+    let out2 = streaming.push_str(cursor_pos);
+    assert_eq!(out2, cursor_pos);
+
+    // Push the prompt + command tail
+    let redraw = "DORCA-023-DR03A# sh mac";
+    let out3 = streaming.push_str(redraw);
+    assert_eq!(strip_ansi(out3.as_bytes()), redraw.as_bytes());
+
+    assert!(streaming.finish().is_empty());
+}
+
+#[test]
+fn interactive_streaming_highlighter_keeps_cisco_help_redraw_command_tail_visible_split_2() {
+    let store = ProfileStore::builtin();
+    let config = PrismConfig::from_profiles(&store, &["cisco"]).expect("cisco loads");
+    let highlighter = Highlighter::from_config(config).expect("rules compile");
+    let mut streaming = new_interactive_streaming(highlighter);
+
+    let _ = streaming.push_str("DORCA-023-DR03A# ");
+    assert_eq!(streaming.push_str("sh mac"), "sh mac");
+
+    // Push the help menu part
+    let help_menu = "?\r\n  mac       MAC configuration commands\r\n  mac-list  Show mac-lists\r\n  mac-move  Display mac-move policy\r\n\r\n";
+    let out1 = streaming.push_str(help_menu);
+    assert_eq!(strip_ansi(out1.as_bytes()), help_menu.as_bytes());
+
+    // Push the cursor positioning sequence + prompt
+    let cursor_pos_prompt = "\x1b[23D\x1b[J\rDORCA-023-DR03A# sh ";
+    let out2 = streaming.push_str(cursor_pos_prompt);
+    assert_eq!(strip_ansi(out2.as_bytes()), b"\rDORCA-023-DR03A# sh ");
+
+    // Push the command tail
+    let redraw_tail = "mac";
+    let out3 = streaming.push_str(redraw_tail);
+    assert_eq!(strip_ansi(out3.as_bytes()), redraw_tail.as_bytes());
+
+    assert!(streaming.finish().is_empty());
+}
+
+#[test]
+fn interactive_streaming_highlighter_keeps_cisco_help_redraw_command_tail_visible_split_3() {
+    let store = ProfileStore::builtin();
+    let config = PrismConfig::from_profiles(&store, &["cisco"]).expect("cisco loads");
+    let highlighter = Highlighter::from_config(config).expect("rules compile");
+    let mut streaming = new_interactive_streaming(highlighter);
+
+    let _ = streaming.push_str("DORCA-023-DR03A# ");
+    assert_eq!(streaming.push_str("sh mac"), "sh mac");
+
+    // Push the help menu part
+    let help_menu = "?\r\n  mac       MAC configuration commands\r\n  mac-list  Show mac-lists\r\n  mac-move  Display mac-move policy\r\n\r\n";
+    let out1 = streaming.push_str(help_menu);
+    assert_eq!(strip_ansi(out1.as_bytes()), help_menu.as_bytes());
+
+    // Push the prompt + command tail with only a carriage return redraw
+    let redraw = "\rDORCA-023-DR03A# sh mac";
+    let out2 = streaming.push_str(redraw);
+    assert_eq!(strip_ansi(out2.as_bytes()), redraw.as_bytes());
+
+    assert!(streaming.finish().is_empty());
+}
+
+#[test]
+fn interactive_streaming_highlighter_keeps_cisco_help_redraw_command_tail_visible_split_4() {
+    let store = ProfileStore::builtin();
+    let config = PrismConfig::from_profiles(&store, &["cisco"]).expect("cisco loads");
+    let highlighter = Highlighter::from_config(config).expect("rules compile");
+    let mut streaming = new_interactive_streaming(highlighter);
+
+    let _ = streaming.push_str("Core(config-if)# ");
+    assert_eq!(streaming.push_str("no ip ospf he"), "no ip ospf he");
+
+    // Cisco help response when "?" is typed, ending with a redraw of the prompt and the command tail
+    let help_redraw = "?\r\nhello-interval\r\nCore(config-if)#no ip ospf he";
+    let output = streaming.push_str(help_redraw);
+    let visible = strip_ansi(output.as_bytes());
+
+    assert_eq!(
+        std::str::from_utf8(&visible).unwrap(),
+        "?\r\nhello-interval\r\nCore(config-if)#no ip ospf he"
+    );
+    assert!(streaming.finish().is_empty());
+}
+
+#[test]
+fn interactive_streaming_highlighter_cisco_help_redraw_does_not_leak_colors() {
+    let store = ProfileStore::builtin();
+    let config = PrismConfig::from_profiles(&store, &["cisco"]).expect("cisco loads");
+    let highlighter = Highlighter::from_config(config).expect("rules compile");
+    let mut streaming = new_interactive_streaming(highlighter);
+
+    let _ = streaming.push_str("DORCA-023-DR03(config-if)# ");
+    assert_eq!(streaming.push_str("ip osp"), "ip osp");
+
+    // Cisco help response when "?" is typed after typing "osp":
+    // The OSPF state "FULL" is printed and highlighted orange (color: f#ffa500, which in ansi is \x1b[38;2;255;165;0m)
+    // Then it redraws the prompt.
+    let help_redraw = "?\r\nFULL\r\nDORCA-023-DR03(config-if)#ip osp";
+    let output = streaming.push_str(help_redraw);
+
+    // Let's assert that "FULL" is highlighted in orange (\x1b[38;2;255;165;0m)
+    assert!(
+        output.contains("\x1b[38;2;255;165;0mFULL"),
+        "expected 'FULL' to be highlighted orange, got: {output:?}"
+    );
+
+    // Let's assert that the prompt "DORCA-023-DR03" is reset and does not have the leaked orange color.
+    // The reset sequence should be emitted before the prompt.
+    assert!(
+        output.contains("\x1b[39mDORCA-023-DR03"),
+        "expected reset before prompt to prevent color leakage, got: {output:?}"
+    );
+    assert!(streaming.finish().is_empty());
+}
+
+#[test]
+fn interactive_streaming_highlighter_cisco_help_redraw_uses_full_reset_when_configured() {
+    let store = ProfileStore::builtin();
+    let config = PrismConfig::from_profiles(&store, &["cisco"]).expect("cisco loads");
+    let highlighter = Highlighter::from_config(config).expect("rules compile");
+    let mut streaming = new_interactive_streaming(highlighter);
+    streaming.set_no_minimal_resets(true);
+
+    let _ = streaming.push_str("DORCA-023-DR03(config-if)# ");
+    assert_eq!(streaming.push_str("ip osp"), "ip osp");
+
+    let help_redraw = "?\r\nFULL\r\nDORCA-023-DR03(config-if)#ip osp";
+    let output = streaming.push_str(help_redraw);
+
+    assert!(
+        output.contains("\x1b[38;2;255;165;0mFULL"),
+        "expected 'FULL' to be highlighted orange, got: {output:?}"
+    );
+    assert!(
+        output.contains("\x1b[0mDORCA-023-DR03"),
+        "expected full reset before prompt to prevent color leakage, got: {output:?}"
+    );
+    assert!(
+        !output.contains("\x1b[39mDORCA-023-DR03"),
+        "expected full reset to replace minimal foreground reset, got: {output:?}"
+    );
+    assert!(streaming.finish().is_empty());
+}
+
+#[test]
 fn interactive_streaming_highlighter_highlights_juniper_prompt_without_bold_or_full_reset() {
     let store = ProfileStore::builtin();
     let config = PrismConfig::from_profiles(&store, &["juniper"]).expect("juniper loads");
     let highlighter = Highlighter::from_config(config).expect("rules compile");
-    let mut streaming = StreamingHighlighter::new_interactive(highlighter);
+    let mut streaming = new_interactive_streaming(highlighter);
 
     let output = streaming.push_str("labuser@LAB-WD02>\n");
 
@@ -1093,7 +1260,7 @@ fn interactive_streaming_highlighter_highlights_output_after_cr_only_command_ech
     let store = ProfileStore::builtin();
     let config = PrismConfig::from_profiles(&store, &["cisco"]).expect("cisco loads");
     let highlighter = Highlighter::from_config(config).expect("rules compile");
-    let mut streaming = StreamingHighlighter::new_interactive(highlighter);
+    let mut streaming = new_interactive_streaming(highlighter);
 
     let mut output = String::new();
     output.push_str(&streaming.push_str("LAB-N9K-01# "));
@@ -1114,7 +1281,7 @@ fn interactive_streaming_highlighter_highlights_output_after_pager_clear() {
     let store = ProfileStore::builtin();
     let config = PrismConfig::from_profiles(&store, &["cisco"]).expect("cisco loads");
     let highlighter = Highlighter::from_config(config).expect("rules compile");
-    let mut streaming = StreamingHighlighter::new_interactive(highlighter);
+    let mut streaming = new_interactive_streaming(highlighter);
 
     let mut output = String::new();
     output.push_str(&streaming.push_str("LAB-N9K-01# "));
@@ -1136,7 +1303,7 @@ fn interactive_streaming_highlighter_preserves_zsh_redraws_before_enter() {
     let store = ProfileStore::builtin();
     let config = PrismConfig::from_profiles(&store, &["linux-unix"]).expect("linux profile loads");
     let highlighter = Highlighter::from_config(config).expect("rules compile");
-    let mut streaming = StreamingHighlighter::new_interactive(highlighter);
+    let mut streaming = new_interactive_streaming(highlighter);
 
     assert_eq!(
         streaming.push_str("labuser@mac-lab % "),
@@ -1156,7 +1323,7 @@ fn interactive_streaming_highlighter_does_not_buffer_echoes_after_completion_red
     let store = ProfileStore::builtin();
     let config = PrismConfig::from_profiles(&store, &["linux-unix"]).expect("linux profile loads");
     let highlighter = Highlighter::from_config(config).expect("rules compile");
-    let mut streaming = StreamingHighlighter::new_interactive(highlighter);
+    let mut streaming = new_interactive_streaming(highlighter);
 
     assert_eq!(streaming.push_str("❯ "), "❯ ");
     assert_eq!(streaming.push_str("dig ptt"), "dig ptt");
@@ -1182,7 +1349,7 @@ fn interactive_streaming_highlighter_rearms_echo_after_promptless_completion_red
     let store = ProfileStore::builtin();
     let config = PrismConfig::from_profiles(&store, &["linux-unix"]).expect("linux profile loads");
     let highlighter = Highlighter::from_config(config).expect("rules compile");
-    let mut streaming = StreamingHighlighter::new_interactive(highlighter);
+    let mut streaming = new_interactive_streaming(highlighter);
 
     assert_eq!(streaming.push_str("❯ "), "❯ ");
     assert_eq!(streaming.push_str("ssh man"), "ssh man");
@@ -1203,7 +1370,7 @@ fn interactive_streaming_highlighter_keeps_echo_after_cursor_only_completion_rep
     let store = ProfileStore::builtin();
     let config = PrismConfig::from_profiles(&store, &["linux-unix"]).expect("linux profile loads");
     let highlighter = Highlighter::from_config(config).expect("rules compile");
-    let mut streaming = StreamingHighlighter::new_interactive(highlighter);
+    let mut streaming = new_interactive_streaming(highlighter);
 
     assert_eq!(streaming.push_str("❯ "), "❯ ");
     assert_eq!(streaming.push_str("ping j"), "ping j");
@@ -1226,7 +1393,7 @@ fn interactive_streaming_highlighter_recovers_highlighting_after_progress_cursor
     let store = ProfileStore::builtin();
     let config = PrismConfig::from_profiles(&store, &["linux-unix"]).expect("linux profile loads");
     let highlighter = Highlighter::from_config(config).expect("rules compile");
-    let mut streaming = StreamingHighlighter::new_interactive(highlighter);
+    let mut streaming = new_interactive_streaming(highlighter);
 
     // Multi-line progress output that ends with cursor-up + non-prompt text on
     // the trailing line (e.g., `git pack-objects`-style progress refreshing the
@@ -1250,7 +1417,7 @@ fn interactive_streaming_highlighter_bypasses_fastfetch_cursor_painting() {
     let store = ProfileStore::builtin();
     let config = PrismConfig::from_profiles(&store, &["linux-unix"]).expect("linux profile loads");
     let highlighter = Highlighter::from_config(config).expect("rules compile");
-    let mut streaming = StreamingHighlighter::new_interactive(highlighter);
+    let mut streaming = new_interactive_streaming(highlighter);
 
     let priming = streaming.push_str("192.0.2.1 ");
     assert!(
@@ -1290,7 +1457,7 @@ fn interactive_streaming_highlighter_highlights_promptless_device_chunks() {
     let store = ProfileStore::builtin();
     let config = PrismConfig::from_profiles(&store, &["juniper"]).expect("juniper loads");
     let highlighter = Highlighter::from_config(config).expect("rules compile");
-    let mut streaming = StreamingHighlighter::new_interactive(highlighter);
+    let mut streaming = new_interactive_streaming(highlighter);
 
     let first = streaming.push_str("st0.9");
     let second = streaming.push_str("\n");
@@ -1366,7 +1533,7 @@ fn interactive_streaming_highlighter_keeps_split_cisco_vlan_svis_colored() {
     let store = ProfileStore::builtin();
     let config = PrismConfig::from_profiles(&store, &["cisco"]).expect("cisco loads");
     let highlighter = Highlighter::from_config(config).expect("rules compile");
-    let mut streaming = StreamingHighlighter::new_interactive(highlighter);
+    let mut streaming = new_interactive_streaming(highlighter);
 
     let first = streaming.push_str("Vlan11");
     let second = streaming.push_str("91    New TZ GW to Internal\n");
@@ -1383,7 +1550,7 @@ fn interactive_streaming_highlighter_uses_minimal_resets_for_highlighted_tokens(
     let store = ProfileStore::builtin();
     let config = PrismConfig::from_profiles(&store, &["cisco"]).expect("cisco loads");
     let highlighter = Highlighter::from_config(config).expect("rules compile");
-    let mut streaming = StreamingHighlighter::new_interactive(highlighter);
+    let mut streaming = new_interactive_streaming(highlighter);
 
     let output = streaming.push_str("Eth1/31 suspended\nVl528 up\n");
 
@@ -1399,7 +1566,7 @@ fn interactive_streaming_highlighter_does_not_reset_between_colored_space_separa
     let store = ProfileStore::builtin();
     let config = PrismConfig::from_profiles(&store, &["juniper"]).expect("juniper loads");
     let highlighter = Highlighter::from_config(config).expect("rules compile");
-    let mut streaming = StreamingHighlighter::new_interactive(highlighter);
+    let mut streaming = new_interactive_streaming(highlighter);
 
     let input = "xe-0/0/6.906        up    up   aenet     --> reth6.906\n";
     let output = streaming.push_str(input);
@@ -1428,7 +1595,7 @@ fn interactive_streaming_highlighter_resets_overlay_after_trailing_prompt_segmen
     let store = ProfileStore::builtin();
     let config = PrismConfig::from_profiles(&store, &["juniper"]).expect("juniper loads");
     let highlighter = Highlighter::from_config(config).expect("rules compile");
-    let mut streaming = StreamingHighlighter::new_interactive(highlighter);
+    let mut streaming = new_interactive_streaming(highlighter);
 
     let input = "labuser@LAB-WD02>";
     let output = streaming.push_str(input);
@@ -1446,7 +1613,7 @@ fn interactive_streaming_highlighter_highlights_juniper_prompt_after_empty_enter
     let store = ProfileStore::builtin();
     let config = PrismConfig::from_profiles(&store, &["juniper"]).expect("juniper loads");
     let highlighter = Highlighter::from_config(config).expect("rules compile");
-    let mut streaming = StreamingHighlighter::new_interactive(highlighter);
+    let mut streaming = new_interactive_streaming(highlighter);
 
     let first_prompt = streaming.push_str("labuser@LAB-WD02> ");
     let second_prompt = streaming.push_str("\r\n\r\n{primary:node0}\r\nlabuser@LAB-WD02> ");
@@ -1482,7 +1649,7 @@ xe-0/0/7.491        up    up   aenet     --> reth7.491
     ];
 
     for chunk_size in 1..=17 {
-        let mut streaming = StreamingHighlighter::new_interactive(highlighter.clone());
+        let mut streaming = new_interactive_streaming(highlighter.clone());
         let mut output = String::new();
         for chunk in input.as_bytes().chunks(chunk_size) {
             output.push_str(
@@ -1506,7 +1673,7 @@ fn interactive_streaming_highlighter_does_not_treat_juniper_route_marker_as_prom
     let store = ProfileStore::builtin();
     let config = PrismConfig::from_profiles(&store, &["juniper"]).expect("juniper loads");
     let highlighter = Highlighter::from_config(config).expect("rules compile");
-    let mut streaming = StreamingHighlighter::new_interactive(highlighter);
+    let mut streaming = new_interactive_streaming(highlighter);
 
     let first = streaming.push_str("203.0.113.0/24\n>");
     let second = streaming.push_str(" to 192.0.2.1 via st0.1055\n");
@@ -1530,7 +1697,7 @@ fn interactive_streaming_highlighter_does_not_reemit_same_color_after_newline() 
     let config = PrismConfig::from_profiles(&store, &["juniper"]).expect("juniper loads");
     let highlighter =
         Highlighter::from_config_with_color_mode(config, ColorMode::Ansi16).expect("rules compile");
-    let mut streaming = StreamingHighlighter::new_interactive(highlighter);
+    let mut streaming = new_interactive_streaming(highlighter);
 
     let input = "xe-0/0/7.409        up    up   aenet     --> reth7.409\nxe-0/0/7.491        up    up   aenet     --> reth7.491\n";
     let output = streaming.push_str(input);
@@ -1547,7 +1714,7 @@ fn interactive_streaming_highlighter_does_not_leak_split_ansi16_prefix_as_text()
     let store = ProfileStore::builtin();
     let config = PrismConfig::from_profiles(&store, &["generic"]).expect("generic loads");
     let highlighter = Highlighter::from_config(config).expect("rules compile");
-    let mut streaming = StreamingHighlighter::new_interactive(highlighter);
+    let mut streaming = new_interactive_streaming(highlighter);
 
     let first = streaming.push_str("\x1b[96m192");
     let second = streaming.push_str(".0.2.132/31\n");
@@ -1563,7 +1730,7 @@ fn interactive_streaming_highlighter_does_not_leak_split_truecolor_prefix_as_tex
     let store = ProfileStore::builtin();
     let config = PrismConfig::from_profiles(&store, &["generic"]).expect("generic loads");
     let highlighter = Highlighter::from_config(config).expect("rules compile");
-    let mut streaming = StreamingHighlighter::new_interactive(highlighter);
+    let mut streaming = new_interactive_streaming(highlighter);
 
     let first = streaming.push_str("\x1b[38;2;0;255;255m192");
     let second = streaming.push_str(".0.2.132/31\n");
@@ -1579,7 +1746,7 @@ fn interactive_streaming_highlighter_does_not_emit_default_white_restore_between
     let store = ProfileStore::builtin();
     let config = PrismConfig::from_profiles(&store, &["cisco"]).expect("cisco loads");
     let highlighter = Highlighter::from_config(config).expect("rules compile");
-    let mut streaming = StreamingHighlighter::new_interactive(highlighter);
+    let mut streaming = new_interactive_streaming(highlighter);
 
     let input = "Gi2/13/27   admin down     down\n";
     let output = streaming.push_str(input);
@@ -1603,7 +1770,7 @@ fn interactive_streaming_highlighter_resets_before_unhighlighted_columns() {
     let store = ProfileStore::builtin();
     let config = PrismConfig::from_profiles(&store, &["juniper"]).expect("juniper loads");
     let highlighter = Highlighter::from_config(config).expect("rules compile");
-    let mut streaming = StreamingHighlighter::new_interactive(highlighter);
+    let mut streaming = new_interactive_streaming(highlighter);
 
     let input = "st0.1025        up    up   vpn_MTL-POSTALPRST-I\n";
     let output = streaming.push_str(input);
@@ -1626,7 +1793,7 @@ fn interactive_streaming_highlighter_restores_known_source_foreground_across_chu
     let store = ProfileStore::builtin();
     let config = PrismConfig::from_profiles(&store, &["generic"]).expect("generic loads");
     let highlighter = Highlighter::from_config(config).expect("rules compile");
-    let mut streaming = StreamingHighlighter::new_interactive(highlighter);
+    let mut streaming = new_interactive_streaming(highlighter);
 
     let first = streaming.push_str("\x1b[38;2;200;210;220mpeer ");
     let second = streaming.push_str("192.0.2.1 plain\n");
@@ -1645,7 +1812,7 @@ fn interactive_streaming_highlighter_keeps_arubacx_interface_colored_after_promp
     let store = ProfileStore::builtin();
     let config = PrismConfig::from_profiles(&store, &["arubacx"]).expect("arubacx loads");
     let highlighter = Highlighter::from_config(config).expect("rules compile");
-    let mut streaming = StreamingHighlighter::new_interactive(highlighter);
+    let mut streaming = new_interactive_streaming(highlighter);
 
     let mut output = String::new();
     for chunk in [
@@ -1668,7 +1835,7 @@ fn interactive_streaming_highlighter_does_not_highlight_typed_words_after_prompt
     let store = ProfileStore::builtin();
     let config = PrismConfig::from_profiles(&store, &["generic"]).expect("generic loads");
     let highlighter = Highlighter::from_config(config).expect("rules compile");
-    let mut streaming = StreamingHighlighter::new_interactive(highlighter);
+    let mut streaming = new_interactive_streaming(highlighter);
 
     assert_eq!(streaming.push_str("router# "), "router# ");
     assert_eq!(streaming.push_str("up"), "up");
@@ -1682,7 +1849,7 @@ fn interactive_streaming_highlighter_resets_overlay_after_linux_root_prompt_befo
     let store = ProfileStore::builtin();
     let config = PrismConfig::from_profiles(&store, &["linux-unix"]).expect("linux profile loads");
     let highlighter = Highlighter::from_config(config).expect("rules compile");
-    let mut streaming = StreamingHighlighter::new_interactive(highlighter);
+    let mut streaming = new_interactive_streaming(highlighter);
 
     let mut output = String::new();
     output.push_str(&streaming.push_str("root@server:~# "));
@@ -1700,7 +1867,7 @@ fn interactive_streaming_highlighter_does_not_highlight_fortinet_typed_diagnose_
     let store = ProfileStore::builtin();
     let config = PrismConfig::from_profiles(&store, &["fortinet"]).expect("fortinet loads");
     let highlighter = Highlighter::from_config(config).expect("rules compile");
-    let mut streaming = StreamingHighlighter::new_interactive(highlighter);
+    let mut streaming = new_interactive_streaming(highlighter);
 
     let mut output = String::new();
     output.push_str(&streaming.push_str("command list\r\nFGT01 # "));
@@ -1718,7 +1885,7 @@ fn interactive_streaming_highlighter_neutralizes_source_sgr_on_fortinet_prompt_e
     let store = ProfileStore::builtin();
     let config = PrismConfig::from_profiles(&store, &["fortinet"]).expect("fortinet loads");
     let highlighter = Highlighter::from_config(config).expect("rules compile");
-    let mut streaming = StreamingHighlighter::new_interactive(highlighter);
+    let mut streaming = new_interactive_streaming(highlighter);
 
     let input = concat!(
         "\r         \ron-demand-sniffer         On-demand sniffer command.\r\n",
@@ -1737,7 +1904,7 @@ fn interactive_streaming_highlighter_still_highlights_complete_chunks() {
     let store = ProfileStore::builtin();
     let config = PrismConfig::from_profiles(&store, &["generic"]).expect("generic loads");
     let highlighter = Highlighter::from_config(config).expect("rules compile");
-    let mut streaming = StreamingHighlighter::new_interactive(highlighter);
+    let mut streaming = new_interactive_streaming(highlighter);
 
     let output = streaming.push_str("198.51.100.7 down\n");
 
@@ -1948,4 +2115,27 @@ fn ansi_sequence_end(input: &[u8], start: usize) -> usize {
         }
     }
     idx
+}
+
+#[test]
+fn interactive_streaming_highlighter_preserves_prompt_state_on_profile_rebuild() {
+    let store = ProfileStore::builtin();
+    let config = PrismConfig::from_profiles(&store, &["generic"]).expect("generic loads");
+    let highlighter = Highlighter::from_config(config).expect("rules compile");
+    let mut streaming = new_interactive_streaming(highlighter);
+
+    // 1. Prime the prompt to enable prompt_echo_passthrough
+    assert_eq!(streaming.push_str("router# "), "router# ");
+
+    // 2. Replace the highlighter (simulating rebuild/profile reload)
+    let new_config = PrismConfig::from_profiles(&store, &["cisco"]).expect("cisco loads");
+    let new_highlighter = Highlighter::from_config(new_config).expect("rules compile");
+    streaming.replace_highlighter(new_highlighter);
+
+    // 3. Type characters one by one. If state was preserved, they are not buffered.
+    assert_eq!(streaming.push_str("s"), "s");
+    assert_eq!(streaming.push_str("h"), "h");
+    assert_eq!(streaming.push_str("o"), "o");
+    assert_eq!(streaming.push_str("w"), "w");
+    assert!(streaming.finish().is_empty());
 }
