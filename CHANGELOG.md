@@ -2,6 +2,26 @@
 
 All notable changes to PrismTTY are documented here.
 
+## 1.0.1 - 2026-05-23
+
+### Interactive Rendering
+
+- Add `--no-minimal-reset` plus `PRISMTTY_NO_MINIMAL_RESET` and
+  `PRISMTTY_NO_39_49_RESETS` for terminal emulators that ignore minimal
+  foreground/background reset codes in interactive streams.
+- Reset active PrismTTY styling before Cisco-style help redraws so completed
+  words do not leak highlight color into the prompt or command tail.
+- Preserve Cisco command tails across split help, cursor-positioning, and prompt
+  redraw chunks.
+- Preserve interactive prompt state when dynamic profile rebuilds replace the
+  active highlighter.
+
+### Tests
+
+- Add Cisco redraw regression coverage for command-tail preservation and
+  configurable full-reset behavior.
+- Add Fortinet replay coverage for merged fixture output.
+
 ## 1.0.0 - 2026-05-20
 
 ### Security and Reliability

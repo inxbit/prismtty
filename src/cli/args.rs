@@ -1,3 +1,4 @@
+use std::env;
 use std::ffi::OsString;
 use std::path::PathBuf;
 
@@ -16,6 +17,7 @@ pub(super) struct Options {
     pub(super) show_profile: bool,
     pub(super) local_echo: bool,
     pub(super) no_dynamic_profile: bool,
+    pub(super) no_minimal_reset: bool,
     pub(super) trace_io: Option<PathBuf>,
 }
 
@@ -71,6 +73,8 @@ struct RawArgs {
     no_auto_detect: bool,
     #[arg(long = "no-dynamic-profile", action = ArgAction::SetTrue, help = "Disable profile switching inside wrapped interactive shells")]
     no_dynamic_profile: bool,
+    #[arg(long = "no-minimal-reset", action = ArgAction::SetTrue, help = "Use full SGR resets instead of minimal foreground/background resets in interactive streams")]
+    no_minimal_reset: bool,
     #[arg(long = "strip-ansi", action = ArgAction::SetTrue, help = "Remove existing ANSI before applying PrismTTY styles")]
     strip_ansi: bool,
     #[arg(long = "show-profile", action = ArgAction::SetTrue, help = "Print selected profiles to stderr")]
@@ -124,6 +128,7 @@ pub(super) fn parse_args(args: Vec<OsString>) -> Result<(Options, Action), CliEr
         show_profile: raw.show_profile,
         local_echo: raw.local_echo,
         no_dynamic_profile: raw.no_dynamic_profile,
+        no_minimal_reset: raw.no_minimal_reset || detect_no_minimal_reset_env(),
         trace_io: raw.trace_io,
     };
 
@@ -136,6 +141,11 @@ pub(super) fn parse_args(args: Vec<OsString>) -> Result<(Options, Action), CliEr
     }
 
     Ok((options, Action::Run(raw.command)))
+}
+
+fn detect_no_minimal_reset_env() -> bool {
+    env::var_os("PRISMTTY_NO_MINIMAL_RESET").is_some()
+        || env::var_os("PRISMTTY_NO_39_49_RESETS").is_some()
 }
 
 fn parse_profiles_command(
@@ -317,6 +327,15 @@ mod tests {
             options.profiles,
             vec!["generic".to_string(), "juniper".to_string()]
         );
+        assert_eq!(action, super::Action::Stdin);
+    }
+
+    #[test]
+    fn parser_contract_no_minimal_reset_sets_option() {
+        let (options, action) =
+            super::parse_args(os_args(&["--no-minimal-reset"])).expect("flag parses");
+
+        assert!(options.no_minimal_reset);
         assert_eq!(action, super::Action::Stdin);
     }
 

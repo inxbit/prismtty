@@ -1,6 +1,6 @@
 # Print an optspec for argparse to handle cmd's options that are independent of any subcommand.
 function __fish_prismtty_global_optspecs
-	string join \n h/help V/version b/benchmark r/reload R/rgb pcre no-auto-detect no-dynamic-profile strip-ansi show-profile local-echo trace-io= p/profile= c/config=
+	string join \n h/help V/version b/benchmark r/reload R/rgb pcre no-auto-detect no-dynamic-profile no-minimal-reset strip-ansi show-profile local-echo trace-io= p/profile= c/config=
 end
 
 function __fish_prismtty_needs_command
@@ -35,6 +35,7 @@ complete -c prismtty -n "__fish_prismtty_needs_command" -s R -l rgb -d 'Force RG
 complete -c prismtty -n "__fish_prismtty_needs_command" -l pcre -d 'Accepted for ChromaTerm compatibility; PCRE2 is always used'
 complete -c prismtty -n "__fish_prismtty_needs_command" -l no-auto-detect -d 'Use only the generic profile unless --profile is set'
 complete -c prismtty -n "__fish_prismtty_needs_command" -l no-dynamic-profile -d 'Disable profile switching inside wrapped interactive shells'
+complete -c prismtty -n "__fish_prismtty_needs_command" -l no-minimal-reset -d 'Use full SGR resets instead of minimal foreground/background resets in interactive streams'
 complete -c prismtty -n "__fish_prismtty_needs_command" -l strip-ansi -d 'Remove existing ANSI before applying PrismTTY styles'
 complete -c prismtty -n "__fish_prismtty_needs_command" -l show-profile -d 'Print selected profiles to stderr'
 complete -c prismtty -n "__fish_prismtty_needs_command" -l local-echo -d 'Locally echo typed printable keys for no-echo device sessions'
@@ -46,7 +47,7 @@ complete -c prismtty -n "__fish_prismtty_using_subcommand profiles; and not __fi
 
 # Print an optspec for argparse to handle cmd's options that are independent of any subcommand.
 function __fish_ptty_global_optspecs
-	string join \n h/help V/version b/benchmark r/reload R/rgb pcre no-auto-detect no-dynamic-profile strip-ansi show-profile local-echo trace-io= p/profile= c/config=
+	string join \n h/help V/version b/benchmark r/reload R/rgb pcre no-auto-detect no-dynamic-profile no-minimal-reset strip-ansi show-profile local-echo trace-io= p/profile= c/config=
 end
 
 function __fish_ptty_needs_command
@@ -81,6 +82,7 @@ complete -c ptty -n "__fish_ptty_needs_command" -s R -l rgb -d 'Force RGB color 
 complete -c ptty -n "__fish_ptty_needs_command" -l pcre -d 'Accepted for ChromaTerm compatibility; PCRE2 is always used'
 complete -c ptty -n "__fish_ptty_needs_command" -l no-auto-detect -d 'Use only the generic profile unless --profile is set'
 complete -c ptty -n "__fish_ptty_needs_command" -l no-dynamic-profile -d 'Disable profile switching inside wrapped interactive shells'
+complete -c ptty -n "__fish_ptty_needs_command" -l no-minimal-reset -d 'Use full SGR resets instead of minimal foreground/background resets in interactive streams'
 complete -c ptty -n "__fish_ptty_needs_command" -l strip-ansi -d 'Remove existing ANSI before applying PrismTTY styles'
 complete -c ptty -n "__fish_ptty_needs_command" -l show-profile -d 'Print selected profiles to stderr'
 complete -c ptty -n "__fish_ptty_needs_command" -l local-echo -d 'Locally echo typed printable keys for no-echo device sessions'
@@ -92,7 +94,7 @@ complete -c ptty -n "__fish_ptty_using_subcommand profiles; and not __fish_seen_
 
 # Print an optspec for argparse to handle cmd's options that are independent of any subcommand.
 function __fish_ct_global_optspecs
-	string join \n h/help V/version b/benchmark r/reload R/rgb pcre no-auto-detect no-dynamic-profile strip-ansi show-profile local-echo trace-io= p/profile= c/config=
+	string join \n h/help V/version b/benchmark r/reload R/rgb pcre no-auto-detect no-dynamic-profile no-minimal-reset strip-ansi show-profile local-echo trace-io= p/profile= c/config=
 end
 
 function __fish_ct_needs_command
@@ -127,6 +129,7 @@ complete -c ct -n "__fish_ct_needs_command" -s R -l rgb -d 'Force RGB color outp
 complete -c ct -n "__fish_ct_needs_command" -l pcre -d 'Accepted for ChromaTerm compatibility; PCRE2 is always used'
 complete -c ct -n "__fish_ct_needs_command" -l no-auto-detect -d 'Use only the generic profile unless --profile is set'
 complete -c ct -n "__fish_ct_needs_command" -l no-dynamic-profile -d 'Disable profile switching inside wrapped interactive shells'
+complete -c ct -n "__fish_ct_needs_command" -l no-minimal-reset -d 'Use full SGR resets instead of minimal foreground/background resets in interactive streams'
 complete -c ct -n "__fish_ct_needs_command" -l strip-ansi -d 'Remove existing ANSI before applying PrismTTY styles'
 complete -c ct -n "__fish_ct_needs_command" -l show-profile -d 'Print selected profiles to stderr'
 complete -c ct -n "__fish_ct_needs_command" -l local-echo -d 'Locally echo typed printable keys for no-echo device sessions'

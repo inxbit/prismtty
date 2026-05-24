@@ -8,6 +8,7 @@ use crate::config::{CaptureRef, PrismConfig, RuleSpec, RuleStyle};
 use crate::style::{ColorMode, Style};
 use pcre2::bytes::{Regex, RegexBuilder};
 use std::collections::HashMap;
+use std::env;
 use std::time::{Duration, Instant};
 use thiserror::Error;
 
@@ -59,6 +60,7 @@ pub struct StreamingHighlighter {
     visible_line_tail: Vec<u8>,
     native_sgr: NativeSgrState,
     interactive_overlay: Option<Style>,
+    no_minimal_resets: bool,
     benchmark: Option<BenchmarkReport>,
 }
 
@@ -317,6 +319,7 @@ impl Highlighter {
         &self,
         chunk: &AnsiChunk,
         benchmark: Option<&mut BenchmarkReport>,
+        reset_mode: ResetMode,
         native_sgr: &mut NativeSgrState,
         overlay_style: &mut Option<Style>,
     ) -> Vec<u8> {
@@ -325,6 +328,7 @@ impl Highlighter {
             &chunk.tokens,
             &styles,
             self.color_mode,
+            reset_mode,
             native_sgr,
             overlay_style,
         )
@@ -343,6 +347,7 @@ impl StreamingHighlighter {
             visible_line_tail: Vec::new(),
             native_sgr: NativeSgrState::default(),
             interactive_overlay: None,
+            no_minimal_resets: detect_no_minimal_resets(),
             benchmark: None,
         }
     }
@@ -358,6 +363,7 @@ impl StreamingHighlighter {
             visible_line_tail: Vec::new(),
             native_sgr: NativeSgrState::default(),
             interactive_overlay: None,
+            no_minimal_resets: detect_no_minimal_resets(),
             benchmark: None,
         }
     }
@@ -373,6 +379,7 @@ impl StreamingHighlighter {
             visible_line_tail: Vec::new(),
             native_sgr: NativeSgrState::default(),
             interactive_overlay: None,
+            no_minimal_resets: detect_no_minimal_resets(),
             benchmark: Some(BenchmarkReport::default()),
         }
     }
@@ -388,6 +395,7 @@ impl StreamingHighlighter {
             visible_line_tail: Vec::new(),
             native_sgr: NativeSgrState::default(),
             interactive_overlay: None,
+            no_minimal_resets: detect_no_minimal_resets(),
             benchmark: Some(BenchmarkReport::default()),
         }
     }
@@ -395,6 +403,16 @@ impl StreamingHighlighter {
     /// Returns benchmark data when this stream was created in benchmark mode.
     pub fn benchmark_report(&self) -> Option<&BenchmarkReport> {
         self.benchmark.as_ref()
+    }
+
+    /// Replaces the inner highlighter while preserving streaming and interactive state.
+    pub fn replace_highlighter(&mut self, highlighter: Highlighter) {
+        self.highlighter = highlighter;
+    }
+
+    /// Controls whether interactive highlights use full SGR resets instead of minimal resets.
+    pub fn set_no_minimal_resets(&mut self, value: bool) {
+        self.no_minimal_resets = value;
     }
 
     /// Pushes a UTF-8 chunk and returns highlighted UTF-8 output ready to display.
@@ -450,6 +468,42 @@ impl StreamingHighlighter {
 
         if alternate_screen_chunk {
             self.prompt_echo_passthrough = false;
+        }
+
+        let is_bypassed = !self.alternate_screen
+            && !contains_alternate_screen_enable_tokens(&combined.tokens)
+            && contains_cursor_positioning_sequence_tokens(&combined.tokens);
+
+        if self.passthrough_single_byte_chunks
+            && !alternate_screen_chunk
+            && !is_bypassed
+            && (self.prompt_echo_passthrough
+                || chunk_contains_prompt_echo_anywhere(combined.visible_bytes()))
+        {
+            let bytes = combined.bytes();
+            if let Some(mut boundary_idx) = find_first_line_boundary(bytes) {
+                let mut output = Vec::new();
+                let mut start = 0;
+
+                loop {
+                    output.extend(
+                        self.push_combined_chunk(AnsiChunk::from_slice(
+                            &bytes[start..boundary_idx],
+                        )),
+                    );
+                    start = boundary_idx;
+
+                    let Some(next_boundary) = find_first_line_boundary(&bytes[start..]) else {
+                        break;
+                    };
+                    boundary_idx = start + next_boundary;
+                }
+
+                if start < bytes.len() {
+                    output.extend(self.push_combined_chunk(AnsiChunk::from_slice(&bytes[start..])));
+                }
+                return output;
+            }
         }
 
         if self.passthrough_single_byte_chunks
@@ -637,9 +691,11 @@ impl StreamingHighlighter {
 
         let chunk = AnsiChunk::new(std::mem::take(input));
         if self.passthrough_single_byte_chunks {
+            let reset_mode = self.interactive_reset_mode();
             output.extend(self.highlighter.highlight_chunk_with_interactive_overlay(
                 &chunk,
                 self.benchmark.as_mut(),
+                reset_mode,
                 &mut self.native_sgr,
                 &mut self.interactive_overlay,
             ));
@@ -654,7 +710,12 @@ impl StreamingHighlighter {
     }
 
     fn emit_prompt_echo_passthrough(&mut self, input: &[u8]) -> Vec<u8> {
-        let output = neutralize_prompt_echo_source_sgr(input, &self.visible_line_tail);
+        let mut output = Vec::new();
+        self.reset_interactive_overlay(&mut output);
+        output.extend(neutralize_prompt_echo_source_sgr(
+            input,
+            &self.visible_line_tail,
+        ));
         self.observe_native_sgr_chunk(&AnsiChunk::new(output.clone()));
         output
     }
@@ -743,10 +804,23 @@ impl StreamingHighlighter {
             output.extend(style_reset_bytes(
                 &style,
                 &self.native_sgr,
-                ResetMode::Minimal,
+                self.interactive_reset_mode(),
             ));
         }
     }
+
+    fn interactive_reset_mode(&self) -> ResetMode {
+        if self.no_minimal_resets {
+            ResetMode::Full
+        } else {
+            ResetMode::Minimal
+        }
+    }
+}
+
+fn detect_no_minimal_resets() -> bool {
+    env::var_os("PRISMTTY_NO_39_49_RESETS").is_some()
+        || env::var_os("PRISMTTY_NO_MINIMAL_RESET").is_some()
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1148,7 +1222,13 @@ fn contains_prompt_echo_before_lf_visible(visible: &[u8]) -> bool {
         .iter()
         .position(|byte| *byte == b'\n')
         .unwrap_or(visible.len());
-    contains_prompt_echo_in_visible_line(&visible[..line_end])
+    let sub = &visible[..line_end];
+    let start = sub
+        .iter()
+        .rposition(|byte| *byte == b'\r')
+        .map(|idx| idx + 1)
+        .unwrap_or(0);
+    contains_prompt_echo_in_visible_line(&sub[start..])
 }
 
 fn contains_prompt_echo_in_visible_line(line: &[u8]) -> bool {
@@ -1526,6 +1606,7 @@ fn emit_interactive_highlighted(
     tokens: &[Token],
     styles: &[Option<Style>],
     color_mode: ColorMode,
+    reset_mode: ResetMode,
     native_sgr: &mut NativeSgrState,
     active_style: &mut Option<Style>,
 ) -> Vec<u8> {
@@ -1546,7 +1627,7 @@ fn emit_interactive_highlighted(
                     let wanted = styles
                         .get(visible_pos)
                         .and_then(Clone::clone)
-                        .map(|style| style_for_reset_mode(style, ResetMode::Minimal))
+                        .map(|style| style_for_reset_mode(style, reset_mode))
                         .filter(|style| !style.is_empty());
 
                     match wanted {
@@ -1564,11 +1645,7 @@ fn emit_interactive_highlighted(
                                 let style = active_style
                                     .take()
                                     .expect("active style checked as present");
-                                output.extend(style_reset_bytes(
-                                    &style,
-                                    native_sgr,
-                                    ResetMode::Minimal,
-                                ));
+                                output.extend(style_reset_bytes(&style, native_sgr, reset_mode));
                             }
                             output.push(*byte);
                         }
@@ -1853,6 +1930,53 @@ fn parse_extended_color(codes: &[u16]) -> ExtendedColorParse {
     }
 }
 
+fn find_first_line_boundary(bytes: &[u8]) -> Option<usize> {
+    let mut idx = 0;
+    while idx < bytes.len() {
+        if bytes[idx] == b'\r' {
+            if idx + 1 < bytes.len() && bytes[idx + 1] == b'\n' {
+                if idx + 2 < bytes.len() {
+                    return Some(idx + 2);
+                }
+            } else if idx + 1 < bytes.len() {
+                return Some(idx + 1);
+            }
+        } else if bytes[idx] == b'\n' && idx + 1 < bytes.len() {
+            return Some(idx + 1);
+        }
+        idx += 1;
+    }
+    None
+}
+
+fn chunk_contains_prompt_echo_anywhere(visible: &[u8]) -> bool {
+    let mut line_start = 0;
+    while line_start < visible.len() {
+        let line_end = visible[line_start..]
+            .iter()
+            .position(|&b| b == b'\n' || b == b'\r')
+            .map(|idx| line_start + idx)
+            .unwrap_or(visible.len());
+
+        let line = &visible[line_start..line_end];
+        if contains_prompt_echo_in_visible_line(line) {
+            return true;
+        }
+
+        if line_end == visible.len() {
+            break;
+        }
+        line_start = line_end + 1;
+        if line_end + 1 < visible.len()
+            && visible[line_end] == b'\r'
+            && visible[line_end + 1] == b'\n'
+        {
+            line_start = line_end + 2;
+        }
+    }
+    false
+}
+
 fn streaming_split_at(bytes: &[u8]) -> usize {
     if bytes.is_empty() {
         return 0;
@@ -2086,6 +2210,7 @@ rules:
         .expect("config parses");
         let highlighter = Highlighter::from_config(config).expect("highlighter builds");
         let mut streaming = StreamingHighlighter::new_interactive(highlighter);
+        streaming.set_no_minimal_resets(false);
 
         let output = String::from_utf8(streaming.push(b"up down\n")).expect("output is utf8");
 

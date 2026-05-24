@@ -19,7 +19,7 @@ network-focused built-in profiles.
 
 Website: [prismtty.com](https://prismtty.com/).
 
-Current version: `1.0.0`.
+Current version: `1.0.1`.
 
 ## Quick Demo
 
@@ -99,7 +99,7 @@ sudo apt-get install libpcre2-dev pkg-config
 ### GitHub Release
 
 Prebuilt release archives and checksums are available on the
-[v1.0.0 release page](https://github.com/inxbit/prismtty/releases/tag/v1.0.0).
+[v1.0.1 release page](https://github.com/inxbit/prismtty/releases/tag/v1.0.1).
 
 Each release archive contains the binaries, license/readme files, example
 profiles, shell completions, and a `.tar.gz.sha256` checksum.
@@ -174,6 +174,9 @@ Important options:
 - `--strip-ansi` removes existing ANSI before PrismTTY styles output.
 - `--show-profile` prints profile selections and transitions to stderr.
 - `--local-echo` locally echoes printable typed keys for no-echo device sessions.
+- `--no-minimal-reset` uses full SGR resets in interactive streams for terminal
+  emulators that ignore minimal foreground/background resets. It can also be
+  enabled with `PRISMTTY_NO_MINIMAL_RESET=1` or `PRISMTTY_NO_39_49_RESETS=1`.
 - `--trace-io <file>` appends hex-encoded PTY input/output plus rendered-output diagnostics.
 - `-R, --rgb` forces RGB color output.
 - `--pcre` is accepted for ChromaTerm compatibility; PCRE2 is always used.
