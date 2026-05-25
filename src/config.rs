@@ -29,6 +29,14 @@ pub enum ConfigError {
     /// YAML decoding failed.
     #[error("failed to parse YAML: {0}")]
     Yaml(#[from] serde_norway::Error),
+    /// YAML decoding failed for a specific file.
+    #[error("failed to parse YAML in {path}: {source}")]
+    YamlFile {
+        /// Path that failed to parse.
+        path: PathBuf,
+        /// Underlying YAML parser error.
+        source: serde_norway::Error,
+    },
     /// A requested profile name was not registered.
     #[error("unknown profile '{0}'")]
     UnknownProfile(String),
@@ -155,6 +163,10 @@ impl PrismConfig {
     /// Parses a ChromaTerm-style YAML document into highlighting rules.
     pub fn from_chromaterm_yaml(input: &str) -> Result<Self, ConfigError> {
         let doc: RulesDoc = serde_norway::from_str(input)?;
+        Self::from_rules_doc(doc)
+    }
+
+    fn from_rules_doc(doc: RulesDoc) -> Result<Self, ConfigError> {
         let palette = parse_palette(&doc.palette).map_err(ConfigError::InvalidPalette)?;
         Ok(Self {
             rules: parse_rule_docs(doc.rules, &palette)?,
@@ -169,7 +181,12 @@ impl PrismConfig {
             path: path.to_path_buf(),
             source,
         })?;
-        Self::from_chromaterm_yaml(&input)
+        let doc: RulesDoc =
+            serde_norway::from_str(&input).map_err(|source| ConfigError::YamlFile {
+                path: path.to_path_buf(),
+                source,
+            })?;
+        Self::from_rules_doc(doc)
     }
 
     /// Builds a configuration from registered profiles and their inherited rules.
@@ -209,7 +226,11 @@ pub fn load_profile_file(path: impl AsRef<Path>) -> Result<LoadedProfileFile, Co
         path: path.to_path_buf(),
         source,
     })?;
-    parse_profile_yaml(&input)
+    let doc: RulesDoc = serde_norway::from_str(&input).map_err(|source| ConfigError::YamlFile {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    profile_file_from_doc(doc, ProfileYamlMode::User)
 }
 
 /// Parses native PrismTTY profile YAML from a string.
@@ -255,6 +276,13 @@ fn parse_profile_yaml_with_mode(
     mode: ProfileYamlMode,
 ) -> Result<LoadedProfileFile, ConfigError> {
     let doc: RulesDoc = serde_norway::from_str(input)?;
+    profile_file_from_doc(doc, mode)
+}
+
+fn profile_file_from_doc(
+    doc: RulesDoc,
+    mode: ProfileYamlMode,
+) -> Result<LoadedProfileFile, ConfigError> {
     let mut meta = doc.profile.ok_or(ConfigError::MissingProfileName)?;
     let runtime = meta.runtime.take();
     match mode {
@@ -342,21 +370,41 @@ fn parse_capture_ref(
             };
             Ok(CaptureRef::Index(group as usize))
         }
-        serde_norway::Value::String(name) if name.bytes().all(|byte| byte.is_ascii_digit()) => name
-            .parse::<usize>()
-            .map(CaptureRef::Index)
-            .map_err(|_| ConfigError::InvalidCaptureKey {
-                description: description.to_string(),
-                key: name,
-            }),
-        serde_norway::Value::String(name) if !name.trim().is_empty() => {
-            Ok(CaptureRef::Name(name.to_string()))
-        }
+        serde_norway::Value::String(name) => parse_capture_ref_string(description, name),
         other => Err(ConfigError::InvalidCaptureKey {
             description: description.to_string(),
             key: format!("{other:?}"),
         }),
     }
+}
+
+fn parse_capture_ref_string(description: &str, name: String) -> Result<CaptureRef, ConfigError> {
+    if name.bytes().all(|byte| byte.is_ascii_digit()) {
+        return name.parse::<usize>().map(CaptureRef::Index).map_err(|_| {
+            ConfigError::InvalidCaptureKey {
+                description: description.to_string(),
+                key: name,
+            }
+        });
+    }
+
+    if is_valid_capture_name(&name) {
+        Ok(CaptureRef::Name(name))
+    } else {
+        Err(ConfigError::InvalidCaptureKey {
+            description: description.to_string(),
+            key: name,
+        })
+    }
+}
+
+fn is_valid_capture_name(name: &str) -> bool {
+    let mut bytes = name.bytes();
+    let Some(first) = bytes.next() else {
+        return false;
+    };
+    (first.is_ascii_alphabetic() || first == b'_')
+        && bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
 }
 
 fn parse_style(
@@ -373,7 +421,10 @@ fn parse_style(
 
 #[cfg(test)]
 mod tests {
-    use super::{RESERVED_PROFILE_RUNTIME_MESSAGE, parse_builtin_profile_yaml, parse_profile_yaml};
+    use super::{
+        PrismConfig, RESERVED_PROFILE_RUNTIME_MESSAGE, load_profile_file,
+        parse_builtin_profile_yaml, parse_profile_yaml,
+    };
 
     #[test]
     fn user_profile_runtime_is_reserved() {
@@ -409,5 +460,50 @@ rules: []
         let err = parse_builtin_profile_yaml(yaml).expect_err("unknown prompt matcher should fail");
 
         assert!(err.to_string().contains("mystery_prompt"));
+    }
+
+    #[test]
+    fn chromaterm_file_yaml_errors_include_path() {
+        let file = tempfile::NamedTempFile::new().expect("temp file creates");
+        std::fs::write(file.path(), "rules: [").expect("invalid yaml writes");
+
+        let err = PrismConfig::from_chromaterm_file(file.path())
+            .expect_err("invalid file YAML should fail");
+        let message = err.to_string();
+
+        assert!(message.contains(&file.path().display().to_string()));
+        assert!(message.contains("failed to parse YAML in"));
+    }
+
+    #[test]
+    fn profile_file_yaml_errors_include_path() {
+        let file = tempfile::NamedTempFile::new().expect("temp file creates");
+        std::fs::write(file.path(), "profile: [").expect("invalid yaml writes");
+
+        let err = load_profile_file(file.path()).expect_err("invalid profile YAML should fail");
+        let message = err.to_string();
+
+        assert!(message.contains(&file.path().display().to_string()));
+        assert!(message.contains("failed to parse YAML in"));
+    }
+
+    #[test]
+    fn capture_names_must_match_pcre2_identifier_shape() {
+        let yaml = r#"
+rules:
+  - description: named capture
+    regex: '(?P<name>\w+)'
+    color:
+      _valid_name_1: f#ffffff
+      bad-name: f#ff0000
+"#;
+
+        let err = PrismConfig::from_chromaterm_yaml(yaml)
+            .expect_err("invalid capture name should fail during config parsing");
+
+        assert_eq!(
+            err.to_string(),
+            "rule 'named capture' has invalid capture key: bad-name"
+        );
     }
 }

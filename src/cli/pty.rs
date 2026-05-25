@@ -461,7 +461,11 @@ fn current_pty_size() -> PtySize {
     }
 
     let stdin = io::stdin();
-    pty_size_from_fd(stdin.as_fd()).unwrap_or_default()
+    fallback_pty_size(pty_size_from_fd(stdin.as_fd()))
+}
+
+fn fallback_pty_size(size: Option<PtySize>) -> PtySize {
+    size.unwrap_or_default()
 }
 
 fn pty_size_from_fd(fd: BorrowedFd<'_>) -> Option<PtySize> {
@@ -746,6 +750,19 @@ mod tests {
 
         assert!(runtime_source.contains("SIGWINCH"));
         assert!(!runtime_source.contains("Duration::from_millis(250)"));
+    }
+
+    #[test]
+    fn pty_size_falls_back_to_standard_terminal_dimensions() {
+        assert_eq!(
+            super::fallback_pty_size(None),
+            portable_pty::PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            }
+        );
     }
 
     #[test]

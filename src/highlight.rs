@@ -896,6 +896,7 @@ fn prompt_echo_source_sgr_plan(
     let mut remove_ranges = Vec::new();
     let mut reset_positions = Vec::new();
     let mut line_start = 0usize;
+    let mut line = Vec::new();
 
     while line_start <= visible.len() {
         let line_end = visible[line_start..]
@@ -908,10 +909,12 @@ fn prompt_echo_source_sgr_plan(
                 || contains_prompt_echo_in_visible_line(previous_visible_tail));
 
         if line_start < line_end {
-            let line = visible[line_start..line_end]
-                .iter()
-                .map(|mapped| mapped.byte)
-                .collect::<Vec<_>>();
+            line.clear();
+            line.extend(
+                visible[line_start..line_end]
+                    .iter()
+                    .map(|mapped| mapped.byte),
+            );
             if let Some((sgr_start_visible, command_start_visible)) =
                 prompt_echo_sgr_bounds(&line, first_line_continues_prompt)
             {
@@ -1170,6 +1173,7 @@ fn prompt_echo_cr_prefix_len(bytes: &[u8], previous_visible_tail: &[u8]) -> Opti
 fn prompt_echo_lf_prefix_len(bytes: &[u8], previous_visible_tail: &[u8]) -> Option<usize> {
     let (visible, _) = visible_byte_map_and_ansi_ranges(bytes);
     let mut line_start = 0usize;
+    let mut line = Vec::new();
 
     while line_start <= visible.len() {
         let line_end = visible[line_start..]
@@ -1182,10 +1186,12 @@ fn prompt_echo_lf_prefix_len(bytes: &[u8], previous_visible_tail: &[u8]) -> Opti
                 || contains_prompt_echo_in_visible_line(previous_visible_tail));
 
         let line_has_prompt_echo = if line_start < line_end {
-            let line = visible[line_start..line_end]
-                .iter()
-                .map(|mapped| mapped.byte)
-                .collect::<Vec<_>>();
+            line.clear();
+            line.extend(
+                visible[line_start..line_end]
+                    .iter()
+                    .map(|mapped| mapped.byte),
+            );
             contains_prompt_echo_in_visible_line(&line)
                 || (first_line_continues_prompt
                     && line.iter().any(|byte| !byte.is_ascii_whitespace()))
