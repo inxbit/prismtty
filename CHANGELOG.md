@@ -2,6 +2,25 @@
 
 All notable changes to PrismTTY are documented here.
 
+## 1.0.3 - 2026-05-25
+
+### Configuration
+
+- Include the offending file path when file-loaded ChromaTerm config or
+  PrismTTY profile YAML cannot be parsed.
+- Reject invalid named capture style keys during config parsing, while keeping
+  numeric capture indexes supported.
+
+### Reliability
+
+- Cover PTY size fallback to standard `24x80` dimensions when terminal size
+  detection does not return usable rows and columns.
+
+### Performance
+
+- Reuse prompt-echo line buffers while scanning interactive chunks instead of
+  allocating a temporary vector for each visible line.
+
 ## 1.0.2 - 2026-05-24
 
 ### Maintenance
