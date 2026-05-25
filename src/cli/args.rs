@@ -232,6 +232,30 @@ pub fn completion_command() -> clap::Command {
 #[cfg(test)]
 mod tests {
     use std::ffi::OsString;
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    struct EnvGuard {
+        previous_preferred: Option<OsString>,
+        previous_legacy: Option<OsString>,
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            // SAFETY: tests execute under `ENV_LOCK`, preventing concurrent env races.
+            unsafe {
+                match &self.previous_preferred {
+                    Some(value) => std::env::set_var("PRISMTTY_NO_MINIMAL_RESET", value),
+                    None => std::env::remove_var("PRISMTTY_NO_MINIMAL_RESET"),
+                }
+                match &self.previous_legacy {
+                    Some(value) => std::env::set_var("PRISMTTY_NO_39_49_RESETS", value),
+                    None => std::env::remove_var("PRISMTTY_NO_39_49_RESETS"),
+                }
+            }
+        }
+    }
 
     fn os_args(args: &[&str]) -> Vec<OsString> {
         args.iter().map(OsString::from).collect()
@@ -245,29 +269,84 @@ mod tests {
         }
     }
 
+    fn with_no_minimal_reset_env<R>(value: Option<&str>, test: impl FnOnce() -> R) -> R {
+        let _guard = ENV_LOCK.lock().expect("env lock is never poisoned");
+        let previous_preferred = std::env::var_os("PRISMTTY_NO_MINIMAL_RESET");
+        let previous_legacy = std::env::var_os("PRISMTTY_NO_39_49_RESETS");
+        let guard = EnvGuard {
+            previous_preferred,
+            previous_legacy,
+        };
+
+        if let Some(value) = value {
+            // SAFETY: tests execute under `ENV_LOCK`, preventing concurrent env races.
+            unsafe {
+                std::env::set_var("PRISMTTY_NO_MINIMAL_RESET", value);
+                std::env::remove_var("PRISMTTY_NO_39_49_RESETS");
+            }
+        } else {
+            // SAFETY: tests execute under `ENV_LOCK`, preventing concurrent env races.
+            unsafe {
+                std::env::remove_var("PRISMTTY_NO_MINIMAL_RESET");
+                std::env::remove_var("PRISMTTY_NO_39_49_RESETS");
+            }
+        }
+
+        let result = test();
+        drop(guard);
+        result
+    }
+
+    fn with_legacy_no_minimal_reset_env<R>(value: Option<&str>, test: impl FnOnce() -> R) -> R {
+        let _guard = ENV_LOCK.lock().expect("env lock is never poisoned");
+        let previous_preferred = std::env::var_os("PRISMTTY_NO_MINIMAL_RESET");
+        let previous_legacy = std::env::var_os("PRISMTTY_NO_39_49_RESETS");
+        let guard = EnvGuard {
+            previous_preferred,
+            previous_legacy,
+        };
+
+        // SAFETY: tests execute under `ENV_LOCK`, preventing concurrent env races.
+        unsafe { std::env::remove_var("PRISMTTY_NO_MINIMAL_RESET") };
+
+        if let Some(value) = value {
+            // SAFETY: tests execute under `ENV_LOCK`, preventing concurrent env races.
+            unsafe { std::env::set_var("PRISMTTY_NO_39_49_RESETS", value) };
+        } else {
+            // SAFETY: tests execute under `ENV_LOCK`, preventing concurrent env races.
+            unsafe { std::env::remove_var("PRISMTTY_NO_39_49_RESETS") };
+        }
+
+        let result = test();
+        drop(guard);
+        result
+    }
+
     #[test]
     fn parser_contract_pcre_is_a_true_noop() {
-        let without_pcre = super::parse_args(os_args(&[
-            "--profile",
-            "generic",
-            "--profile",
-            "cisco",
-            "ssh",
-            "r1",
-        ]))
-        .expect("args parse without --pcre");
-        let with_pcre = super::parse_args(os_args(&[
-            "--pcre",
-            "--profile",
-            "generic",
-            "--profile",
-            "cisco",
-            "ssh",
-            "r1",
-        ]))
-        .expect("args parse with --pcre");
+        with_no_minimal_reset_env(None, || {
+            let without_pcre = super::parse_args(os_args(&[
+                "--profile",
+                "generic",
+                "--profile",
+                "cisco",
+                "ssh",
+                "r1",
+            ]))
+            .expect("args parse without --pcre");
+            let with_pcre = super::parse_args(os_args(&[
+                "--pcre",
+                "--profile",
+                "generic",
+                "--profile",
+                "cisco",
+                "ssh",
+                "r1",
+            ]))
+            .expect("args parse with --pcre");
 
-        assert_eq!(with_pcre, without_pcre);
+            assert_eq!(with_pcre, without_pcre);
+        });
     }
 
     #[test]
@@ -340,13 +419,35 @@ mod tests {
     }
 
     #[test]
-    fn parser_contract_reload_short_circuits_and_ignores_later_args() {
-        let (options, action) =
-            super::parse_args(os_args(&["-r", "--profile", "cisco", "ssh", "router"]))
-                .expect("reload parses");
+    fn parser_contract_no_minimal_reset_env_sets_option() {
+        with_no_minimal_reset_env(Some("1"), || {
+            let (options, action) = super::parse_args(os_args(&[])).expect("empty parse");
 
-        assert_eq!(options, super::Options::default());
-        assert_eq!(action, super::Action::Reload);
+            assert!(options.no_minimal_reset);
+            assert_eq!(action, super::Action::Stdin);
+        });
+    }
+
+    #[test]
+    fn parser_contract_legacy_no_minimal_reset_env_sets_option() {
+        with_legacy_no_minimal_reset_env(Some("1"), || {
+            let (options, action) = super::parse_args(os_args(&[])).expect("empty parse");
+
+            assert!(options.no_minimal_reset);
+            assert_eq!(action, super::Action::Stdin);
+        });
+    }
+
+    #[test]
+    fn parser_contract_reload_short_circuits_and_ignores_later_args() {
+        with_no_minimal_reset_env(None, || {
+            let (options, action) =
+                super::parse_args(os_args(&["-r", "--profile", "cisco", "ssh", "router"]))
+                    .expect("reload parses");
+
+            assert_eq!(options, super::Options::default());
+            assert_eq!(action, super::Action::Reload);
+        });
     }
 
     #[test]

@@ -2,6 +2,16 @@
 
 All notable changes to PrismTTY are documented here.
 
+## 1.0.2 - 2026-05-24
+
+### Maintenance
+
+- Stabilize release and parser-path tests by isolating `PRISMTTY_NO_MINIMAL_RESET`
+  and `PRISMTTY_NO_39_49_RESETS` environment state during argument parsing
+  checks.
+- Add deterministic environment restore helpers with explicit lock ordering for
+  test execution safety.
+
 ## 1.0.1 - 2026-05-23
 
 ### Interactive Rendering
