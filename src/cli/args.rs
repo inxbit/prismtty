@@ -101,6 +101,11 @@ struct RawArgs {
 }
 
 pub(super) fn parse_args(args: Vec<OsString>) -> Result<(Options, Action), CliError> {
+    let command_forced_by_delimiter = args
+        .iter()
+        .position(|arg| arg == "--")
+        .and_then(|idx| args.get(idx + 1))
+        .cloned();
     let raw = RawArgs::try_parse_from(std::iter::once(OsString::from("prismtty")).chain(args))
         .map_err(|error| CliError::Usage(error.to_string()))?;
 
@@ -132,7 +137,9 @@ pub(super) fn parse_args(args: Vec<OsString>) -> Result<(Options, Action), CliEr
         trace_io: raw.trace_io,
     };
 
-    if raw.command.first().is_some_and(|arg| arg == "profiles") {
+    if raw.command.first().is_some_and(|arg| arg == "profiles")
+        && command_forced_by_delimiter.as_ref() != raw.command.first()
+    {
         return parse_profiles_command(options, &raw.command[1..]);
     }
 
@@ -366,6 +373,16 @@ mod tests {
 
         assert_eq!(options.profiles, vec!["cisco".to_string()]);
         assert_eq!(action, super::Action::Run(os_args(&["-literal", "--flag"])));
+    }
+
+    #[test]
+    fn parser_contract_double_dash_allows_wrapped_profiles_command() {
+        let (options, action) =
+            super::parse_args(os_args(&["--profile", "cisco", "--", "profiles", "list"]))
+                .expect("double dash command parses");
+
+        assert_eq!(options.profiles, vec!["cisco".to_string()]);
+        assert_eq!(action, super::Action::Run(os_args(&["profiles", "list"])));
     }
 
     #[test]

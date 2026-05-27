@@ -1409,7 +1409,10 @@ fn interactive_streaming_highlighter_recovers_highlighting_after_progress_cursor
         recovered.contains("\x1b[38;2;0;255;255m192.0.2.1"),
         "expected IP highlighting to recover after cursor-positioning progress chunk, got: {recovered:?}"
     );
-    assert!(streaming.finish().is_empty());
+    assert_eq!(
+        String::from_utf8(streaming.finish()).expect("finish output is UTF-8"),
+        "\x1b[39m"
+    );
 }
 
 #[test]
@@ -1900,6 +1903,35 @@ fn interactive_streaming_highlighter_neutralizes_source_sgr_on_fortinet_prompt_e
 }
 
 #[test]
+fn interactive_streaming_highlighter_uses_full_reset_when_neutralizing_prompt_echo_sgr() {
+    let store = ProfileStore::builtin();
+    let config = PrismConfig::from_profiles(&store, &["fortinet"]).expect("fortinet loads");
+    let highlighter = Highlighter::from_config(config).expect("rules compile");
+    let mut streaming = StreamingHighlighter::new_interactive(highlighter);
+    streaming.set_no_minimal_resets(true);
+
+    let input = concat!(
+        "\r         \ron-demand-sniffer         On-demand sniffer command.\r\n",
+        "\r\n \r\n",
+        "\x1b[38;2;255;255;255mFGT01 # ",
+        "\x1b[38;2;255;0;255mdiagnose "
+    );
+    let output = streaming.push_str(input);
+
+    let diagnose_idx = output.find("diagnose").expect("typed command is present");
+    let before_diagnose = &output[..diagnose_idx];
+    assert_eq!(strip_ansi(output.as_bytes()), strip_ansi(input.as_bytes()));
+    assert!(
+        before_diagnose.contains("\x1b[0m"),
+        "expected full reset before typed command: {output:?}"
+    );
+    assert!(
+        !before_diagnose.contains("\x1b[39m"),
+        "minimal foreground reset should not be used with --no-minimal-reset: {output:?}"
+    );
+}
+
+#[test]
 fn interactive_streaming_highlighter_still_highlights_complete_chunks() {
     let store = ProfileStore::builtin();
     let config = PrismConfig::from_profiles(&store, &["generic"]).expect("generic loads");
@@ -1912,6 +1944,65 @@ fn interactive_streaming_highlighter_still_highlights_complete_chunks() {
     assert!(output.contains("\x1b[38;2;255;0;0mdown"));
     assert!(!output.contains("\x1b[1;38;2;255;0;0mdown"));
     assert!(!output.contains("\x1b[0m"), "{output:?}");
+}
+
+#[test]
+fn interactive_streaming_highlighter_resets_active_style_on_finish() {
+    let store = ProfileStore::builtin();
+    let config = PrismConfig::from_profiles(&store, &["generic"]).expect("generic loads");
+    let highlighter = Highlighter::from_config(config).expect("rules compile");
+    let mut streaming = new_interactive_streaming(highlighter);
+
+    let mut output = streaming.push_str("198.51.100.7 down\n");
+    output.push_str(&String::from_utf8(streaming.finish()).expect("finish output is UTF-8"));
+
+    assert_eq!(strip_ansi(output.as_bytes()), b"198.51.100.7 down\n");
+    assert!(output.contains("\x1b[38;2;255;0;0mdown"));
+    assert!(
+        output.ends_with("\x1b[39m") || output.ends_with("\x1b[0m"),
+        "interactive stream should not exit with active style: {output:?}"
+    );
+}
+
+#[test]
+fn interactive_streaming_highlighter_finish_is_empty_when_no_style_is_active() {
+    let store = ProfileStore::builtin();
+    let config = PrismConfig::from_profiles(&store, &["generic"]).expect("generic loads");
+    let highlighter = Highlighter::from_config(config).expect("rules compile");
+    let mut streaming = new_interactive_streaming(highlighter);
+
+    // Prompt echo plus typed text that matches no rule never activates an
+    // interactive overlay style, so there is nothing for finish() to reset.
+    let mut output = streaming.push_str("router# ");
+    output.push_str(&streaming.push_str("show"));
+
+    assert!(
+        !output.contains('\x1b'),
+        "precondition: no interactive style should be emitted: {output:?}"
+    );
+    assert!(
+        streaming.finish().is_empty(),
+        "interactive finish() must emit nothing when no style is active"
+    );
+}
+
+#[test]
+fn noninteractive_streaming_highlighter_finish_does_not_append_interactive_reset() {
+    let store = ProfileStore::builtin();
+    let config = PrismConfig::from_profiles(&store, &["generic"]).expect("generic loads");
+    let highlighter = Highlighter::from_config(config).expect("rules compile");
+    let mut streaming = StreamingHighlighter::new(highlighter);
+
+    // Noninteractive highlighting terminates each styled span with its own
+    // reset, so a complete line leaves nothing buffered: the interactive
+    // end-of-input cleanup reset must not leak into this mode.
+    let output = streaming.push_str("198.51.100.7 down\n");
+
+    assert!(output.contains("\x1b[1;38;2;255;0;0mdown"));
+    assert!(
+        streaming.finish().is_empty(),
+        "noninteractive finish() must not append an interactive cleanup reset"
+    );
 }
 
 #[test]
