@@ -17,3 +17,11 @@ test('privacy scan includes Cargo.lock in sensitive marker checks', () => {
 
   assert.doesNotMatch(script, /:!Cargo\.lock/);
 });
+
+test('release packaging maps macOS arm64 to the published target name', () => {
+  const script = read('scripts/package-release.sh');
+
+  assert.match(script, /default_arch="\$\(uname -m\)"/);
+  assert.match(script, /"\$\{default_arch\}" == "arm64"/);
+  assert.match(script, /default_arch="aarch64"/);
+});

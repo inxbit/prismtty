@@ -2,6 +2,26 @@
 
 All notable changes to PrismTTY are documented here.
 
+## 1.0.5 - 2026-05-27
+
+### Interactive Rendering
+
+- Reset active interactive highlighting when a stream finishes so subsequent
+  terminal output is not left in PrismTTY's foreground color.
+- Honor full-reset mode while neutralizing source SGR sequences in Fortinet
+  prompt echo, instead of always using minimal foreground resets.
+
+### CLI
+
+- Preserve `--` command delimiters when wrapping commands named `profiles`, so
+  `ptty -- profiles ...` runs the command instead of invoking PrismTTY's
+  internal profile subcommand.
+
+### Release
+
+- Map macOS `arm64` hosts to the published `darwin-aarch64` release target when
+  building local release archives without an explicit target argument.
+
 ## 1.0.4 - 2026-05-27
 
 ### Interactive Rendering

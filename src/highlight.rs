@@ -575,11 +575,24 @@ impl StreamingHighlighter {
         output
     }
 
-    /// Flushes any buffered partial terminal sequence or token.
+    /// Flushes any buffered partial terminal sequence or token and returns the
+    /// stream's final bytes.
+    ///
+    /// Callers must write the returned bytes: they are part of the output, not
+    /// optional cleanup. For interactive streams the result may include a
+    /// terminal reset (`ESC[39m`, or `ESC[0m` with minimal resets disabled)
+    /// when a highlight style is still active at end of input, so subsequent
+    /// program output is not left rendered in the highlighter's color. The
+    /// result is empty when nothing is buffered and no style is active.
+    /// Noninteractive streams never append this end-of-input reset.
     pub fn finish(&mut self) -> Vec<u8> {
         let pending = std::mem::take(&mut self.pending);
         let pending = AnsiChunk::new(pending);
-        self.highlight_output_chunk(&pending)
+        let mut output = self.highlight_output_chunk(&pending);
+        if self.passthrough_single_byte_chunks {
+            self.reset_interactive_overlay(&mut output);
+        }
+        output
     }
 
     /// Flushes buffered interactive input echo that is only waiting for a token
@@ -744,6 +757,7 @@ impl StreamingHighlighter {
         output.extend(neutralize_prompt_echo_source_sgr(
             input,
             &self.visible_line_tail,
+            self.interactive_reset_mode(),
         ));
         self.observe_native_sgr_chunk(&AnsiChunk::new(output.clone()));
         output
@@ -865,7 +879,11 @@ struct AnsiRange {
     is_sgr: bool,
 }
 
-fn neutralize_prompt_echo_source_sgr(input: &[u8], previous_visible_tail: &[u8]) -> Vec<u8> {
+fn neutralize_prompt_echo_source_sgr(
+    input: &[u8],
+    previous_visible_tail: &[u8],
+    reset_mode: ResetMode,
+) -> Vec<u8> {
     let (mut remove_ranges, mut reset_positions) =
         prompt_echo_source_sgr_plan(input, previous_visible_tail);
     if remove_ranges.is_empty() {
@@ -884,7 +902,7 @@ fn neutralize_prompt_echo_source_sgr(input: &[u8], previous_visible_tail: &[u8])
 
     while idx < input.len() {
         while reset_positions.get(reset_idx) == Some(&idx) {
-            output.extend_from_slice(b"\x1b[39m");
+            output.extend_from_slice(prompt_echo_source_sgr_reset(reset_mode));
             reset_idx += 1;
         }
 
@@ -901,11 +919,18 @@ fn neutralize_prompt_echo_source_sgr(input: &[u8], previous_visible_tail: &[u8])
     }
 
     while reset_positions.get(reset_idx) == Some(&idx) {
-        output.extend_from_slice(b"\x1b[39m");
+        output.extend_from_slice(prompt_echo_source_sgr_reset(reset_mode));
         reset_idx += 1;
     }
 
     output
+}
+
+fn prompt_echo_source_sgr_reset(reset_mode: ResetMode) -> &'static [u8] {
+    match reset_mode {
+        ResetMode::Full => b"\x1b[0m",
+        ResetMode::Minimal => b"\x1b[39m",
+    }
 }
 
 fn prompt_echo_has_active_source_sgr(input: &[u8], previous_visible_tail: &[u8]) -> bool {

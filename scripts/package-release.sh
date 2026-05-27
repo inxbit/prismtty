@@ -1,7 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-target_name="${1:-$(uname -s | tr '[:upper:]' '[:lower:]')-$(uname -m)}"
+default_arch="$(uname -m)"
+if [[ "${default_arch}" == "arm64" ]]; then
+  default_arch="aarch64"
+fi
+target_name="${1:-$(uname -s | tr '[:upper:]' '[:lower:]')-${default_arch}}"
 case "${target_name}" in
   darwin-aarch64|darwin-x86_64|linux-x86_64) ;;
   *)
