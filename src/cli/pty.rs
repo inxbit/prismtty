@@ -819,6 +819,11 @@ mod tests {
     #[test]
     fn iterm_shell_integration_guard_keeps_environment_for_non_iterm_or_noninteractive() {
         let mut builder = portable_pty::CommandBuilder::new("/bin/zsh");
+        // CommandBuilder seeds itself from the process environment, so clear it
+        // first: otherwise an ambient PRISMTTY_PARENT_* (present when the suite
+        // runs inside a nested prismtty session) would masquerade as output of
+        // the guard under test and fail the is_none() assertions below.
+        builder.env_clear();
         builder.env("TERM_PROGRAM", "iTerm.app");
         builder.env("ITERM_SESSION_ID", "w0t0p0");
 

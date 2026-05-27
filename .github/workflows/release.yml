@@ -29,6 +29,13 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Verify release tag is on main
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          set -euo pipefail
+          git fetch --no-tags --depth=1000 origin +refs/heads/main:refs/remotes/origin/main
+          git merge-base --is-ancestor HEAD origin/main
+
       - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # stable toolchain
         with:
           toolchain: stable
@@ -42,8 +49,19 @@ jobs:
             sudo apt-get install -y libpcre2-dev pkg-config
           fi
 
+      - name: Format check
+        run: cargo fmt --check
+
       - name: Test
         run: cargo test
+
+      - name: Verify generated completions
+        run: |
+          cargo run --features completion-generation --bin gen-completions
+          git diff --exit-code completions/
+
+      - name: Verify static site and release policies
+        run: node --test tests/*.test.mjs
 
       - name: Package
         run: bash scripts/package-release.sh "${{ matrix.target_name }}"
@@ -72,6 +90,12 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
+
+      - name: Verify release tag is on main
+        run: |
+          set -euo pipefail
+          git fetch --no-tags --depth=1000 origin +refs/heads/main:refs/remotes/origin/main
+          git merge-base --is-ancestor HEAD origin/main
 
       - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # stable toolchain
         with:
@@ -111,10 +135,23 @@ jobs:
             test -f "$archive"
             test -f "$checksum"
             grep -E "^[0-9a-f]{64}  prismtty-${version}-${target}\\.tar\\.gz$" "$checksum"
+            (cd "$artifact_dir" && shasum -a 256 -c "$checksum")
           done
 
       - name: Generate Homebrew formula
         run: bash scripts/generate-homebrew-formula.sh "${RUNNER_TEMP}/release-artifacts/prismtty.rb" "${RUNNER_TEMP}/release-artifacts"
+
+      - name: Validate Homebrew formula
+        run: |
+          set -euo pipefail
+          formula="${RUNNER_TEMP}/release-artifacts/prismtty.rb"
+          grep -F "version \"${GITHUB_REF_NAME#v}\"" "$formula"
+          grep -F 'depends_on "pcre2"' "$formula"
+          grep -F "linux-x86_64" "$formula"
+          if grep -n -E "REPLACE_WITH|linux-aarch64" "$formula"; then
+            echo "Generated Homebrew formula has placeholder checksums or unsupported artifacts."
+            exit 1
+          fi
 
       - name: Attest release artifacts
         uses: actions/attest@59d89421af93a897026c735860bf21b6eb4f7b26 # v4.1.0

@@ -582,6 +582,35 @@ impl StreamingHighlighter {
         self.highlight_output_chunk(&pending)
     }
 
+    /// Flushes buffered interactive input echo that is only waiting for a token
+    /// boundary, while keeping an incomplete trailing escape sequence buffered.
+    ///
+    /// Interactive callers should invoke this when no more input is immediately
+    /// available (for example after a keystroke-sized read) so typed characters
+    /// surface promptly instead of staying buffered until the next byte completes
+    /// a token. It is a no-op for noninteractive streams, where speculative
+    /// token buffering is required for correct highlighting.
+    pub(crate) fn flush_buffered_echo(&mut self) -> Vec<u8> {
+        if !self.passthrough_single_byte_chunks || self.pending.is_empty() {
+            return Vec::new();
+        }
+
+        // Keep only a trailing incomplete escape buffered; its completing bytes
+        // arrive in the same burst and emitting a partial escape corrupts output.
+        let flush_len = incomplete_escape_start(&self.pending).unwrap_or(self.pending.len());
+        if flush_len == 0 {
+            return Vec::new();
+        }
+
+        let mut flushed = std::mem::take(&mut self.pending);
+        self.pending = flushed.split_off(flush_len);
+        let processed = AnsiChunk::new(flushed);
+        let mut output = self.highlight_output_chunk(&processed);
+        self.observe_interactive_visible_chunk(&processed);
+        self.reset_interactive_overlay_after_prompt_tail(&mut output);
+        output
+    }
+
     fn highlight_output_chunk(&mut self, input: &AnsiChunk) -> Vec<u8> {
         if self.passthrough_single_byte_chunks {
             self.highlight_interactive_output_chunk(input)
@@ -2222,6 +2251,83 @@ rules:
 
         assert!(output.contains("\x1b[4;38;2;0;255;0;48;2;0;0;255mup"));
         assert!(output.contains("\x1b[24;39;49m"));
+    }
+
+    #[test]
+    fn interactive_flush_buffered_echo_surfaces_colon_prompt_typed_characters() {
+        // Reproduces the interactive echo bug: at a colon/menu-style prompt that
+        // the detector does not recognise (e.g. useradd's "Full Name []:" or a
+        // 1/2/3 menu), a typed character is buffered as an incomplete token and
+        // stays invisible until another byte arrives. flush_buffered_echo surfaces
+        // it once the input source goes idle (a keystroke-sized read with nothing
+        // following).
+        let highlighter =
+            Highlighter::from_config(PrismConfig::default()).expect("empty config compiles");
+        let mut streaming = StreamingHighlighter::new_interactive(highlighter);
+
+        assert_eq!(streaming.push_str("Full Name []: "), "Full Name []: ");
+
+        // The keystroke is held back by the streaming token buffer (the bug).
+        assert_eq!(streaming.push_str("1"), "");
+        // Going idle surfaces the buffered echo from that push, not a later one.
+        assert_eq!(
+            String::from_utf8(streaming.flush_buffered_echo()).expect("echo is UTF-8"),
+            "1"
+        );
+
+        // A second keystroke behaves identically.
+        assert_eq!(streaming.push_str("j"), "");
+        assert_eq!(
+            String::from_utf8(streaming.flush_buffered_echo()).expect("echo is UTF-8"),
+            "j"
+        );
+
+        // Nothing remains buffered.
+        assert!(streaming.finish().is_empty());
+    }
+
+    #[test]
+    fn flush_buffered_echo_never_emits_a_partial_escape_sequence() {
+        let highlighter =
+            Highlighter::from_config(PrismConfig::default()).expect("empty config compiles");
+        let mut streaming = StreamingHighlighter::new_interactive(highlighter);
+
+        assert_eq!(streaming.push_str("Choice []: "), "Choice []: ");
+        // A read that ends mid escape sequence leaves only the partial escape buffered.
+        assert_eq!(streaming.push_str("\x1b["), "");
+        // An idle flush must keep the incomplete escape buffered, never emit it raw.
+        assert!(streaming.flush_buffered_echo().is_empty());
+        // The completing bytes produce the full sequence.
+        assert_eq!(streaming.push_str("0m"), "\x1b[0m");
+        assert!(streaming.finish().is_empty());
+    }
+
+    #[test]
+    fn flush_buffered_echo_is_noop_for_noninteractive_streams() {
+        let config = PrismConfig::from_chromaterm_yaml(
+            r##"
+rules:
+  - description: documentation IPv4 addresses
+    regex: '\b192\.0\.2\.\d+\b'
+    color: f#00ffff
+"##,
+        )
+        .expect("config parses");
+        let highlighter = Highlighter::from_config(config).expect("rules compile");
+        let mut streaming = StreamingHighlighter::new(highlighter);
+
+        // Noninteractive streaming speculatively buffers a partial token so a token
+        // split across reads is still highlighted as a unit.
+        assert_eq!(streaming.push_str("ip 192.0."), "ip ");
+        // An echo flush must not disturb noninteractive token buffering.
+        assert!(streaming.flush_buffered_echo().is_empty());
+        // The rest of the token completes and is highlighted as a single span.
+        let mut output = String::from("ip ");
+        output.push_str(&streaming.push_str("2.1\n"));
+        assert!(
+            output.contains("\x1b[38;2;0;255;255m192.0.2.1\x1b[0m"),
+            "{output:?}"
+        );
     }
 
     #[test]
