@@ -2,6 +2,28 @@
 
 All notable changes to PrismTTY are documented here.
 
+## 1.0.4 - 2026-05-27
+
+### Interactive Rendering
+
+- Flush buffered typed-character echo after keystroke-sized interactive reads
+  so colon and menu prompts surface input immediately without weakening
+  token buffering for replay or noninteractive streams.
+- Preserve incomplete trailing escape sequences during the interactive echo
+  flush so partial CSI controls are not emitted as raw terminal bytes.
+
+### Release Security
+
+- Require tag-triggered releases to prove the tag commit is on `main`, verify
+  downloaded artifact checksums before attestation/publish, and include
+  `Cargo.lock` in privacy scans for sensitive local markers.
+
+### Tests
+
+- Add regression coverage for colon-prompt typed echo, noninteractive token
+  buffering, partial escape preservation, and nested-session iTerm guard
+  environment assertions.
+
 ## 1.0.3 - 2026-05-25
 
 ### Configuration

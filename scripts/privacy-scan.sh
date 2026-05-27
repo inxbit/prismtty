@@ -4,7 +4,6 @@ set -euo pipefail
 path_pattern='(/Users|/home)/[^[:space:]"<>]+/(Desktop|Documents|Downloads)|(^|[^[:alnum:]_/.-])Desktop/[A-Za-z0-9_.-]+\.(txt|log|trace|pcap|pcapng|cfg|conf)'
 host_pattern='(^|[^[:alnum:]_.-])[A-Za-z0-9][A-Za-z0-9.-]*\.(corp|internal|lab|lan|local|localdomain)(\.[A-Za-z0-9.-]+)?([^[:alnum:]_.-]|$)'
 exclude=(
-  ':!Cargo.lock'
   ':!.github/workflows/ci.yml'
   ':!scripts/privacy-scan.sh'
 )
@@ -39,7 +38,6 @@ allowed_netmasks = {
     "255.255.255.252",
 }
 exclude = [
-    ":!Cargo.lock",
     ":!scripts/privacy-scan.sh",
 ]
 result = subprocess.run(

@@ -19,6 +19,11 @@ use super::trace::IoTrace;
 
 const AUTO_DETECT_SAMPLE_LIMIT: usize = 64 * 1024;
 
+/// Largest read still treated as interactive keystroke echo. Bulk program output
+/// arrives in much larger reads, so only tiny reads trigger an echo flush; that
+/// keeps cross-read token highlighting intact for streamed output.
+const INTERACTIVE_ECHO_FLUSH_MAX_READ: usize = 8;
+
 pub(super) fn highlight_stream<R: Read, W: Write>(
     mut reader: R,
     writer: &mut W,
@@ -62,6 +67,9 @@ pub(super) fn highlight_stream<R: Read, W: Write>(
         session.switch_profiles(writer, &trace, next_profile_names)?;
     }
     session.push(writer, &trace, &first_chunk)?;
+    if should_flush_input_echo(interactive, read) {
+        session.flush_input_echo(writer, &trace)?;
+    }
     writer.flush()?;
 
     loop {
@@ -99,6 +107,9 @@ pub(super) fn highlight_stream<R: Read, W: Write>(
             session.reload(writer, &trace)?;
         }
         session.push(writer, &trace, &chunk)?;
+        if should_flush_input_echo(interactive, read) {
+            session.flush_input_echo(writer, &trace)?;
+        }
         writer.flush()?;
     }
 
@@ -176,6 +187,15 @@ impl<'a> HighlightSession<'a> {
         chunk: &AnsiChunk,
     ) -> Result<(), CliError> {
         write_rendered(writer, trace, self.streaming.push_chunk(chunk))?;
+        Ok(())
+    }
+
+    fn flush_input_echo<W: Write>(
+        &mut self,
+        writer: &mut W,
+        trace: &IoTrace,
+    ) -> Result<(), CliError> {
+        write_rendered(writer, trace, self.streaming.flush_buffered_echo())?;
         Ok(())
     }
 
@@ -299,6 +319,10 @@ fn prepare_chunk(input: &[u8], strip_existing_ansi: bool) -> AnsiChunk {
     }
 }
 
+fn should_flush_input_echo(interactive: bool, read: usize) -> bool {
+    interactive && read <= INTERACTIVE_ECHO_FLUSH_MAX_READ
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -308,5 +332,22 @@ mod tests {
 
         assert!(!runtime_source.contains("let visible_chunk = strip_ansi(chunk)"));
         assert!(runtime_source.contains("visible_bytes()"));
+    }
+
+    #[test]
+    fn input_echo_flush_targets_only_small_interactive_reads() {
+        // Keystroke-sized interactive reads flush buffered echo promptly.
+        assert!(super::should_flush_input_echo(true, 1));
+        assert!(super::should_flush_input_echo(
+            true,
+            super::INTERACTIVE_ECHO_FLUSH_MAX_READ
+        ));
+        // Bulk interactive reads keep speculative token buffering for highlighting.
+        assert!(!super::should_flush_input_echo(
+            true,
+            super::INTERACTIVE_ECHO_FLUSH_MAX_READ + 1
+        ));
+        // Noninteractive streams never force an early echo flush.
+        assert!(!super::should_flush_input_echo(false, 1));
     }
 }
