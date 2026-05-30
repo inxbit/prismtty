@@ -7,6 +7,9 @@ rules:
   - description: CustomOS interface
     regex: '\bcust\d+/\d+\b'
     color: f#00ffff bold
+  # Role words like "primary" or "standby" appear in plenty of unrelated
+  # output, so anchor the rule to its HA context instead of matching the bare
+  # word; otherwise every "primary uplink" line would light up.
   - description: CustomOS HA role
-    regex: '(?i)\b(primary|secondary|standby)\b'
+    regex: '(?i)\bha (?:role|state): (primary|secondary|standby)\b'
     color: f#ffff00

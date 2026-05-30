@@ -145,25 +145,6 @@ fn ensure_private_pid_dir(dir: &Path) -> io::Result<PathBuf> {
     Ok(path)
 }
 
-#[cfg(not(unix))]
-fn ensure_private_pid_dir(dir: &Path) -> io::Result<PathBuf> {
-    let path = dir.join(PID_DIR_NAME);
-    match fs::metadata(&path) {
-        Ok(metadata) if metadata.is_dir() => {}
-        Ok(metadata) if metadata.is_file() => fs::remove_file(&path)?,
-        Ok(_) => {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("runtime pid path is not a directory: {}", path.display()),
-            ));
-        }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error),
-    }
-    fs::create_dir_all(&path)?;
-    Ok(path)
-}
-
 #[cfg(unix)]
 fn reload_marker_time(path: &Path) -> Option<SystemTime> {
     let metadata = fs::symlink_metadata(path).ok()?;
@@ -171,13 +152,6 @@ fn reload_marker_time(path: &Path) -> Option<SystemTime> {
         return None;
     }
     metadata.modified().ok()
-}
-
-#[cfg(not(unix))]
-fn reload_marker_time(path: &Path) -> Option<SystemTime> {
-    fs::metadata(path)
-        .and_then(|metadata| metadata.modified())
-        .ok()
 }
 
 #[cfg(unix)]
@@ -215,11 +189,6 @@ fn ensure_private_runtime_dir(dir: &Path) -> io::Result<()> {
     Ok(())
 }
 
-#[cfg(not(unix))]
-fn ensure_private_runtime_dir(dir: &Path) -> io::Result<()> {
-    fs::create_dir_all(dir)
-}
-
 #[cfg(unix)]
 fn write_private_file(path: &Path, contents: &[u8]) -> io::Result<()> {
     let mut file = OpenOptions::new()
@@ -231,11 +200,6 @@ fn write_private_file(path: &Path, contents: &[u8]) -> io::Result<()> {
         .open(path)?;
     ensure_private_runtime_file(&file, path)?;
     file.write_all(contents)
-}
-
-#[cfg(not(unix))]
-fn write_private_file(path: &Path, contents: &[u8]) -> io::Result<()> {
-    fs::write(path, contents)
 }
 
 #[cfg(unix)]

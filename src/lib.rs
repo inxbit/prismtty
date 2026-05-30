@@ -3,6 +3,12 @@
 //! This crate exposes the configuration parser, bundled profile store, style
 //! model, and highlighters used by the `prismtty`, `ptty`, and `ct` binaries.
 
+#[cfg(not(unix))]
+compile_error!(
+    "PrismTTY targets Unix-like platforms only: it requires a PTY, termios, and POSIX signals. \
+     On Windows, run it under WSL."
+);
+
 /// Command-line entry point and CLI error type.
 pub mod cli;
 /// Configuration loading and profile YAML parsing.
