@@ -2230,3 +2230,311 @@ fn interactive_streaming_highlighter_preserves_prompt_state_on_profile_rebuild()
     assert_eq!(streaming.push_str("w"), "w");
     assert!(streaming.finish().is_empty());
 }
+
+// AUDIT H1: real syslog tags (preceded by SOL/space/colon) must be highlighted.
+#[test]
+fn generic_syslog_severity_tags_are_highlighted() {
+    let store = ProfileStore::builtin();
+    let config = PrismConfig::from_profiles(&store, &["generic"]).expect("generic loads");
+    let highlighter = Highlighter::from_config(config).expect("rules compile");
+    let output = highlighter
+        .highlight_str("%LINK-3-UPDOWN: changed\n%SYS-5-CONFIG_I done\n%OSPF-6-ADJCHG seen\n");
+
+    assert!(
+        output.contains("\x1b[1;38;2;255;51;51m%LINK-3-UPDOWN\x1b[0m"),
+        "syslog severe tag not highlighted: {output:?}"
+    );
+    assert!(
+        output.contains("\x1b[38;2;255;255;0m%SYS-5-CONFIG_I\x1b[0m"),
+        "syslog warning tag not highlighted: {output:?}"
+    );
+    assert!(
+        output.contains("\x1b[38;2;101;215;253m%OSPF-6-ADJCHG\x1b[0m"),
+        "syslog info tag not highlighted: {output:?}"
+    );
+}
+
+// AUDIT M9: BGP transient/fault states (Active, Connect) must keep the Versa
+// blue and not be repainted green by the inherited generic good-state rule.
+#[test]
+fn versa_bgp_transient_states_stay_blue_over_generic_good_state() {
+    let store = ProfileStore::builtin();
+    let config = PrismConfig::from_profiles(&store, &["versa"]).expect("versa loads");
+    let highlighter = Highlighter::from_config(config).expect("rules compile");
+    let output = highlighter.highlight_str("Peer1 Active\nPeer2 Connect\n");
+
+    assert!(
+        output.contains("\x1b[1;38;2;77;166;255mActive\x1b[0m"),
+        "versa BGP 'Active' should stay blue, not generic green: {output:?}"
+    );
+    assert!(
+        output.contains("\x1b[1;38;2;77;166;255mConnect\x1b[0m"),
+        "versa BGP 'Connect' should stay blue, not generic green: {output:?}"
+    );
+}
+
+// AUDIT M11: systemd states must be colored by health, not all green.
+#[test]
+fn linux_systemd_states_are_colored_by_health() {
+    let store = ProfileStore::builtin();
+    let config = PrismConfig::from_profiles(&store, &["linux-unix"]).expect("linux-unix loads");
+    let highlighter = Highlighter::from_config(config).expect("rules compile");
+    let output = highlighter.highlight_str("svc-a active\nsvc-b dead\nsvc-c masked\n");
+
+    assert!(
+        output.contains("\x1b[38;2;0;255;0mactive\x1b[0m"),
+        "healthy 'active' should stay green: {output:?}"
+    );
+    assert!(
+        output.contains("\x1b[1;38;2;255;0;0mdead\x1b[0m"),
+        "'dead' should be red, not green: {output:?}"
+    );
+    assert!(
+        output.contains("\x1b[38;2;255;255;0mmasked\x1b[0m"),
+        "'masked' should be yellow, not green: {output:?}"
+    );
+}
+
+// AUDIT M12: log priority levels must be colored by severity; info/notice/debug
+// are informational (not warnings) and severe levels are red.
+#[test]
+fn linux_log_priority_levels_are_colored_by_severity() {
+    let store = ProfileStore::builtin();
+    let config = PrismConfig::from_profiles(&store, &["linux-unix"]).expect("linux-unix loads");
+    let highlighter = Highlighter::from_config(config).expect("rules compile");
+    let output = highlighter.highlight_str("level info here\nlevel warn here\nlevel emerg here\n");
+
+    assert!(
+        output.contains("\x1b[38;2;101;215;253minfo\x1b[0m"),
+        "'info' should be info-cyan, not warning-yellow: {output:?}"
+    );
+    assert!(
+        output.contains("\x1b[38;2;255;255;0mwarn\x1b[0m"),
+        "'warn' should stay yellow: {output:?}"
+    );
+    assert!(
+        output.contains("\x1b[1;38;2;255;0;0memerg\x1b[0m"),
+        "'emerg' should be severe-red: {output:?}"
+    );
+}
+
+// AUDIT M4: misspelled/unknown keys in user config must be rejected, not
+// silently dropped.
+#[test]
+fn unknown_top_level_config_key_is_rejected() {
+    let yaml = "rule:\n  - regex: foo\n    color: f#ff0000\n";
+    assert!(
+        PrismConfig::from_chromaterm_yaml(yaml).is_err(),
+        "misspelled top-level key 'rule' (vs 'rules') should be rejected"
+    );
+}
+
+#[test]
+fn unknown_rule_field_is_rejected() {
+    let yaml = "rules:\n  - regex: foo\n    color: f#ff0000\n    colour: red\n";
+    assert!(
+        PrismConfig::from_chromaterm_yaml(yaml).is_err(),
+        "misspelled rule field 'colour' (vs 'color') should be rejected"
+    );
+}
+
+// AUDIT L5: Cisco BGP transient states must stay blue (same class as Versa M9).
+#[test]
+fn cisco_bgp_transient_states_stay_blue_over_generic_good_state() {
+    let store = ProfileStore::builtin();
+    let config = PrismConfig::from_profiles(&store, &["cisco"]).expect("cisco loads");
+    let highlighter = Highlighter::from_config(config).expect("rules compile");
+    let output = highlighter.highlight_str("Neighbor1 Active\nNeighbor2 Connect\n");
+
+    assert!(
+        output.contains("\x1b[1;38;2;77;166;255mActive\x1b[0m"),
+        "cisco BGP 'Active' should stay blue, not generic green: {output:?}"
+    );
+    assert!(
+        output.contains("\x1b[1;38;2;77;166;255mConnect\x1b[0m"),
+        "cisco BGP 'Connect' should stay blue, not generic green: {output:?}"
+    );
+}
+
+// AUDIT M1: a byte-mode match boundary inside a multibyte char must not make
+// highlight_str panic; style spans snap to UTF-8 char boundaries.
+#[test]
+fn highlight_str_does_not_panic_on_match_boundary_inside_multibyte_char() {
+    let config =
+        PrismConfig::from_chromaterm_yaml("rules:\n  - regex: 'CPU: .'\n    color: f#ff0000\n")
+            .expect("config loads");
+    let highlighter = Highlighter::from_config(config).expect("rules compile");
+    let output = highlighter.highlight_str("CPU: \u{2501} load\n");
+    assert_eq!(
+        strip_ansi(output.as_bytes()).as_slice(),
+        "CPU: \u{2501} load\n".as_bytes(),
+        "visible text must round-trip"
+    );
+}
+
+// AUDIT M2: the CLI byte path must keep valid UTF-8 even when a match boundary
+// lands mid-codepoint.
+#[test]
+fn highlight_bytes_keeps_valid_utf8_on_mid_codepoint_match_boundary() {
+    let config =
+        PrismConfig::from_chromaterm_yaml("rules:\n  - regex: 'load: .'\n    color: f#0099ff\n")
+            .expect("config loads");
+    let highlighter = Highlighter::from_config(config).expect("rules compile");
+    let output = highlighter.highlight_bytes("load: \u{2501} ok\n".as_bytes());
+    assert!(
+        std::str::from_utf8(&output).is_ok(),
+        "highlighted output must remain valid UTF-8: {output:?}"
+    );
+}
+
+// AUDIT G2: engine robustness sweep — feeding diverse multibyte/combining
+// inputs through the byte highlighter (with rules whose matches can end
+// mid-codepoint) must never produce invalid UTF-8 and must round-trip under
+// strip_ansi, regardless of where byte-mode match boundaries fall.
+#[test]
+fn highlight_bytes_never_corrupts_valid_utf8_across_generated_inputs() {
+    // 'x.' ends a match one byte into whatever follows 'x'; '.$' matches the
+    // single last byte before a newline. Both land mid-codepoint when that byte
+    // belongs to a multibyte glyph, and nothing else re-colors the whole glyph.
+    let config = PrismConfig::from_chromaterm_yaml(concat!(
+        "rules:\n",
+        "  - regex: 'x.'\n    color: f#ff0000\n",
+        "  - regex: '.$'\n    color: f#00ff00\n",
+    ))
+    .expect("config loads");
+    let highlighter = Highlighter::from_config(config).expect("rules compile");
+
+    let glyphs = ["é", "\u{2501}", "🌐", "中", "a\u{0301}"];
+    for glyph in glyphs {
+        let inputs = [
+            format!("x{glyph} ok\n"),
+            format!("a x{glyph}b\n"),
+            format!("value {glyph}\n"),
+            format!("{glyph}\n"),
+            format!("{glyph}{glyph}\n"),
+        ];
+        for input in inputs {
+            let output = highlighter.highlight_bytes(input.as_bytes());
+            assert!(
+                std::str::from_utf8(&output).is_ok(),
+                "non-UTF8 output for input {input:?}: {output:?}"
+            );
+            assert_eq!(
+                strip_ansi(&output).as_slice(),
+                input.as_bytes(),
+                "strip_ansi(output) != input for {input:?}"
+            );
+        }
+    }
+}
+
+// AUDIT M8: the Cisco interface rule must require a number, so bare
+// abbreviations and English words are not painted as interfaces.
+#[test]
+fn cisco_interface_rule_requires_a_number() {
+    let store = ProfileStore::builtin();
+    let config = PrismConfig::from_profiles(&store, &["cisco"]).expect("cisco loads");
+    let h = Highlighter::from_config(config).expect("rules compile");
+
+    let real = h.highlight_str("Gi1/0/1 and Po10\n");
+    assert!(
+        real.contains("\x1b[38;2;0;153;255mGi1/0/1\x1b[0m"),
+        "Gi1/0/1 should still highlight: {real:?}"
+    );
+    assert!(
+        real.contains("\x1b[38;2;0;153;255mPo10\x1b[0m"),
+        "Po10 should still highlight: {real:?}"
+    );
+
+    let prose = h.highlight_str("serial loopback Te done\n");
+    for word in ["serial", "loopback", "Te"] {
+        assert!(
+            !prose.contains(&format!("\x1b[38;2;0;153;255m{word}")),
+            "{word} wrongly highlighted as an interface: {prose:?}"
+        );
+    }
+}
+
+// AUDIT L1: the Juniper interface rule must require a unit/number, so plain
+// words are not painted as interfaces.
+#[test]
+fn juniper_interface_rule_does_not_match_plain_words() {
+    let store = ProfileStore::builtin();
+    let config = PrismConfig::from_profiles(&store, &["juniper"]).expect("juniper loads");
+    let h = Highlighter::from_config(config).expect("rules compile");
+
+    let real = h.highlight_str("xe-7/0/2 reth1.808 vlan.100 ae0\n");
+    for iface in ["xe-7/0/2", "reth1.808", "vlan.100", "ae0"] {
+        assert!(
+            real.contains(&format!("\x1b[38;2;0;153;255m{iface}\x1b[0m")),
+            "{iface} should still highlight: {real:?}"
+        );
+    }
+
+    let prose = h.highlight_str("set a tap on the gre vlan irb and ae reth\n");
+    for word in ["tap", "gre", "vlan", "irb", "ae", "reth"] {
+        assert!(
+            !prose.contains(&format!("\x1b[38;2;0;153;255m{word}\x1b[0m")),
+            "{word} wrongly highlighted as an interface: {prose:?}"
+        );
+    }
+}
+
+// AUDIT L11: ArubaCX platform terms must not match the bare English word
+// 'event'.
+#[test]
+fn arubacx_platform_terms_skip_bare_event_word() {
+    let store = ProfileStore::builtin();
+    let config = PrismConfig::from_profiles(&store, &["arubacx"]).expect("arubacx loads");
+    let h = Highlighter::from_config(config).expect("rules compile");
+
+    assert!(
+        h.highlight_str("status vsx\n")
+            .contains("\x1b[38;2;255;0;255mvsx\x1b[0m"),
+        "vsx should stay highlighted"
+    );
+    assert!(
+        !h.highlight_str("an event happened\n")
+            .contains("\x1b[38;2;255;0;255mevent"),
+        "bare 'event' must not be colored as a platform term"
+    );
+}
+
+// AUDIT L7: the Versa prompt must highlight realistic prompts whose hostname is
+// not literally 'versa'/'voss'.
+#[test]
+fn versa_prompt_highlights_arbitrary_hostnames() {
+    let store = ProfileStore::builtin();
+    let config = PrismConfig::from_profiles(&store, &["versa"]).expect("versa loads");
+    let h = Highlighter::from_config(config).expect("rules compile");
+
+    let out = h.highlight_str("admin@edge-01> show interfaces\n");
+    assert!(
+        out.contains("\x1b[38;2;0;191;255madmin@edge-01>"),
+        "versa prompt with an arbitrary hostname was not highlighted: {out:?}"
+    );
+}
+
+// AUDIT L4: the Cisco prompt rule must not paint prose like `issue#42`, while
+// still matching real prompts (with or without an immediately typed command).
+#[test]
+fn cisco_prompt_rule_ignores_prose_with_numeric_suffix() {
+    let store = ProfileStore::builtin();
+    let config = PrismConfig::from_profiles(&store, &["cisco"]).expect("cisco loads");
+    let h = Highlighter::from_config(config).expect("rules compile");
+
+    for line in ["Router#\n", "Router#show ip\n", "Switch(config)#\n"] {
+        let out = h.highlight_str(line);
+        assert!(
+            out.contains("\x1b[38;2;255;255;255m"),
+            "real prompt not highlighted for {line:?}: {out:?}"
+        );
+    }
+    for line in ["issue#42\n", "item#1\n"] {
+        let out = h.highlight_str(line);
+        assert!(
+            !out.contains("\x1b[38;2;255;255;255m"),
+            "prose wrongly highlighted as a prompt for {line:?}: {out:?}"
+        );
+    }
+}

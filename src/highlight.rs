@@ -1397,6 +1397,11 @@ impl Highlighter {
                 if start >= end || end > styles.len() {
                     continue;
                 }
+                // A byte-mode regex can return offsets inside a multibyte UTF-8
+                // sequence. Snap the span outward to char boundaries so the SGR
+                // escapes emitted at style transitions never split a codepoint.
+                let start = floor_char_boundary(visible, start);
+                let end = ceil_char_boundary(visible, end);
                 if protected[start..end]
                     .iter()
                     .any(|is_protected| *is_protected)
@@ -1417,6 +1422,22 @@ impl Highlighter {
             .map(|style| (!style.is_empty()).then_some(style))
             .collect()
     }
+}
+
+/// Largest UTF-8 char-boundary index at or below `index` in `bytes`.
+fn floor_char_boundary(bytes: &[u8], mut index: usize) -> usize {
+    while index > 0 && index < bytes.len() && (bytes[index] & 0xC0) == 0x80 {
+        index -= 1;
+    }
+    index
+}
+
+/// Smallest UTF-8 char-boundary index at or above `index` in `bytes`.
+fn ceil_char_boundary(bytes: &[u8], mut index: usize) -> usize {
+    while index < bytes.len() && (bytes[index] & 0xC0) == 0x80 {
+        index += 1;
+    }
+    index
 }
 
 fn match_rule(rule: &CompiledRule, visible: &[u8]) -> (Vec<(usize, usize, Style)>, usize) {

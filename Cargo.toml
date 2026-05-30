@@ -1,6 +1,6 @@
 [package]
 name = "prismtty"
-version = "1.0.5"
+version = "1.0.6"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT"
@@ -21,7 +21,7 @@ clap = { version = "4.5", features = ["derive"] }
 clap_complete = { version = "4.5", optional = true }
 directories = "6.0"
 is-terminal = "0.4"
-nix = { version = "0.31", features = ["term"] }
+nix = { version = "0.31", features = ["term", "process", "signal"] }
 pcre2 = "0.2"
 portable-pty = "0.9"
 serde = { version = "1.0", features = ["derive"] }
@@ -30,6 +30,8 @@ thiserror = "2.0"
 
 [dev-dependencies]
 assert_cmd = "2.0"
+libc = "0.2"
+portable-pty = "0.9"
 predicates = "3.1"
 tempfile = "3.14"
 

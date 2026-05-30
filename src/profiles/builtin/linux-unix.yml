@@ -46,12 +46,24 @@ rules:
   - description: root user
     regex: '\broot\b'
     color: f#ff0000 bold
-  - description: systemd states
-    regex: '(?i)\b(active|inactive|failed|dead|running|exited|enabled|disabled|masked|loaded)\b'
+  - description: systemd healthy states
+    regex: '(?i)\b(active|running|enabled|exited|loaded)\b'
     color: f#00ff00
-  - description: log priority
-    regex: '(?i)\b(emerg|alert|crit|critical|error|err|warning|warn|notice|info|debug)\b'
+  - description: systemd fault states
+    regex: '(?i)\b(failed|dead)\b'
+    color: f#ff0000 bold
+  - description: systemd inactive states
+    regex: '(?i)\b(inactive|disabled|masked)\b'
     color: f#ffff00
+  - description: log priority severe
+    regex: '(?i)\b(emerg|alert|crit|critical|error|err)\b'
+    color: f#ff0000 bold
+  - description: log priority warning
+    regex: '(?i)\b(warning|warn)\b'
+    color: f#ffff00
+  - description: log priority info
+    regex: '(?i)\b(notice|info|debug)\b'
+    color: f#65d7fd
   - description: port
     regex: '(?i)\b(tcp|udp)/\d{1,5}\b|((?<=[A-Za-z0-9_.-]{3})|(?<=\])):\d{1,5}\b'
     color: f#00ffc0
