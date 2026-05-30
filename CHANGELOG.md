@@ -2,6 +2,30 @@
 
 All notable changes to PrismTTY are documented here.
 
+## 1.0.8 - 2026-05-30
+
+### Security and Reliability
+
+- Treat oversized unterminated ANSI escape sequences as complete for
+  carry-detection purposes so hostile terminal output is flushed or neutralized
+  instead of being retained in streaming and interactive buffers.
+
+### Profiles
+
+- Highlight IPv6 addresses in the generic profile, including compressed forms
+  and prefixes.
+- Add Fortinet interface highlighting for common interface names such as
+  `port1`, `wan2`, `mgmt`, aggregate, NPU, FortiLink, and SSL VPN interfaces.
+- Narrow Versa object highlighting to distinctive object tokens so ordinary
+  prose such as `tenant`, `branch`, and `controller` is not highlighted as a
+  Versa object.
+
+### Tests
+
+- Add focused regression coverage for oversized incomplete escapes, IPv6
+  highlighting, Fortinet interfaces, Versa object false positives, and unstyled
+  replay tokens.
+
 ## 1.0.7 - 2026-05-30
 
 ### Security and Reliability

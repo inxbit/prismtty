@@ -2576,3 +2576,63 @@ fn streaming_buffers_multibyte_codepoint_split_across_reads() {
     );
     assert_eq!(strip_ansi(&out).as_slice(), "a\u{2501}b\n".as_bytes());
 }
+
+// AUDIT L12: IPv6 addresses (full, compressed, and with a prefix) must be
+// highlighted, like IPv4.
+#[test]
+fn generic_highlights_ipv6_addresses() {
+    let store = ProfileStore::builtin();
+    let config = PrismConfig::from_profiles(&store, &["generic"]).expect("generic loads");
+    let h = Highlighter::from_config(config).expect("rules compile");
+
+    let out = h.highlight_str("link-local fe80::1 site 2001:db8::1 loop ::1/128\n");
+    for addr in ["fe80::1", "2001:db8::1", "::1/128"] {
+        assert!(
+            out.contains(&format!("\x1b[38;2;0;255;255m{addr}\x1b[0m")),
+            "IPv6 {addr} not highlighted: {out:?}"
+        );
+    }
+}
+
+// AUDIT L8: FortiGate interface names (port1, wan2, mgmt, …) must be
+// highlighted; the profile previously had no interface rule.
+#[test]
+fn fortinet_highlights_interface_names() {
+    let store = ProfileStore::builtin();
+    let config = PrismConfig::from_profiles(&store, &["fortinet"]).expect("fortinet loads");
+    let h = Highlighter::from_config(config).expect("rules compile");
+
+    let out = h.highlight_str("traffic from port1 to wan2 over mgmt\n");
+    for iface in ["port1", "wan2", "mgmt"] {
+        assert!(
+            out.contains(&format!("\x1b[38;2;0;153;255m{iface}\x1b[0m")),
+            "fortinet interface {iface} not highlighted: {out:?}"
+        );
+    }
+}
+
+// AUDIT (Versa object over-match, found during L7): distinctive Versa tokens
+// still paint, but common English words must not.
+#[test]
+fn versa_object_rule_does_not_match_plain_english_words() {
+    let store = ProfileStore::builtin();
+    let config = PrismConfig::from_profiles(&store, &["versa"]).expect("versa loads");
+    let h = Highlighter::from_config(config).expect("rules compile");
+
+    let out = h.highlight_str("vni-5 over sdwan fabric\n");
+    for term in ["vni-5", "sdwan"] {
+        assert!(
+            out.contains(&format!("\x1b[38;2;255;0;255m{term}\x1b[0m")),
+            "versa object {term} not highlighted: {out:?}"
+        );
+    }
+
+    let prose =
+        h.highlight_str("the branch office org chart tenant agreement controller appliance\n");
+    for word in ["branch", "org", "tenant", "controller", "appliance"] {
+        assert!(
+            !prose.contains(&format!("\x1b[38;2;255;0;255m{word}")),
+            "English word {word} wrongly highlighted as a Versa object: {prose:?}"
+        );
+    }
+}

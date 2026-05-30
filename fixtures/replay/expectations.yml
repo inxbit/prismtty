@@ -9,6 +9,10 @@ fixtures:
         foreground: "#0099ff"
       - text: "192.0.2.22"
         foreground: "#00ffff"
+      - text: "Uplink"
+        unstyled: true
+      - text: "Spare"
+        unstyled: true
   cisco-nexus.txt:
     synthetic: true
     expected_profiles: ["generic", "cisco"]
