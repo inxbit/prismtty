@@ -287,10 +287,19 @@ fn trim_to_recent_chars(text: &mut String, limit: usize) {
 }
 
 fn contains_close_marker(text: &str) -> bool {
-    text.contains("closed by remote host")
-        || text.contains("connection closed")
-        || (text.contains("connection to ") && text.contains(" closed"))
-        || text.lines().any(|line| line.trim() == "logout")
+    // Anchored to whole-line teardown shapes so benign output that merely
+    // mentions these words (e.g. a log line "... connection to X closed and
+    // reopened") does not pop a still-live remote profile. The caller passes
+    // lowercased text.
+    text.lines().any(|line| {
+        let line = line.trim();
+        line == "logout"
+            || line.ends_with("closed by remote host")
+            || line.ends_with("closed by remote host.")
+            || line.starts_with("connection closed")
+            || (line.starts_with("connection to ")
+                && (line.ends_with(" closed") || line.ends_with(" closed.")))
+    })
 }
 
 fn looks_like_prompt_detection_boundary(text: &str) -> bool {
@@ -478,6 +487,26 @@ mod tests {
 
         assert_eq!(changed, Some(names(&["generic", "linux-unix"])));
         assert_eq!(runtime.active_profiles(), names(&["generic", "linux-unix"]));
+    }
+
+    // Only a teardown-shaped line should count as a close marker; benign output
+    // that merely contains the words must not pop the profile.
+    #[test]
+    fn close_marker_requires_a_teardown_shaped_line() {
+        assert!(super::contains_close_marker(
+            "connection to 192.0.2.5 closed.\n"
+        ));
+        assert!(super::contains_close_marker(
+            "connection closed by remote host\r\n"
+        ));
+        assert!(super::contains_close_marker("logout\n"));
+
+        assert!(!super::contains_close_marker(
+            "apr 01 connection to 192.0.2.5 closed and reopened\n"
+        ));
+        assert!(!super::contains_close_marker(
+            "the connection closed flag is documented here\n"
+        ));
     }
 
     #[test]

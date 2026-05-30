@@ -2538,3 +2538,41 @@ fn cisco_prompt_rule_ignores_prose_with_numeric_suffix() {
         );
     }
 }
+
+// An empty profile name must be rejected, not registered under "".
+#[test]
+fn empty_profile_name_is_rejected() {
+    let empty = "profile:\n  name: \"\"\n  inherits: [generic]\nrules: []\n";
+    assert!(
+        prismtty::config::parse_profile_yaml(empty).is_err(),
+        "empty profile name should be rejected"
+    );
+    let valid = "profile:\n  name: edge\n  inherits: [generic]\nrules: []\n";
+    assert!(
+        prismtty::config::parse_profile_yaml(valid).is_ok(),
+        "a valid profile should still parse"
+    );
+}
+
+// A multibyte UTF-8 codepoint split across two reads must be buffered, not
+// flushed mid-codepoint (which would splice a reset escape into it and emit
+// invalid UTF-8).
+#[test]
+fn streaming_buffers_multibyte_codepoint_split_across_reads() {
+    let config =
+        PrismConfig::from_chromaterm_yaml("rules:\n  - regex: '.+'\n    color: f#ff0000\n")
+            .expect("config loads");
+    let highlighter = Highlighter::from_config(config).expect("rules compile");
+    let mut streaming = StreamingHighlighter::new(highlighter);
+
+    let mut out = Vec::new();
+    out.extend(streaming.push(b"a\xe2")); // chunk ends on the lead byte of '━'
+    out.extend(streaming.push(b"\x94\x81b\n")); // its continuation bytes
+    out.extend(streaming.finish());
+
+    assert!(
+        std::str::from_utf8(&out).is_ok(),
+        "streamed output must stay valid UTF-8: {out:?}"
+    );
+    assert_eq!(strip_ansi(&out).as_slice(), "a\u{2501}b\n".as_bytes());
+}

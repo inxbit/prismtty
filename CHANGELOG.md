@@ -2,6 +2,26 @@
 
 All notable changes to PrismTTY are documented here.
 
+## 1.0.7 - 2026-05-30
+
+### Security and Reliability
+
+- Bound `--strip-ansi` carry buffering for unterminated ANSI escape sequences
+  so hostile remote output cannot grow memory without limit.
+- Preserve split ANSI escape stripping across reads without leaking parameter
+  bytes into visible output.
+- Keep streaming output valid when multibyte UTF-8 codepoints split across read
+  boundaries.
+- Reject empty and whitespace-only native profile names before profile
+  registration.
+- Narrow dynamic profile close-marker detection to teardown-shaped lines so
+  benign log prose does not pop an active remote profile.
+
+### Performance
+
+- Cache compiled highlighters across dynamic profile switches with a bounded
+  cache, avoiding repeated regex compilation during profile flapping.
+
 ## 1.0.6 - 2026-05-30
 
 ### Security and Reliability

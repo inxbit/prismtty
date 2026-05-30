@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use thiserror::Error;
 
 const UNICODE_PROMPT_MARKERS: &[&str] = &["○", "●", "❯", "❮", "❱", "›", "»", "➜", "➤", "λ"];
-const MAX_INCOMPLETE_ESCAPE_BYTES: usize = 16 * 1024;
+pub(crate) const MAX_INCOMPLETE_ESCAPE_BYTES: usize = 16 * 1024;
 const PCRE2_JIT_STACK_LIMIT_BYTES: usize = 32 * 1024;
 
 /// Errors returned while compiling highlighting rules.
@@ -2067,6 +2067,10 @@ fn streaming_split_at(bytes: &[u8]) -> usize {
         return escape_start;
     }
 
+    if let Some(utf8_start) = incomplete_utf8_start(bytes) {
+        return utf8_start;
+    }
+
     if !is_token_continuation(*bytes.last().expect("checked non-empty")) {
         return bytes.len();
     }
@@ -2085,6 +2089,26 @@ fn streaming_split_at(bytes: &[u8]) -> usize {
     } else {
         bytes.len()
     }
+}
+
+/// If `bytes` ends partway through a multibyte UTF-8 sequence, returns the
+/// index of that sequence's lead byte so the partial codepoint can be carried
+/// to the next chunk instead of being emitted and split by an SGR escape.
+fn incomplete_utf8_start(bytes: &[u8]) -> Option<usize> {
+    let mut idx = bytes.len();
+    let mut continuations = 0usize;
+    while idx > 0 && (bytes[idx - 1] & 0xC0) == 0x80 {
+        idx -= 1;
+        continuations += 1;
+    }
+    let lead = *bytes.get(idx.checked_sub(1)?)?;
+    let expected = match lead {
+        0xc0..=0xdf => 2,
+        0xe0..=0xef => 3,
+        0xf0..=0xf7 => 4,
+        _ => return None,
+    };
+    (continuations + 1 < expected).then_some(idx - 1)
 }
 
 fn ansi_sequence_end_containing(bytes: &[u8], index: usize) -> Option<usize> {
@@ -2130,7 +2154,7 @@ fn interactive_split_at_chunk(
     }
 }
 
-fn incomplete_escape_start(bytes: &[u8]) -> Option<usize> {
+pub(crate) fn incomplete_escape_start(bytes: &[u8]) -> Option<usize> {
     let start = bytes.iter().rposition(|byte| *byte == 0x1b)?;
     escape_is_incomplete_at(bytes, start).then_some(start)
 }

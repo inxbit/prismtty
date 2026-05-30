@@ -287,6 +287,9 @@ fn profile_file_from_doc(
     mode: ProfileYamlMode,
 ) -> Result<LoadedProfileFile, ConfigError> {
     let mut meta = doc.profile.ok_or(ConfigError::MissingProfileName)?;
+    if meta.name.trim().is_empty() {
+        return Err(ConfigError::MissingProfileName);
+    }
     let runtime = meta.runtime.take();
     match mode {
         ProfileYamlMode::User if runtime.is_some() => {

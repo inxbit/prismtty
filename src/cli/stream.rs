@@ -1,9 +1,13 @@
 use std::cmp::Reverse;
+use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::sync::mpsc;
 use std::time::Instant;
 
-use crate::highlight::{AnsiChunk, BenchmarkReport, Highlighter, StreamingHighlighter, strip_ansi};
+use crate::highlight::{
+    AnsiChunk, BenchmarkReport, Highlighter, MAX_INCOMPLETE_ESCAPE_BYTES, StreamingHighlighter,
+    incomplete_escape_start, strip_ansi,
+};
 use crate::profile_runtime::ProfileRuntime;
 use crate::profiles::ProfileStore;
 
@@ -36,13 +40,14 @@ pub(super) fn highlight_stream<R: Read, W: Write>(
     let started = Instant::now();
     let mut input_bytes = 0usize;
     let mut buffer = [0_u8; 8192];
+    let mut strip_carry: Vec<u8> = Vec::new();
     let read = reader.read(&mut buffer)?;
     if read == 0 {
         return Ok(());
     }
 
     trace.log("OUT", &buffer[..read]);
-    let first_chunk = prepare_chunk(&buffer[..read], options.strip_ansi);
+    let first_chunk = prepare_chunk(&buffer[..read], options.strip_ansi, &mut strip_carry);
     let mut detection_sample = first_chunk.bytes().to_vec();
     input_bytes += first_chunk.bytes().len();
     let store = profile_store()?;
@@ -78,7 +83,7 @@ pub(super) fn highlight_stream<R: Read, W: Write>(
             break;
         }
         trace.log("OUT", &buffer[..read]);
-        let chunk = prepare_chunk(&buffer[..read], options.strip_ansi);
+        let chunk = prepare_chunk(&buffer[..read], options.strip_ansi, &mut strip_carry);
         input_bytes += chunk.bytes().len();
         if let Some(next_profile_names) = observe_dynamic_profile(
             &mut profile_runtime,
@@ -128,6 +133,38 @@ pub(super) fn highlight_stream<R: Read, W: Write>(
     Ok(())
 }
 
+/// Bounds the number of distinct compiled-highlighter sets retained so that
+/// adversarial profile flapping cannot grow memory without limit.
+const HIGHLIGHTER_CACHE_LIMIT: usize = 32;
+
+/// Caches compiled highlighters by profile-name set. Recompiling (and
+/// JIT-compiling) every regex on each dynamic profile switch lets untrusted
+/// device output force unbounded recompilation; cloning a cached highlighter
+/// shares the already-compiled `pcre2` code via `Arc` instead.
+#[derive(Default)]
+struct HighlighterCache {
+    entries: HashMap<Vec<String>, Highlighter>,
+}
+
+impl HighlighterCache {
+    fn get_or_build<E>(
+        &mut self,
+        profile_names: &[String],
+        build: impl FnOnce() -> Result<Highlighter, E>,
+    ) -> Result<Highlighter, E> {
+        if let Some(cached) = self.entries.get(profile_names) {
+            return Ok(cached.clone());
+        }
+        let highlighter = build()?;
+        if self.entries.len() >= HIGHLIGHTER_CACHE_LIMIT {
+            self.entries.clear();
+        }
+        self.entries
+            .insert(profile_names.to_vec(), highlighter.clone());
+        Ok(highlighter)
+    }
+}
+
 struct HighlightSession<'a> {
     options: &'a Options,
     store: &'a ProfileStore,
@@ -135,6 +172,7 @@ struct HighlightSession<'a> {
     profile_names: Vec<String>,
     streaming: StreamingHighlighter,
     reporter: ProfileReporter,
+    highlighter_cache: HighlighterCache,
 }
 
 impl<'a> HighlightSession<'a> {
@@ -153,6 +191,7 @@ impl<'a> HighlightSession<'a> {
             profile_names,
             streaming,
             reporter,
+            highlighter_cache: HighlighterCache::default(),
         })
     }
 
@@ -216,12 +255,13 @@ impl<'a> HighlightSession<'a> {
         report: bool,
     ) -> Result<(), CliError> {
         self.profile_names = profile_names;
-        let highlighter = build_highlighter_for_profiles_with_store(
-            self.options,
-            self.store,
-            &self.profile_names,
-            self.interactive,
-        )?;
+        let options = self.options;
+        let store = self.store;
+        let interactive = self.interactive;
+        let names = self.profile_names.clone();
+        let highlighter = self.highlighter_cache.get_or_build(&names, || {
+            build_highlighter_for_profiles_with_store(options, store, &names, interactive)
+        })?;
         self.streaming.replace_highlighter(highlighter);
         if report {
             self.report_current();
@@ -311,9 +351,18 @@ fn print_benchmark_report(report: Option<&BenchmarkReport>, input_bytes: usize, 
     eprintln!("Processed {input_bytes} bytes in {elapsed_secs:.3}s");
 }
 
-fn prepare_chunk(input: &[u8], strip_existing_ansi: bool) -> AnsiChunk {
+fn prepare_chunk(input: &[u8], strip_existing_ansi: bool, strip_carry: &mut Vec<u8>) -> AnsiChunk {
     if strip_existing_ansi {
-        AnsiChunk::new(strip_ansi(input))
+        // Reassemble any escape that was split across the previous read before
+        // stripping, otherwise its tail bytes would survive as literal text.
+        let mut combined = std::mem::take(strip_carry);
+        combined.extend_from_slice(input);
+        let split = incomplete_escape_start(&combined).unwrap_or(combined.len());
+        strip_carry.extend_from_slice(&combined[split..]);
+        if strip_carry.len() > MAX_INCOMPLETE_ESCAPE_BYTES {
+            strip_carry.clear();
+        }
+        AnsiChunk::new(strip_ansi(&combined[..split]))
     } else {
         AnsiChunk::from_slice(input)
     }
@@ -325,6 +374,86 @@ fn should_flush_input_echo(interactive: bool, read: usize) -> bool {
 
 #[cfg(test)]
 mod tests {
+    fn sample_highlighter() -> crate::highlight::Highlighter {
+        let config =
+            crate::config::PrismConfig::from_chromaterm_yaml("rules: []\n").expect("config loads");
+        crate::highlight::Highlighter::from_config(config).expect("highlighter compiles")
+    }
+
+    // Switching back to a previously-seen profile set must reuse the cached
+    // compiled highlighter instead of recompiling, so untrusted output that
+    // flaps the detected profile cannot force unbounded recompilation.
+    #[test]
+    fn highlighter_cache_reuses_compiled_highlighters_for_seen_profile_sets() {
+        let mut cache = super::HighlighterCache::default();
+        let set_a = vec!["generic".to_string(), "cisco".to_string()];
+        let set_b = vec!["generic".to_string(), "juniper".to_string()];
+        let mut builds = 0usize;
+
+        cache
+            .get_or_build(&set_a, || {
+                builds += 1;
+                Ok::<_, ()>(sample_highlighter())
+            })
+            .unwrap();
+        cache
+            .get_or_build(&set_b, || {
+                builds += 1;
+                Ok::<_, ()>(sample_highlighter())
+            })
+            .unwrap();
+        cache
+            .get_or_build(&set_a, || {
+                builds += 1;
+                Ok::<_, ()>(sample_highlighter())
+            })
+            .unwrap();
+
+        assert_eq!(
+            builds, 2,
+            "switching back to a seen profile set must not recompile"
+        );
+    }
+
+    // In --strip-ansi mode an escape split across reads must be reassembled
+    // before stripping, so its parameter/final bytes do not leak into the
+    // visible output as literal text.
+    #[test]
+    fn strip_mode_carries_split_escape_across_reads() {
+        let mut carry = Vec::new();
+        let first = super::prepare_chunk(b"hello\x1b[3", true, &mut carry);
+        let second = super::prepare_chunk(b"1m world", true, &mut carry);
+        let mut visible = first.bytes().to_vec();
+        visible.extend_from_slice(second.bytes());
+        assert_eq!(
+            visible,
+            b"hello world",
+            "split escape tail leaked into stripped output: {:?}",
+            String::from_utf8_lossy(&visible)
+        );
+    }
+
+    #[test]
+    fn strip_mode_drops_oversized_incomplete_escape_carry() {
+        let mut carry = Vec::new();
+        let mut input = b"\x1b[".to_vec();
+        input.extend(std::iter::repeat_n(
+            b'1',
+            crate::highlight::MAX_INCOMPLETE_ESCAPE_BYTES + 1,
+        ));
+
+        let chunk = super::prepare_chunk(&input, true, &mut carry);
+
+        assert!(
+            chunk.bytes().is_empty(),
+            "oversized incomplete escape should be stripped as control data"
+        );
+        assert!(
+            carry.is_empty(),
+            "oversized incomplete escape carry must not grow without bound"
+        );
+    }
+
     #[test]
     fn dynamic_profile_observation_reuses_prepared_visible_chunk() {
         let source = include_str!("stream.rs");
