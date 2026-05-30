@@ -180,7 +180,7 @@ impl PrismConfig {
     /// Reads and parses a ChromaTerm-style YAML file.
     pub fn from_chromaterm_file(path: impl AsRef<Path>) -> Result<Self, ConfigError> {
         let path = path.as_ref();
-        let input = fs::read_to_string(path).map_err(|source| ConfigError::Read {
+        let input = read_config_file(path).map_err(|source| ConfigError::Read {
             path: path.to_path_buf(),
             source,
         })?;
@@ -222,10 +222,46 @@ impl PrismConfig {
     }
 }
 
-/// Reads and parses a native PrismTTY profile YAML file.
+/// Largest config / profile file PrismTTY will read. Profiles and ChromaTerm
+/// configs are kilobytes; this bounds the read so a giant (or non-regular) file
+/// cannot be slurped without limit.
+const MAX_CONFIG_FILE_BYTES: u64 = 1024 * 1024;
+
+/// Reads a config / profile file as UTF-8, rejecting anything larger than
+/// [`MAX_CONFIG_FILE_BYTES`].
+fn read_config_file(path: &Path) -> std::io::Result<String> {
+    use std::io::Read as _;
+    let file = fs::File::open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.file_type().is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("config path is not a regular file: {}", path.display()),
+        ));
+    }
+    let len = metadata.len();
+    if len > MAX_CONFIG_FILE_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("config file is too large ({len} bytes; limit {MAX_CONFIG_FILE_BYTES})"),
+        ));
+    }
+    let mut input = Vec::new();
+    file.take(MAX_CONFIG_FILE_BYTES + 1)
+        .read_to_end(&mut input)?;
+    if input.len() as u64 > MAX_CONFIG_FILE_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("config file is too large (more than {MAX_CONFIG_FILE_BYTES} bytes)"),
+        ));
+    }
+    String::from_utf8(input)
+        .map_err(|source| std::io::Error::new(std::io::ErrorKind::InvalidData, source))
+}
+
 pub fn load_profile_file(path: impl AsRef<Path>) -> Result<LoadedProfileFile, ConfigError> {
     let path = path.as_ref();
-    let input = fs::read_to_string(path).map_err(|source| ConfigError::Read {
+    let input = read_config_file(path).map_err(|source| ConfigError::Read {
         path: path.to_path_buf(),
         source,
     })?;
@@ -431,6 +467,37 @@ mod tests {
         PrismConfig, RESERVED_PROFILE_RUNTIME_MESSAGE, load_profile_file,
         parse_builtin_profile_yaml, parse_profile_yaml,
     };
+
+    #[test]
+    fn read_config_file_rejects_oversized_files() {
+        let small = tempfile::NamedTempFile::new().expect("temp file");
+        std::fs::write(small.path(), "rules: []\n").expect("write small");
+        assert!(
+            super::read_config_file(small.path()).is_ok(),
+            "a normal config file should read"
+        );
+
+        let big = tempfile::NamedTempFile::new().expect("temp file");
+        std::fs::write(
+            big.path(),
+            vec![b'#'; super::MAX_CONFIG_FILE_BYTES as usize + 1],
+        )
+        .expect("write big");
+        assert!(
+            super::read_config_file(big.path()).is_err(),
+            "an oversized config file should be rejected"
+        );
+    }
+
+    #[test]
+    fn read_config_file_rejects_non_regular_files() {
+        let dir = tempfile::tempdir().expect("tempdir creates");
+
+        let error =
+            super::read_config_file(dir.path()).expect_err("directory paths should be rejected");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    }
 
     #[test]
     fn user_profile_runtime_is_reserved() {

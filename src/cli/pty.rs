@@ -89,6 +89,33 @@ fn forward_signal_to_child(signal: u8) {
     }
 }
 
+/// Runs `body`, catching a panic so it surfaces as a clear diagnostic instead
+/// of silently killing a detached worker thread (which could otherwise leave
+/// the session wedged with no error). Returns `false` if `body` panicked. When
+/// `restore_terminal` is set (the stdin forwarder), a panic also restores
+/// cooked mode so the user is not stranded in raw mode.
+fn run_supervised(name: &str, restore_terminal: bool, body: impl FnOnce()) -> bool {
+    if std::panic::catch_unwind(std::panic::AssertUnwindSafe(body)).is_ok() {
+        return true;
+    }
+    if restore_terminal {
+        restore_raw_mode_from_signal_state();
+    }
+    eprintln!("prismtty: the {name} thread stopped unexpectedly (panic)");
+    false
+}
+
+/// Spawns a worker thread whose body is run under [`run_supervised`].
+fn spawn_supervised(
+    name: &'static str,
+    restore_terminal: bool,
+    body: impl FnOnce() + Send + 'static,
+) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        run_supervised(name, restore_terminal, body);
+    })
+}
+
 pub(super) fn run_command(options: Options, command: Vec<OsString>) -> Result<ExitCode, CliError> {
     let command_name = command[0].clone();
     let command_args = command[1..].to_vec();
@@ -131,7 +158,7 @@ pub(super) fn run_command(options: Options, command: Vec<OsString>) -> Result<Ex
         let mut writer = pair.master.take_writer()?;
         let trace = trace.clone();
         let local_echo = options.local_echo;
-        thread::spawn(move || {
+        spawn_supervised("input forwarding", true, move || {
             let stdin = io::stdin();
             let mut stdin = stdin.lock();
             let _ =
@@ -213,11 +240,6 @@ fn configure_child_pty(master: &dyn portable_pty::MasterPty) -> Result<(), CliEr
     let mut termios = source;
     normalize_child_pty_termios(&mut termios);
     tcsetattr(slave_tty.as_fd(), SetArg::TCSANOW, &termios)?;
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn configure_child_pty(_master: &dyn portable_pty::MasterPty) -> Result<(), CliError> {
     Ok(())
 }
 
@@ -469,7 +491,9 @@ impl RawSignalWatcher {
             return Err(error);
         }
         RAW_MODE_SIGNAL_WRITE_FD.store(write_fd, Ordering::SeqCst);
-        let thread = thread::spawn(move || restore_raw_mode_on_signals(read_fd));
+        let thread = spawn_supervised("signal handler", false, move || {
+            restore_raw_mode_on_signals(read_fd)
+        });
         Ok(Self {
             write_fd,
             thread: Some(thread),
@@ -568,7 +592,9 @@ impl PtyResizeWatcher {
                 return Err(error);
             }
         };
-        let thread = thread::spawn(move || resize_pty_on_signals(master, read_fd));
+        let thread = spawn_supervised("resize watcher", false, move || {
+            resize_pty_on_signals(master, read_fd)
+        });
         Ok(Self {
             write_fd,
             thread: Some(thread),
@@ -713,6 +739,14 @@ mod tests {
     use std::io::Cursor;
 
     use nix::sys::termios::{InputFlags, LocalFlags, OutputFlags};
+
+    #[test]
+    fn supervised_run_catches_a_panicking_body() {
+        assert!(super::run_supervised("test-thread", false, || {}));
+        assert!(!super::run_supervised("test-thread", false, || panic!(
+            "intentional test panic"
+        )));
+    }
 
     // AUDIT L15: a child killed by a signal must report 128+signal, not a
     // misleading generic code (portable-pty's ExitStatus reports 1 and drops

@@ -2636,3 +2636,57 @@ fn versa_object_rule_does_not_match_plain_english_words() {
         );
     }
 }
+
+#[test]
+fn fortinet_terms_skip_bare_ha_word() {
+    let store = ProfileStore::builtin();
+    let config = PrismConfig::from_profiles(&store, &["fortinet"]).expect("fortinet loads");
+    let h = Highlighter::from_config(config).expect("rules compile");
+
+    // A distinctive term still highlights (magenta #ff00ff).
+    assert!(
+        h.highlight_str("config vdom edit\n")
+            .contains("\x1b[38;2;255;0;255mvdom\x1b[0m"),
+        "vdom should still highlight"
+    );
+    // Bare 'ha' must not be colored.
+    assert!(
+        !h.highlight_str("set the ha mode now\n")
+            .contains("\x1b[38;2;255;0;255mha"),
+        "bare 'ha' must not be highlighted as a Fortinet term"
+    );
+}
+
+#[test]
+fn example_custom_router_ha_role_requires_context() {
+    use prismtty::config::load_profile_file;
+
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/profiles/custom-router.example.yml"
+    );
+    let loaded = load_profile_file(path).expect("example profile loads");
+    let mut store = ProfileStore::builtin();
+    store.insert_profile(
+        loaded.meta.name.clone(),
+        loaded.meta.inherits.clone(),
+        loaded.meta.detection.clone(),
+        loaded.rules.clone(),
+    );
+    let config = PrismConfig::from_profiles(&store, &[loaded.meta.name.as_str()])
+        .expect("example profile compiles");
+    let h = Highlighter::from_config(config).expect("rules compile");
+
+    const YELLOW: &str = "\x1b[38;2;255;255;0m";
+    // A bare role word in unrelated prose must not light up.
+    assert!(
+        !h.highlight_str("the primary copy was kept\n")
+            .contains(YELLOW),
+        "bare 'primary' must not be highlighted as an HA role"
+    );
+    // The same word in its HA context is highlighted.
+    assert!(
+        h.highlight_str("HA role: primary\n").contains(YELLOW),
+        "an HA-role status line should highlight"
+    );
+}

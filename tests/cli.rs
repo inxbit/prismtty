@@ -621,3 +621,23 @@ fn wrapped_command_preserves_utf8_terminal_glyphs() {
         .stdout(predicate::str::contains("CPU: ━━━━━━━ ã é 🚀 "))
         .stdout(predicate::str::contains("^D").not());
 }
+
+#[test]
+fn profiles_d_override_of_a_builtin_warns_on_stderr() {
+    let xdg = tempfile::tempdir().expect("temp xdg config");
+    let profiles_dir = xdg.path().join("prismtty").join("profiles.d");
+    fs::create_dir_all(&profiles_dir).expect("create profiles.d");
+    fs::write(
+        profiles_dir.join("cisco.yml"),
+        "profile:\n  name: cisco\n  inherits: [generic]\nrules: []\n",
+    )
+    .expect("write shadowing profile");
+
+    let mut cmd = Command::cargo_bin("prismtty").expect("binary exists");
+    cmd.env("XDG_CONFIG_HOME", xdg.path())
+        .write_stdin("router up\n");
+
+    cmd.assert().success().stderr(predicate::str::contains(
+        "user profile 'cisco' from profiles.d overrides the built-in",
+    ));
+}

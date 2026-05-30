@@ -151,8 +151,20 @@ pub(super) fn parse_args(args: Vec<OsString>) -> Result<(Options, Action), CliEr
 }
 
 fn detect_no_minimal_reset_env() -> bool {
-    env::var_os("PRISMTTY_NO_MINIMAL_RESET").is_some()
-        || env::var_os("PRISMTTY_NO_39_49_RESETS").is_some()
+    env_flag_enabled("PRISMTTY_NO_MINIMAL_RESET") || env_flag_enabled("PRISMTTY_NO_39_49_RESETS")
+}
+
+fn env_flag_enabled(name: &str) -> bool {
+    env::var_os(name).is_some_and(|value| env_flag_value_enabled(&value.to_string_lossy()))
+}
+
+/// Treats a falsy env value ("0", "false", "no", "off", or empty) as disabled,
+/// so the flag can be turned *off* through the environment and not only on
+fn env_flag_value_enabled(value: &str) -> bool {
+    !matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "" | "0" | "false" | "no" | "off"
+    )
 }
 
 fn parse_profiles_command(
@@ -240,6 +252,22 @@ pub fn completion_command() -> clap::Command {
 mod tests {
     use std::ffi::OsString;
     use std::sync::Mutex;
+
+    #[test]
+    fn env_flag_value_distinguishes_on_and_off() {
+        for on in ["1", "true", "yes", "on", "enabled"] {
+            assert!(
+                super::env_flag_value_enabled(on),
+                "{on:?} should be enabled"
+            );
+        }
+        for off in ["0", "false", "no", "off", "", "  0  "] {
+            assert!(
+                !super::env_flag_value_enabled(off),
+                "{off:?} should be disabled"
+            );
+        }
+    }
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 

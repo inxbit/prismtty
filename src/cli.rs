@@ -137,7 +137,6 @@ fn run_inner(args: Vec<OsString>) -> Result<ExitCode, CliError> {
             Ok(ExitCode::SUCCESS)
         }
         Action::Stdin => run_stdin(options),
-        Action::Run(command) if command.is_empty() => run_stdin(options),
         Action::Run(command) => run_command(options, command),
     }
 }

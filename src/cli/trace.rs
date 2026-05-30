@@ -1,6 +1,7 @@
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -15,18 +16,34 @@ pub(super) struct IoTrace {
     inner: Option<Arc<TraceInner>>,
 }
 
+/// Upper bound on a trace file's size. I/O traces are a debugging aid; this
+/// keeps a long-running or noisy session from filling the disk.
+const MAX_TRACE_FILE_BYTES: u64 = 64 * 1024 * 1024;
+
 struct TraceInner {
     file: Mutex<File>,
     start: Instant,
+    written: AtomicU64,
+    limit: u64,
 }
 
 impl IoTrace {
     pub(super) fn open(path: Option<&Path>) -> io::Result<Self> {
+        Self::open_with_limit(path, MAX_TRACE_FILE_BYTES)
+    }
+
+    fn open_with_limit(path: Option<&Path>, limit: u64) -> io::Result<Self> {
         let inner = match path {
-            Some(path) => Some(Arc::new(TraceInner {
-                file: Mutex::new(open_trace_file(path)?),
-                start: Instant::now(),
-            })),
+            Some(path) => {
+                let file = open_trace_file(path)?;
+                let written = file.metadata()?.len().min(limit);
+                Some(Arc::new(TraceInner {
+                    file: Mutex::new(file),
+                    start: Instant::now(),
+                    written: AtomicU64::new(written),
+                    limit,
+                }))
+            }
             None => None,
         };
         Ok(Self { inner })
@@ -36,17 +53,40 @@ impl IoTrace {
         let Some(inner) = &self.inner else {
             return;
         };
-        let Ok(mut file) = inner.file.lock() else {
+        if inner.written.load(Ordering::Relaxed) >= inner.limit {
             return;
-        };
+        }
         let elapsed = inner.start.elapsed();
-        let _ = writeln!(
-            file,
-            "{:>4}.{:06} {direction} {}",
+        let line = format!(
+            "{:>4}.{:06} {direction} {}\n",
             elapsed.as_secs(),
             elapsed.subsec_micros(),
             trace_hex(bytes),
         );
+        let Ok(mut file) = inner.file.lock() else {
+            return;
+        };
+        let previous = inner.written.load(Ordering::Relaxed);
+        if previous >= inner.limit {
+            return;
+        }
+        let line_len = line.len() as u64;
+        if previous.saturating_add(line_len) > inner.limit {
+            let marker = format!("---- trace truncated at {} bytes ----\n", inner.limit);
+            let remaining = (inner.limit - previous) as usize;
+            if remaining >= marker.len() && file.write_all(marker.as_bytes()).is_ok() {
+                inner
+                    .written
+                    .store(previous + marker.len() as u64, Ordering::Relaxed);
+            } else {
+                inner.written.store(inner.limit, Ordering::Relaxed);
+            }
+            return;
+        }
+        if file.write_all(line.as_bytes()).is_err() {
+            return;
+        }
+        inner.written.store(previous + line_len, Ordering::Relaxed);
     }
 }
 
@@ -87,11 +127,6 @@ fn open_trace_file(path: &Path) -> io::Result<File> {
     Ok(file)
 }
 
-#[cfg(not(unix))]
-fn open_trace_file(path: &Path) -> io::Result<File> {
-    OpenOptions::new().create(true).append(true).open(path)
-}
-
 fn trace_hex(bytes: &[u8]) -> String {
     use std::fmt::Write;
 
@@ -113,6 +148,38 @@ mod tests {
     #[test]
     fn trace_hex_encodes_bytes_for_diagnostics() {
         assert_eq!(super::trace_hex(b"echo\r\n"), "65 63 68 6f 0d 0a");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn trace_file_stops_growing_past_its_limit() {
+        let dir = tempfile::tempdir().expect("tempdir creates");
+        let path = dir.path().join("trace.log");
+
+        let trace = super::IoTrace::open_with_limit(Some(&path), 128).expect("trace opens");
+        for _ in 0..1000 {
+            trace.log("OUT", b"some representative payload bytes");
+        }
+        drop(trace);
+
+        let size = std::fs::metadata(&path).expect("trace metadata").len();
+        assert!(size <= 128, "trace should stay within its byte limit");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn trace_file_limit_counts_existing_bytes() {
+        let dir = tempfile::tempdir().expect("tempdir creates");
+        let path = dir.path().join("trace.log");
+        std::fs::write(&path, vec![b'x'; 128]).expect("existing trace writes");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            .expect("trace permissions set");
+
+        let trace = super::IoTrace::open_with_limit(Some(&path), 128).expect("trace opens");
+        trace.log("OUT", b"new sensitive bytes");
+        drop(trace);
+
+        assert_eq!(std::fs::metadata(&path).expect("trace metadata").len(), 128);
     }
 
     #[cfg(unix)]

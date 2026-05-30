@@ -26,7 +26,7 @@ rules:
     regex: '(?m)^[A-Za-z0-9_.-]+ #'
     color: f#ffffff
   - description: Fortinet terms
-    regex: '(?i)\b(vdom|policyid|srcintf|dstintf|utm|ipsec|phase1|phase2|ha|diagnose|vd-root)\b'
+    regex: '(?i)\b(vdom|policyid|srcintf|dstintf|utm|ipsec|phase1|phase2|diagnose|vd-root)\b'
     color: f#ff00ff
   - description: Fortinet interface
     regex: '(?i)\b(port\d+|wan\d+|mgmt\d*|agg\d+|npu\d+|fortilink|ssl\.[a-z0-9_.-]+)\b'

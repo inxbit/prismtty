@@ -142,12 +142,18 @@ impl ProfileReporter {
 pub(super) fn profile_store() -> Result<ProfileStore, CliError> {
     let mut store = ProfileStore::builtin();
     for loaded in load_profiles_d()? {
-        store.insert_profile(
+        let name = loaded.meta.name.clone();
+        let shadowed = store.insert_profile(
             loaded.meta.name,
             loaded.meta.inherits,
             loaded.meta.detection,
             loaded.rules,
         );
+        if shadowed {
+            eprintln!(
+                "prismtty: user profile '{name}' from profiles.d overrides the built-in profile of the same name"
+            );
+        }
     }
     Ok(store)
 }

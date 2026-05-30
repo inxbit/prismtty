@@ -257,24 +257,27 @@ impl ProfileStore {
         self.profiles.get(name)
     }
 
-    /// Registers a user profile with default runtime metadata.
+    /// Registers a user profile, returning `true` if it shadowed an existing
+    /// (built-in or earlier user) profile of the same name.
     pub fn insert_profile(
         &mut self,
         name: String,
         inherits: Vec<String>,
         detection: Vec<String>,
         rules: Vec<RuleSpec>,
-    ) {
-        self.profiles.insert(
-            name.clone(),
-            Profile {
-                name,
-                inherits,
-                detection,
-                runtime: ProfileRuntimeMeta::default(),
-                rules,
-            },
-        );
+    ) -> bool {
+        self.profiles
+            .insert(
+                name.clone(),
+                Profile {
+                    name,
+                    inherits,
+                    detection,
+                    runtime: ProfileRuntimeMeta::default(),
+                    rules,
+                },
+            )
+            .is_some()
     }
 
     /// Detects likely profiles from a startup sample, always including `generic`.
@@ -807,6 +810,19 @@ mod tests {
     use std::collections::BTreeSet;
     use std::fs;
     use std::path::Path;
+
+    #[test]
+    fn insert_profile_reports_shadowing_a_builtin() {
+        let mut store = ProfileStore::builtin();
+        assert!(
+            store.insert_profile("cisco".to_string(), Vec::new(), Vec::new(), Vec::new()),
+            "overriding a built-in profile name must report a shadow"
+        );
+        assert!(
+            !store.insert_profile("user-only".to_string(), Vec::new(), Vec::new(), Vec::new()),
+            "a fresh profile name must not report a shadow"
+        );
+    }
 
     #[test]
     fn every_builtin_yaml_file_is_registered() {

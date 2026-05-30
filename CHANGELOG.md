@@ -2,6 +2,30 @@
 
 All notable changes to PrismTTY are documented here.
 
+## 1.0.9 - 2026-05-30
+
+### Security and Reliability
+
+- Bound config and profile file reads to regular files under the configured
+  size limit before parsing YAML.
+- Count existing bytes in `--trace-io` append targets before writing new trace
+  data, keeping long-running diagnostics inside the trace size cap.
+- Surface panics from PTY worker threads and restore cooked terminal mode when
+  the stdin forwarder fails unexpectedly.
+- Make the crate Unix-only at compile time, matching its PTY, termios, and
+  signal-handling runtime requirements.
+
+### Profiles and CLI
+
+- Warn when a `profiles.d` profile overrides a built-in profile name.
+- Treat falsy reset-mode environment values such as `0`, `false`, `no`, and
+  `off` as disabled.
+- Narrow Fortinet and example custom-router rules so common English words such
+  as `ha` and `primary` do not highlight without device-specific context.
+- Anchor completion generation to the crate root so generated shell completion
+  files land in the repository output directory regardless of the caller's
+  current working directory.
+
 ## 1.0.8 - 2026-05-30
 
 ### Security and Reliability
