@@ -2164,6 +2164,15 @@ fn escape_is_incomplete_at(bytes: &[u8], start: usize) -> bool {
         return true;
     }
 
+    // An unterminated escape longer than the cap is treated as complete so it is
+    // flushed rather than carried across reads without bound. This protects the
+    // streaming `pending`, `--strip-ansi` carry, and interactive echo buffers
+    // (all reached through `incomplete_escape_start`) from a memory-exhaustion
+    // vector in hostile device output.
+    if bytes.len().saturating_sub(start) > MAX_INCOMPLETE_ESCAPE_BYTES {
+        return false;
+    }
+
     match bytes[start + 1] {
         b'[' => bytes[start + 2..]
             .iter()
@@ -2301,6 +2310,43 @@ pub fn strip_ansi(input: &[u8]) -> Vec<u8> {
 mod tests {
     use super::{Highlighter, NativeSgrState, StreamingHighlighter, incomplete_escape_start};
     use crate::PrismConfig;
+
+    // AUDIT (1.0.8): an unterminated escape longer than the cap must be treated
+    // as complete so it is flushed instead of carried across reads without
+    // bound (memory-exhaustion vector from hostile device output).
+    #[test]
+    fn unterminated_escape_past_the_cap_is_treated_as_complete() {
+        // A short unterminated CSI is still incomplete (carry it across reads).
+        assert!(super::escape_is_incomplete_at(b"\x1b[1;2", 0));
+
+        // One longer than the cap is treated as complete (flush, don't buffer).
+        let mut oversized = b"\x1b[".to_vec();
+        oversized.extend(std::iter::repeat_n(
+            b';',
+            super::MAX_INCOMPLETE_ESCAPE_BYTES,
+        ));
+        assert!(!super::escape_is_incomplete_at(&oversized, 0));
+    }
+
+    #[test]
+    fn streaming_does_not_buffer_unterminated_escape_without_bound() {
+        let highlighter =
+            Highlighter::from_config(PrismConfig::default()).expect("empty config compiles");
+        let mut streaming = StreamingHighlighter::new(highlighter);
+
+        let mut input = b"\x1b[".to_vec();
+        input.extend(std::iter::repeat_n(
+            b';',
+            super::MAX_INCOMPLETE_ESCAPE_BYTES + 1,
+        ));
+        let out = streaming.push(&input);
+
+        assert!(
+            out.len() >= super::MAX_INCOMPLETE_ESCAPE_BYTES,
+            "an unterminated escape past the cap must be flushed, not buffered (got {} bytes)",
+            out.len()
+        );
+    }
 
     #[test]
     fn interactive_minimal_reset_keeps_text_attributes_and_backgrounds() {

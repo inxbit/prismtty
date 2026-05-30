@@ -22,7 +22,7 @@ rules:
     regex: '(?m)^[A-Za-z0-9_.-]+@[A-Za-z0-9_.-]+[^>#\n]*[>#]'
     color: f#00bfff
   - description: Versa object
-    regex: '(?i)\b(vni-\d+|tvi-\d+/\d+|sdwan|tenant|appliance|org|controller|branch)\b'
+    regex: '(?i)\b(vni-\d+|tvi-\d+/\d+|sdwan)\b'
     color: f#ff00ff
   - description: Versa interface
     regex: '(?i)\b((vni-\d+/\d+)|(tvi-\d+/\d+)|(ptvi-\d+))(\.\d+)?\b'

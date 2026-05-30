@@ -23,6 +23,10 @@ struct TokenExpectation {
     foreground: Option<String>,
     #[serde(default)]
     bold: bool,
+    /// Assert the token is present in the visible output but covered by no
+    /// styled span (guards against over-broad rules / false positives).
+    #[serde(default)]
+    unstyled: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -224,6 +228,29 @@ fn assert_token(
     spans: &[StyledSpan],
     expected: &TokenExpectation,
 ) {
+    if expected.unstyled {
+        let occurrences = count_occurrences(visible_text, &expected.text);
+        assert_eq!(
+            occurrences, 1,
+            "{fixture} {mode:?}: token {:?} must appear exactly once in visible output",
+            expected.text
+        );
+        let token_start = visible_text
+            .find(&expected.text)
+            .expect("token exists after occurrence count");
+        let token_end = token_start + expected.text.len();
+        let covering: Vec<&StyledSpan> = spans
+            .iter()
+            .filter(|span| span.start < token_end && span.end > token_start)
+            .collect();
+        assert!(
+            covering.is_empty(),
+            "{fixture} {mode:?}: token {:?} must be unstyled but is covered by {covering:?}",
+            expected.text
+        );
+        return;
+    }
+
     if expected.foreground.is_none() {
         assert!(
             visible_text.contains(&expected.text),
