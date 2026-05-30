@@ -43,6 +43,51 @@ static RAW_MODE_FD: AtomicI32 = AtomicI32::new(-1);
 static RAW_MODE_ORIGINAL: AtomicPtr<libc::termios> = AtomicPtr::new(std::ptr::null_mut());
 static RAW_MODE_SIGNAL_WRITE_FD: AtomicI32 = AtomicI32::new(-1);
 static RESIZE_SIGNAL_WRITE_FD: AtomicI32 = AtomicI32::new(-1);
+static FORWARD_CHILD_PID: AtomicI32 = AtomicI32::new(0);
+
+/// Maps a raw process exit code to a process exit byte, clamping codes above
+/// 255 instead of truncating them (so e.g. 256 stays non-zero rather than
+/// wrapping to a misleading success).
+fn exit_code_byte(raw: u32) -> u8 {
+    u8::try_from(raw).unwrap_or(u8::MAX)
+}
+
+/// Maps a reaped child's wait status to a process exit byte: a normal exit
+/// preserves its (clamped) code, and a signal death reports `128 + signal`
+/// (the shell convention) instead of a misleading generic code.
+fn exit_code_from_wait(status: nix::sys::wait::WaitStatus) -> u8 {
+    use nix::sys::wait::WaitStatus;
+    match status {
+        WaitStatus::Exited(_, code) => exit_code_byte(code as u32),
+        WaitStatus::Signaled(_, signal, _) => 128u8.saturating_add(signal as i32 as u8),
+        _ => 1,
+    }
+}
+
+/// Reaps the wrapped child and returns its process-exit byte. Prefers a direct
+/// `waitpid` so a terminating signal becomes `128 + signal`, falling back to
+/// portable-pty's status when the pid is unavailable.
+fn reap_child(child: &mut Box<dyn portable_pty::Child + Send + Sync>) -> Result<u8, CliError> {
+    if let Some(pid) = child.process_id() {
+        if let Ok(status) = nix::sys::wait::waitpid(nix::unistd::Pid::from_raw(pid as i32), None) {
+            return Ok(exit_code_from_wait(status));
+        }
+    }
+    let status = child.wait()?;
+    Ok(exit_code_byte(status.exit_code()))
+}
+
+/// Forwards a signal received by prismtty to the wrapped child's process group
+/// so a `kill` of prismtty reaches the child instead of orphaning it. The child
+/// is a PTY session leader, so its process-group id equals its pid.
+fn forward_signal_to_child(signal: u8) {
+    let pid = FORWARD_CHILD_PID.load(Ordering::SeqCst);
+    if pid > 0 {
+        unsafe {
+            libc::kill(-pid, libc::c_int::from(signal));
+        }
+    }
+}
 
 pub(super) fn run_command(options: Options, command: Vec<OsString>) -> Result<ExitCode, CliError> {
     let command_name = command[0].clone();
@@ -63,6 +108,10 @@ pub(super) fn run_command(options: Options, command: Vec<OsString>) -> Result<Ex
 
     let mut child = pair.slave.spawn_command(builder)?;
     drop(pair.slave);
+    FORWARD_CHILD_PID.store(
+        child.process_id().map(|pid| pid as i32).unwrap_or(0),
+        Ordering::SeqCst,
+    );
 
     let raw_mode = if interactive {
         Some(RawModeGuard::enable()?)
@@ -96,7 +145,7 @@ pub(super) fn run_command(options: Options, command: Vec<OsString>) -> Result<Ex
     let mut stdout = io::stdout();
     let _registration = RuntimeRegistration::register()?;
     let reload_watcher = Some(ReloadWatcher::new());
-    highlight_stream(
+    let stream_result = highlight_stream(
         &mut reader,
         &mut stdout,
         &options,
@@ -104,12 +153,19 @@ pub(super) fn run_command(options: Options, command: Vec<OsString>) -> Result<Ex
         reload_watcher,
         trace,
         profile_input_rx,
-    )?;
+    );
 
-    let status = child.wait()?;
     resize_watcher.stop();
+    // Reap the child on every exit path. If the stream errored the child may
+    // still be running, so terminate it first to avoid blocking on the reap.
+    if stream_result.is_err() {
+        let _ = child.kill();
+    }
+    let exit = reap_child(&mut child)?;
+    FORWARD_CHILD_PID.store(0, Ordering::SeqCst);
     drop(raw_mode);
-    Ok(ExitCode::from(status.exit_code() as u8))
+    stream_result?;
+    Ok(ExitCode::from(exit))
 }
 
 fn parent_terminal_is_iterm() -> bool {
@@ -446,6 +502,7 @@ fn restore_raw_mode_on_signals(read_fd: RawFd) {
         }
         if let Some(signal) = bytes.into_iter().next() {
             restore_raw_mode_from_signal_state();
+            forward_signal_to_child(signal);
             unsafe {
                 libc::_exit(128 + libc::c_int::from(signal));
             }
@@ -656,6 +713,38 @@ mod tests {
     use std::io::Cursor;
 
     use nix::sys::termios::{InputFlags, LocalFlags, OutputFlags};
+
+    // AUDIT L15: a child killed by a signal must report 128+signal, not a
+    // misleading generic code (portable-pty's ExitStatus reports 1 and drops
+    // the signal number, so we reap with waitpid and map the raw status).
+    #[test]
+    fn exit_code_from_wait_maps_signal_deaths_to_128_plus_signal() {
+        use nix::sys::signal::Signal;
+        use nix::sys::wait::WaitStatus;
+        use nix::unistd::Pid;
+
+        let pid = Pid::from_raw(1);
+        assert_eq!(super::exit_code_from_wait(WaitStatus::Exited(pid, 0)), 0);
+        assert_eq!(super::exit_code_from_wait(WaitStatus::Exited(pid, 42)), 42);
+        assert_eq!(
+            super::exit_code_from_wait(WaitStatus::Signaled(pid, Signal::SIGTERM, false)),
+            143
+        );
+        assert_eq!(
+            super::exit_code_from_wait(WaitStatus::Signaled(pid, Signal::SIGSEGV, false)),
+            139
+        );
+    }
+
+    // AUDIT G5: exit codes above 255 must clamp, not wrap to a misleading 0.
+    #[test]
+    fn exit_code_byte_clamps_codes_above_255() {
+        assert_eq!(super::exit_code_byte(0), 0);
+        assert_eq!(super::exit_code_byte(1), 1);
+        assert_eq!(super::exit_code_byte(255), 255);
+        assert_eq!(super::exit_code_byte(256), 255);
+        assert_eq!(super::exit_code_byte(u32::MAX), 255);
+    }
 
     #[test]
     fn child_pty_flags_enable_echo_and_canonical_input() {

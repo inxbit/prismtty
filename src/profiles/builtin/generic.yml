@@ -24,11 +24,11 @@ rules:
     regex: '(?i)\b(up|ok(ay)?|permit(ed|s)?|accept(s|ed)?|enable(d)?|online|succe((ss(ful|fully)?)|ed(ed)?)?|connect(ed)?|reachable|valid|forwarding|synchronized|active)\b'
     color: f#00ff00
   - description: syslog severe
-    regex: '\b(%\w+-[0-3]-\w+)\b'
+    regex: '(%\w+-[0-3]-\w+)\b'
     color: f#ff3333 bold
   - description: syslog warning
-    regex: '\b(%\w+-[4-5]-\w+)\b'
+    regex: '(%\w+-[4-5]-\w+)\b'
     color: f#ffff00
   - description: syslog info
-    regex: '\b(%\w+-[6-7]-\w+)\b'
+    regex: '(%\w+-[6-7]-\w+)\b'
     color: f#65d7fd

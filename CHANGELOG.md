@@ -2,6 +2,34 @@
 
 All notable changes to PrismTTY are documented here.
 
+## 1.0.6 - 2026-05-30
+
+### Security and Reliability
+
+- Keep highlighted UTF-8 output valid when byte-mode PCRE2 matches land inside
+  multibyte characters.
+- Reject unknown top-level, profile, and rule fields in user YAML so misspelled
+  configuration fails closed instead of being silently ignored.
+- Forward external termination signals to the wrapped child process group and
+  preserve signal-derived child exit statuses.
+- Clamp child exit codes above 255 instead of truncating them to a misleading
+  success code.
+
+### Profiles
+
+- Restore generic syslog severity highlighting for realistic `%FACILITY-N-MSG`
+  tags.
+- Narrow Cisco, Juniper, ArubaCX, Linux/Unix, and Versa profile rules so common
+  prose and unhealthy states are not highlighted as healthy interface or status
+  output.
+
+### Release
+
+- Add a clippy `-D warnings` gate to CI.
+- Add regression coverage for PTY signal forwarding, exit-status mapping,
+  UTF-8-safe highlighting, strict YAML parsing, and profile false-positive
+  fixes.
+
 ## 1.0.5 - 2026-05-27
 
 ### Interactive Rendering

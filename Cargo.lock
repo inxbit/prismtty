@@ -590,7 +590,7 @@ dependencies = [
 
 [[package]]
 name = "prismtty"
-version = "1.0.5"
+version = "1.0.6"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -598,6 +598,7 @@ dependencies = [
  "clap_complete",
  "directories",
  "is-terminal",
+ "libc",
  "nix 0.31.3",
  "pcre2",
  "portable-pty",

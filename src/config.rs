@@ -114,6 +114,7 @@ pub enum RuleStyle {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RulesDoc {
     #[serde(default)]
     profile: Option<ProfileMetaDoc>,
@@ -125,6 +126,7 @@ struct RulesDoc {
 
 /// Metadata declared in a native profile YAML file.
 #[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProfileMetaDoc {
     /// Profile name used on the command line and in inheritance lists.
     pub name: String,
@@ -139,6 +141,7 @@ pub struct ProfileMetaDoc {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RuleDoc {
     #[serde(default)]
     description: String,

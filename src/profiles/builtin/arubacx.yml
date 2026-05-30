@@ -26,5 +26,5 @@ rules:
     regex: '\bLOG_(EMERG|ALERT|CRIT|ERR|ERROR|WARNING|NOTICE|INFO|DEBUG)\b'
     color: f#65d7fd
   - description: ArubaCX platform terms
-    regex: '(?i)\b(arubaos-cx|aos-cx|hpe-restd|vsx|vsf|checkpoint|event)\b'
+    regex: '(?i)\b(arubaos-cx|aos-cx|hpe-restd|vsx|vsf|checkpoint)\b'
     color: f#ff00ff

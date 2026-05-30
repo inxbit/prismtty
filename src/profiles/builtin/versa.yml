@@ -19,7 +19,7 @@ profile:
     runtime_prompt: versa_user_at_host
 rules:
   - description: Versa prompt
-    regex: '(?m)^[A-Za-z0-9_.-]+@(versa|voss)[^>#\n]*[>#]'
+    regex: '(?m)^[A-Za-z0-9_.-]+@[A-Za-z0-9_.-]+[^>#\n]*[>#]'
     color: f#00bfff
   - description: Versa object
     regex: '(?i)\b(vni-\d+|tvi-\d+/\d+|sdwan|tenant|appliance|org|controller|branch)\b'
@@ -30,3 +30,4 @@ rules:
   - description: Versa BGP state
     regex: '\b(Idle|Connect|Active|OpenSent|OpenConfirm|Established)\b'
     color: f#4da6ff bold
+    exclusive: true

@@ -127,6 +127,25 @@ fn wrapped_command_can_trace_pty_output_bytes() {
     );
 }
 
+// AUDIT L15: a wrapped child killed by a signal is reported as 128+signal,
+// not portable-pty's generic exit code 1.
+#[test]
+#[cfg(unix)]
+fn wrapped_child_killed_by_signal_reports_128_plus_signal() {
+    let mut cmd = Command::cargo_bin("ptty").expect("ptty binary exists");
+    cmd.arg("sh").arg("-c").arg("kill -TERM $$");
+    cmd.assert().code(143);
+}
+
+// AUDIT M6/L15: a normal non-zero exit code survives the reaping path intact.
+#[test]
+#[cfg(unix)]
+fn wrapped_child_nonzero_exit_code_is_preserved() {
+    let mut cmd = Command::cargo_bin("ptty").expect("ptty binary exists");
+    cmd.arg("sh").arg("-c").arg("exit 7");
+    cmd.assert().code(7);
+}
+
 #[test]
 fn accepts_chromaterm_cli_compatibility_flags() {
     let mut config = tempfile::NamedTempFile::new().expect("temp config");
