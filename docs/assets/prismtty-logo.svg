@@ -42,13 +42,13 @@
   <path d="M127 153 L144 141 L127 129" fill="none" stroke="#22d3ee" stroke-width="7" stroke-linecap="round" stroke-linejoin="round"/>
   <path d="M157 160 H196" stroke="#a3e635" stroke-width="7" stroke-linecap="round"/>
 
-  <text x="470" y="128" fill="#f8fafc" font-family="Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="78" font-weight="800" letter-spacing="0">
+  <text x="470" y="126" fill="#f8fafc" font-family="'Berkeley Mono', 'JetBrains Mono', 'Cascadia Code', 'SF Mono', ui-monospace, Menlo, Consolas, monospace" font-size="74" font-weight="700" letter-spacing="-2">
     Prism<tspan fill="#22d3ee">TTY</tspan>
   </text>
-  <text x="474" y="170" fill="#94a3b8" font-family="Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="24" letter-spacing="0">
+  <text x="474" y="168" fill="#94a3b8" font-family="'Berkeley Mono', 'JetBrains Mono', 'Cascadia Code', 'SF Mono', ui-monospace, Menlo, Consolas, monospace" font-size="22" letter-spacing="0">
     terminal output highlighting
   </text>
-  <text x="474" y="206" fill="#64748b" font-family="SFMono-Regular, Consolas, Liberation Mono, Menlo, monospace" font-size="18" letter-spacing="0">
+  <text x="474" y="202" fill="#64748b" font-family="'Berkeley Mono', 'JetBrains Mono', 'Cascadia Code', 'SF Mono', ui-monospace, Menlo, Consolas, monospace" font-size="17" letter-spacing="0">
     network / unix profiles
   </text>
 </svg>

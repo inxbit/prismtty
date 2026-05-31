@@ -1,7 +1,7 @@
 # PrismTTY
 
 <p align="center">
-  <img src=".github/assets/prismtty-logo.svg?v=20260513b" alt="PrismTTY" width="760">
+  <img src=".github/assets/prismtty-logo.svg?v=20260531" alt="PrismTTY" width="760">
 </p>
 
 <p align="center">
@@ -23,7 +23,7 @@ Current version: `1.0.9`.
 
 ## Quick Demo
 
-![Animated PrismTTY terminal demo](.github/assets/prismtty-terminal-demo.svg?v=20260514)
+![Animated PrismTTY terminal demo](.github/assets/prismtty-terminal-demo.svg?v=20260531)
 
 ## Preview
 
@@ -31,7 +31,7 @@ Synthetic terminal previews using documentation-only hostnames and addresses:
 
 ![Highlighted PrismTTY terminal output](.github/assets/prismtty-terminal-preview.svg?v=20260513)
 
-![Dynamic PrismTTY profile switching](.github/assets/prismtty-profile-switching.svg?v=20260513b)
+![Dynamic PrismTTY profile switching](.github/assets/prismtty-profile-switching.svg?v=20260531)
 
 ## What This Is / What This Is Not
 

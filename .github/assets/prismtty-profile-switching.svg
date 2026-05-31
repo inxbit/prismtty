@@ -9,7 +9,7 @@
     <style>
       .mono { font-family: SFMono-Regular, Consolas, Liberation Mono, Menlo, monospace; font-size: 21px; }
       .small { font-family: SFMono-Regular, Consolas, Liberation Mono, Menlo, monospace; font-size: 16px; }
-      .label { font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif; font-size: 18px; font-weight: 700; }
+      .label { font-family: 'Berkeley Mono', 'JetBrains Mono', 'Cascadia Code', 'SF Mono', ui-monospace, Menlo, Consolas, monospace; font-size: 18px; font-weight: 700; }
       .fg { fill: #e5e7eb; }
       .muted { fill: #94a3b8; }
       .dim { fill: #64748b; }
