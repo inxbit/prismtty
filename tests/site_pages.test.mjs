@@ -20,12 +20,15 @@ test('GitHub Pages site has the expected static contract', () => {
   assert.match(html, /<title>PrismTTY - Terminal Output Highlighting<\/title>/);
   assert.match(html, /Readable network output, live in your terminal\./);
   assert.match(html, /Live terminal highlighting, not device management\./);
-  assert.match(html, /Feedback wanted/);
+  assert.match(html, /feedback wanted/i);
   assert.match(html, /href="https:\/\/github\.com\/inxbit\/prismtty"/);
   assert.match(html, /href="https:\/\/crates\.io\/crates\/prismtty"/);
   assert.match(html, /https:\/\/prismtty\.com\/assets\/prismtty-social-card\.png/);
-  assert.match(html, /href="assets\/prismtty-terminal-demo\.svg"/);
-  assert.match(html, /src="assets\/prismtty-terminal-demo\.svg"/);
+  // The hero now demonstrates highlighting with JS-driven demos (live terminal,
+  // raw/highlighted compare slider, profile tabs) instead of a static SVG image.
+  assert.match(html, /data-terminal\b/);
+  assert.match(html, /data-compare\b/);
+  assert.match(html, /data-profiles\b/);
   assert.doesNotMatch(html, /show-tech\.txt \| prismtty/);
 
   const css = read('docs/styles.css');
