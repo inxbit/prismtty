@@ -17,65 +17,79 @@
     <meta name="twitter:card" content="summary_large_image">
     <meta name="twitter:image" content="https://prismtty.com/assets/prismtty-social-card.png">
     <link rel="canonical" href="https://prismtty.com/">
-    <link rel="preload" as="image" href="assets/prismtty-terminal-demo.svg">
+    <link rel="icon" href="assets/prismtty-mark.svg" type="image/svg+xml">
     <link rel="stylesheet" href="styles.css">
     <script src="script.js" defer></script>
   </head>
   <body>
+    <div class="grain" aria-hidden="true"></div>
+
     <header class="site-header" data-site-header>
       <a class="brand" href="#top" aria-label="PrismTTY home">
-        <span class="brand-mark" aria-hidden="true"></span>
-        <span>PrismTTY</span>
+        <img class="brand-logo" src="assets/prismtty-lockup.svg" alt="" width="68" height="30">
+        <span class="brand-name">Prism<span class="tty">TTY</span></span>
       </a>
       <nav class="site-nav" aria-label="Primary navigation">
-        <a href="#preview">Preview</a>
-        <a href="#scope">Scope</a>
+        <a href="#preview">Demo</a>
+        <a href="#compare">Compare</a>
         <a href="#profiles">Profiles</a>
-        <a href="#feedback">Feedback</a>
         <a href="#install">Install</a>
-        <a href="https://github.com/inxbit/prismtty">GitHub</a>
+        <a class="nav-external" href="https://github.com/inxbit/prismtty">GitHub ↗</a>
       </nav>
     </header>
 
     <main id="top">
       <section class="hero" aria-labelledby="hero-title">
-        <div class="hero-beams" aria-hidden="true">
-          <span></span>
-          <span></span>
-          <span></span>
+        <div class="hero-bg" aria-hidden="true">
+          <span class="beam beam-cyan"></span>
+          <span class="beam beam-green"></span>
+          <span class="beam beam-pink"></span>
         </div>
+
         <div class="hero-copy">
-          <img class="hero-logo" src="assets/prismtty-logo.svg" alt="PrismTTY">
-          <p class="eyebrow">Network and Unix terminal highlighting</p>
-          <h1 id="hero-title">Readable network output, live in your terminal.</h1>
+          <p class="eyebrow">// network &amp; unix terminal highlighting</p>
+          <h1 id="hero-title">Readable output,<br><span class="spectrum-text">live in your terminal.</span></h1>
           <p class="hero-lede">
-            PrismTTY wraps shells, SSH sessions, pipes, and logs with fast PCRE2-powered
-            highlighting tuned for network devices and Unix administration.
+            PrismTTY wraps shells, SSH sessions, pipes, and logs with fast
+            PCRE2-powered highlighting tuned for network devices and Unix
+            administration. No login. No agent. Just signal.
           </p>
-          <div class="hero-actions" aria-label="Primary actions">
+          <div class="hero-actions">
             <a class="button primary" href="#install">Install PrismTTY</a>
-            <a class="button secondary" href="https://github.com/inxbit/prismtty">View on GitHub</a>
+            <a class="button ghost" href="https://github.com/inxbit/prismtty">View source ↗</a>
           </div>
           <dl class="hero-facts" aria-label="Project highlights">
             <div>
               <dt>Profiles</dt>
-              <dd>9 built in</dd>
+              <dd>9 <span>built&nbsp;in</span></dd>
             </div>
             <div>
-              <dt>Current</dt>
+              <dt>Latest</dt>
               <dd>v1.0.9</dd>
             </div>
             <div>
               <dt>Engine</dt>
               <dd>PCRE2</dd>
             </div>
+            <div>
+              <dt>License</dt>
+              <dd>MIT</dd>
+            </div>
           </dl>
         </div>
-        <figure class="hero-preview" id="preview">
-          <img
-            src="assets/prismtty-terminal-demo.svg"
-            alt="Animated synthetic terminal session highlighted by PrismTTY, showing profile detection, interfaces, addresses, status, and syslog severity."
-          >
+
+        <figure class="terminal hero-terminal" id="preview">
+          <div class="terminal-bar">
+            <span class="dots" aria-hidden="true"><i></i><i></i><i></i></span>
+            <span class="terminal-title" data-terminal-title>ptty ssh edge-sw1.example.net</span>
+            <span class="terminal-badge" data-terminal-badge>● live</span>
+          </div>
+          <div class="terminal-body" data-terminal aria-hidden="true"></div>
+          <figcaption class="sr-only">
+            A live terminal session: PrismTTY wraps an SSH connection to a switch and
+            highlights interfaces in amber, IP addresses in cyan, link state in green and
+            pink, and syslog severity in violet.
+          </figcaption>
         </figure>
       </section>
 
@@ -90,26 +104,57 @@
         </div>
         <div class="command-line">
           <span class="prompt">$</span>
-          <code>prismtty --reload</code>
+          <code>ptty /bin/zsh</code>
+        </div>
+      </section>
+
+      <section class="section compare-section" id="compare" aria-labelledby="compare-title">
+        <div class="section-heading compact">
+          <p class="eyebrow">// the difference</p>
+          <h2 id="compare-title">Drag the seam. Watch the noise turn into signal.</h2>
+          <p class="section-sub">
+            Same <code>show tech</code> dump, same monospace, same screen. The only thing
+            that changed is where your eyes land first.
+          </p>
+        </div>
+
+        <div class="compare" data-compare>
+          <pre class="compare-pane compare-raw" data-compare-raw aria-hidden="true"></pre>
+          <pre class="compare-pane compare-hl" data-compare-hl aria-hidden="true"></pre>
+          <div class="compare-divider" data-compare-divider aria-hidden="true">
+            <span class="compare-knob">⇄</span>
+          </div>
+          <label class="sr-only" for="compare-range">Reveal PrismTTY highlighting</label>
+          <input
+            class="compare-range"
+            id="compare-range"
+            type="range"
+            min="0"
+            max="100"
+            value="58"
+            data-compare-range
+          >
+          <span class="compare-tag compare-tag-left" aria-hidden="true">raw</span>
+          <span class="compare-tag compare-tag-right" aria-hidden="true">prismtty</span>
         </div>
       </section>
 
       <section class="section scope-section" id="scope" aria-labelledby="scope-title">
         <div class="section-heading compact">
-          <p class="eyebrow">Scope</p>
+          <p class="eyebrow">// scope</p>
           <h2 id="scope-title">Live terminal highlighting, not device management.</h2>
         </div>
         <div class="scope-grid">
-          <article class="scope-panel">
-            <h3>What this is</h3>
+          <article class="scope-panel scope-yes">
+            <h3><span class="scope-tick" aria-hidden="true">+</span> What this is</h3>
             <p>
               PrismTTY highlights output already flowing through shells, SSH sessions,
               pipes, and logs. It adds terminal color for prompts, interfaces, addresses,
               protocol state, counters, severity, and common vendor terms.
             </p>
           </article>
-          <article class="scope-panel">
-            <h3>What this is not</h3>
+          <article class="scope-panel scope-no">
+            <h3><span class="scope-tick" aria-hidden="true">−</span> What this is not</h3>
             <p>
               It is not an NMS, a configuration management tool, a source of truth,
               a SIEM, a log platform, or a device inventory system. It does not log in,
@@ -119,9 +164,9 @@
         </div>
       </section>
 
-      <section class="section section-grid" aria-labelledby="features-title">
+      <section class="section features-section" aria-labelledby="features-title">
         <div class="section-heading">
-          <p class="eyebrow">Built for real terminal work</p>
+          <p class="eyebrow">// built for real terminal work</p>
           <h2 id="features-title">Color where operators need signal.</h2>
         </div>
         <div class="feature-grid">
@@ -152,61 +197,50 @@
         </div>
       </section>
 
-      <section class="section split-section" id="profiles" aria-labelledby="profiles-title">
-        <div class="media-panel">
-          <img
-            src="assets/prismtty-profile-switching.svg"
-            alt="Synthetic session showing PrismTTY switching from linux-unix to fortinet and then juniper profiles."
-          >
-        </div>
-        <div class="section-copy">
-          <p class="eyebrow">Dynamic profile switching</p>
+      <section class="section profiles-section" id="profiles" aria-labelledby="profiles-title">
+        <div class="section-heading compact">
+          <p class="eyebrow">// dynamic profile switching</p>
           <h2 id="profiles-title">One wrapped shell follows changing device context.</h2>
-          <p>
-            PrismTTY observes login banners, prompts, and typed remote-jump commands.
-            It can move from a local Unix shell into network device sessions while keeping
-            normal command output from churning the selected profile.
+          <p class="section-sub">
+            PrismTTY watches login banners, prompts, and remote-jump commands, then
+            re-colors the same kind of output the way each vendor expects. Pick a profile:
           </p>
-          <div class="profile-list" aria-label="Built-in profiles">
-            <span>generic</span>
-            <span>linux-unix</span>
-            <span>cisco</span>
-            <span>juniper</span>
-            <span>fortinet</span>
-            <span>palo-alto</span>
-            <span>arista</span>
-            <span>arubacx</span>
-            <span>versa</span>
+        </div>
+
+        <div class="profiles-demo" data-profiles>
+          <div class="profile-tabs" role="tablist" aria-label="Built-in profiles">
+            <button class="profile-tab" role="tab" data-profile="cisco" aria-selected="true">cisco</button>
+            <button class="profile-tab" role="tab" data-profile="juniper" aria-selected="false">juniper</button>
+            <button class="profile-tab" role="tab" data-profile="fortinet" aria-selected="false">fortinet</button>
+            <button class="profile-tab" role="tab" data-profile="arista" aria-selected="false">arista</button>
+            <button class="profile-tab" role="tab" data-profile="linux-unix" aria-selected="false">linux-unix</button>
+          </div>
+          <div class="terminal profile-terminal">
+            <div class="terminal-bar">
+              <span class="dots" aria-hidden="true"><i></i><i></i><i></i></span>
+              <span class="terminal-title" data-profile-title></span>
+            </div>
+            <div class="terminal-body" data-profile-body aria-live="polite"></div>
           </div>
         </div>
-      </section>
 
-      <section class="section feedback-section" id="feedback" aria-labelledby="feedback-title">
-        <div class="section-heading compact">
-          <p class="eyebrow">Feedback wanted</p>
-          <h2 id="feedback-title">Profile coverage gets better with real-world testing.</h2>
-        </div>
-        <p class="feedback-copy">
-          Testing help is especially useful across the built-in profile set and custom
-          profile files for other vendors, appliances, and terminal workflows.
-        </p>
-        <div class="feedback-list" aria-label="Profiles and vendors wanted for testing">
-          <span>Cisco IOS / IOS XE / IOS XR / NX-OS / ASA</span>
-          <span>Juniper Junos</span>
-          <span>Fortinet FortiGate / FortiOS</span>
-          <span>Palo Alto PAN-OS</span>
-          <span>Arista EOS</span>
-          <span>Aruba CX</span>
-          <span>Versa</span>
-          <span>Linux / Unix</span>
-          <span>Custom vendor profiles</span>
+        <div class="profile-list" aria-label="All built-in profiles">
+          <span>generic</span>
+          <span>linux-unix</span>
+          <span>cisco</span>
+          <span>juniper</span>
+          <span>fortinet</span>
+          <span>palo-alto</span>
+          <span>arista</span>
+          <span>arubacx</span>
+          <span>versa</span>
         </div>
       </section>
 
       <section class="section install-section" id="install" aria-labelledby="install-title">
         <div class="section-heading compact">
-          <p class="eyebrow">Install</p>
-          <h2 id="install-title">Get PrismTTY from Homebrew, Cargo, or GitHub releases.</h2>
+          <p class="eyebrow">// install</p>
+          <h2 id="install-title">Up and highlighting in one line.</h2>
         </div>
         <div class="install-grid">
           <article class="install-card">
@@ -232,40 +266,70 @@
           </article>
         </div>
         <div class="install-links">
-          <a href="https://crates.io/crates/prismtty">crates.io package</a>
-          <a href="https://github.com/inxbit/prismtty/releases">GitHub releases</a>
-          <a href="https://github.com/inxbit/homebrew-tap">Homebrew tap</a>
+          <a href="https://crates.io/crates/prismtty">crates.io package ↗</a>
+          <a href="https://github.com/inxbit/prismtty/releases">GitHub releases ↗</a>
+          <a href="https://github.com/inxbit/homebrew-tap">Homebrew tap ↗</a>
         </div>
       </section>
 
       <section class="section workflow-section" aria-labelledby="workflow-title">
         <div class="section-heading compact">
-          <p class="eyebrow">Workflow</p>
+          <p class="eyebrow">// workflow</p>
           <h2 id="workflow-title">Designed to sit between you and noisy output.</h2>
         </div>
-        <div class="workflow">
-          <div class="workflow-step">
+        <ol class="workflow">
+          <li class="workflow-step">
             <span class="step-number">1</span>
             <h3>Wrap the session</h3>
             <p>Run <code>ptty</code> around a shell, SSH command, or console tool.</p>
-          </div>
-          <div class="workflow-step">
+          </li>
+          <li class="workflow-step">
             <span class="step-number">2</span>
             <h3>Detect context</h3>
-            <p>Use built-in profile hints to recognize Unix and vendor prompts.</p>
-          </div>
-          <div class="workflow-step">
+            <p>Built-in profile hints recognize Unix and vendor prompts on the fly.</p>
+          </li>
+          <li class="workflow-step">
             <span class="step-number">3</span>
             <h3>Highlight output</h3>
-            <p>Render addresses, interfaces, state, counters, and severity in place.</p>
-          </div>
+            <p>Addresses, interfaces, state, counters, and severity, colored in place.</p>
+          </li>
+        </ol>
+      </section>
+
+      <section class="section feedback-section" id="feedback" aria-labelledby="feedback-title">
+        <div class="section-heading compact">
+          <p class="eyebrow">// feedback wanted</p>
+          <h2 id="feedback-title">Profile coverage gets better with real-world testing.</h2>
+        </div>
+        <p class="section-sub feedback-copy">
+          Testing help is especially useful across the built-in profile set and custom
+          profile files for other vendors, appliances, and terminal workflows.
+        </p>
+        <div class="feedback-list" aria-label="Profiles and vendors wanted for testing">
+          <span>Cisco IOS / IOS XE / IOS XR / NX-OS / ASA</span>
+          <span>Juniper Junos</span>
+          <span>Fortinet FortiGate / FortiOS</span>
+          <span>Palo Alto PAN-OS</span>
+          <span>Arista EOS</span>
+          <span>Aruba CX</span>
+          <span>Versa</span>
+          <span>Linux / Unix</span>
+          <span>Custom vendor profiles</span>
         </div>
       </section>
     </main>
 
     <footer class="site-footer">
-      <span>PrismTTY is MIT licensed.</span>
-      <a href="https://github.com/inxbit/prismtty/blob/main/README.md">Read the docs</a>
+      <div class="footer-brand">
+        <img class="brand-logo" src="assets/prismtty-lockup.svg" alt="" width="54" height="24">
+        <span>Prism<span class="tty">TTY</span></span>
+      </div>
+      <p class="footer-note">MIT licensed · clean-room profiles · no telemetry.</p>
+      <nav class="footer-links" aria-label="Footer">
+        <a href="https://github.com/inxbit/prismtty/blob/main/README.md">Docs</a>
+        <a href="https://github.com/inxbit/prismtty">GitHub ↗</a>
+        <a href="https://crates.io/crates/prismtty">crates.io ↗</a>
+      </nav>
     </footer>
   </body>
 </html>
