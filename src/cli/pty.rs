@@ -2,9 +2,10 @@ use std::ffi::{OsStr, OsString};
 use std::fs::OpenOptions;
 use std::io::{self, Read, Write};
 use std::mem;
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd, RawFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::process::ExitCode;
 use std::sync::{
+    Arc, Mutex,
     atomic::{AtomicI32, AtomicPtr, Ordering},
     mpsc::{self, SyncSender},
 };
@@ -21,7 +22,7 @@ use super::CliError;
 use super::args::Options;
 use super::profile_selection::dynamic_profile_enabled;
 use super::runtime::{ReloadWatcher, RuntimeRegistration};
-use super::stream::highlight_stream;
+use super::stream::{InputSource, highlight_stream, terminal_echo_enabled};
 use super::trace::IoTrace;
 
 const STRIPPED_ITERM_ENV: [&str; 6] = [
@@ -33,6 +34,10 @@ const STRIPPED_ITERM_ENV: [&str; 6] = [
     "ITERM_PROFILE",
 ];
 const PROFILE_INPUT_QUEUE_CAPACITY: usize = 1024;
+/// How many bytes of recently forwarded input the highlight loop keeps to match
+/// against buffered echo. A buffered token is small (≤512 bytes), so this only
+/// needs to cover the tail of the latest input; older input is dropped.
+const RECENT_INPUT_WINDOW: usize = 4096;
 const TERMINATING_SIGNALS: [libc::c_int; 4] =
     [libc::SIGTERM, libc::SIGHUP, libc::SIGQUIT, libc::SIGINT];
 const RAW_SIGNAL_STOP_BYTE: u8 = 0;
@@ -154,15 +159,42 @@ pub(super) fn run_command(options: Options, command: Vec<OsString>) -> Result<Ex
         (None, None)
     };
 
+    // An owned dup of the wrapped PTY master fd, kept for the whole session. The
+    // read loop polls it (idle detection) and reads its ECHO flag, and the stdin
+    // forwarder reads its ECHO flag too. Duping keeps these uses independent of
+    // the resize watcher (which owns the master itself), so a resize-thread exit
+    // cannot close the descriptor out from under the read loop.
+    let pty_fd_owned = if interactive {
+        Some(dup_master_fd(&*pair.master)?)
+    } else {
+        None
+    };
+    let pty_fd = pty_fd_owned.as_ref().map(AsRawFd::as_raw_fd);
+
+    // Records bytes forwarded to the child so the highlight loop can recognise
+    // their echo: it surfaces a buffered trailing token on idle only when the
+    // token is a suffix of this (genuine echo), never a speculatively-buffered
+    // token of program output. Input forwarded while the child's terminal ECHO
+    // is off (e.g. a password) is never recorded — it cannot echo, so retaining
+    // it would only risk a stale match and keep a secret in memory.
+    let recent_input = Arc::new(Mutex::new(Vec::new()));
     if raw_mode.is_some() {
         let mut writer = pair.master.take_writer()?;
         let trace = trace.clone();
         let local_echo = options.local_echo;
+        let recent_input = Arc::clone(&recent_input);
         spawn_supervised("input forwarding", true, move || {
             let stdin = io::stdin();
             let mut stdin = stdin.lock();
-            let _ =
-                forward_stdin_to_pty(&mut stdin, &mut writer, local_echo, trace, profile_input_tx);
+            let _ = forward_stdin_to_pty(
+                &mut stdin,
+                &mut writer,
+                local_echo,
+                trace,
+                profile_input_tx,
+                &recent_input,
+                pty_fd,
+            );
         });
     }
 
@@ -176,7 +208,11 @@ pub(super) fn run_command(options: Options, command: Vec<OsString>) -> Result<Ex
         &mut reader,
         &mut stdout,
         &options,
-        interactive,
+        InputSource {
+            interactive,
+            pty_fd,
+            recent_input: Some(recent_input),
+        },
         reload_watcher,
         trace,
         profile_input_rx,
@@ -278,6 +314,8 @@ fn forward_stdin_to_pty<R: Read, W: Write>(
     local_echo: bool,
     trace: IoTrace,
     profile_input: Option<SyncSender<Vec<u8>>>,
+    recent_input: &Mutex<Vec<u8>>,
+    pty_fd: Option<RawFd>,
 ) -> io::Result<()> {
     let mut buffer = [0_u8; 1024];
     let mut echo_state = LocalEchoState::default();
@@ -291,6 +329,9 @@ fn forward_stdin_to_pty<R: Read, W: Write>(
         if let Some(sender) = &profile_input {
             let _ = sender.try_send(input.to_vec());
         }
+        // Record before writing to the PTY so an immediate line-discipline echo
+        // cannot outrun the highlight loop's suffix match.
+        record_recent_input(recent_input, input, pty_fd);
         writer.write_all(input)?;
         writer.flush()?;
 
@@ -303,6 +344,45 @@ fn forward_stdin_to_pty<R: Read, W: Write>(
             }
         }
     }
+}
+
+/// Records forwarded input for the highlight loop's echo matching.
+///
+/// While the child's terminal has ECHO on, appends `input`, retaining only the
+/// last [`RECENT_INPUT_WINDOW`] bytes so the buffer cannot grow without bound.
+/// While ECHO is off (password prompts, raw-mode programs) the input never
+/// echoes back, so it is not recorded; the buffer is cleared instead, so a typed
+/// secret is not retained and cannot later be mistaken for program output.
+fn record_recent_input(recent_input: &Mutex<Vec<u8>>, input: &[u8], pty_fd: Option<RawFd>) {
+    let mut recent = recent_input
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if !terminal_echo_enabled(pty_fd) {
+        recent.clear();
+        return;
+    }
+    recent.extend_from_slice(input);
+    let overflow = recent.len().saturating_sub(RECENT_INPUT_WINDOW);
+    if overflow > 0 {
+        recent.drain(..overflow);
+    }
+}
+
+fn dup_master_fd(master: &dyn portable_pty::MasterPty) -> io::Result<OwnedFd> {
+    let fd = master.as_raw_fd().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::Unsupported,
+            "PTY master file descriptor is unavailable",
+        )
+    })?;
+    // SAFETY: `fd` is the live PTY master descriptor. `dup` returns a fresh
+    // descriptor that `OwnedFd` takes sole ownership of and closes on drop.
+    let duped = unsafe { libc::dup(fd) };
+    if duped < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `duped` is a newly-created descriptor owned by this function.
+    Ok(unsafe { OwnedFd::from_raw_fd(duped) })
 }
 
 #[cfg(test)]
@@ -737,6 +817,7 @@ fn restore_signal_handler(signal: libc::c_int, previous: &libc::sigaction) {
 #[cfg(test)]
 mod tests {
     use std::io::Cursor;
+    use std::sync::Mutex;
 
     use nix::sys::termios::{InputFlags, LocalFlags, OutputFlags};
 
@@ -827,11 +908,79 @@ mod tests {
         let mut input = Cursor::new(b"show version\n".to_vec());
         let mut output = Vec::new();
         let trace = super::IoTrace::open(None).expect("trace disabled");
+        let recent_input = Mutex::new(Vec::new());
 
-        super::forward_stdin_to_pty(&mut input, &mut output, false, trace, Some(tx))
-            .expect("stdin forwards even when profile input queue is full");
+        // pty_fd: None makes terminal_echo_enabled default to true, so input is
+        // recorded (the ECHO-off skip path is covered by the integration tests).
+        super::forward_stdin_to_pty(
+            &mut input,
+            &mut output,
+            false,
+            trace,
+            Some(tx),
+            &recent_input,
+            None,
+        )
+        .expect("stdin forwards even when profile input queue is full");
 
         assert_eq!(output, b"show version\n");
+        assert_eq!(
+            recent_input.lock().unwrap().as_slice(),
+            b"show version\n",
+            "forwarded input is recorded for echo matching by the highlight loop"
+        );
+    }
+
+    #[test]
+    fn forwarded_input_is_recorded_before_child_can_echo_it() {
+        let source = include_str!("pty.rs");
+        let function_source = source
+            .split("fn forward_stdin_to_pty")
+            .nth(1)
+            .expect("forwarder exists")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("function precedes tests");
+
+        let record_idx = function_source
+            .find("record_recent_input(recent_input, input,")
+            .expect("recent input is recorded");
+        let write_idx = function_source
+            .find("writer.write_all(input)?")
+            .expect("input is written to child PTY");
+
+        assert!(
+            record_idx < write_idx,
+            "recent input must be recorded before PTY write so immediate echo can be matched"
+        );
+    }
+
+    #[test]
+    fn record_recent_input_skips_non_echoed_input() {
+        use nix::pty::openpty;
+        use nix::sys::termios::{SetArg, tcgetattr, tcsetattr};
+        use std::os::fd::AsRawFd;
+
+        let pty = openpty(None, None).expect("openpty");
+        let master_fd = pty.master.as_raw_fd();
+        let recent = Mutex::new(Vec::new());
+
+        // ECHO on: forwarded input is recorded for echo matching.
+        let mut attrs = tcgetattr(&pty.slave).expect("tcgetattr");
+        attrs.local_flags.insert(LocalFlags::ECHO);
+        tcsetattr(&pty.slave, SetArg::TCSANOW, &attrs).expect("echo on");
+        super::record_recent_input(&recent, b"show version", Some(master_fd));
+        assert_eq!(recent.lock().unwrap().as_slice(), b"show version");
+
+        // ECHO off (e.g. a password prompt): the typed secret is never recorded,
+        // and any prior tail is cleared, so it cannot be retained or later matched.
+        attrs.local_flags.remove(LocalFlags::ECHO);
+        tcsetattr(&pty.slave, SetArg::TCSANOW, &attrs).expect("echo off");
+        super::record_recent_input(&recent, b"hunter2-secret-passphrase", Some(master_fd));
+        assert!(
+            recent.lock().unwrap().is_empty(),
+            "non-echoed input (password) must not be retained in recent_input"
+        );
     }
 
     #[test]

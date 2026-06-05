@@ -2,6 +2,29 @@
 
 All notable changes to PrismTTY are documented here.
 
+## 1.0.10 - 2026-06-05
+
+### Interactive Rendering
+
+- Surface pasted interactive input echo once the wrapped child PTY goes idle,
+  so a delimiter-less trailing token does not stay hidden until the next
+  keystroke.
+- Preserve cross-read highlighting for program output while type-ahead is
+  present, including no-echo terminal modes such as password prompts.
+
+### Security and Reliability
+
+- Fail closed when an interactive PTY descriptor cannot report terminal ECHO
+  state, and make the PTY descriptor duplication used for echo checks explicit
+  and fallible.
+- Clear recently matched echoed input after it has served the echo-tail match,
+  reducing how long typed or pasted command text remains in memory.
+
+### Tests
+
+- Add integration coverage for pasted input visibility, split program-output
+  highlighting, and concurrent no-echo input edge cases.
+
 ## 1.0.9 - 2026-05-30
 
 ### Security and Reliability

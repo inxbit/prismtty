@@ -598,8 +598,9 @@ impl StreamingHighlighter {
     /// Flushes buffered interactive input echo that is only waiting for a token
     /// boundary, while keeping an incomplete trailing escape sequence buffered.
     ///
-    /// Interactive callers should invoke this when no more input is immediately
-    /// available (for example after a keystroke-sized read) so typed characters
+    /// Interactive callers should invoke this when the input source has gone idle
+    /// and the buffered tail is genuine input echo (see
+    /// `cli::stream::should_flush_input_echo`), so typed or pasted characters
     /// surface promptly instead of staying buffered until the next byte completes
     /// a token. It is a no-op for noninteractive streams, where speculative
     /// token buffering is required for correct highlighting.
@@ -622,6 +623,20 @@ impl StreamingHighlighter {
         self.observe_interactive_visible_chunk(&processed);
         self.reset_interactive_overlay_after_prompt_tail(&mut output);
         output
+    }
+
+    /// The raw bytes that [`Self::flush_buffered_echo`] would surface right now:
+    /// the buffered trailing token, minus any incomplete trailing escape. Empty
+    /// when nothing would flush. The read loop matches these against recently
+    /// forwarded input to confirm the tail is genuine echo before flushing it,
+    /// so a speculatively-buffered *program-output* token is never surfaced
+    /// standalone (which would split its highlight span).
+    pub(crate) fn buffered_echo(&self) -> &[u8] {
+        if !self.passthrough_single_byte_chunks || self.pending.is_empty() {
+            return &[];
+        }
+        let flush_len = incomplete_escape_start(&self.pending).unwrap_or(self.pending.len());
+        &self.pending[..flush_len]
     }
 
     fn highlight_output_chunk(&mut self, input: &AnsiChunk) -> Vec<u8> {
