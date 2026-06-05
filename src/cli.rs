@@ -25,7 +25,7 @@ use args::{Action, Options, parse_args, print_help};
 use profile_selection::profile_store;
 use pty::run_command;
 use runtime::{ReloadWatcher, RuntimeRegistration, request_reload};
-use stream::highlight_stream;
+use stream::{InputSource, highlight_stream};
 use trace::IoTrace;
 
 #[cfg(feature = "completion-generation")]
@@ -152,7 +152,11 @@ fn run_stdin(options: Options) -> Result<ExitCode, CliError> {
         stdin.lock(),
         &mut stdout,
         &options,
-        interactive,
+        InputSource {
+            interactive,
+            pty_fd: None,
+            recent_input: None,
+        },
         reload_watcher,
         trace,
         None,
