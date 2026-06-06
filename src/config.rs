@@ -259,6 +259,7 @@ fn read_config_file(path: &Path) -> std::io::Result<String> {
         .map_err(|source| std::io::Error::new(std::io::ErrorKind::InvalidData, source))
 }
 
+/// Loads and validates a native PrismTTY profile YAML file from disk.
 pub fn load_profile_file(path: impl AsRef<Path>) -> Result<LoadedProfileFile, ConfigError> {
     let path = path.as_ref();
     let input = read_config_file(path).map_err(|source| ConfigError::Read {

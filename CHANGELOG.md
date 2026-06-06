@@ -2,6 +2,30 @@
 
 All notable changes to PrismTTY are documented here.
 
+## 1.0.11 - 2026-06-06
+
+### Interactive Rendering
+
+- Surface delimiter-less raw-mode input echo without waiting for another
+  keystroke, covering ssh-style sessions where the local terminal ECHO flag is
+  off but the child still returns visible echo bytes.
+- Keep the echo flush scoped to idle, byte-for-byte suffix matches, so ordinary
+  split program output remains buffered for cross-read highlighting unless it
+  exactly matches recent type-ahead.
+
+### Security and Reliability
+
+- Scope recent input tracking to the current line and clear it on submit,
+  interrupt, EOF, line kill, suspend, or quit controls so abandoned non-echoed
+  input does not linger.
+- Preserve the display boundary that only child output bytes are emitted; recent
+  user input remains a bounded matching key and is never written directly.
+
+### Tests
+
+- Add raw-mode paste and typed-character integration coverage for ECHO-off
+  child sessions, plus unit coverage for current-line recent input clearing.
+
 ## 1.0.10 - 2026-06-05
 
 ### Interactive Rendering

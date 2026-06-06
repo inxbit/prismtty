@@ -331,12 +331,209 @@ fn split_program_output_token_survives_concurrent_nonechoing_input() {
     assert_spans_intact(&echo_off_split_stream_while_typing(b"x"));
 }
 
-/// The adversarial case the suffix match alone cannot catch: with echo off the
-/// user types the EXACT bytes of the streamed token. Content matching would see
-/// recent input ending in those bytes and flush the *program* token, splitting
-/// it. The ECHO-state gate closes this: with echo off there is no input echo at
-/// all, so nothing is surfaced and the span stays intact.
+// Accepted limitation (no test): when the child has ECHO off AND the user types
+// the EXACT bytes of a concurrently-streamed program token, the byte-equality
+// suffix match can surface that program token and split its span. This is the
+// deliberate trade that lets raw-mode/ssh echo surface (see the raw_mode_* tests
+// below); the `idle` gate prevents it during continuous output, and the
+// non-matching guard above still holds. Screen-safety is unaffected — only the
+// child's own output bytes are ever emitted, never recent_input.
+
+/// Raw-mode (ECHO-off) echo must also surface without extra input. This is the
+/// nsupdate-over-ssh shape: the local PTY is raw with ECHO off, and the child
+/// (here `cat` after `stty raw -echo`) re-emits forwarded bytes as program
+/// output — exactly as a remote readline app's echo arrives back over ssh. The
+/// buffered trailing token must surface on idle, not wait for a delimiter.
 #[test]
-fn split_program_output_token_survives_concurrent_input_matching_the_token() {
-    assert_spans_intact(&echo_off_split_stream_while_typing(b"Vlan11"));
+fn raw_mode_paste_line_is_visible_without_extra_input() {
+    let pair = native_pty_system()
+        .openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("openpty");
+
+    let mut builder = CommandBuilder::new(env!("CARGO_BIN_EXE_ptty"));
+    builder.arg("sh");
+    builder.arg("-c");
+    builder.arg("stty raw -echo 2>/dev/null; printf 'READY\\n'; exec cat");
+
+    let mut child = pair
+        .slave
+        .spawn_command(builder)
+        .expect("spawn ptty raw cat");
+    drop(pair.slave);
+
+    let mut reader = pair.master.try_clone_reader().expect("clone reader");
+    let mut writer = pair.master.take_writer().expect("take writer");
+
+    let (tx, rx) = mpsc::channel::<String>();
+    thread::spawn(move || {
+        let mut acc = Vec::new();
+        let mut buf = [0u8; 256];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    acc.extend_from_slice(&buf[..n]);
+                    let visible = String::from_utf8_lossy(&strip_ansi(&acc)).into_owned();
+                    if tx.send(visible).is_err() {
+                        break;
+                    }
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => break,
+            }
+        }
+    });
+
+    let ready_deadline = Instant::now() + Duration::from_secs(5);
+    let mut visible = String::new();
+    while Instant::now() < ready_deadline {
+        match rx.recv_timeout(Duration::from_millis(200)) {
+            Ok(latest) => {
+                visible = latest;
+                if visible.contains("READY") {
+                    break;
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    assert!(
+        visible.contains("READY"),
+        "raw-mode child was not ready before paste; saw: {visible:?}"
+    );
+
+    // A delimiter-less trailing token ("192.0.2.1") echoed back by `cat` while
+    // the tty has ECHO off. No newline: it can only surface via the idle flush.
+    let paste = b"update add test.example.com 3600 A 192.0.2.1";
+    writer.write_all(paste).expect("write paste");
+    writer.flush().expect("flush paste");
+
+    let target = "update add test.example.com 3600 A 192.0.2.1";
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        match rx.recv_timeout(Duration::from_millis(200)) {
+            Ok(latest) => {
+                visible = latest;
+                if visible.contains(target) {
+                    break;
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+
+    let _ = child.kill();
+    let _ = child.wait();
+
+    assert!(
+        visible.contains(target),
+        "raw-mode pasted line never fully surfaced without extra input; saw: {visible:?}"
+    );
+}
+
+/// The char-by-char mirror of the nsupdate report: in a raw/ECHO-off session the
+/// running prefix of a typed token must surface at idle, before any delimiter.
+/// Bytes are written one at a time with gaps, so each single-byte read is the
+/// maximum split; without the idle flush the token stays invisible until Enter.
+#[test]
+fn raw_mode_typed_chars_are_visible_without_extra_input() {
+    let pair = native_pty_system()
+        .openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("openpty");
+
+    let mut builder = CommandBuilder::new(env!("CARGO_BIN_EXE_ptty"));
+    builder.arg("sh");
+    builder.arg("-c");
+    builder.arg("stty raw -echo 2>/dev/null; printf 'READY\\n'; exec cat");
+
+    let mut child = pair
+        .slave
+        .spawn_command(builder)
+        .expect("spawn ptty raw cat");
+    drop(pair.slave);
+
+    let mut reader = pair.master.try_clone_reader().expect("clone reader");
+    let mut writer = pair.master.take_writer().expect("take writer");
+
+    let (tx, rx) = mpsc::channel::<String>();
+    thread::spawn(move || {
+        let mut acc = Vec::new();
+        let mut buf = [0u8; 256];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    acc.extend_from_slice(&buf[..n]);
+                    let visible = String::from_utf8_lossy(&strip_ansi(&acc)).into_owned();
+                    if tx.send(visible).is_err() {
+                        break;
+                    }
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => break,
+            }
+        }
+    });
+
+    let ready_deadline = Instant::now() + Duration::from_secs(5);
+    let mut visible = String::new();
+    while Instant::now() < ready_deadline {
+        match rx.recv_timeout(Duration::from_millis(200)) {
+            Ok(latest) => {
+                visible = latest;
+                if visible.contains("READY") {
+                    break;
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    assert!(
+        visible.contains("READY"),
+        "raw-mode child was not ready before typing; saw: {visible:?}"
+    );
+
+    // A single delimiter-less token typed one byte at a time. With no space or
+    // newline ever following, the only path to visibility is the idle flush.
+    for byte in b"showversion" {
+        writer.write_all(&[*byte]).expect("write byte");
+        writer.flush().expect("flush byte");
+        thread::sleep(Duration::from_millis(40));
+    }
+
+    let target = "showversion";
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        match rx.recv_timeout(Duration::from_millis(200)) {
+            Ok(latest) => {
+                visible = latest;
+                if visible.contains(target) {
+                    break;
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+
+    let _ = child.kill();
+    let _ = child.wait();
+
+    assert!(
+        visible.contains(target),
+        "raw-mode typed token never surfaced without a delimiter; saw: {visible:?}"
+    );
 }

@@ -628,9 +628,10 @@ impl StreamingHighlighter {
     /// The raw bytes that [`Self::flush_buffered_echo`] would surface right now:
     /// the buffered trailing token, minus any incomplete trailing escape. Empty
     /// when nothing would flush. The read loop matches these against recently
-    /// forwarded input to confirm the tail is genuine echo before flushing it,
-    /// so a speculatively-buffered *program-output* token is never surfaced
-    /// standalone (which would split its highlight span).
+    /// forwarded input (byte equality) to confirm the tail is echo before
+    /// flushing it, so a speculatively-buffered *program-output* token is
+    /// normally left buffered; the exception is the accepted case where program
+    /// output exactly coincides with the user's recent input.
     pub(crate) fn buffered_echo(&self) -> &[u8] {
         if !self.passthrough_single_byte_chunks || self.pending.is_empty() {
             return &[];

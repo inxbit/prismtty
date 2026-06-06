@@ -22,7 +22,7 @@ use super::CliError;
 use super::args::Options;
 use super::profile_selection::dynamic_profile_enabled;
 use super::runtime::{ReloadWatcher, RuntimeRegistration};
-use super::stream::{InputSource, highlight_stream, terminal_echo_enabled};
+use super::stream::{InputSource, highlight_stream};
 use super::trace::IoTrace;
 
 const STRIPPED_ITERM_ENV: [&str; 6] = [
@@ -160,8 +160,7 @@ pub(super) fn run_command(options: Options, command: Vec<OsString>) -> Result<Ex
     };
 
     // An owned dup of the wrapped PTY master fd, kept for the whole session. The
-    // read loop polls it (idle detection) and reads its ECHO flag, and the stdin
-    // forwarder reads its ECHO flag too. Duping keeps these uses independent of
+    // read loop polls it (idle detection). Duping keeps that use independent of
     // the resize watcher (which owns the master itself), so a resize-thread exit
     // cannot close the descriptor out from under the read loop.
     let pty_fd_owned = if interactive {
@@ -173,10 +172,10 @@ pub(super) fn run_command(options: Options, command: Vec<OsString>) -> Result<Ex
 
     // Records bytes forwarded to the child so the highlight loop can recognise
     // their echo: it surfaces a buffered trailing token on idle only when the
-    // token is a suffix of this (genuine echo), never a speculatively-buffered
-    // token of program output. Input forwarded while the child's terminal ECHO
-    // is off (e.g. a password) is never recorded — it cannot echo, so retaining
-    // it would only risk a stale match and keep a secret in memory.
+    // token is a byte-for-byte suffix of this recent input, never a
+    // speculatively-buffered token of program output. The buffer is scoped to
+    // the in-progress line (cleared on submit/abort) and is never emitted to the
+    // screen, so a non-echoed secret is never drawn even if it is briefly held.
     let recent_input = Arc::new(Mutex::new(Vec::new()));
     if raw_mode.is_some() {
         let mut writer = pair.master.take_writer()?;
@@ -193,7 +192,6 @@ pub(super) fn run_command(options: Options, command: Vec<OsString>) -> Result<Ex
                 trace,
                 profile_input_tx,
                 &recent_input,
-                pty_fd,
             );
         });
     }
@@ -315,7 +313,6 @@ fn forward_stdin_to_pty<R: Read, W: Write>(
     trace: IoTrace,
     profile_input: Option<SyncSender<Vec<u8>>>,
     recent_input: &Mutex<Vec<u8>>,
-    pty_fd: Option<RawFd>,
 ) -> io::Result<()> {
     let mut buffer = [0_u8; 1024];
     let mut echo_state = LocalEchoState::default();
@@ -329,9 +326,11 @@ fn forward_stdin_to_pty<R: Read, W: Write>(
         if let Some(sender) = &profile_input {
             let _ = sender.try_send(input.to_vec());
         }
-        // Record before writing to the PTY so an immediate line-discipline echo
-        // cannot outrun the highlight loop's suffix match.
-        record_recent_input(recent_input, input, pty_fd);
+        // Record before the PTY write so an immediate line-discipline echo cannot
+        // outrun the highlight loop's suffix match. The match runs on the read-loop
+        // thread and `write_all` may block, so this is a cross-thread pre-write
+        // window; it is idle-gated and only ever surfaces the child's own output.
+        record_recent_input(recent_input, input);
         writer.write_all(input)?;
         writer.flush()?;
 
@@ -348,20 +347,26 @@ fn forward_stdin_to_pty<R: Read, W: Write>(
 
 /// Records forwarded input for the highlight loop's echo matching.
 ///
-/// While the child's terminal has ECHO on, appends `input`, retaining only the
-/// last [`RECENT_INPUT_WINDOW`] bytes so the buffer cannot grow without bound.
-/// While ECHO is off (password prompts, raw-mode programs) the input never
-/// echoes back, so it is not recorded; the buffer is cleared instead, so a typed
-/// secret is not retained and cannot later be mistaken for program output.
-fn record_recent_input(recent_input: &Mutex<Vec<u8>>, input: &[u8], pty_fd: Option<RawFd>) {
+/// Appends `input`, then scopes the buffer to the in-progress line: everything up
+/// to and including the last line-break/abort byte is dropped, so a line that is
+/// submitted (CR/LF), interrupted (Ctrl-C), EOF'd (Ctrl-D), killed (Ctrl-U),
+/// suspended (Ctrl-Z), or quit (Ctrl-\) does not linger. The retained tail is
+/// bounded by [`RECENT_INPUT_WINDOW`]. This buffer is only ever compared against
+/// the child's echoed output and is never emitted, so a non-echoed secret (e.g. a
+/// password) is never drawn even while it is briefly held. Backspace and
+/// word-erase are not normalised out — such bytes may remain until the next
+/// break/abort byte, a window overflow, or a successful flush clears them.
+fn record_recent_input(recent_input: &Mutex<Vec<u8>>, input: &[u8]) {
+    fn is_line_break(byte: &u8) -> bool {
+        matches!(byte, b'\r' | b'\n' | 0x03 | 0x04 | 0x15 | 0x1a | 0x1c)
+    }
     let mut recent = recent_input
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if !terminal_echo_enabled(pty_fd) {
-        recent.clear();
-        return;
-    }
     recent.extend_from_slice(input);
+    if let Some(idx) = recent.iter().rposition(is_line_break) {
+        recent.drain(..=idx);
+    }
     let overflow = recent.len().saturating_sub(RECENT_INPUT_WINDOW);
     if overflow > 0 {
         recent.drain(..overflow);
@@ -910,8 +915,6 @@ mod tests {
         let trace = super::IoTrace::open(None).expect("trace disabled");
         let recent_input = Mutex::new(Vec::new());
 
-        // pty_fd: None makes terminal_echo_enabled default to true, so input is
-        // recorded (the ECHO-off skip path is covered by the integration tests).
         super::forward_stdin_to_pty(
             &mut input,
             &mut output,
@@ -919,15 +922,15 @@ mod tests {
             trace,
             Some(tx),
             &recent_input,
-            None,
         )
         .expect("stdin forwards even when profile input queue is full");
 
         assert_eq!(output, b"show version\n");
-        assert_eq!(
-            recent_input.lock().unwrap().as_slice(),
-            b"show version\n",
-            "forwarded input is recorded for echo matching by the highlight loop"
+        // The line ended with a newline, so recent_input is scoped back to empty
+        // (the submitted line is dropped); the forwarding itself is unaffected.
+        assert!(
+            recent_input.lock().unwrap().is_empty(),
+            "a submitted line is not retained in recent_input"
         );
     }
 
@@ -943,7 +946,7 @@ mod tests {
             .expect("function precedes tests");
 
         let record_idx = function_source
-            .find("record_recent_input(recent_input, input,")
+            .find("record_recent_input(recent_input, input)")
             .expect("recent input is recorded");
         let write_idx = function_source
             .find("writer.write_all(input)?")
@@ -956,30 +959,39 @@ mod tests {
     }
 
     #[test]
-    fn record_recent_input_skips_non_echoed_input() {
-        use nix::pty::openpty;
-        use nix::sys::termios::{SetArg, tcgetattr, tcsetattr};
-        use std::os::fd::AsRawFd;
-
-        let pty = openpty(None, None).expect("openpty");
-        let master_fd = pty.master.as_raw_fd();
+    fn record_recent_input_scopes_to_current_line() {
+        // Recording no longer depends on ECHO state; instead the buffer is scoped
+        // to the in-progress line, so a submitted or aborted line (and any secret
+        // in it) does not linger.
         let recent = Mutex::new(Vec::new());
 
-        // ECHO on: forwarded input is recorded for echo matching.
-        let mut attrs = tcgetattr(&pty.slave).expect("tcgetattr");
-        attrs.local_flags.insert(LocalFlags::ECHO);
-        tcsetattr(&pty.slave, SetArg::TCSANOW, &attrs).expect("echo on");
-        super::record_recent_input(&recent, b"show version", Some(master_fd));
+        // Plain typing accumulates for echo matching.
+        super::record_recent_input(&recent, b"show version");
         assert_eq!(recent.lock().unwrap().as_slice(), b"show version");
 
-        // ECHO off (e.g. a password prompt): the typed secret is never recorded,
-        // and any prior tail is cleared, so it cannot be retained or later matched.
-        attrs.local_flags.remove(LocalFlags::ECHO);
-        tcsetattr(&pty.slave, SetArg::TCSANOW, &attrs).expect("echo off");
-        super::record_recent_input(&recent, b"hunter2-secret-passphrase", Some(master_fd));
+        // A submitted line (CR) drops; an embedded newline keeps only the tail.
+        super::record_recent_input(&recent, b"\r");
+        assert!(recent.lock().unwrap().is_empty());
+        super::record_recent_input(&recent, b"ab\ncd");
+        assert_eq!(recent.lock().unwrap().as_slice(), b"cd");
+
+        // Abort/kill controls drop the in-progress line immediately, so a partial
+        // password cannot be retained.
+        super::record_recent_input(&recent, b"secret\x03"); // Ctrl-C
         assert!(
             recent.lock().unwrap().is_empty(),
-            "non-echoed input (password) must not be retained in recent_input"
+            "Ctrl-C abandons the line, dropping any partial secret"
+        );
+        super::record_recent_input(&recent, b"secret\x1c"); // Ctrl-\
+        assert!(
+            recent.lock().unwrap().is_empty(),
+            "Ctrl-\\ abandons the line, dropping any partial secret"
+        );
+        super::record_recent_input(&recent, b"pw\x15retyped"); // Ctrl-U
+        assert_eq!(
+            recent.lock().unwrap().as_slice(),
+            b"retyped",
+            "Ctrl-U kills the line, keeping only what is typed after"
         );
     }
 

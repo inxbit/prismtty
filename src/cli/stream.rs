@@ -1,13 +1,12 @@
 use std::cmp::Reverse;
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
-use std::os::fd::{BorrowedFd, RawFd};
+use std::os::fd::RawFd;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use nix::libc;
-use nix::sys::termios::{LocalFlags, tcgetattr};
 
 use crate::highlight::{
     AnsiChunk, BenchmarkReport, Highlighter, MAX_INCOMPLETE_ESCAPE_BYTES, StreamingHighlighter,
@@ -35,10 +34,11 @@ const AUTO_DETECT_SAMPLE_LIMIT: usize = 64 * 1024;
 /// - `pty_fd`: the PTY master to poll so an echo burst's buffered trailing token
 ///   is flushed once the child goes idle (a paste echoes back in one large read),
 /// - `recent_input`: the bytes the stdin forwarder recently sent to the child.
-///   The loop flushes a buffered trailing token only when it is a suffix of this
-///   (i.e. genuine input echo), so a speculatively-buffered *program-output*
-///   token is never surfaced standalone — even when the child has echo off and
-///   the user is typing while output streams.
+///   The loop flushes a buffered trailing token only when it is a byte-for-byte
+///   suffix of this (a heuristic for genuine input echo). The match is byte
+///   equality, not provenance: in the rare case bulk program output coincides
+///   with the user's exact type-ahead a program token may surface — but only the
+///   child's own output bytes are ever emitted, never `recent_input`.
 pub(super) struct InputSource {
     pub(super) interactive: bool,
     pub(super) pty_fd: Option<RawFd>,
@@ -407,26 +407,22 @@ fn prepare_chunk(input: &[u8], strip_existing_ansi: bool, strip_carry: &mut Vec<
 /// across reads still highlights as one unit. For interactive input echo that
 /// buffering must not strand the last token: a keystroke or pasted line echoes
 /// back and then the child goes idle, so the token would otherwise stay hidden
-/// until the next byte. We flush it once four conditions hold:
+/// until the next byte. We flush it once three conditions hold:
 /// - there is something buffered (`buffered_echo` non-empty),
 /// - the echo burst has drained ([`input_source_idle`]), so we do not split a
 ///   multi-read echo mid-burst, and
-/// - the child's terminal still has ECHO on, since echo only exists while ECHO
-///   is on (so with it off a buffered token can only be program output), and
-/// - the buffered token is a suffix of the recently forwarded input, i.e. it is
-///   genuine echo of what the user typed/pasted — not a speculatively-buffered
-///   token of bulk *program* output (which would lose its cross-read highlight
-///   if flushed standalone).
+/// - the buffered token is a byte-for-byte suffix of the recently forwarded
+///   input ([`consume_echo_suffix`]) — a heuristic for "this is echo of what the
+///   user typed/pasted," not a speculatively-buffered token of bulk *program*
+///   output (which would lose its cross-read highlight if flushed standalone).
 ///
-/// The ECHO check and the suffix match are complementary: the suffix match keeps
-/// program output the user did not type from being flushed, and the ECHO check
-/// covers the converse — a program-output token whose bytes happen to coincide
-/// with non-echoing type-ahead (echo off) is still left buffered.
+/// The suffix match is byte equality, not provenance: in the rare case where
+/// bulk program output coincides with the user's exact non-echoed type-ahead a
+/// program token can surface (and split its span). This is accepted — screen
+/// safety does not rely on the heuristic, because the session only ever emits
+/// the child's own output bytes, never `recent_input`.
 ///
-/// Consumes the matched suffix from `recent_input` when it flushes. Also, when
-/// the child's terminal ECHO is off, clears all of `recent_input` (without
-/// flushing) — the forwarder is the primary guard there, this just drops any
-/// stale tail the read loop observes during an ECHO-off stretch.
+/// Consumes the matched suffix from `recent_input` when it flushes.
 fn should_flush_input_echo(
     interactive: bool,
     pty_fd: Option<RawFd>,
@@ -439,13 +435,6 @@ fn should_flush_input_echo(
     let Some(recent_input) = recent_input else {
         return false;
     };
-    if !terminal_echo_enabled(pty_fd) {
-        recent_input
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clear();
-        return false;
-    }
     if !input_source_idle(pty_fd) {
         return false;
     }
@@ -453,27 +442,6 @@ fn should_flush_input_echo(
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     consume_echo_suffix(&mut recent_input, buffered_echo)
-}
-
-/// Whether the child's terminal currently has ECHO enabled. Input is only
-/// reflected back as echo while ECHO is on; with it off (password prompts,
-/// raw-mode programs) a buffered token can only be program output, never input
-/// echo — even if its bytes coincide with non-echoing type-ahead. The forwarder
-/// uses the same check to avoid recording non-echoed input at all. Defaults to
-/// `true` only when there is no descriptor; when a supplied descriptor cannot
-/// report terminal state, fail closed.
-pub(super) fn terminal_echo_enabled(pty_fd: Option<RawFd>) -> bool {
-    let Some(fd) = pty_fd else {
-        return true;
-    };
-    // SAFETY: `fd` is an owned descriptor for the wrapped PTY (a dup of the
-    // master), kept open by its owner for the whole session; the borrow lasts
-    // only for this `tcgetattr` call.
-    let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
-    match tcgetattr(borrowed) {
-        Ok(termios) => termios.local_flags.contains(LocalFlags::ECHO),
-        Err(_) => false,
-    }
 }
 
 /// If `recent_input` ends with `echo`, the buffered token is genuine input echo:
@@ -492,10 +460,9 @@ fn consume_echo_suffix(recent_input: &mut Vec<u8>, echo: &[u8]) -> bool {
 /// Reports whether the PTY master has no output readable at this instant — the
 /// cue that an interactive echo burst has drained, so buffered echo can surface
 /// without waiting for the next byte. A failed/interrupted poll is treated as
-/// idle so echo still surfaces promptly; the ECHO-on check and the recent-input
-/// suffix match in [`should_flush_input_echo`] keep that from disturbing
-/// program-output buffering. Returns false when no descriptor is available
-/// (stdin mode).
+/// idle so echo still surfaces promptly; the recent-input suffix match in
+/// [`should_flush_input_echo`] keeps that from disturbing program-output
+/// buffering. Returns false when no descriptor is available (stdin mode).
 fn input_source_idle(pty_fd: Option<RawFd>) -> bool {
     let Some(fd) = pty_fd else {
         return false;
@@ -630,8 +597,8 @@ mod tests {
 
     #[test]
     fn should_flush_input_echo_requires_interactive_buffered_and_recent_input() {
-        // No pty_fd: terminal_echo_enabled defaults true and input_source_idle
-        // returns false (stdin mode), so a non-interactive stream never flushes.
+        // Not interactive: the interactive guard short-circuits, so a
+        // non-interactive stream never flushes.
         assert!(!super::should_flush_input_echo(false, None, b"tok", None));
         // Interactive but nothing buffered: never flushes.
         let recent = Mutex::new(b"tok".to_vec());
@@ -646,33 +613,17 @@ mod tests {
     }
 
     #[test]
-    fn terminal_echo_enabled_fails_closed_for_non_terminal_fd() {
-        let mut fds = [0 as nix::libc::c_int; 2];
-        assert_eq!(unsafe { nix::libc::pipe(fds.as_mut_ptr()) }, 0);
-        assert!(!super::terminal_echo_enabled(Some(fds[0])));
-
-        unsafe {
-            nix::libc::close(fds[0]);
-            nix::libc::close(fds[1]);
-        }
-    }
-
-    #[test]
     fn should_flush_input_echo_flushes_only_matching_idle_echo() {
         use nix::pty::openpty;
-        use nix::sys::termios::{SetArg, tcgetattr, tcsetattr};
         use std::os::fd::AsRawFd;
 
         let pty = openpty(None, None).expect("openpty");
         let master_fd = pty.master.as_raw_fd();
         let slave_fd = pty.slave.as_raw_fd();
-        let mut attrs = tcgetattr(&pty.slave).expect("tcgetattr");
-        attrs
-            .local_flags
-            .insert(nix::sys::termios::LocalFlags::ECHO);
-        tcsetattr(&pty.slave, SetArg::TCSANOW, &attrs).expect("echo on");
 
         // Buffered token is a suffix of recent input + idle: flush and clear it.
+        // ECHO state is irrelevant now — the suffix match is the sole
+        // discriminator, which is what lets raw-mode/ssh echo (ECHO off) surface.
         let recent = Mutex::new(b"router# show ".to_vec());
         assert!(super::should_flush_input_echo(
             true,
