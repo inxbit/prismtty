@@ -1058,7 +1058,7 @@ fn interactive_streaming_highlighter_keeps_cisco_help_redraw_command_tail_visibl
     let highlighter = Highlighter::from_config(config).expect("rules compile");
     let mut streaming = new_interactive_streaming(highlighter);
 
-    let _ = streaming.push_str("DORCA-023-DR03A# ");
+    let _ = streaming.push_str("LAB-N9K-CORE-01# ");
     assert_eq!(streaming.push_str("sh mac"), "sh mac");
 
     let help_redraw = concat!(
@@ -1067,13 +1067,13 @@ fn interactive_streaming_highlighter_keeps_cisco_help_redraw_command_tail_visibl
         "  mac-list  Show mac-lists\r\n",
         "  mac-move  Display mac-move policy\r\n",
         "\r\n",
-        "\x1b[23D\x1b[J\rDORCA-023-DR03A# sh mac",
+        "\x1b[23D\x1b[J\rLAB-N9K-CORE-01# sh mac",
     );
 
     let output = streaming.push_str(help_redraw);
     let visible = strip_ansi(output.as_bytes());
 
-    assert!(visible.ends_with(b"DORCA-023-DR03A# sh mac"), "{output:?}");
+    assert!(visible.ends_with(b"LAB-N9K-CORE-01# sh mac"), "{output:?}");
     assert!(streaming.finish().is_empty());
 }
 
@@ -1084,7 +1084,7 @@ fn interactive_streaming_highlighter_keeps_cisco_help_redraw_command_tail_visibl
     let highlighter = Highlighter::from_config(config).expect("rules compile");
     let mut streaming = new_interactive_streaming(highlighter);
 
-    let _ = streaming.push_str("DORCA-023-DR03A# ");
+    let _ = streaming.push_str("LAB-N9K-CORE-01# ");
     assert_eq!(streaming.push_str("sh mac"), "sh mac");
 
     // Push the help menu part
@@ -1098,7 +1098,7 @@ fn interactive_streaming_highlighter_keeps_cisco_help_redraw_command_tail_visibl
     assert_eq!(out2, cursor_pos);
 
     // Push the prompt + command tail
-    let redraw = "DORCA-023-DR03A# sh mac";
+    let redraw = "LAB-N9K-CORE-01# sh mac";
     let out3 = streaming.push_str(redraw);
     assert_eq!(strip_ansi(out3.as_bytes()), redraw.as_bytes());
 
@@ -1112,7 +1112,7 @@ fn interactive_streaming_highlighter_keeps_cisco_help_redraw_command_tail_visibl
     let highlighter = Highlighter::from_config(config).expect("rules compile");
     let mut streaming = new_interactive_streaming(highlighter);
 
-    let _ = streaming.push_str("DORCA-023-DR03A# ");
+    let _ = streaming.push_str("LAB-N9K-CORE-01# ");
     assert_eq!(streaming.push_str("sh mac"), "sh mac");
 
     // Push the help menu part
@@ -1121,9 +1121,9 @@ fn interactive_streaming_highlighter_keeps_cisco_help_redraw_command_tail_visibl
     assert_eq!(strip_ansi(out1.as_bytes()), help_menu.as_bytes());
 
     // Push the cursor positioning sequence + prompt
-    let cursor_pos_prompt = "\x1b[23D\x1b[J\rDORCA-023-DR03A# sh ";
+    let cursor_pos_prompt = "\x1b[23D\x1b[J\rLAB-N9K-CORE-01# sh ";
     let out2 = streaming.push_str(cursor_pos_prompt);
-    assert_eq!(strip_ansi(out2.as_bytes()), b"\rDORCA-023-DR03A# sh ");
+    assert_eq!(strip_ansi(out2.as_bytes()), b"\rLAB-N9K-CORE-01# sh ");
 
     // Push the command tail
     let redraw_tail = "mac";
@@ -1140,7 +1140,7 @@ fn interactive_streaming_highlighter_keeps_cisco_help_redraw_command_tail_visibl
     let highlighter = Highlighter::from_config(config).expect("rules compile");
     let mut streaming = new_interactive_streaming(highlighter);
 
-    let _ = streaming.push_str("DORCA-023-DR03A# ");
+    let _ = streaming.push_str("LAB-N9K-CORE-01# ");
     assert_eq!(streaming.push_str("sh mac"), "sh mac");
 
     // Push the help menu part
@@ -1149,7 +1149,7 @@ fn interactive_streaming_highlighter_keeps_cisco_help_redraw_command_tail_visibl
     assert_eq!(strip_ansi(out1.as_bytes()), help_menu.as_bytes());
 
     // Push the prompt + command tail with only a carriage return redraw
-    let redraw = "\rDORCA-023-DR03A# sh mac";
+    let redraw = "\rLAB-N9K-CORE-01# sh mac";
     let out2 = streaming.push_str(redraw);
     assert_eq!(strip_ansi(out2.as_bytes()), redraw.as_bytes());
 
@@ -1185,13 +1185,13 @@ fn interactive_streaming_highlighter_cisco_help_redraw_does_not_leak_colors() {
     let highlighter = Highlighter::from_config(config).expect("rules compile");
     let mut streaming = new_interactive_streaming(highlighter);
 
-    let _ = streaming.push_str("DORCA-023-DR03(config-if)# ");
+    let _ = streaming.push_str("LAB-N9K-CORE-01(config-if)# ");
     assert_eq!(streaming.push_str("ip osp"), "ip osp");
 
     // Cisco help response when "?" is typed after typing "osp":
     // The OSPF state "FULL" is printed and highlighted orange (color: f#ffa500, which in ansi is \x1b[38;2;255;165;0m)
     // Then it redraws the prompt.
-    let help_redraw = "?\r\nFULL\r\nDORCA-023-DR03(config-if)#ip osp";
+    let help_redraw = "?\r\nFULL\r\nLAB-N9K-CORE-01(config-if)#ip osp";
     let output = streaming.push_str(help_redraw);
 
     // Let's assert that "FULL" is highlighted in orange (\x1b[38;2;255;165;0m)
@@ -1200,10 +1200,10 @@ fn interactive_streaming_highlighter_cisco_help_redraw_does_not_leak_colors() {
         "expected 'FULL' to be highlighted orange, got: {output:?}"
     );
 
-    // Let's assert that the prompt "DORCA-023-DR03" is reset and does not have the leaked orange color.
+    // Let's assert that the prompt "LAB-N9K-CORE-01" is reset and does not have the leaked orange color.
     // The reset sequence should be emitted before the prompt.
     assert!(
-        output.contains("\x1b[39mDORCA-023-DR03"),
+        output.contains("\x1b[39mLAB-N9K-CORE-01"),
         "expected reset before prompt to prevent color leakage, got: {output:?}"
     );
     assert!(streaming.finish().is_empty());
@@ -1217,10 +1217,10 @@ fn interactive_streaming_highlighter_cisco_help_redraw_uses_full_reset_when_conf
     let mut streaming = new_interactive_streaming(highlighter);
     streaming.set_no_minimal_resets(true);
 
-    let _ = streaming.push_str("DORCA-023-DR03(config-if)# ");
+    let _ = streaming.push_str("LAB-N9K-CORE-01(config-if)# ");
     assert_eq!(streaming.push_str("ip osp"), "ip osp");
 
-    let help_redraw = "?\r\nFULL\r\nDORCA-023-DR03(config-if)#ip osp";
+    let help_redraw = "?\r\nFULL\r\nLAB-N9K-CORE-01(config-if)#ip osp";
     let output = streaming.push_str(help_redraw);
 
     assert!(
@@ -1228,11 +1228,11 @@ fn interactive_streaming_highlighter_cisco_help_redraw_uses_full_reset_when_conf
         "expected 'FULL' to be highlighted orange, got: {output:?}"
     );
     assert!(
-        output.contains("\x1b[0mDORCA-023-DR03"),
+        output.contains("\x1b[0mLAB-N9K-CORE-01"),
         "expected full reset before prompt to prevent color leakage, got: {output:?}"
     );
     assert!(
-        !output.contains("\x1b[39mDORCA-023-DR03"),
+        !output.contains("\x1b[39mLAB-N9K-CORE-01"),
         "expected full reset to replace minimal foreground reset, got: {output:?}"
     );
     assert!(streaming.finish().is_empty());

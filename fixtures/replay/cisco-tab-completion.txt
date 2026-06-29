@@ -1,0 +1,5 @@
+N9K-LAB-01# show version
+Cisco Nexus Operating System (NX-OS) Software
+N9K-LAB-01# sh lo[22D[JN9K-LAB-01# sh lo
+locator-led   logging       login
+[JN9K-LAB-01# sh lo
