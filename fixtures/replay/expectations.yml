@@ -22,6 +22,16 @@ fixtures:
         foreground: "#0099ff"
       - text: "Vlan1191"
         foreground: "#0099ff"
+  cisco-tab-completion.txt:
+    synthetic: true
+    expected_profiles: ["generic", "cisco"]
+    # Presence-only: the redraw's cursor-positioning escapes trigger PrismTTY's
+    # cursor-paint bypass (so styled-token assertions don't apply); this fixture
+    # guards profile detection + clean processing of the redraw across chunk modes.
+    tokens:
+      - text: "Cisco Nexus Operating System"
+      - text: "locator-led"
+      - text: "login"
   juniper.txt:
     synthetic: true
     expected_profiles: ["generic", "juniper"]

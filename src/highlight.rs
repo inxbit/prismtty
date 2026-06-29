@@ -54,6 +54,12 @@ pub struct StyledSpan {
 pub struct StreamingHighlighter {
     highlighter: Highlighter,
     pending: Vec<u8>,
+    /// True when `pending` holds the trailing token split off a prompt-echo
+    /// redraw remainder (set at the prompt-echo split branches in
+    /// `push_combined_chunk`). The read loop flushes such a tail on idle even
+    /// without a recent-input byte match; program output buffered by the normal
+    /// streaming split leaves this `false`.
+    pending_from_prompt_echo_remainder: bool,
     alternate_screen: bool,
     passthrough_single_byte_chunks: bool,
     prompt_echo_passthrough: bool,
@@ -341,6 +347,7 @@ impl StreamingHighlighter {
         Self {
             highlighter,
             pending: Vec::new(),
+            pending_from_prompt_echo_remainder: false,
             alternate_screen: false,
             passthrough_single_byte_chunks: false,
             prompt_echo_passthrough: false,
@@ -357,6 +364,7 @@ impl StreamingHighlighter {
         Self {
             highlighter,
             pending: Vec::new(),
+            pending_from_prompt_echo_remainder: false,
             alternate_screen: false,
             passthrough_single_byte_chunks: true,
             prompt_echo_passthrough: false,
@@ -373,6 +381,7 @@ impl StreamingHighlighter {
         Self {
             highlighter,
             pending: Vec::new(),
+            pending_from_prompt_echo_remainder: false,
             alternate_screen: false,
             passthrough_single_byte_chunks: false,
             prompt_echo_passthrough: false,
@@ -389,6 +398,7 @@ impl StreamingHighlighter {
         Self {
             highlighter,
             pending: Vec::new(),
+            pending_from_prompt_echo_remainder: false,
             alternate_screen: false,
             passthrough_single_byte_chunks: true,
             prompt_echo_passthrough: false,
@@ -462,6 +472,12 @@ impl StreamingHighlighter {
     }
 
     fn push_combined_chunk(&mut self, mut combined: AnsiChunk) -> Vec<u8> {
+        // Recompute provenance for this chunk's pending from scratch: the flag is
+        // only meaningful alongside the `pending` this call produces. Each split
+        // site below re-asserts it; resetting here keeps a stale `true` from an
+        // earlier chunk (e.g. after a partial `flush_buffered_echo` drain or an
+        // emit-all passthrough that leaves `pending` untouched) from surviving.
+        self.pending_from_prompt_echo_remainder = false;
         combined.neutralize_oversized_incomplete_escape();
         let alternate_screen_chunk =
             self.alternate_screen || contains_alternate_screen_enable_tokens(&combined.tokens);
@@ -528,6 +544,7 @@ impl StreamingHighlighter {
 
             let split_at = interactive_split_at_chunk(&remainder, false, self.alternate_screen);
             let processed = split_prepared_pending(&mut remainder, split_at, &mut self.pending);
+            self.pending_from_prompt_echo_remainder = !self.pending.is_empty();
 
             output.extend(self.highlight_output_chunk(&processed));
             self.observe_interactive_visible_chunk(&processed);
@@ -551,6 +568,7 @@ impl StreamingHighlighter {
 
             let split_at = interactive_split_at_chunk(&remainder, false, self.alternate_screen);
             let processed = split_prepared_pending(&mut remainder, split_at, &mut self.pending);
+            self.pending_from_prompt_echo_remainder = !self.pending.is_empty();
 
             output.extend(self.highlight_output_chunk(&processed));
             self.observe_interactive_visible_chunk(&processed);
@@ -568,6 +586,7 @@ impl StreamingHighlighter {
             streaming_split_at(combined.bytes())
         };
         let processed = split_prepared_pending(&mut combined, split_at, &mut self.pending);
+        self.pending_from_prompt_echo_remainder = false;
 
         let mut output = self.highlight_output_chunk(&processed);
         self.observe_interactive_visible_chunk(&processed);
@@ -611,7 +630,7 @@ impl StreamingHighlighter {
 
         // Keep only a trailing incomplete escape buffered; its completing bytes
         // arrive in the same burst and emitting a partial escape corrupts output.
-        let flush_len = incomplete_escape_start(&self.pending).unwrap_or(self.pending.len());
+        let flush_len = flushable_pending_len(&self.pending);
         if flush_len == 0 {
             return Vec::new();
         }
@@ -636,8 +655,23 @@ impl StreamingHighlighter {
         if !self.passthrough_single_byte_chunks || self.pending.is_empty() {
             return &[];
         }
-        let flush_len = incomplete_escape_start(&self.pending).unwrap_or(self.pending.len());
+        let flush_len = flushable_pending_len(&self.pending);
         &self.pending[..flush_len]
+    }
+
+    /// True only when [`Self::buffered_echo`] holds a token that was split off a
+    /// prompt-echo redraw remainder AND the current visible line is a recognized
+    /// `prompt# command` line, the shape a device produces when it redraws the
+    /// command line after a Tab/`?` completion without echoing the trigger byte.
+    /// Program output buffered by the normal streaming split has provenance
+    /// `false` and never qualifies, so the read loop's idle flush of this tail
+    /// cannot fire on ordinary output. Only the child's own buffered bytes are
+    /// ever emitted, so a line with no echoed command (a password prompt) holds
+    /// no token and returns false.
+    pub(crate) fn buffered_echo_completes_prompt_line(&self) -> bool {
+        !self.buffered_echo().is_empty()
+            && self.pending_from_prompt_echo_remainder
+            && contains_prompt_echo_in_visible_line(&self.visible_line_tail)
     }
 
     fn highlight_output_chunk(&mut self, input: &AnsiChunk) -> Vec<u8> {
@@ -2127,6 +2161,16 @@ fn incomplete_utf8_start(bytes: &[u8]) -> Option<usize> {
     (continuations + 1 < expected).then_some(idx - 1)
 }
 
+/// The leading length of `pending` that is safe to surface now: up to a trailing
+/// incomplete escape OR a trailing incomplete UTF-8 sequence, whichever begins
+/// earlier. Their completing bytes arrive in the same burst, so emitting a
+/// partial escape or codepoint would corrupt output.
+fn flushable_pending_len(pending: &[u8]) -> usize {
+    let escape = incomplete_escape_start(pending).unwrap_or(pending.len());
+    let utf8 = incomplete_utf8_start(pending).unwrap_or(pending.len());
+    escape.min(utf8)
+}
+
 fn ansi_sequence_end_containing(bytes: &[u8], index: usize) -> Option<usize> {
     let mut search_end = index.min(bytes.len());
     while search_end > 0 {
@@ -2342,6 +2386,169 @@ mod tests {
             super::MAX_INCOMPLETE_ESCAPE_BYTES,
         ));
         assert!(!super::escape_is_incomplete_at(&oversized, 0));
+    }
+
+    // Cisco Nexus ambiguous-Tab redraw (real --trace-io bytes, hostname
+    // synthesized). The device redraws the command line ending in the bare token
+    // "log" and idles; the trailing token is withheld in `pending`. The live read
+    // loop must surface it on idle. This asserts the provenance signal the read
+    // loop keys on and that the flush emits exactly the tail.
+    #[test]
+    fn interactive_buffered_tab_completion_tail_is_flagged_as_prompt_echo() {
+        let highlighter =
+            Highlighter::from_config(PrismConfig::default()).expect("empty config compiles");
+        let mut streaming = StreamingHighlighter::new_interactive(highlighter);
+
+        let _ = streaming.push_str("LAB-N9K-CORE-01# ");
+        assert_eq!(streaming.push_str("sh lo"), "sh lo");
+
+        let redraw = "\x1b[23D\x1b[J\rLAB-N9K-CORE-01# sh log\r\r\nlogging   login     \r\r\n\x1b[J\rLAB-N9K-CORE-01# sh log";
+        let out = streaming.push_str(redraw);
+        let visible = super::strip_ansi(out.as_bytes());
+
+        // The trailing token is withheld (the live bug): only "...# sh " is emitted.
+        assert!(
+            visible.ends_with(b"LAB-N9K-CORE-01# sh "),
+            "tail should be withheld: {out:?}"
+        );
+        assert_eq!(streaming.buffered_echo(), b"log");
+
+        // New signal: the buffered tail provably came from a prompt-echo redraw.
+        assert!(streaming.buffered_echo_completes_prompt_line());
+
+        // The idle flush surfaces exactly the tail.
+        assert_eq!(super::strip_ansi(&streaming.flush_buffered_echo()), b"log");
+        assert!(streaming.finish().is_empty());
+    }
+
+    #[test]
+    fn buffered_echo_withholds_incomplete_utf8_tail() {
+        let highlighter =
+            Highlighter::from_config(PrismConfig::default()).expect("empty config compiles");
+        let mut streaming = StreamingHighlighter::new_interactive(highlighter);
+
+        // Interactive chunk ending mid-codepoint (first two bytes of '❯' U+276F =
+        // E2 9D AF). The partial multibyte must not be surfaced by the idle flush.
+        let _ = streaming.push(b"echo \xe2\x9d");
+        assert!(
+            streaming.buffered_echo().is_empty(),
+            "incomplete UTF-8 tail must stay buffered: {:?}",
+            streaming.buffered_echo()
+        );
+        assert!(streaming.flush_buffered_echo().is_empty());
+
+        // Completing the codepoint surfaces the whole character.
+        let out = streaming.push(b"\xafx");
+        assert!(
+            super::strip_ansi(&out)
+                .windows(3)
+                .any(|w| w == "❯".as_bytes()),
+            "completed codepoint should surface intact: {out:?}"
+        );
+    }
+
+    // Provenance guard: program output must never trigger the prompt-echo idle
+    // flush.
+    #[test]
+    fn program_output_does_not_qualify_for_prompt_echo_flush() {
+        // Plain bulk output split mid-token: buffered via the normal streaming
+        // branch, so provenance is false and it is not eligible.
+        let highlighter =
+            Highlighter::from_config(PrismConfig::default()).expect("empty config compiles");
+        let mut streaming = StreamingHighlighter::new_interactive(highlighter);
+        let _ = streaming.push(b"interface Vlan11");
+        assert_eq!(streaming.buffered_echo(), b"Vlan11");
+        assert!(
+            !streaming.buffered_echo_completes_prompt_line(),
+            "bulk program output must not qualify as a prompt-echo redraw tail"
+        );
+
+        // Output whose line resembles `word# text` must likewise never trigger
+        // the flush (it is emitted as prompt-echo passthrough, not stranded as a
+        // buffered tail with prompt-echo provenance).
+        let highlighter =
+            Highlighter::from_config(PrismConfig::default()).expect("empty config compiles");
+        let mut streaming = StreamingHighlighter::new_interactive(highlighter);
+        let _ = streaming.push(b"status# Vlan11");
+        assert!(
+            !streaming.buffered_echo_completes_prompt_line(),
+            "prompt-shaped program output must not trigger the prompt-echo flush"
+        );
+    }
+
+    #[test]
+    fn password_prompt_after_command_does_not_qualify_for_prompt_echo_flush() {
+        let highlighter =
+            Highlighter::from_config(PrismConfig::default()).expect("empty config compiles");
+        let mut streaming = StreamingHighlighter::new_interactive(highlighter);
+
+        let _ = streaming.push(b"host# ssh admin@192.0.2.1\r\n");
+        let _ = streaming.push(b"Password: ");
+        // A non-echoed password produces no buffered token, and `Password: ` is
+        // not a `prompt# command` line, so the prompt-echo flush cannot fire.
+        assert!(streaming.buffered_echo().is_empty());
+        assert!(!streaming.buffered_echo_completes_prompt_line());
+    }
+
+    #[test]
+    fn more_paging_prompt_does_not_qualify_for_prompt_echo_flush() {
+        let highlighter =
+            Highlighter::from_config(PrismConfig::default()).expect("empty config compiles");
+        let mut streaming = StreamingHighlighter::new_interactive(highlighter);
+
+        let _ = streaming.push(b"a line of output\r\n");
+        let _ = streaming.push(b"\x1b[7m--More--\x1b[27m");
+        assert!(
+            !streaming.buffered_echo_completes_prompt_line(),
+            "the --More-- pager prompt is not a prompt-echo command line"
+        );
+    }
+
+    #[test]
+    fn prompt_echo_redraw_split_across_writes_loses_no_text() {
+        let highlighter =
+            Highlighter::from_config(PrismConfig::default()).expect("empty config compiles");
+        let mut streaming = StreamingHighlighter::new_interactive(highlighter);
+
+        let _ = streaming.push_str("LAB-N9K-CORE-01# ");
+        let _ = streaming.push_str("sh lo");
+
+        // The same redraw delivered as two fragmented writes must not lose the
+        // command tail; the idle flush plus finish() surface anything buffered.
+        let full = "\x1b[23D\x1b[J\rLAB-N9K-CORE-01# sh log\r\r\nlogging   login     \r\r\n\x1b[J\rLAB-N9K-CORE-01# sh log";
+        let mid = full.len() / 2;
+        let mut visible = super::strip_ansi(streaming.push_str(&full[..mid]).as_bytes());
+        visible.extend(super::strip_ansi(
+            streaming.push_str(&full[mid..]).as_bytes(),
+        ));
+        visible.extend(super::strip_ansi(&streaming.flush_buffered_echo()));
+        visible.extend(super::strip_ansi(&streaming.finish()));
+        let needle = b"LAB-N9K-CORE-01# sh log";
+        assert!(
+            visible.windows(needle.len()).any(|w| w == needle),
+            "command tail lost across a split redraw: {visible:?}"
+        );
+    }
+
+    #[test]
+    fn local_shell_dollar_prompt_completion_tail_qualifies_for_prompt_echo_flush() {
+        let highlighter =
+            Highlighter::from_config(PrismConfig::default()).expect("empty config compiles");
+        let mut streaming = StreamingHighlighter::new_interactive(highlighter);
+
+        // A local shell `$` prompt redrawing the command after Tab, ending in a
+        // bare token, must qualify exactly like a network device (vendor-agnostic).
+        let _ = streaming.push_str("user@host:~$ ");
+        let _ = streaming.push_str("git lo");
+        let redraw = "\x1b[20D\x1b[J\ruser@host:~$ git log\r\r\nlog       logout    \r\r\n\x1b[J\ruser@host:~$ git log";
+        let _ = streaming.push_str(redraw);
+
+        assert_eq!(streaming.buffered_echo(), b"log");
+        assert!(
+            streaming.buffered_echo_completes_prompt_line(),
+            "a $-prompt completion redraw tail must qualify"
+        );
+        assert_eq!(super::strip_ansi(&streaming.flush_buffered_echo()), b"log");
     }
 
     #[test]

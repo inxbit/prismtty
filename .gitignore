@@ -12,3 +12,7 @@
 *.key
 *.pcap
 *.pcapng
+
+# Plan-review artifacts (transient, never commit)
+/PLAN.md
+/PLAN-REVIEW-LOG.md

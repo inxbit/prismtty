@@ -2,6 +2,24 @@
 
 All notable changes to PrismTTY are documented here.
 
+## 1.0.12 - 2026-06-28
+
+### Interactive Rendering
+
+- Surface prompt-redraw completion tails after Tab or `?` completion when the
+  wrapped program redraws `prompt# command` and then goes idle, so completed
+  command text no longer stays hidden until the next keystroke.
+- Keep the new idle flush scoped to prompt-echo provenance, prompt-line shape,
+  and a strict clean-idle PTY poll so ordinary program output and password
+  prompts do not flush early.
+
+### Reliability
+
+- Preserve incomplete UTF-8 and ANSI escape tails while flushing buffered
+  interactive echo, avoiding partial codepoint or escape emission.
+- Document the prompt-echo idle-flush decision and add replay coverage for
+  Cisco-style completion redraws.
+
 ## 1.0.11 - 2026-06-06
 
 ### Interactive Rendering
