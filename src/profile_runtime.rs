@@ -238,8 +238,7 @@ impl ProfileRuntime {
         }
 
         if self.stack.len() >= PROFILE_STACK_LIMIT {
-            let remove_index = usize::from(self.stack.len() > 1);
-            self.stack.remove(remove_index);
+            self.stack.remove(0);
         }
         self.stack.push(self.active_profiles.clone());
         self.active_profiles = profiles;
@@ -695,6 +694,34 @@ mod tests {
         assert_eq!(
             runtime.observe_output(b"labuser@mx480>\n", &store),
             Some(names(&["generic", "juniper"]))
+        );
+    }
+
+    // Overflowing the profile stack must evict the OLDEST entry so the
+    // remaining history stays contiguous and pops restore the right profiles.
+    // The eviction used to always remove index 1, stranding the oldest entry
+    // forever and corrupting the restore order for deeply nested sessions.
+    #[test]
+    fn profile_stack_overflow_evicts_oldest_entry() {
+        let mut runtime = ProfileRuntime::new(names(&["generic"]));
+
+        for index in 0..(super::PROFILE_STACK_LIMIT + 2) {
+            let switched = runtime.switch_to(vec![format!("vendor-{index}")]);
+            assert!(switched.is_some(), "switch {index} must take effect");
+        }
+
+        assert_eq!(runtime.stack_len(), super::PROFILE_STACK_LIMIT);
+        // Pushes were: generic, vendor-0 .. vendor-8; two overflows must have
+        // evicted the two oldest (generic, vendor-0), keeping vendor-1..vendor-8.
+        assert_eq!(
+            runtime.stack.first().cloned(),
+            Some(vec!["vendor-1".to_string()]),
+            "oldest surviving entry must be vendor-1"
+        );
+        assert_eq!(
+            runtime.stack.last().cloned(),
+            Some(vec!["vendor-8".to_string()]),
+            "newest entry must be the previously active vendor-8"
         );
     }
 }

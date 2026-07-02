@@ -2,6 +2,37 @@
 
 All notable changes to PrismTTY are documented here.
 
+## 1.1.0 - 2026-07-02
+
+### Security and Reliability
+
+- Add `--sanitize` to strip OSC, DCS, SOS, PM, APC, OSC 52 clipboard, and
+  window-title string escapes from program output while preserving normal
+  CSI/SGR styling.
+- Handle raw 8-bit C1 string-control forms and split sanitize reads without
+  leaking control payloads, while preserving UTF-8 glyphs split across chunks.
+- Make `--local-echo` and `--trace-io` warnings explicit about hidden prompt
+  secrets and recorded keystrokes.
+- Warn once when cumulative matching time for a single rule crosses the slow
+  regex threshold, pointing users at `--benchmark` instead of silently
+  appearing hung.
+
+### Profiles
+
+- Discover symlinked `profiles.d` YAML files so dotfile-managed profile
+  directories work normally while preserving existing file validation.
+- Surface mutually inheriting selected profiles as cyclic inheritance errors
+  instead of silently producing an empty configuration.
+- Evict the oldest dynamic profile stack entry on overflow, preserving the most
+  recent remote profile context.
+
+### Tests
+
+- Add sanitize coverage for OSC 52, DCS/SOS/PM/APC, raw C1 string controls,
+  split string escapes, and split UTF-8 input under sanitize mode.
+- Add regressions for symlinked profile discovery, profile stack overflow, and
+  mutually inheriting selected profiles.
+
 ## 1.0.12 - 2026-06-28
 
 ### Interactive Rendering

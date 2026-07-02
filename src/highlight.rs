@@ -67,7 +67,11 @@ pub struct StreamingHighlighter {
     native_sgr: NativeSgrState,
     interactive_overlay: Option<Style>,
     no_minimal_resets: bool,
-    benchmark: Option<BenchmarkReport>,
+    /// Per-rule matching time, collected in every mode so the stream layer can
+    /// surface pathologically slow user rules; exposed as a report only when
+    /// `benchmark_enabled`.
+    benchmark: BenchmarkReport,
+    benchmark_enabled: bool,
 }
 
 /// Aggregate timing and match data collected in benchmark mode.
@@ -355,7 +359,8 @@ impl StreamingHighlighter {
             native_sgr: NativeSgrState::default(),
             interactive_overlay: None,
             no_minimal_resets: detect_no_minimal_resets(),
-            benchmark: None,
+            benchmark: BenchmarkReport::default(),
+            benchmark_enabled: false,
         }
     }
 
@@ -372,7 +377,8 @@ impl StreamingHighlighter {
             native_sgr: NativeSgrState::default(),
             interactive_overlay: None,
             no_minimal_resets: detect_no_minimal_resets(),
-            benchmark: None,
+            benchmark: BenchmarkReport::default(),
+            benchmark_enabled: false,
         }
     }
 
@@ -389,7 +395,8 @@ impl StreamingHighlighter {
             native_sgr: NativeSgrState::default(),
             interactive_overlay: None,
             no_minimal_resets: detect_no_minimal_resets(),
-            benchmark: Some(BenchmarkReport::default()),
+            benchmark: BenchmarkReport::default(),
+            benchmark_enabled: true,
         }
     }
 
@@ -406,13 +413,25 @@ impl StreamingHighlighter {
             native_sgr: NativeSgrState::default(),
             interactive_overlay: None,
             no_minimal_resets: detect_no_minimal_resets(),
-            benchmark: Some(BenchmarkReport::default()),
+            benchmark: BenchmarkReport::default(),
+            benchmark_enabled: true,
         }
     }
 
     /// Returns benchmark data when this stream was created in benchmark mode.
     pub fn benchmark_report(&self) -> Option<&BenchmarkReport> {
-        self.benchmark.as_ref()
+        self.benchmark_enabled.then_some(&self.benchmark)
+    }
+
+    /// Returns the rule with the largest cumulative matching time, if any rule
+    /// has run. Timing accumulates in every mode (not just benchmark mode) so
+    /// the stream layer can name a pathologically slow user rule instead of
+    /// stalling silently.
+    pub(crate) fn slowest_rule(&self) -> Option<&RuleBenchmark> {
+        self.benchmark
+            .rules()
+            .iter()
+            .max_by_key(|rule| rule.duration)
     }
 
     /// Replaces the inner highlighter while preserving streaming and interactive state.
@@ -786,7 +805,7 @@ impl StreamingHighlighter {
             let reset_mode = self.interactive_reset_mode();
             output.extend(self.highlighter.highlight_chunk_with_interactive_overlay(
                 &chunk,
-                self.benchmark.as_mut(),
+                Some(&mut self.benchmark),
                 reset_mode,
                 &mut self.native_sgr,
                 &mut self.interactive_overlay,
@@ -794,7 +813,7 @@ impl StreamingHighlighter {
         } else {
             output.extend(self.highlighter.highlight_chunk_with_native_sgr(
                 &chunk,
-                self.benchmark.as_mut(),
+                Some(&mut self.benchmark),
                 ResetMode::Full,
                 &mut NativeSgrState::default(),
             ));
@@ -1555,45 +1574,59 @@ fn ansi_sequence_end(input: &[u8], start: usize) -> usize {
     }
 
     match input[start + 1] {
-        b'[' => {
-            let mut idx = start + 2;
-            while idx < input.len() {
-                let byte = input[idx];
-                idx += 1;
-                if (0x40..=0x7e).contains(&byte) {
-                    break;
-                }
-            }
-            idx
-        }
-        b']' => {
-            let mut idx = start + 2;
-            while idx < input.len() {
-                if input[idx] == 0x07 {
-                    return idx + 1;
-                }
-                if input[idx] == 0x1b && idx + 1 < input.len() && input[idx + 1] == b'\\' {
-                    return idx + 2;
-                }
-                idx += 1;
-            }
-            input.len()
-        }
-        b'P' | b'X' | b'^' | b'_' => {
-            let mut idx = start + 2;
-            while idx + 1 < input.len() {
-                if input[idx] == 0x1b && input[idx + 1] == b'\\' {
-                    return idx + 2;
-                }
-                idx += 1;
-            }
-            input.len()
-        }
+        b'[' => csi_sequence_end(input, start + 2),
+        b']' => osc_sequence_end(input, start + 2),
+        b'P' | b'X' | b'^' | b'_' => string_sequence_end(input, start + 2),
         b'(' | b')' | b'*' | b'+' | b'-' | b'.' | b'/' | b'#' | b'%' => {
             (start + 3).min(input.len())
         }
         _ => (start + 2).min(input.len()),
     }
+}
+
+fn csi_sequence_end(input: &[u8], mut idx: usize) -> usize {
+    while idx < input.len() {
+        let byte = input[idx];
+        idx += 1;
+        if (0x40..=0x7e).contains(&byte) {
+            break;
+        }
+    }
+    idx
+}
+
+fn osc_sequence_end(input: &[u8], mut idx: usize) -> usize {
+    while idx < input.len() {
+        if input[idx] == 0x07 || input[idx] == 0x9c {
+            return idx + 1;
+        }
+        if input[idx] == 0x1b && idx + 1 < input.len() && input[idx + 1] == b'\\' {
+            return idx + 2;
+        }
+        idx += 1;
+    }
+    input.len()
+}
+
+fn c1_string_escape_end(input: &[u8], start: usize) -> usize {
+    match input[start] {
+        0x9d => osc_sequence_end(input, start + 1),
+        0x90 | 0x98 | 0x9e | 0x9f => string_sequence_end(input, start + 1),
+        _ => (start + 1).min(input.len()),
+    }
+}
+
+fn string_sequence_end(input: &[u8], mut idx: usize) -> usize {
+    while idx < input.len() {
+        if input[idx] == 0x9c {
+            return idx + 1;
+        }
+        if input[idx] == 0x1b && idx + 1 < input.len() && input[idx + 1] == b'\\' {
+            return idx + 2;
+        }
+        idx += 1;
+    }
+    input.len()
 }
 
 fn is_alternate_screen_enable(bytes: &[u8]) -> bool {
@@ -2260,6 +2293,65 @@ fn escape_is_incomplete_at(bytes: &[u8], start: usize) -> bool {
     }
 }
 
+pub(crate) fn incomplete_sanitize_start(bytes: &[u8]) -> Option<usize> {
+    let escape = incomplete_escape_start(bytes).unwrap_or(bytes.len());
+    let utf8 = incomplete_utf8_start(bytes).unwrap_or(bytes.len());
+    let c1 = incomplete_c1_string_escape_start(bytes).unwrap_or(bytes.len());
+    let split = escape.min(utf8).min(c1);
+    (split < bytes.len()).then_some(split)
+}
+
+fn incomplete_c1_string_escape_start(bytes: &[u8]) -> Option<usize> {
+    let mut search_end = bytes.len();
+    while let Some(start) = bytes[..search_end]
+        .iter()
+        .rposition(|byte| is_c1_string_escape_start(*byte))
+    {
+        if byte_is_inside_valid_utf8_codepoint(bytes, start) {
+            search_end = start;
+            continue;
+        }
+        return c1_string_escape_is_incomplete_at(bytes, start).then_some(start);
+    }
+    None
+}
+
+fn byte_is_inside_valid_utf8_codepoint(bytes: &[u8], index: usize) -> bool {
+    let search_start = index.saturating_sub(3);
+    for start in search_start..index {
+        if let Some(width) = valid_utf8_char_width_at(bytes, start)
+            && start + width > index
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn c1_string_escape_is_incomplete_at(bytes: &[u8], start: usize) -> bool {
+    if bytes.len().saturating_sub(start) > MAX_INCOMPLETE_ESCAPE_BYTES {
+        return false;
+    }
+    let complete = match bytes[start] {
+        0x9d => {
+            bytes[start + 1..]
+                .iter()
+                .any(|byte| *byte == 0x07 || *byte == 0x9c)
+                || bytes[start + 1..]
+                    .windows(2)
+                    .any(|window| window == b"\x1b\\")
+        }
+        0x90 | 0x98 | 0x9e | 0x9f => {
+            bytes[start + 1..].contains(&0x9c)
+                || bytes[start + 1..]
+                    .windows(2)
+                    .any(|window| window == b"\x1b\\")
+        }
+        _ => true,
+    };
+    !complete
+}
+
 enum EscapeScan {
     Complete(usize),
     IncompleteWithinLimit,
@@ -2366,10 +2458,143 @@ pub fn strip_ansi(input: &[u8]) -> Vec<u8> {
     stripped
 }
 
+/// Removes string-type escape sequences — OSC, DCS, SOS, PM, APC — while
+/// keeping visible text, CSI/SGR, and simple escapes intact. These are the
+/// 7-bit ESC and 8-bit C1 sequences a hostile child or remote device can abuse
+/// (window-title spoofing, OSC 52 clipboard injection, DCS payload smuggling);
+/// everything a normal TUI needs to render survives. An unterminated string
+/// sequence at the end of the input is dropped rather than passed through.
+pub fn strip_string_escapes(input: &[u8]) -> Vec<u8> {
+    let mut sanitized = Vec::with_capacity(input.len());
+    let mut idx = 0;
+    while idx < input.len() {
+        if input[idx] == 0x1b {
+            let end = ansi_sequence_end(input, idx);
+            if !is_string_escape(&input[idx..end]) {
+                sanitized.extend_from_slice(&input[idx..end]);
+            }
+            idx = end;
+            continue;
+        }
+        if let Some(width) = valid_utf8_char_width_at(input, idx) {
+            sanitized.extend_from_slice(&input[idx..idx + width]);
+            idx += width;
+            continue;
+        }
+        if is_c1_string_escape_start(input[idx]) {
+            idx = c1_string_escape_end(input, idx);
+        } else {
+            sanitized.push(input[idx]);
+            idx += 1;
+        }
+    }
+    sanitized
+}
+
+fn valid_utf8_char_width_at(input: &[u8], idx: usize) -> Option<usize> {
+    let width = match input[idx] {
+        0xc2..=0xdf => 2,
+        0xe0..=0xef => 3,
+        0xf0..=0xf4 => 4,
+        _ => return None,
+    };
+    let end = idx.checked_add(width)?;
+    if end <= input.len() && std::str::from_utf8(&input[idx..end]).is_ok() {
+        Some(width)
+    } else {
+        None
+    }
+}
+
+fn is_c1_string_escape_start(byte: u8) -> bool {
+    matches!(byte, 0x90 | 0x98 | 0x9d | 0x9e | 0x9f)
+}
+
+fn is_string_escape(bytes: &[u8]) -> bool {
+    bytes.len() >= 2 && bytes[0] == 0x1b && matches!(bytes[1], b']' | b'P' | b'X' | b'^' | b'_')
+}
+
 #[cfg(test)]
 mod tests {
     use super::{Highlighter, NativeSgrState, StreamingHighlighter, incomplete_escape_start};
     use crate::PrismConfig;
+
+    // Timing must accumulate even without benchmark mode so the stream layer
+    // can name a pathologically slow rule; the report itself stays gated.
+    #[test]
+    fn rule_timings_collect_without_benchmark_mode() {
+        let config = PrismConfig::from_chromaterm_yaml(
+            "rules:\n  - description: up state\n    regex: up\n    color: f#00ff00\n",
+        )
+        .expect("config parses");
+        let mut stream =
+            StreamingHighlighter::new(Highlighter::from_config(config).expect("rules compile"));
+
+        let _ = stream.push_str("link up\n");
+
+        assert!(
+            stream.benchmark_report().is_none(),
+            "report is exposed only in benchmark mode"
+        );
+        let slowest = stream
+            .slowest_rule()
+            .expect("timings collected in every mode");
+        assert_eq!(slowest.description, "up state");
+    }
+
+    // --sanitize core: string escapes (OSC title/clipboard, DCS, SOS, PM, APC)
+    // are dropped; text, CSI/SGR, and simple escapes survive byte-for-byte.
+    #[test]
+    fn strip_string_escapes_drops_only_string_sequences() {
+        // OSC 52 clipboard write, BEL-terminated.
+        assert_eq!(
+            super::strip_string_escapes(b"safe\x1b]52;c;aGVsbG8=\x07 after"),
+            b"safe after".to_vec()
+        );
+        // OSC 0 title, ST-terminated.
+        assert_eq!(
+            super::strip_string_escapes(b"a\x1b]0;evil title\x1b\\b"),
+            b"ab".to_vec()
+        );
+        // DCS, SOS, PM, APC payloads.
+        assert_eq!(
+            super::strip_string_escapes(
+                b"x\x1bPpayload\x1b\\y\x1bXs\x1b\\z\x1b^p\x1b\\w\x1b_a\x1b\\v"
+            ),
+            b"xyzwv".to_vec()
+        );
+        // 8-bit C1 string controls have the same terminal effects as their
+        // ESC-prefixed forms and must be stripped by --sanitize too.
+        assert_eq!(
+            super::strip_string_escapes(
+                b"a\x9d52;c;aGVsbG8=\x07b\x90dcs\x9cc\x98sos\x9cd\x9epm\x9ce\x9fapc\x9cf"
+            ),
+            b"abcdef".to_vec()
+        );
+        let utf8_prompt = "prompt \u{276f} ready".as_bytes();
+        assert_eq!(
+            super::strip_string_escapes(utf8_prompt),
+            utf8_prompt.to_vec()
+        );
+        // CSI/SGR and simple escapes pass through unchanged.
+        assert_eq!(
+            super::strip_string_escapes(b"\x1b[1;38;2;0;255;0mok\x1b[0m\x1b[2J\x1b(B"),
+            b"\x1b[1;38;2;0;255;0mok\x1b[0m\x1b[2J\x1b(B".to_vec()
+        );
+        assert_eq!(
+            super::strip_string_escapes(b"\x9b1mok\x9b0m"),
+            b"\x9b1mok\x9b0m".to_vec()
+        );
+        // An unterminated OSC at end of input is dropped, not passed through.
+        assert_eq!(
+            super::strip_string_escapes(b"tail\x1b]52;c;aGVsbG8="),
+            b"tail".to_vec()
+        );
+        assert_eq!(
+            super::strip_string_escapes(b"tail\x9d52;c;aGVsbG8="),
+            b"tail".to_vec()
+        );
+    }
 
     // AUDIT (1.0.8): an unterminated escape longer than the cap must be treated
     // as complete so it is flushed instead of carried across reads without

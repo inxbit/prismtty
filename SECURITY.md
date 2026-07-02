@@ -32,3 +32,24 @@ attach real device captures, private hostnames, customer names, IP inventories,
 credentials, or trace files from sensitive sessions. Reduce reports to synthetic
 examples that preserve only the token shape needed to reproduce the issue.
 
+## Operational Cautions
+
+- `--local-echo` echoes every typed printable key, including secrets typed at
+  prompts that deliberately suppress echo (password prompts). Leave it off when
+  entering credentials.
+- `--trace-io` records all PTY input and output to the trace file, including
+  typed passwords. The file is created owner-only (0600), but treat it as
+  sensitive and delete it after debugging.
+- User-supplied rule regexes run against every byte of terminal output.
+  PrismTTY bounds each match (PCRE2 match limits, 8 KiB read chunks), so a
+  pathological pattern cannot hang it, but expensive patterns (for example
+  unanchored lookaheads such as `(?=.*foo)`) can slow throughput severely on
+  very long lines. PrismTTY warns once per session when a rule crosses five
+  seconds of cumulative matching time; use `--benchmark` to identify slow
+  rules in a config.
+- By default PrismTTY is a transparent wrapper: escape sequences from the
+  wrapped program pass through unchanged, exactly like `ssh` or `tmux`. When
+  working against untrusted remote devices, `--sanitize` strips string-type
+  escapes (window title, OSC 52 clipboard, DCS/SOS/PM/APC payloads) from
+  program output while leaving colors and cursor control intact.
+

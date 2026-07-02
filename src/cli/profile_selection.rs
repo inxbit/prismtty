@@ -195,7 +195,13 @@ fn load_profiles_d_from_config_dir(
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
         let path = entry.path();
-        if entry.file_type()?.is_file() && is_yaml(&path) {
+        // `fs::metadata` follows symlinks (unlike `DirEntry::file_type`) so
+        // symlinked profiles install by dotfile managers are discovered; a
+        // broken symlink is skipped like any other non-file entry.
+        let is_file = fs::metadata(&path)
+            .map(|metadata| metadata.is_file())
+            .unwrap_or(false);
+        if is_file && is_yaml(&path) {
             entries.push(path);
         }
     }
@@ -309,6 +315,41 @@ rules:
             super::load_profiles_d_from_config_dir(temp.path()).expect("profiles.d loads");
 
         assert_eq!(profiles.len(), 1);
+        assert_eq!(profiles[0].meta.name, "router");
+    }
+
+    // Dotfile managers (stow, chezmoi) install profiles.d entries as symlinks.
+    // Discovery must follow them; `DirEntry::file_type()` does not, which used
+    // to silently skip every symlinked profile.
+    #[test]
+    fn load_profiles_d_follows_symlinked_profile_files() {
+        let temp = tempfile::tempdir().expect("tempdir creates");
+        let profiles_dir = temp.path().join("prismtty").join("profiles.d");
+        fs::create_dir_all(&profiles_dir).expect("profiles.d creates");
+        let target = temp.path().join("router-target.yml");
+        fs::write(
+            &target,
+            r##"
+profile:
+  name: router
+rules:
+  - description: router prompt
+    regex: '^router#'
+    color: f#ffffff
+"##,
+        )
+        .expect("profile target writes");
+        std::os::unix::fs::symlink(&target, profiles_dir.join("router.yml"))
+            .expect("symlink creates");
+
+        let profiles =
+            super::load_profiles_d_from_config_dir(temp.path()).expect("profiles.d loads");
+
+        assert_eq!(
+            profiles.len(),
+            1,
+            "symlinked profile file must be discovered"
+        );
         assert_eq!(profiles[0].meta.name, "router");
     }
 }

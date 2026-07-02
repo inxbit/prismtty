@@ -143,12 +143,17 @@ Important options:
 - `--no-dynamic-profile` disables profile switching inside wrapped interactive shells.
 - `-c, --config <file>` loads a ChromaTerm-compatible YAML file.
 - `--strip-ansi` removes existing ANSI before PrismTTY styles output.
+- `--sanitize` strips window-title, clipboard (OSC 52), and other OSC/DCS
+  string escapes from program output while preserving normal CSI/SGR styling.
 - `--show-profile` prints profile selections and transitions to stderr.
-- `--local-echo` locally echoes printable typed keys for no-echo device sessions.
+- `--local-echo` locally echoes printable typed keys for no-echo device
+  sessions. Do not use it at hidden prompts; it will echo typed secrets.
 - `--no-minimal-reset` uses full SGR resets in interactive streams for terminal
   emulators that ignore minimal foreground/background resets. It can also be
   enabled with `PRISMTTY_NO_MINIMAL_RESET=1` or `PRISMTTY_NO_39_49_RESETS=1`.
-- `--trace-io <file>` appends hex-encoded PTY input/output plus rendered-output diagnostics.
+- `--trace-io <file>` appends hex-encoded PTY input/output plus
+  rendered-output diagnostics. Trace files include all keystrokes and output,
+  including passwords typed during the session.
 - `-R, --rgb` forces RGB color output.
 - `--pcre` is accepted for ChromaTerm compatibility; PCRE2 is always used.
 - `-b, --benchmark` prints per-rule timing and match-count data.
