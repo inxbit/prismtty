@@ -4,13 +4,13 @@ use std::io::{self, Read, Write};
 use std::os::fd::RawFd;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use nix::libc;
 
 use crate::highlight::{
     AnsiChunk, BenchmarkReport, Highlighter, MAX_INCOMPLETE_ESCAPE_BYTES, StreamingHighlighter,
-    incomplete_escape_start, strip_ansi,
+    incomplete_escape_start, incomplete_sanitize_start, strip_ansi, strip_string_escapes,
 };
 use crate::profile_runtime::ProfileRuntime;
 use crate::profiles::ProfileStore;
@@ -26,6 +26,12 @@ use super::runtime::ReloadWatcher;
 use super::trace::IoTrace;
 
 const AUTO_DETECT_SAMPLE_LIMIT: usize = 64 * 1024;
+
+/// Cumulative per-rule matching time after which the session warns once that a
+/// rule is pathologically slow. Healthy rules stay orders of magnitude below
+/// this; an imported config with a catastrophic pattern blows past it within
+/// the first few megabytes and would otherwise read as a silent hang.
+const SLOW_RULE_WARN_THRESHOLD: Duration = Duration::from_secs(5);
 
 /// Describes the stream's input source for interactive echo handling. It groups
 /// the facts the read loop needs to surface buffered echo promptly without
@@ -64,7 +70,12 @@ pub(super) fn highlight_stream<R: Read, W: Write>(
     }
 
     trace.log("OUT", &buffer[..read]);
-    let first_chunk = prepare_chunk(&buffer[..read], options.strip_ansi, &mut strip_carry);
+    let first_chunk = prepare_chunk(
+        &buffer[..read],
+        options.strip_ansi,
+        options.sanitize,
+        &mut strip_carry,
+    );
     let mut detection_sample = first_chunk.bytes().to_vec();
     input_bytes += first_chunk.bytes().len();
     let store = profile_store()?;
@@ -89,6 +100,9 @@ pub(super) fn highlight_stream<R: Read, W: Write>(
         session.switch_profiles(writer, &trace, next_profile_names)?;
     }
     session.push(writer, &trace, &first_chunk)?;
+    if let Some(warning) = session.slow_rule_warning() {
+        eprintln!("{warning}");
+    }
     if let Some(reason) = should_flush_input_echo(
         input.interactive,
         input.pty_fd,
@@ -107,7 +121,12 @@ pub(super) fn highlight_stream<R: Read, W: Write>(
             break;
         }
         trace.log("OUT", &buffer[..read]);
-        let chunk = prepare_chunk(&buffer[..read], options.strip_ansi, &mut strip_carry);
+        let chunk = prepare_chunk(
+            &buffer[..read],
+            options.strip_ansi,
+            options.sanitize,
+            &mut strip_carry,
+        );
         input_bytes += chunk.bytes().len();
         if let Some(next_profile_names) = observe_dynamic_profile(
             &mut profile_runtime,
@@ -136,6 +155,9 @@ pub(super) fn highlight_stream<R: Read, W: Write>(
             session.reload(writer, &trace)?;
         }
         session.push(writer, &trace, &chunk)?;
+        if let Some(warning) = session.slow_rule_warning() {
+            eprintln!("{warning}");
+        }
         if let Some(reason) = should_flush_input_echo(
             input.interactive,
             input.pty_fd,
@@ -204,6 +226,7 @@ struct HighlightSession<'a> {
     streaming: StreamingHighlighter,
     reporter: ProfileReporter,
     highlighter_cache: HighlighterCache,
+    slow_rule_warned: bool,
 }
 
 impl<'a> HighlightSession<'a> {
@@ -223,6 +246,7 @@ impl<'a> HighlightSession<'a> {
             streaming,
             reporter,
             highlighter_cache: HighlighterCache::default(),
+            slow_rule_warned: false,
         })
     }
 
@@ -267,6 +291,30 @@ impl<'a> HighlightSession<'a> {
     ) -> Result<(), CliError> {
         write_rendered(writer, trace, self.streaming.flush_buffered_echo())?;
         Ok(())
+    }
+
+    /// One-time warning naming the slowest rule once its cumulative matching
+    /// time crosses [`SLOW_RULE_WARN_THRESHOLD`]. A pathological (usually
+    /// imported) regex degrades throughput so badly it reads as a hang; naming
+    /// the rule points the user at `--benchmark` instead of stalling silently.
+    fn slow_rule_warning(&mut self) -> Option<String> {
+        self.slow_rule_warning_at(SLOW_RULE_WARN_THRESHOLD)
+    }
+
+    fn slow_rule_warning_at(&mut self, threshold: Duration) -> Option<String> {
+        if self.slow_rule_warned {
+            return None;
+        }
+        let rule = self.streaming.slowest_rule()?;
+        if rule.duration < threshold {
+            return None;
+        }
+        self.slow_rule_warned = true;
+        Some(format!(
+            "prismtty: rule '{}' has spent {:.1}s matching; a slow regex is degrading throughput (profile with --benchmark)",
+            rule.description,
+            rule.duration.as_secs_f64(),
+        ))
     }
 
     /// The buffered trailing token the next echo flush would surface, for the
@@ -396,20 +444,32 @@ fn print_benchmark_report(report: Option<&BenchmarkReport>, input_bytes: usize, 
     eprintln!("Processed {input_bytes} bytes in {elapsed_secs:.3}s");
 }
 
-fn prepare_chunk(input: &[u8], strip_existing_ansi: bool, strip_carry: &mut Vec<u8>) -> AnsiChunk {
+fn prepare_chunk(
+    input: &[u8],
+    strip_existing_ansi: bool,
+    sanitize: bool,
+    strip_carry: &mut Vec<u8>,
+) -> AnsiChunk {
+    if !strip_existing_ansi && !sanitize {
+        return AnsiChunk::from_slice(input);
+    }
+    // Reassemble any escape that was split across the previous read before
+    // filtering, otherwise its tail bytes would survive as literal text.
+    let mut combined = std::mem::take(strip_carry);
+    combined.extend_from_slice(input);
+    let split = if sanitize && !strip_existing_ansi {
+        incomplete_sanitize_start(&combined).unwrap_or(combined.len())
+    } else {
+        incomplete_escape_start(&combined).unwrap_or(combined.len())
+    };
+    strip_carry.extend_from_slice(&combined[split..]);
+    if strip_carry.len() > MAX_INCOMPLETE_ESCAPE_BYTES {
+        strip_carry.clear();
+    }
     if strip_existing_ansi {
-        // Reassemble any escape that was split across the previous read before
-        // stripping, otherwise its tail bytes would survive as literal text.
-        let mut combined = std::mem::take(strip_carry);
-        combined.extend_from_slice(input);
-        let split = incomplete_escape_start(&combined).unwrap_or(combined.len());
-        strip_carry.extend_from_slice(&combined[split..]);
-        if strip_carry.len() > MAX_INCOMPLETE_ESCAPE_BYTES {
-            strip_carry.clear();
-        }
         AnsiChunk::new(strip_ansi(&combined[..split]))
     } else {
-        AnsiChunk::from_slice(input)
+        AnsiChunk::new(strip_string_escapes(&combined[..split]))
     }
 }
 
@@ -582,8 +642,8 @@ mod tests {
     #[test]
     fn strip_mode_carries_split_escape_across_reads() {
         let mut carry = Vec::new();
-        let first = super::prepare_chunk(b"hello\x1b[3", true, &mut carry);
-        let second = super::prepare_chunk(b"1m world", true, &mut carry);
+        let first = super::prepare_chunk(b"hello\x1b[3", true, false, &mut carry);
+        let second = super::prepare_chunk(b"1m world", true, false, &mut carry);
         let mut visible = first.bytes().to_vec();
         visible.extend_from_slice(second.bytes());
         assert_eq!(
@@ -603,7 +663,7 @@ mod tests {
             crate::highlight::MAX_INCOMPLETE_ESCAPE_BYTES + 1,
         ));
 
-        let chunk = super::prepare_chunk(&input, true, &mut carry);
+        let chunk = super::prepare_chunk(&input, true, false, &mut carry);
 
         assert!(
             chunk.bytes().is_empty(),
@@ -613,6 +673,87 @@ mod tests {
             carry.is_empty(),
             "oversized incomplete escape carry must not grow without bound"
         );
+    }
+
+    // --sanitize: a string escape split across reads must be reassembled and
+    // dropped whole, so neither its payload nor its tail leaks to the terminal.
+    #[test]
+    fn sanitize_mode_drops_split_string_escape_across_reads() {
+        let mut carry = Vec::new();
+        let first = super::prepare_chunk(b"safe\x1b]52;c;", false, true, &mut carry);
+        let second = super::prepare_chunk(b"aGVsbG8=\x07 after", false, true, &mut carry);
+        let mut visible = first.bytes().to_vec();
+        visible.extend_from_slice(second.bytes());
+        assert_eq!(
+            visible,
+            b"safe after",
+            "split OSC 52 leaked into sanitized output: {:?}",
+            String::from_utf8_lossy(&visible)
+        );
+    }
+
+    #[test]
+    fn sanitize_mode_drops_split_c1_string_escape_across_reads() {
+        let mut carry = Vec::new();
+        let first = super::prepare_chunk(b"safe\x9d52;c;", false, true, &mut carry);
+        let second = super::prepare_chunk(b"aGVsbG8=\x07 after", false, true, &mut carry);
+        let mut visible = first.bytes().to_vec();
+        visible.extend_from_slice(second.bytes());
+        assert_eq!(
+            visible,
+            b"safe after",
+            "split C1 OSC 52 leaked into sanitized output: {:?}",
+            String::from_utf8_lossy(&visible)
+        );
+    }
+
+    #[test]
+    fn sanitize_mode_preserves_split_utf8_across_reads() {
+        let mut carry = Vec::new();
+        let first = super::prepare_chunk(b"prompt \xe2", false, true, &mut carry);
+        let second = super::prepare_chunk(b"\x9d\xaf ready", false, true, &mut carry);
+        let mut visible = first.bytes().to_vec();
+        visible.extend_from_slice(second.bytes());
+        assert_eq!(visible, "prompt \u{276f} ready".as_bytes());
+    }
+
+    // The slow-rule warning names the slowest rule once per session; the
+    // threshold is injected so the test does not depend on wall-clock time.
+    #[test]
+    fn slow_rule_warning_fires_once_per_session() {
+        let store = crate::profiles::ProfileStore::builtin();
+        let options = crate::cli::args::Options::default();
+        let mut session =
+            super::HighlightSession::new(&options, &store, false, vec!["generic".to_string()])
+                .expect("session builds");
+        let trace = super::IoTrace::open(None).expect("no-op trace");
+        let mut writer: Vec<u8> = Vec::new();
+        let chunk = crate::highlight::AnsiChunk::from_slice(b"status up\n");
+        session
+            .push(&mut writer, &trace, &chunk)
+            .expect("push succeeds");
+
+        let warning = session
+            .slow_rule_warning_at(std::time::Duration::ZERO)
+            .expect("zero threshold names the slowest rule");
+        assert!(
+            warning.contains("--benchmark"),
+            "warning should point at --benchmark: {warning}"
+        );
+        assert!(
+            session
+                .slow_rule_warning_at(std::time::Duration::ZERO)
+                .is_none(),
+            "warning must fire at most once per session"
+        );
+        // A healthy rule set never crosses the real threshold.
+        let mut fresh =
+            super::HighlightSession::new(&options, &store, false, vec!["generic".to_string()])
+                .expect("session builds");
+        fresh
+            .push(&mut writer, &trace, &chunk)
+            .expect("push succeeds");
+        assert!(fresh.slow_rule_warning().is_none());
     }
 
     #[test]

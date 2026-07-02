@@ -319,16 +319,21 @@ impl ProfileStore {
     ) -> Result<Vec<&'a str>, ConfigError> {
         let mut top_level = Vec::new();
         for candidate in profile_names {
-            let inherited_by_selected = profile_names
-                .iter()
-                .filter(|other| *other != candidate)
-                .try_fold(false, |inherited, other| {
-                    if inherited {
-                        Ok(true)
-                    } else {
-                        self.profile_inherits_profile(other, candidate)
-                    }
-                })?;
+            let mut inherited_by_selected = false;
+            for other in profile_names.iter().filter(|other| *other != candidate) {
+                if !self.profile_inherits_profile(other, candidate)? {
+                    continue;
+                }
+                // Mutual inheritance would drop BOTH candidates here, silently
+                // yielding a config with zero rules; surface the cycle instead.
+                if self.profile_inherits_profile(candidate, other)? {
+                    return Err(ConfigError::CyclicProfileInheritance(
+                        [*candidate, *other, *candidate].join(" -> "),
+                    ));
+                }
+                inherited_by_selected = true;
+                break;
+            }
             if !inherited_by_selected {
                 top_level.push(*candidate);
             }
@@ -1011,5 +1016,42 @@ mod tests {
             !helper_source.contains("to_ascii_lowercase"),
             "case-insensitive signal helpers should avoid lowercase String allocations"
         );
+    }
+
+    // Two selected profiles that inherit each other must surface the cycle as
+    // an error. Pre-filtering in `top_level_profile_names` used to drop both
+    // (each looks "inherited by" the other), silently yielding a config with
+    // zero rules and no diagnostic.
+    #[test]
+    fn mutually_inheriting_selected_profiles_error_instead_of_empty_config() {
+        let mut store = ProfileStore::default();
+        store.insert_profile(
+            "alpha".to_string(),
+            vec!["beta".to_string()],
+            Vec::new(),
+            vec![RuleSpec {
+                description: "alpha keyword".to_string(),
+                regex: r"\bup\b".to_string(),
+                style: RuleStyle::Whole(Style::parse("f#00ff00").expect("style parses")),
+                exclusive: false,
+            }],
+        );
+        store.insert_profile(
+            "beta".to_string(),
+            vec!["alpha".to_string()],
+            Vec::new(),
+            Vec::new(),
+        );
+
+        match PrismConfig::from_profiles(&store, &["alpha", "beta"]) {
+            Err(crate::config::ConfigError::CyclicProfileInheritance(cycle)) => {
+                assert!(
+                    cycle.contains("alpha") && cycle.contains("beta"),
+                    "cycle message should name both profiles: {cycle}"
+                );
+            }
+            Err(other) => panic!("expected cyclic-inheritance error, got: {other}"),
+            Ok(_) => panic!("expected cyclic-inheritance error, got a silently empty config"),
+        }
     }
 }

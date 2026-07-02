@@ -15,7 +15,7 @@ _prismtty() {
 
     local context curcontext="$curcontext" state line
     _arguments "${_arguments_options[@]}" : \
-'--trace-io=[Append hex-encoded PTY input/output diagnostics]:FILE:_files' \
+'--trace-io=[Append hex-encoded PTY input/output diagnostics (records all keystrokes, including passwords)]:FILE:_files' \
 '*-p+[Force a profile; repeat to enable several]:NAME:_default' \
 '*--profile=[Force a profile; repeat to enable several]:NAME:_default' \
 '-c+[Load a ChromaTerm-compatible YAML config]:FILE:_files' \
@@ -36,8 +36,9 @@ _prismtty() {
 '--no-dynamic-profile[Disable profile switching inside wrapped interactive shells]' \
 '--no-minimal-reset[Use full SGR resets instead of minimal foreground/background resets in interactive streams]' \
 '--strip-ansi[Remove existing ANSI before applying PrismTTY styles]' \
+'--sanitize[Strip window-title, clipboard (OSC 52), and other OSC/DCS string escapes from program output]' \
 '--show-profile[Print selected profiles to stderr]' \
-'--local-echo[Locally echo typed printable keys for no-echo device sessions]' \
+'--local-echo[Locally echo typed printable keys for no-echo device sessions (also echoes secrets typed at hidden prompts)]' \
 '::command:_default' \
 ":: :_prismtty_commands" \
 "*::: :->prismtty" \

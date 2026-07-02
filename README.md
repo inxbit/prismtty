@@ -19,7 +19,7 @@ network-focused built-in profiles.
 
 Website: [prismtty.com](https://prismtty.com/).
 
-Current version: `1.0.12`.
+Current version: `1.1.0`.
 
 ## Quick Demo
 
@@ -99,7 +99,7 @@ sudo apt-get install libpcre2-dev pkg-config
 ### GitHub Release
 
 Prebuilt release archives and checksums are available on the
-[v1.0.12 release page](https://github.com/inxbit/prismtty/releases/tag/v1.0.12).
+[v1.1.0 release page](https://github.com/inxbit/prismtty/releases/tag/v1.1.0).
 
 Each release archive contains the binaries, license/readme files, example
 profiles, shell completions, and a `.tar.gz.sha256` checksum.
@@ -172,6 +172,9 @@ Important options:
 - `--no-dynamic-profile` disables profile switching inside wrapped interactive shells.
 - `-c, --config <file>` loads a ChromaTerm-compatible YAML file.
 - `--strip-ansi` removes existing ANSI before PrismTTY styles output.
+- `--sanitize` strips window-title, clipboard (OSC 52), and other OSC/DCS string
+  escapes from program output — hardening against escape injection from
+  untrusted remote devices.
 - `--show-profile` prints profile selections and transitions to stderr.
 - `--local-echo` locally echoes printable typed keys for no-echo device sessions.
 - `--no-minimal-reset` uses full SGR resets in interactive streams for terminal

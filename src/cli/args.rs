@@ -12,6 +12,7 @@ pub(super) struct Options {
     pub(super) no_auto_detect: bool,
     pub(super) config: Option<PathBuf>,
     pub(super) strip_ansi: bool,
+    pub(super) sanitize: bool,
     pub(super) force_rgb: bool,
     pub(super) benchmark: bool,
     pub(super) show_profile: bool,
@@ -77,14 +78,16 @@ struct RawArgs {
     no_minimal_reset: bool,
     #[arg(long = "strip-ansi", action = ArgAction::SetTrue, help = "Remove existing ANSI before applying PrismTTY styles")]
     strip_ansi: bool,
+    #[arg(long = "sanitize", action = ArgAction::SetTrue, help = "Strip window-title, clipboard (OSC 52), and other OSC/DCS string escapes from program output")]
+    sanitize: bool,
     #[arg(long = "show-profile", action = ArgAction::SetTrue, help = "Print selected profiles to stderr")]
     show_profile: bool,
-    #[arg(long = "local-echo", action = ArgAction::SetTrue, help = "Locally echo typed printable keys for no-echo device sessions")]
+    #[arg(long = "local-echo", action = ArgAction::SetTrue, help = "Locally echo typed printable keys for no-echo device sessions (also echoes secrets typed at hidden prompts)")]
     local_echo: bool,
     #[arg(
         long = "trace-io",
         value_name = "FILE",
-        help = "Append hex-encoded PTY input/output diagnostics"
+        help = "Append hex-encoded PTY input/output diagnostics (records all keystrokes, including passwords)"
     )]
     trace_io: Option<PathBuf>,
     #[arg(short = 'p', long = "profile", value_name = "NAME", action = ArgAction::Append, help = "Force a profile; repeat to enable several")]
@@ -128,6 +131,7 @@ pub(super) fn parse_args(args: Vec<OsString>) -> Result<(Options, Action), CliEr
         no_auto_detect: raw.no_auto_detect,
         config: raw.config,
         strip_ansi: raw.strip_ansi,
+        sanitize: raw.sanitize,
         force_rgb: raw.force_rgb,
         benchmark: raw.benchmark,
         show_profile: raw.show_profile,
@@ -171,6 +175,14 @@ fn parse_profiles_command(
     options: Options,
     args: &[OsString],
 ) -> Result<(Options, Action), CliError> {
+    // A conventional `--` separator carries no meaning inside `profiles`
+    // arguments (nothing after it is a command to spawn); strip the first one
+    // so `profiles test cisco -- fixture` reads the fixture, not a file
+    // literally named `--`.
+    let mut args: Vec<&OsString> = args.iter().collect();
+    if let Some(delimiter) = args.iter().position(|arg| *arg == "--") {
+        args.remove(delimiter);
+    }
     let subcommand = args
         .first()
         .map(|arg| arg.to_string_lossy().to_string())
@@ -427,6 +439,28 @@ mod tests {
     }
 
     #[test]
+    fn parser_contract_double_dash_inside_profiles_subcommand_is_stripped() {
+        let (_options, action) =
+            super::parse_args(os_args(&["profiles", "test", "cisco", "--", "fixture.txt"]))
+                .expect("profiles test with delimiter parses");
+        assert_eq!(
+            action,
+            super::Action::ProfilesTest {
+                profile: "cisco".to_string(),
+                fixture: std::path::PathBuf::from("fixture.txt"),
+            }
+        );
+
+        let (_options, action) =
+            super::parse_args(os_args(&["profiles", "validate", "--", "custom.yml"]))
+                .expect("profiles validate with delimiter parses");
+        assert_eq!(
+            action,
+            super::Action::ProfilesValidate(std::path::PathBuf::from("custom.yml"))
+        );
+    }
+
+    #[test]
     fn parser_contract_profiles_subcommands_parse_after_global_options() {
         let (options, action) = super::parse_args(os_args(&[
             "--profile",
@@ -451,6 +485,14 @@ mod tests {
             options.profiles,
             vec!["generic".to_string(), "juniper".to_string()]
         );
+        assert_eq!(action, super::Action::Stdin);
+    }
+
+    #[test]
+    fn parser_contract_sanitize_sets_option() {
+        let (options, action) = super::parse_args(os_args(&["--sanitize"])).expect("flag parses");
+
+        assert!(options.sanitize);
         assert_eq!(action, super::Action::Stdin);
     }
 
