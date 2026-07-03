@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>404 - PrismTTY</title>
+    <meta name="robots" content="noindex">
+    <meta name="theme-color" content="#020617">
+    <link rel="icon" href="/assets/prismtty-mark.svg" type="image/svg+xml">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link
+      rel="stylesheet"
+      href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&display=swap"
+    >
+    <link rel="stylesheet" href="/styles.css">
+    <style>
+      .nf-wrap {
+        display: grid;
+        place-items: center;
+        min-height: 100dvh;
+        padding: 24px;
+      }
+      .nf-terminal { width: min(560px, 100%); }
+      .nf-terminal .terminal-body { min-height: 0; white-space: normal; }
+      .nf-code {
+        margin: 0 0 6px;
+        font-family: var(--mono);
+        font-size: 13px;
+        color: var(--subtle);
+      }
+      .nf-actions { margin-top: 18px; display: flex; gap: 10px; flex-wrap: wrap; }
+    </style>
+  </head>
+  <body>
+    <div class="grain" aria-hidden="true"></div>
+    <main class="nf-wrap">
+      <h1 class="sr-only">404: page not found</h1>
+      <figure class="terminal nf-terminal">
+        <div class="terminal-bar">
+          <span class="dots" aria-hidden="true"><i></i><i></i><i></i></span>
+          <span class="terminal-title">ptty /bin/zsh</span>
+        </div>
+        <div class="terminal-body">
+          <span class="tline"><span class="hl-host">visitor@prismtty.com%</span> <span class="t-cmd">open <span id="nf-path">this page</span></span></span>
+          <span class="tline"><span class="hl-down">open: no such file or directory (404)</span></span>
+          <span class="tline">&nbsp;</span>
+          <span class="tline">The page you asked for is not routed here.</span>
+          <span class="tline">&nbsp;</span>
+          <div class="nf-actions">
+            <a class="button primary" href="/">Back to prismtty.com</a>
+            <a class="button ghost" href="https://github.com/inxbit/prismtty">GitHub ↗</a>
+          </div>
+        </div>
+      </figure>
+    </main>
+    <script>
+      var el = document.getElementById('nf-path');
+      if (el && location.pathname && location.pathname !== '/') {
+        el.textContent = location.pathname.replace(/[^\w\-./]/g, '');
+      }
+    </script>
+  </body>
+</html>

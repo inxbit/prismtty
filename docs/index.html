@@ -17,11 +17,19 @@
     <meta name="twitter:card" content="summary_large_image">
     <meta name="twitter:image" content="https://prismtty.com/assets/prismtty-social-card.png">
     <link rel="canonical" href="https://prismtty.com/">
+    <meta name="theme-color" content="#020617">
     <link rel="icon" href="assets/prismtty-mark.svg" type="image/svg+xml">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link
+      rel="stylesheet"
+      href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700;800&family=Space+Grotesk:wght@400;500;600;700&display=swap"
+    >
     <link rel="stylesheet" href="styles.css">
     <script src="script.js" defer></script>
   </head>
   <body>
+    <a class="skip-link" href="#top">Skip to content</a>
     <div class="grain" aria-hidden="true"></div>
 
     <header class="site-header" data-site-header>
@@ -38,7 +46,7 @@
       </nav>
     </header>
 
-    <main id="top">
+    <main id="top" tabindex="-1">
       <section class="hero" aria-labelledby="hero-title">
         <div class="hero-bg" aria-hidden="true">
           <span class="beam beam-cyan"></span>
@@ -131,7 +139,7 @@
             type="range"
             min="0"
             max="100"
-            value="58"
+            value="46"
             data-compare-range
           >
           <span class="compare-tag compare-tag-left" aria-hidden="true">raw</span>
