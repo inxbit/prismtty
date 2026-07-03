@@ -58,7 +58,7 @@
   }
   function rawHTML(line) {
     const text = typeof line === 'string' ? line : line.p + line.c;
-    return `<span class="tline">${esc(blank(text))}</span>`;
+    return `<span class="tline">${blank(esc(text))}</span>`;
   }
   const render = (lines, fn) => lines.map(fn).join('');
 
@@ -67,12 +67,12 @@
     { p: 'ops@workstation%', c: ' ptty ssh edge-sw1.example.net' },
     'Connected to edge-sw1.example.net.',
     { p: 'edge-sw1#', c: 'show ip interface brief' },
-    'Interface              IP-Address      OK? Method Status    Protocol',
-    'GigabitEthernet1/0/1   192.0.2.10      YES manual up        up',
-    'GigabitEthernet1/0/2   198.51.100.42   YES manual down      down',
-    'Vlan10                 203.0.113.1     YES manual up        up',
+    'Interface              IP-Address      Status    Protocol',
+    'GigabitEthernet1/0/1   192.0.2.10      up        up',
+    'GigabitEthernet1/0/2   198.51.100.42   down      down',
+    'Vlan10                 203.0.113.1     up        up',
     { p: 'edge-sw1#', c: 'show logging | include LINK' },
-    '%LINK-3-UPDOWN: Interface GigabitEthernet1/0/2, changed state to down',
+    '%LINK-3-UPDOWN: Interface Gi1/0/2, changed state to down',
   ];
 
   const COMPARE = [
@@ -261,6 +261,22 @@
     });
   }
 
+  /* ---- cursor spotlight on panels ---- */
+  function initSpotlight() {
+    if (reduceMotion || window.matchMedia('(hover: none)').matches) return;
+    const panels = document.querySelectorAll(
+      '.feature-card, .install-card, .workflow-step, .scope-panel'
+    );
+    panels.forEach((el) => {
+      el.classList.add('spot');
+      el.addEventListener('pointermove', (e) => {
+        const r = el.getBoundingClientRect();
+        el.style.setProperty('--mx', `${e.clientX - r.left}px`);
+        el.style.setProperty('--my', `${e.clientY - r.top}px`);
+      });
+    });
+  }
+
   /* ---- scroll reveal ---- */
   function initReveal() {
     const targets = document.querySelectorAll('.section, .command-band');
@@ -306,6 +322,7 @@
   initCompare();
   initProfiles();
   initCopy();
+  initSpotlight();
   initReveal();
   initNav();
   runHero();
