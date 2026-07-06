@@ -38,7 +38,7 @@ _prismtty() {
 
     case "${cmd}" in
         prismtty)
-            opts="-h -v -V -b -r -R -p -c --help --version --benchmark --reload --rgb --pcre --no-auto-detect --no-dynamic-profile --no-minimal-reset --strip-ansi --sanitize --show-profile --local-echo --trace-io --profile --config [COMMAND]... profiles"
+            opts="-h -v -V -b -r -R -p -c --help --version --benchmark --reload --rgb --pcre --no-auto-detect --no-dynamic-profile --no-minimal-reset --strip-ansi --sanitize --show-profile --local-echo --trace-io --profile --config profiles"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 1 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -100,7 +100,7 @@ _prismtty() {
             return 0
             ;;
         prismtty__subcmd__profiles__subcmd__show)
-            opts="<PROFILE>"
+            opts=""
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -114,7 +114,7 @@ _prismtty() {
             return 0
             ;;
         prismtty__subcmd__profiles__subcmd__test)
-            opts="<PROFILE> <FILE>"
+            opts=""
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -128,7 +128,7 @@ _prismtty() {
             return 0
             ;;
         prismtty__subcmd__profiles__subcmd__validate)
-            opts="<FILE>"
+            opts=""
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -190,7 +190,7 @@ _ptty() {
 
     case "${cmd}" in
         ptty)
-            opts="-h -v -V -b -r -R -p -c --help --version --benchmark --reload --rgb --pcre --no-auto-detect --no-dynamic-profile --no-minimal-reset --strip-ansi --sanitize --show-profile --local-echo --trace-io --profile --config [COMMAND]... profiles"
+            opts="-h -v -V -b -r -R -p -c --help --version --benchmark --reload --rgb --pcre --no-auto-detect --no-dynamic-profile --no-minimal-reset --strip-ansi --sanitize --show-profile --local-echo --trace-io --profile --config profiles"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 1 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -252,7 +252,7 @@ _ptty() {
             return 0
             ;;
         ptty__subcmd__profiles__subcmd__show)
-            opts="<PROFILE>"
+            opts=""
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -266,7 +266,7 @@ _ptty() {
             return 0
             ;;
         ptty__subcmd__profiles__subcmd__test)
-            opts="<PROFILE> <FILE>"
+            opts=""
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -280,7 +280,7 @@ _ptty() {
             return 0
             ;;
         ptty__subcmd__profiles__subcmd__validate)
-            opts="<FILE>"
+            opts=""
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -342,7 +342,7 @@ _ct() {
 
     case "${cmd}" in
         ct)
-            opts="-h -v -V -b -r -R -p -c --help --version --benchmark --reload --rgb --pcre --no-auto-detect --no-dynamic-profile --no-minimal-reset --strip-ansi --sanitize --show-profile --local-echo --trace-io --profile --config [COMMAND]... profiles"
+            opts="-h -v -V -b -r -R -p -c --help --version --benchmark --reload --rgb --pcre --no-auto-detect --no-dynamic-profile --no-minimal-reset --strip-ansi --sanitize --show-profile --local-echo --trace-io --profile --config profiles"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 1 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -404,7 +404,7 @@ _ct() {
             return 0
             ;;
         ct__subcmd__profiles__subcmd__show)
-            opts="<PROFILE>"
+            opts=""
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -418,7 +418,7 @@ _ct() {
             return 0
             ;;
         ct__subcmd__profiles__subcmd__test)
-            opts="<PROFILE> <FILE>"
+            opts=""
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -432,7 +432,7 @@ _ct() {
             return 0
             ;;
         ct__subcmd__profiles__subcmd__validate)
-            opts="<FILE>"
+            opts=""
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
