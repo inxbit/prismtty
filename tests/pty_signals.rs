@@ -92,3 +92,86 @@ fn external_signal_is_forwarded_to_wrapped_child() {
         "wrapped child never received the forwarded SIGTERM (it was orphaned)"
     );
 }
+
+/// A stream failure (stdout closing mid-session) must terminate and reap a
+/// wrapped child that ignores SIGHUP instead of hanging forever in the reap:
+/// portable-pty's `kill()` only delivers SIGHUP on unix, which such a child
+/// shrugs off, so the exit path needs a bounded escalation to SIGKILL.
+#[test]
+fn stream_error_terminates_sighup_immune_child() {
+    use std::io::{self, BufRead};
+    use std::process::{Command, Stdio};
+
+    let marker = tempfile::NamedTempFile::new().expect("marker file");
+    let marker_path = marker.path().to_path_buf();
+    std::fs::remove_file(&marker_path).ok();
+
+    let mut ptty = Command::new(env!("CARGO_BIN_EXE_ptty"))
+        .env("PRISMTTY_PID_MARKER", &marker_path)
+        .arg("sh")
+        .arg("-c")
+        // The child ignores HUP/TERM, records its pid, announces readiness,
+        // then keeps emitting output so ptty's next stdout write hits EPIPE
+        // once the test closes its end. The loop is bounded so a regression
+        // cannot leak a runaway process.
+        .arg(
+            "trap '' HUP TERM; echo $$ > \"$PRISMTTY_PID_MARKER\"; echo START; i=0; while [ $i -lt 300 ]; do i=$((i+1)); echo tick; sleep 0.1; done",
+        )
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn ptty");
+
+    // Wait for START so the wrapped shell has installed its traps and written
+    // its pid before the stream is broken.
+    let stdout = ptty.stdout.take().expect("piped stdout");
+    let mut lines = io::BufReader::new(stdout).lines();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match lines.next() {
+            Some(Ok(line)) if line.contains("START") => break,
+            Some(_) => {}
+            None => panic!("ptty stdout closed before the wrapped child started"),
+        }
+        assert!(
+            Instant::now() < deadline,
+            "wrapped child never announced readiness"
+        );
+    }
+    let wrapped_pid: libc::pid_t = std::fs::read_to_string(&marker_path)
+        .expect("pid marker")
+        .trim()
+        .parse()
+        .expect("pid marker contents");
+
+    // Break the stream: ptty's next relay write fails with EPIPE.
+    drop(lines);
+
+    // ptty must exit instead of blocking forever reaping the HUP-immune child.
+    let exit_deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if ptty.try_wait().expect("try_wait ptty").is_some() {
+            break;
+        }
+        if Instant::now() >= exit_deadline {
+            let _ = ptty.kill();
+            unsafe { libc::kill(wrapped_pid, libc::SIGKILL) };
+            panic!("ptty hung reaping a wrapped child that ignores SIGHUP");
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    // And the wrapped child must be gone, not orphaned.
+    let gone_deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if unsafe { libc::kill(wrapped_pid, 0) } != 0 {
+            break;
+        }
+        if Instant::now() >= gone_deadline {
+            unsafe { libc::kill(wrapped_pid, libc::SIGKILL) };
+            panic!("wrapped child survived ptty's stream failure (orphaned)");
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+}

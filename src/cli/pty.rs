@@ -10,6 +10,7 @@ use std::sync::{
     mpsc::{self, SyncSender},
 };
 use std::thread;
+use std::time::{Duration, Instant};
 
 use is_terminal::IsTerminal;
 use nix::libc;
@@ -82,6 +83,52 @@ fn reap_child(child: &mut Box<dyn portable_pty::Child + Send + Sync>) -> Result<
     Ok(exit_code_byte(status.exit_code()))
 }
 
+/// Grace period between the polite SIGHUP and the SIGKILL escalation when the
+/// wrapped child must be terminated on a failure path.
+const CHILD_EXIT_GRACE: Duration = Duration::from_secs(2);
+
+/// Terminates and reaps the wrapped child on a failure path without risking a
+/// hang. Signals go to the child's process group (it is a PTY session leader,
+/// so its pgid equals its pid), escalating from SIGHUP — which the child may
+/// ignore — to SIGKILL. Every wait is bounded: a child blocked writing to an
+/// undrained PTY sits in uninterruptible sleep (macOS), where even SIGKILL is
+/// not acted on, and an unbounded reap would wedge the whole session. If the
+/// child still cannot be reaped, give up; the process is exiting and init
+/// will reap the remains.
+fn terminate_and_reap_child(child: &mut Box<dyn portable_pty::Child + Send + Sync>) {
+    use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
+
+    let Some(pid) = child.process_id() else {
+        let _ = child.try_wait();
+        return;
+    };
+    let pid = pid as i32;
+    for signal in [libc::SIGHUP, libc::SIGKILL] {
+        unsafe { libc::kill(-pid, signal) };
+        let deadline = Instant::now() + CHILD_EXIT_GRACE;
+        while Instant::now() < deadline {
+            match waitpid(nix::unistd::Pid::from_raw(pid), Some(WaitPidFlag::WNOHANG)) {
+                Ok(WaitStatus::StillAlive) => thread::sleep(Duration::from_millis(20)),
+                _ => return,
+            }
+        }
+    }
+}
+
+/// Passes a fallible post-spawn setup step through; on failure, terminates and
+/// reaps the just-spawned child so an early error cannot orphan it or hang on
+/// a child that ignores SIGHUP.
+fn cleanup_child_on_err<T, E>(
+    result: Result<T, E>,
+    child: &mut Box<dyn portable_pty::Child + Send + Sync>,
+) -> Result<T, E> {
+    if result.is_err() {
+        terminate_and_reap_child(child);
+        FORWARD_CHILD_PID.store(0, Ordering::SeqCst);
+    }
+    result
+}
+
 /// Forwards a signal received by prismtty to the wrapped child's process group
 /// so a `kill` of prismtty reaches the child instead of orphaning it. The child
 /// is a PTY session leader, so its process-group id equals its pid.
@@ -146,12 +193,12 @@ pub(super) fn run_command(options: Options, command: Vec<OsString>) -> Result<Ex
     );
 
     let raw_mode = if interactive {
-        Some(RawModeGuard::enable()?)
+        Some(cleanup_child_on_err(RawModeGuard::enable(), &mut child)?)
     } else {
         None
     };
 
-    let trace = IoTrace::open(options.trace_io.as_deref())?;
+    let trace = cleanup_child_on_err(IoTrace::open(options.trace_io.as_deref()), &mut child)?;
     let (profile_input_tx, profile_input_rx) = if dynamic_profile_enabled(&options, interactive) {
         let (tx, rx) = mpsc::sync_channel(PROFILE_INPUT_QUEUE_CAPACITY);
         (Some(tx), Some(rx))
@@ -164,7 +211,10 @@ pub(super) fn run_command(options: Options, command: Vec<OsString>) -> Result<Ex
     // the resize watcher (which owns the master itself), so a resize-thread exit
     // cannot close the descriptor out from under the read loop.
     let pty_fd_owned = if interactive {
-        Some(dup_master_fd(&*pair.master)?)
+        Some(cleanup_child_on_err(
+            dup_master_fd(&*pair.master),
+            &mut child,
+        )?)
     } else {
         None
     };
@@ -178,7 +228,7 @@ pub(super) fn run_command(options: Options, command: Vec<OsString>) -> Result<Ex
     // screen, so a non-echoed secret is never drawn even if it is briefly held.
     let recent_input = Arc::new(Mutex::new(Vec::new()));
     if raw_mode.is_some() {
-        let mut writer = pair.master.take_writer()?;
+        let mut writer = cleanup_child_on_err(pair.master.take_writer(), &mut child)?;
         let trace = trace.clone();
         let local_echo = options.local_echo;
         let recent_input = Arc::clone(&recent_input);
@@ -196,11 +246,12 @@ pub(super) fn run_command(options: Options, command: Vec<OsString>) -> Result<Ex
         });
     }
 
-    let mut reader = pair.master.try_clone_reader()?;
-    let mut resize_watcher = PtyResizeWatcher::start(pair.master)?;
+    let mut reader = cleanup_child_on_err(pair.master.try_clone_reader(), &mut child)?;
+    let mut resize_watcher =
+        cleanup_child_on_err(PtyResizeWatcher::start(pair.master), &mut child)?;
 
     let mut stdout = io::stdout();
-    let _registration = RuntimeRegistration::register()?;
+    let _registration = cleanup_child_on_err(RuntimeRegistration::register(), &mut child)?;
     let reload_watcher = Some(ReloadWatcher::new());
     let stream_result = highlight_stream(
         &mut reader,
@@ -218,11 +269,21 @@ pub(super) fn run_command(options: Options, command: Vec<OsString>) -> Result<Ex
 
     resize_watcher.stop();
     // Reap the child on every exit path. If the stream errored the child may
-    // still be running, so terminate it first to avoid blocking on the reap.
-    if stream_result.is_err() {
-        let _ = child.kill();
-    }
-    let exit = reap_child(&mut child)?;
+    // still be running, so terminate it first — escalating past SIGHUP, which
+    // the child may ignore — to avoid blocking forever on the reap. Drain the
+    // master while doing so: with the read loop gone, a child blocked writing
+    // to the full PTY is uninterruptible and cannot act on any signal until
+    // its write completes.
+    let exit = if stream_result.is_err() {
+        thread::spawn(move || {
+            let mut sink = [0u8; 4096];
+            while matches!(reader.read(&mut sink), Ok(n) if n > 0) {}
+        });
+        terminate_and_reap_child(&mut child);
+        1
+    } else {
+        reap_child(&mut child)?
+    };
     FORWARD_CHILD_PID.store(0, Ordering::SeqCst);
     drop(raw_mode);
     stream_result?;
