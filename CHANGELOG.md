@@ -2,6 +2,33 @@
 
 All notable changes to PrismTTY are documented here.
 
+## Unreleased
+
+### Security and Reliability
+
+- Terminate and reap the wrapped child on failure paths with a bounded
+  SIGHUP-then-SIGKILL escalation to its process group, draining the PTY master
+  so a child blocked writing to the full PTY cannot wedge the exit. Previously
+  a stream error while wrapping a SIGHUP-immune child hung prismtty forever,
+  and an early setup error could orphan the child.
+- Serve the website's fonts from the site itself instead of Google Fonts and
+  ship a strict Content-Security-Policy on every page, so visitors no longer
+  contact third-party hosts.
+
+### Packaging
+
+- Limit the crates.io package to sources, builtin profiles, license, and
+  readmes (98 to 33 files).
+- Extend cargo-deny unmaintained-dependency coverage to transitive
+  dependencies.
+
+### Tests
+
+- Add a regression test that breaks the output stream mid-session against a
+  SIGHUP-immune child and asserts prismtty exits and the child is reaped.
+- Assert the site pages ship a CSP, reference no third-party font hosts, and
+  keep the 404 page's inline-block hashes in sync.
+
 ## 1.1.0 - 2026-07-02
 
 ### Security and Reliability
