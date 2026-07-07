@@ -19,7 +19,7 @@ network-focused built-in profiles.
 
 Website: [prismtty.com](https://prismtty.com/).
 
-Current version: `1.1.0`.
+Current version: `1.1.1`.
 
 ## Quick Demo
 
@@ -99,7 +99,7 @@ sudo apt-get install libpcre2-dev pkg-config
 ### GitHub Release
 
 Prebuilt release archives and checksums are available on the
-[v1.1.0 release page](https://github.com/inxbit/prismtty/releases/tag/v1.1.0).
+[v1.1.1 release page](https://github.com/inxbit/prismtty/releases/tag/v1.1.1).
 
 Each release archive contains the binaries, license/readme files, example
 profiles, shell completions, and a `.tar.gz.sha256` checksum.

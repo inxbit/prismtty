@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { existsSync, readFileSync } from 'node:fs';
 import test from 'node:test';
 
@@ -47,4 +48,31 @@ test('GitHub Pages site has the expected static contract', () => {
   assert.match(cratesReadme, /Installed commands:/);
   assert.match(cratesReadme, /Runtime Reload/);
   assert.doesNotMatch(cratesReadme, /show-tech\.txt \| prismtty/);
+});
+
+test('site pages ship a strict CSP and self-hosted fonts', () => {
+  assert.equal(existsSync('docs/assets/fonts/jetbrains-mono-latin.woff2'), true);
+  assert.equal(existsSync('docs/assets/fonts/space-grotesk-latin.woff2'), true);
+  assert.equal(existsSync('docs/assets/fonts/OFL-jetbrains-mono.txt'), true);
+  assert.equal(existsSync('docs/assets/fonts/OFL-space-grotesk.txt'), true);
+
+  const index = read('docs/index.html');
+  const notFound = read('docs/404.html');
+  for (const page of [index, notFound]) {
+    assert.match(page, /http-equiv="Content-Security-Policy"/);
+    assert.doesNotMatch(page, /fonts\.googleapis|fonts\.gstatic/);
+  }
+  assert.match(read('docs/styles.css'), /@font-face/);
+
+  // The 404 CSP allows its inline <style> and <script> by hash; make sure the
+  // hashes stay in sync when either block is edited.
+  const csp = notFound.match(
+    /Content-Security-Policy"\s*content="([^"]+)"/
+  )[1];
+  const styleBlock = notFound.match(/<style>([\s\S]*?)<\/style>/)[1];
+  const scriptBlock = notFound.match(/<script>([\s\S]*?)<\/script>/)[1];
+  const hash = (s) =>
+    `sha256-${createHash('sha256').update(s, 'utf8').digest('base64')}`;
+  assert.ok(csp.includes(`'${hash(styleBlock)}'`), 'stale 404 style hash');
+  assert.ok(csp.includes(`'${hash(scriptBlock)}'`), 'stale 404 script hash');
 });
