@@ -2,7 +2,7 @@
 
 All notable changes to PrismTTY are documented here.
 
-## Unreleased
+## 1.1.1 - 2026-07-07
 
 ### Security and Reliability
 
