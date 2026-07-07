@@ -11,6 +11,15 @@ homepage = "https://prismtty.com/"
 documentation = "https://docs.rs/prismtty"
 keywords = ["terminal", "highlighting", "network", "cli"]
 categories = ["command-line-utilities"]
+# Keep the crates.io package to what a build needs; the website, tests,
+# fixtures, and CI live in the repository only.
+include = [
+  "/src/**/*.rs",
+  "/src/profiles/builtin/*.yml",
+  "/LICENSE",
+  "/README.crates.md",
+  "/CHANGELOG.md",
+]
 
 [features]
 completion-generation = ["dep:clap_complete"]
