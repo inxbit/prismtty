@@ -171,6 +171,21 @@ test('CI verifies the minimum supported Rust version used for releases', () => {
   );
 });
 
+test('cargo audit stays pinned to a release-MSRV-compatible version', () => {
+  const ci = read('.github/workflows/ci.yml');
+  const release = read('.github/workflows/release.yml');
+  const install = /cargo install cargo-audit --version 0\.22\.1 --locked/g;
+
+  assert.equal((ci.match(install) ?? []).length, 1);
+  assert.equal((release.match(install) ?? []).length, 1);
+  assert.match(ci, /cargo audit --deny warnings/);
+  assert.match(release, /cargo audit --deny warnings/);
+  assert.doesNotMatch(ci, /rustsec\/audit-check/);
+  assert.doesNotMatch(release, /rustsec\/audit-check/);
+  assert.doesNotMatch(jobBody(ci, 'supply-chain'), /checks: write/);
+  assert.doesNotMatch(jobBody(release, 'release-validation'), /checks: write/);
+});
+
 test('release artifacts use supported runner labels for each architecture', () => {
   const workflow = read('.github/workflows/release.yml');
 

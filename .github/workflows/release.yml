@@ -89,7 +89,6 @@ jobs:
       crate-published: ${{ steps.crates-io-state.outputs.published }}
     permissions:
       contents: read
-      checks: write
 
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -110,10 +109,10 @@ jobs:
       - name: Privacy scan
         run: bash scripts/privacy-scan.sh
 
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --version 0.22.1 --locked
       - name: cargo audit
-        uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+        run: cargo audit --deny warnings
       - name: cargo deny
         uses: EmbarkStudios/cargo-deny-action@bb137d7af7e4fb67e5f82a49c4fce4fad40782fe # v2.0.20
         with:
