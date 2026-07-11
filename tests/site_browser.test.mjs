@@ -43,6 +43,106 @@ test('loads the PrismTTY landing page without local runtime errors', async ({ pa
   expect(messages).toEqual([]);
 });
 
+test('structured data is valid and authorized by the content security policy', async ({ page }) => {
+  const consoleErrors = [];
+  page.on('console', (message) => {
+    if (message.type() === 'error') consoleErrors.push(message.text());
+  });
+  await page.addInitScript(() => {
+    window.__prismttyCspViolations = [];
+    document.addEventListener('securitypolicyviolation', (event) => {
+      window.__prismttyCspViolations.push({
+        blockedURI: event.blockedURI,
+        violatedDirective: event.violatedDirective,
+      });
+    });
+  });
+  await page.goto('/');
+
+  const structuredDataScript = page.locator('script[type="application/ld+json"]');
+  await expect(structuredDataScript).toHaveCount(1);
+  const structuredData = JSON.parse(
+    await structuredDataScript.textContent(),
+  );
+  expect(structuredData).toMatchObject({
+    '@context': 'https://schema.org',
+    '@type': 'SoftwareApplication',
+    name: 'PrismTTY',
+    softwareVersion: '1.2.1',
+  });
+  expect(await page.evaluate(() => window.__prismttyCspViolations)).toEqual([]);
+  expect(consoleErrors).toEqual([]);
+});
+
+test('rendered page has no WCAG A or AA axe violations', async ({ page }) => {
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await page.goto('/');
+  await page.evaluate(() => document.fonts.ready);
+  await settleFiniteAnimations(page);
+  const results = await new AxeBuilder({ page })
+    .withTags(['wcag2a', 'wcag2aa', 'wcag21a', 'wcag21aa'])
+    .analyze();
+  expect(results.violations).toEqual([]);
+});
+
+for (const viewport of [
+  { width: 320, height: 800 },
+  { width: 390, height: 844 },
+  { width: 768, height: 1024 },
+  { width: 1024, height: 768 },
+  { width: 1440, height: 900 },
+]) {
+  test(`has no page overflow at ${viewport.width}px`, async ({ page }) => {
+    await page.setViewportSize(viewport);
+    await page.goto('/');
+    const widths = await page.evaluate(() => ({
+      client: document.documentElement.clientWidth,
+      scroll: document.documentElement.scrollWidth,
+      body: document.body.scrollWidth,
+    }));
+    expect(widths.scroll).toBeLessThanOrEqual(widths.client);
+    expect(widths.body).toBeLessThanOrEqual(widths.client);
+  });
+}
+
+test('404 page is branded, accessible, and contained', async ({ page }) => {
+  await page.addInitScript(() => {
+    window.__prismttyCspViolations = [];
+    document.addEventListener('securitypolicyviolation', (event) => {
+      window.__prismttyCspViolations.push(event.violatedDirective);
+    });
+  });
+  for (const viewport of [
+    { width: 320, height: 800 },
+    { width: 1440, height: 900 },
+  ]) {
+    await page.setViewportSize(viewport);
+    await page.goto('/404.html');
+    await page.evaluate(() => document.fonts.ready);
+
+    await expect(page.locator('meta[name="robots"]')).toHaveAttribute('content', 'noindex');
+    await expect(page.getByRole('heading', { name: '404: page not found' })).toBeAttached();
+    const back = page.getByRole('link', { name: 'Back to prismtty.com' });
+    const github = page.getByRole('link', { name: 'GitHub' });
+    await expect(back).toBeVisible();
+    await expect(github).toBeVisible();
+    await back.focus();
+    await expect(back).toBeFocused();
+
+    const widths = await page.evaluate(() => ({
+      client: document.documentElement.clientWidth,
+      scroll: document.documentElement.scrollWidth,
+    }));
+    expect(widths.scroll).toBeLessThanOrEqual(widths.client);
+    expect(await page.evaluate(() => window.__prismttyCspViolations)).toEqual([]);
+
+    const results = await new AxeBuilder({ page })
+      .withTags(['wcag2a', 'wcag2aa', 'wcag21a', 'wcag21aa'])
+      .analyze();
+    expect(results.violations).toEqual([]);
+  }
+});
+
 test('shows the approved hero inside the first desktop viewport', async ({ page }) => {
   await page.setViewportSize({ width: 1440, height: 900 });
   await page.goto('/');

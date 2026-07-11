@@ -5,21 +5,43 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta
       http-equiv="Content-Security-Policy"
-      content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; base-uri 'none'; form-action 'none'"
+      content="default-src 'none'; script-src 'self' 'sha256-L5J+ELi7nmj6rzeGJD/pCtUKNX2pBrzgFrbKk2w/WwU='; style-src 'self'; img-src 'self' data:; font-src 'self'; base-uri 'none'; form-action 'none'"
     >
+    <script type="application/ld+json">
+      {
+        "@context": "https://schema.org",
+        "@type": "SoftwareApplication",
+        "name": "PrismTTY",
+        "description": "Fast terminal output highlighter focused on network devices and Unix systems",
+        "applicationCategory": "DeveloperApplication",
+        "operatingSystem": ["macOS", "Linux"],
+        "softwareVersion": "1.2.1",
+        "url": "https://prismtty.com/",
+        "downloadUrl": "https://github.com/inxbit/prismtty/releases/tag/v1.2.1",
+        "codeRepository": "https://github.com/inxbit/prismtty",
+        "license": "https://opensource.org/license/mit"
+      }
+    </script>
     <title>PrismTTY - Terminal Output Highlighting</title>
     <meta
       name="description"
       content="PrismTTY makes dense SSH, network-device, and Unix/Linux terminal output easier to scan in real time."
     >
-    <meta property="og:title" content="PrismTTY">
+    <meta property="og:title" content="PrismTTY - Terminal Output Highlighting">
     <meta property="og:description" content="Readable network output, live in your terminal.">
     <meta property="og:type" content="website">
+    <meta property="og:url" content="https://prismtty.com/">
+    <meta property="og:site_name" content="PrismTTY">
     <meta property="og:image" content="https://prismtty.com/assets/prismtty-social-card.png">
+    <meta property="og:image:type" content="image/png">
     <meta property="og:image:width" content="1200">
     <meta property="og:image:height" content="630">
+    <meta property="og:image:alt" content="PrismTTY highlighting network terminal output in a dark terminal interface">
     <meta name="twitter:card" content="summary_large_image">
+    <meta name="twitter:title" content="PrismTTY - Terminal Output Highlighting">
+    <meta name="twitter:description" content="Readable network output, live in your terminal.">
     <meta name="twitter:image" content="https://prismtty.com/assets/prismtty-social-card.png">
+    <meta name="twitter:image:alt" content="PrismTTY highlighting network terminal output in a dark terminal interface">
     <link rel="canonical" href="https://prismtty.com/">
     <meta name="theme-color" content="#07090d">
     <link rel="icon" href="assets/prismtty-mark.svg" type="image/svg+xml">

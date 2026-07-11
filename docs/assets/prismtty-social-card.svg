@@ -1,74 +1,103 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1200" height="630" viewBox="0 0 1200 630" role="img" aria-labelledby="title desc">
-  <title id="title">PrismTTY social preview</title>
-  <desc id="desc">PrismTTY terminal output highlighting preview for network and Unix operations.</desc>
+  <title id="title">PrismTTY terminal output highlighting</title>
+  <desc id="desc">Noise becomes signal beside a dark terminal showing highlighted network output.</desc>
   <defs>
-    <linearGradient id="bg" x1="0" x2="1" y1="0" y2="1">
-      <stop offset="0" stop-color="#111827"/>
-      <stop offset="0.56" stop-color="#020617"/>
-      <stop offset="1" stop-color="#07111f"/>
-    </linearGradient>
-    <linearGradient id="beam" x1="0" x2="1" y1="0" y2="0">
-      <stop offset="0" stop-color="#22d3ee"/>
-      <stop offset="0.5" stop-color="#a3e635"/>
-      <stop offset="1" stop-color="#f472b6"/>
-    </linearGradient>
     <style>
-      .sans { font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif; }
-      .mono { font-family: SFMono-Regular, Consolas, Liberation Mono, Menlo, monospace; }
-      .title { fill: #f8fafc; font-size: 84px; font-weight: 900; letter-spacing: 0; }
-      .lede { fill: #cbd5e1; font-size: 32px; font-weight: 700; letter-spacing: 0; }
-      .small { fill: #94a3b8; font-size: 22px; font-weight: 700; letter-spacing: 0; }
-      .term { fill: #0f172a; stroke: #334155; stroke-width: 2; }
-      .bar { fill: #111827; }
-      .cyan { fill: #22d3ee; }
-      .green { fill: #a3e635; }
-      .yellow { fill: #facc15; }
-      .red { fill: #fb7185; }
-      .purple { fill: #c084fc; }
-      .fg { fill: #e5e7eb; }
-      .muted { fill: #64748b; }
+      @font-face {
+        font-family: "Space Grotesk";
+        src: url("./fonts/space-grotesk-latin.woff2") format("woff2");
+        font-weight: 400 700;
+      }
+      @font-face {
+        font-family: "JetBrains Mono";
+        src: url("./fonts/jetbrains-mono-latin.woff2") format("woff2");
+        font-weight: 400 800;
+      }
+      .sans { font-family: "Space Grotesk", sans-serif; }
+      .mono { font-family: "JetBrains Mono", monospace; }
+      .brand { fill: #f2f5f7; font-size: 24px; font-weight: 650; }
+      .headline { fill: #f2f5f7; font-size: 70px; font-weight: 650; letter-spacing: -3px; }
+      .lede { fill: #a9b4bf; font-size: 23px; font-weight: 450; }
+      .meta { fill: #8f9ba8; font-size: 16px; font-weight: 550; letter-spacing: 0.4px; }
+      .terminal-title { fill: #8f9ba8; font-size: 14px; }
+      .terminal-text { fill: #d8dee5; font-size: 15px; }
+      .host { fill: #8bd450; font-weight: 700; }
+      .iface { fill: #f3bd4f; }
+      .ip { fill: #55d6e8; }
+      .up { fill: #5edb8a; font-weight: 700; }
+      .down { fill: #e678a8; font-weight: 700; }
+      .severity { fill: #ad8ce5; font-weight: 700; }
     </style>
+    <linearGradient id="background" x1="0" x2="1" y1="0" y2="1">
+      <stop offset="0" stop-color="#05070a"/>
+      <stop offset="0.62" stop-color="#07090d"/>
+      <stop offset="1" stop-color="#091116"/>
+    </linearGradient>
+    <radialGradient id="cyan-atmosphere" cx="0" cy="0" r="1" gradientTransform="translate(984 82) rotate(139) scale(590 430)" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#45c7d8" stop-opacity="0.13"/>
+      <stop offset="1" stop-color="#45c7d8" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="prism-stroke" x1="76" x2="150" y1="44" y2="104" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#f2f5f7"/>
+      <stop offset="0.48" stop-color="#55d6e8"/>
+      <stop offset="1" stop-color="#ad8ce5"/>
+    </linearGradient>
+    <pattern id="grid" width="42" height="42" patternUnits="userSpaceOnUse">
+      <path d="M42 0H0V42" fill="none" stroke="#45c7d8" stroke-opacity="0.035"/>
+    </pattern>
+    <filter id="terminal-shadow" x="-30%" y="-30%" width="160%" height="170%">
+      <feDropShadow dx="0" dy="28" stdDeviation="32" flood-color="#000" flood-opacity="0.55"/>
+    </filter>
   </defs>
 
-  <rect width="1200" height="630" fill="url(#bg)"/>
-  <path d="M610 70h660v78H610z" fill="#22d3ee" opacity="0.10" transform="skewX(-16)"/>
-  <path d="M520 192h760v64H520z" fill="#a3e635" opacity="0.12" transform="skewX(-16)"/>
-  <path d="M650 306h640v58H650z" fill="#f472b6" opacity="0.10" transform="skewX(-16)"/>
+  <rect width="1200" height="630" fill="url(#background)"/>
+  <rect width="1200" height="630" fill="url(#cyan-atmosphere)"/>
+  <rect x="600" width="600" height="630" fill="url(#grid)"/>
+
+  <g aria-hidden="true">
+    <path d="M72 104L108 42l40 62Z" fill="none" stroke="url(#prism-stroke)" stroke-width="5" stroke-linejoin="round"/>
+    <rect x="82" y="68" width="54" height="32" rx="5" fill="#0d1117" stroke="#2a3441"/>
+    <path d="M91 87l8-6-8-6" fill="none" stroke="#55d6e8" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="M105 91h18" stroke="#8bd450" stroke-width="3" stroke-linecap="round"/>
+    <path d="M153 64h48" stroke="#55d6e8" stroke-width="7" stroke-linecap="round" opacity="0.85"/>
+    <path d="M153 78h58" stroke="#8bd450" stroke-width="7" stroke-linecap="round" opacity="0.78"/>
+    <path d="M153 92h44" stroke="#e678a8" stroke-width="7" stroke-linecap="round" opacity="0.72"/>
+  </g>
+  <text x="226" y="85" class="sans brand">Prism<tspan fill="#55d6e8">TTY</tspan></text>
 
   <g class="sans">
-    <text x="70" y="138" class="title">PrismTTY</text>
-    <text x="74" y="192" class="lede">Readable SSH, network-device, and Unix output.</text>
-    <text x="74" y="234" class="small">Live terminal highlighting for operators.</text>
+    <text x="72" y="210" class="headline">Noise becomes</text>
+    <text x="72" y="282" class="headline">signal.</text>
+    <text x="76" y="346" class="lede">Readable network and Unix output,</text>
+    <text x="76" y="380" class="lede">live in the terminal you already use.</text>
+    <path d="M76 454h64" stroke="#45c7d8" stroke-width="3"/>
+    <text x="76" y="500" class="meta">prismtty.com</text>
+    <text x="76" y="532" class="meta">macOS + Linux / MIT licensed</text>
   </g>
 
-  <g transform="translate(70 285)">
-    <rect width="1060" height="270" rx="20" class="term"/>
-    <rect width="1060" height="52" rx="20" class="bar"/>
-    <rect y="34" width="1060" height="18" class="bar"/>
-    <circle cx="30" cy="26" r="8" fill="#ef4444"/>
-    <circle cx="58" cy="26" r="8" fill="#f59e0b"/>
-    <circle cx="86" cy="26" r="8" fill="#22c55e"/>
-    <text x="122" y="35" class="mono small">ptty ssh edge-sw1.example.net</text>
-    <rect y="52" width="1060" height="4" fill="url(#beam)"/>
+  <g filter="url(#terminal-shadow)">
+    <rect x="616" y="54" width="520" height="522" rx="30" fill="#0a0d12" stroke="#2a3441" stroke-width="2"/>
+    <rect x="624" y="62" width="504" height="506" rx="23" fill="#070b10" stroke="#1b2530"/>
+    <path d="M624 122h504" stroke="#202b36"/>
+    <circle cx="650" cy="92" r="5" fill="#697582"/>
+    <circle cx="670" cy="92" r="5" fill="#697582"/>
+    <circle cx="690" cy="92" r="5" fill="#697582"/>
+    <text x="714" y="97" class="mono terminal-title">ptty ssh edge-sw1.example.net</text>
 
-    <text x="32" y="98" class="mono green" font-size="24">edge-sw1#</text>
-    <text x="166" y="98" class="mono fg" font-size="24">show ip interface brief</text>
-    <text x="32" y="140" class="mono muted" font-size="19">Interface</text>
-    <text x="260" y="140" class="mono muted" font-size="19">IP-Address</text>
-    <text x="500" y="140" class="mono muted" font-size="19">Status</text>
-    <text x="680" y="140" class="mono muted" font-size="19">Protocol</text>
-    <text x="32" y="180" class="mono yellow" font-size="22">Gi1/0/1</text>
-    <text x="260" y="180" class="mono cyan" font-size="22">192.0.2.10</text>
-    <text x="500" y="180" class="mono green" font-size="22">up</text>
-    <text x="680" y="180" class="mono green" font-size="22">up</text>
-    <text x="32" y="220" class="mono yellow" font-size="22">Gi1/0/2</text>
-    <text x="260" y="220" class="mono cyan" font-size="22">198.51.100.42</text>
-    <text x="500" y="220" class="mono red" font-size="22">down</text>
-    <text x="680" y="220" class="mono red" font-size="22">down</text>
-    <text x="32" y="258" class="mono purple" font-size="22">%LINK-3-UPDOWN:</text>
-    <text x="250" y="258" class="mono fg" font-size="22">Interface </text>
-    <text x="378" y="258" class="mono yellow" font-size="22">Gi1/0/2</text>
-    <text x="492" y="258" class="mono fg" font-size="22"> changed state to </text>
-    <text x="736" y="258" class="mono red" font-size="22">down</text>
+    <g class="mono terminal-text">
+      <text x="650" y="156"><tspan class="host">ops@workstation%</tspan><tspan> ptty ssh edge-sw1.example.net</tspan></text>
+      <text x="650" y="188">Connected to edge-sw1.example.net.</text>
+      <text x="650" y="232"><tspan class="host">edge-sw1#</tspan><tspan>show ip interface brief</tspan></text>
+      <text x="650" y="264" fill="#8f9ba8">Interface            IP-Address       Status</text>
+      <text x="650" y="298"><tspan class="iface">Gi1/0/1</tspan><tspan dx="73" class="ip">192.0.2.10</tspan><tspan dx="63" class="up">up</tspan></text>
+      <text x="650" y="330"><tspan class="iface">Gi1/0/2</tspan><tspan dx="73" class="ip">198.51.100.42</tspan><tspan dx="38" class="down">down</tspan></text>
+      <text x="650" y="382"><tspan class="host">edge-sw1#</tspan><tspan>show logging | include LINK</tspan></text>
+      <text x="650" y="418"><tspan class="severity">%LINK-3-UPDOWN:</tspan></text>
+      <text x="650" y="448">Interface <tspan class="iface">Gi1/0/2</tspan> changed state to <tspan class="down">down</tspan></text>
+    </g>
+
+    <rect x="650" y="494" width="452" height="46" rx="11" fill="#0d1117" stroke="#202b36"/>
+    <circle cx="674" cy="517" r="4" fill="#45c7d8"/>
+    <text x="690" y="522" class="mono terminal-title">9 profiles / zero telemetry</text>
   </g>
 </svg>
