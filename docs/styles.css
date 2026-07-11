@@ -406,15 +406,20 @@ img { display: block; max-width: 100%; }
   text-overflow: ellipsis;
 }
 .terminal-body {
-  overflow-x: auto;
   padding: 18px 18px 20px;
   font-family: var(--mono);
   font-size: 13.5px;
   line-height: 1.72;
-  white-space: pre;
+  white-space: pre-wrap;
+  word-break: break-word;
   tab-size: 2;
 }
-.hero-terminal .terminal-body { min-height: 326px; }
+.hero-terminal .terminal-body {
+  overflow-x: auto;
+  min-height: 326px;
+  white-space: pre;
+  word-break: normal;
+}
 
 /* terminal line rendering */
 .tline { display: block; }

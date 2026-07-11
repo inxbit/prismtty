@@ -1,4 +1,5 @@
 import { expect, test } from '@playwright/test';
+import AxeBuilder from '@axe-core/playwright';
 
 test('loads the PrismTTY landing page without local runtime errors', async ({ page }) => {
   const messages = [];
@@ -29,4 +30,15 @@ test('shows the approved hero inside the first desktop viewport', async ({ page 
   const installBox = await installLink.boundingBox();
   expect(installBox).not.toBeNull();
   expect(installBox.y + installBox.height).toBeLessThanOrEqual(900);
+});
+
+test('has no unfocusable scrollable regions on mobile', async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.goto('/');
+
+  const results = await new AxeBuilder({ page })
+    .withRules('scrollable-region-focusable')
+    .analyze();
+
+  expect(results.violations).toEqual([]);
 });
