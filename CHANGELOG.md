@@ -2,6 +2,16 @@
 
 All notable changes to PrismTTY are documented here.
 
+## 1.2.1 - 2026-07-11
+
+### Release and QA
+
+- Publish the completed 1.2.0 changes under a fresh immutable patch tag after
+  the protected v1.2.0 tag stopped in validation before any release assets or
+  crate were published.
+- Pin `cargo-audit` to the latest Rust 1.85-compatible release in CI and
+  release validation so upstream tool updates cannot break publication.
+
 ## 1.2.0 - 2026-07-11
 
 ### Library API
@@ -34,8 +44,6 @@ All notable changes to PrismTTY are documented here.
 
 - Test the declared Rust 1.85 minimum supported version in CI before release
   tags run the pinned release toolchain.
-- Pin `cargo-audit` to the latest Rust 1.85-compatible release in CI and
-  release validation so upstream tool updates cannot break publication.
 - Include untracked, non-ignored files in the privacy gate so new source and
   fixture files cannot bypass local pre-commit checks, and reject raw or
   conventionally compressed packet captures and trace artifacts that
