@@ -20,7 +20,8 @@ All notable changes to PrismTTY are documented here.
 - Keep bounded close-marker inspection aligned to complete output lines so a
   truncated prose line cannot be mistaken for a remote teardown marker.
 - Kill signal-immune PTY descendants before reaping an exited process-group
-  leader, and supervise Linux-only terminating signals during raw-mode cleanup.
+  leader, supervise Linux-only terminating signals during raw-mode cleanup,
+  and restore cooked terminal state before job-control suspension.
 - Recover visible output when raw ST follows malformed UTF-8 inside an
   oversized terminal string, and cap incomplete non-string controls at 1 KiB
   so byte-fragmented CSI input cannot trigger a 16 KiB quadratic rescan.

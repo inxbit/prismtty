@@ -1160,7 +1160,11 @@ fn handle_session_signals(read_fd: RawFd, raw_mode_state: SharedRawModeState) {
                     || {
                         forward_signal_to_child(libc::SIGSTOP as u8);
                         unsafe {
-                            libc::kill(libc::getpid(), libc::SIGSTOP);
+                            // Target the calling thread so Linux delivers the
+                            // stop before this worker can continue and reapply
+                            // raw mode. A process-directed kill may return
+                            // while SIGSTOP is still pending.
+                            libc::raise(libc::SIGSTOP);
                         }
                         forward_signal_to_child(libc::SIGCONT as u8);
                     },

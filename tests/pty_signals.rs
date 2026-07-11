@@ -825,17 +825,26 @@ fn assert_job_control_stop_resume(signal: libc::c_int) {
     );
 
     assert_eq!(unsafe { libc::kill(pid, signal) }, 0);
+    let mut observed_stop = None;
     assert!(
         wait_for_condition(Duration::from_secs(2), || {
-            matches!(
-                waitpid(
-                    Pid::from_raw(pid),
-                    Some(WaitPidFlag::WUNTRACED | WaitPidFlag::WNOHANG)
-                ),
-                Ok(WaitStatus::Stopped(_, _))
-            )
+            match waitpid(
+                Pid::from_raw(pid),
+                Some(WaitPidFlag::WUNTRACED | WaitPidFlag::WNOHANG),
+            ) {
+                Ok(WaitStatus::Stopped(_, stopped_by)) => {
+                    observed_stop = Some(stopped_by);
+                    true
+                }
+                _ => false,
+            }
         }),
         "ptty did not enter a stopped state for job-control signal {signal}"
+    );
+    assert_eq!(
+        observed_stop,
+        Some(nix::sys::signal::Signal::SIGSTOP),
+        "ptty stopped before completing its supervised job-control transition"
     );
     assert_eq!(
         tcgetattr(&tty).expect("attrs while stopped"),
