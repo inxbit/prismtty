@@ -62,6 +62,10 @@ test('GitHub Pages site has the expected static contract', () => {
   assert.match(html, /class="proof-rail"/);
   assert.match(html, /data-menu-trigger/);
   assert.match(html, /data-terminal[^>]*>[\s\S]*class="tline"/);
+  assert.match(html, /data-terminal[^>]*>[\s\S]*?GigabitEthernet1\/0\/2[\s\S]*?<\/div>/);
+  assert.match(html, /data-compare-raw[^>]*>[\s\S]*?GigabitEthernet1\/0\/2[\s\S]*?<\/pre>/);
+  assert.match(html, /data-compare-hl[^>]*>[\s\S]*?GigabitEthernet1\/0\/2[\s\S]*?<\/pre>/);
+  assert.match(html, /data-profile-body[^>]*>[\s\S]*?GigabitEthernet1\/0\/1[\s\S]*?<\/div>/);
   assert.doesNotMatch(html, /terminal-badge|● live|spectrum-text|hero-facts/);
   assert.match(html, /data-compare\b/);
   assert.match(html, /data-profiles\b/);

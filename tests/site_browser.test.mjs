@@ -57,6 +57,152 @@ test('shows the approved hero inside the first desktop viewport', async ({ page 
   expect(installBox.y + installBox.height).toBeLessThanOrEqual(900);
 });
 
+test('motion preference changes make the hero complete and stable without a reload', async ({ page }) => {
+  await page.emulateMedia({ reducedMotion: 'no-preference' });
+  await page.goto('/');
+  const terminal = page.locator('[data-terminal]');
+  const comparison = page.locator('[data-compare]');
+
+  await expect(terminal).not.toContainText('%LINK-3-UPDOWN');
+  await page.emulateMedia({ reducedMotion: 'reduce' });
+
+  await expect(terminal).toContainText('%LINK-3-UPDOWN', { timeout: 1500 });
+  const firstStableMarkup = await terminal.innerHTML();
+  await page.waitForTimeout(500);
+  expect(await terminal.innerHTML()).toBe(firstStableMarkup);
+  await expect(page.locator('.section').first()).toHaveCSS('opacity', '1');
+  await expect(page.locator('.section').first()).toHaveCSS('transform', 'none');
+  await expect(comparison).toHaveCSS('--compare-position', '50%');
+
+  await page.emulateMedia({ reducedMotion: 'no-preference' });
+  await expect.poll(() => terminal.innerHTML()).not.toBe(firstStableMarkup);
+
+  await page.emulateMedia({ reducedMotion: 'reduce' });
+  await expect(terminal).toContainText('%LINK-3-UPDOWN', { timeout: 1500 });
+  const secondStableMarkup = await terminal.innerHTML();
+  await page.waitForTimeout(500);
+  expect(await terminal.innerHTML()).toBe(secondStableMarkup);
+});
+
+test('hero playback stops offscreen and resumes when the preview returns', async ({ page }) => {
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await page.emulateMedia({ reducedMotion: 'no-preference' });
+  await page.goto('/');
+  const terminal = page.locator('[data-terminal]');
+
+  await expect(terminal).not.toContainText('%LINK-3-UPDOWN');
+  await page.locator('.site-footer').scrollIntoViewIfNeeded();
+  await expect(terminal).toContainText('%LINK-3-UPDOWN', { timeout: 2000 });
+  const offscreenMarkup = await terminal.innerHTML();
+  await page.waitForTimeout(500);
+  expect(await terminal.innerHTML()).toBe(offscreenMarkup);
+
+  await page.locator('#preview').scrollIntoViewIfNeeded();
+  await expect.poll(() => terminal.innerHTML()).not.toBe(offscreenMarkup);
+});
+
+test('hero playback stops while the document is hidden and resumes when visible', async ({ page }) => {
+  await page.emulateMedia({ reducedMotion: 'no-preference' });
+  await page.goto('/');
+  const terminal = page.locator('[data-terminal]');
+
+  await page.evaluate(() => {
+    window.__prismttyTestHidden = true;
+    Object.defineProperty(document, 'hidden', {
+      configurable: true,
+      get: () => window.__prismttyTestHidden,
+    });
+    document.dispatchEvent(new Event('visibilitychange'));
+  });
+  await expect(terminal).toContainText('%LINK-3-UPDOWN');
+  const hiddenMarkup = await terminal.innerHTML();
+  await page.waitForTimeout(500);
+  expect(await terminal.innerHTML()).toBe(hiddenMarkup);
+
+  await page.evaluate(() => {
+    window.__prismttyTestHidden = false;
+    document.dispatchEvent(new Event('visibilitychange'));
+  });
+  await expect.poll(() => terminal.innerHTML()).not.toBe(hiddenMarkup);
+});
+
+test('missing IntersectionObserver falls back to complete static content', async ({ page }) => {
+  await page.addInitScript(() => {
+    Reflect.deleteProperty(window, 'IntersectionObserver');
+  });
+  const errors = [];
+  page.on('pageerror', (error) => errors.push(error.message));
+  await page.goto('/');
+  const terminal = page.locator('[data-terminal]');
+
+  await expect(terminal).toContainText('%LINK-3-UPDOWN', { timeout: 1500 });
+  const stableMarkup = await terminal.innerHTML();
+  await page.waitForTimeout(500);
+  expect(await terminal.innerHTML()).toBe(stableMarkup);
+  for (const selector of ['.proof-rail', '.command-band', '.section']) {
+    await expect(page.locator(selector).first()).toHaveCSS('opacity', '1');
+    await expect(page.locator(selector).first()).toHaveCSS('transform', 'none');
+  }
+  expect(errors).toEqual([]);
+});
+
+test('sections remain rendered before their reveal intersection', async ({ page }) => {
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await page.emulateMedia({ reducedMotion: 'no-preference' });
+  await page.goto('/');
+  const install = page.locator('#install');
+
+  const geometry = await install.boundingBox();
+  expect(geometry).not.toBeNull();
+  expect(geometry.y).toBeGreaterThan(900);
+  await expect(install).toHaveCSS('opacity', '1');
+  await expect(install).toHaveCSS('transform', 'none');
+  await expect(install.getByRole('heading', { name: 'One command away.' })).toBeVisible();
+});
+
+test('user comparison state survives live motion preference changes', async ({ page }) => {
+  await page.emulateMedia({ reducedMotion: 'reduce' });
+  await page.goto('/#compare');
+  const comparison = page.locator('[data-compare]');
+  const range = page.getByRole('slider', { name: 'Highlighted output reveal' });
+
+  await expect(comparison).toHaveCSS('--compare-position', '50%');
+  await range.fill('72');
+  await expect(comparison).toHaveCSS('--compare-position', '72%');
+  await expect(comparison).toHaveAttribute('data-compare-source', 'user');
+
+  await page.emulateMedia({ reducedMotion: 'no-preference' });
+  await page.locator('[data-compare-step]').first().scrollIntoViewIfNeeded();
+  await page.waitForTimeout(250);
+  await expect(comparison).toHaveCSS('--compare-position', '72%');
+
+  await page.emulateMedia({ reducedMotion: 'reduce' });
+  await expect(comparison).toHaveCSS('--compare-position', '72%');
+});
+
+test('profile and hero entrance motion use only opacity and transforms', async ({ page }) => {
+  await page.emulateMedia({ reducedMotion: 'no-preference' });
+  await page.goto('/#profiles');
+  const body = page.locator('[data-profile-body]');
+
+  await page.getByRole('tab', { name: 'juniper' }).click();
+  const keyframeProperties = await body.evaluate((element) => {
+    const allowedMetadata = new Set(['offset', 'computedOffset', 'easing', 'composite']);
+    return element.getAnimations().flatMap((animation) => (
+      animation.effect.getKeyframes().flatMap((frame) => (
+        Object.keys(frame).filter((property) => !allowedMetadata.has(property))
+      ))
+    ));
+  });
+  expect(keyframeProperties.length).toBeGreaterThan(0);
+  expect(new Set(keyframeProperties)).toEqual(new Set(['opacity', 'transform']));
+  await expect(page.locator('.hero')).toHaveClass(/hero-enter/);
+
+  await page.emulateMedia({ reducedMotion: 'reduce' });
+  await page.getByRole('tab', { name: 'fortinet' }).click();
+  expect(await body.evaluate((element) => element.getAnimations().length)).toBe(0);
+});
+
 test('mobile menu traps focus and restores the trigger on Escape', async ({ page }) => {
   await page.setViewportSize({ width: 390, height: 844 });
   await page.goto('/');

@@ -6,11 +6,40 @@
 (() => {
   'use strict';
 
-  const reduceMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  const motionQuery = window.matchMedia('(prefers-reduced-motion: reduce)');
+  let reduceMotion = motionQuery.matches;
+  let heroVisible = true;
+  let heroController;
+  let compareObserver;
+  let revealObserver;
+  let profileOutputAnimation;
+  const revealAnimations = new Set();
   const ESC = { '&': '&amp;', '<': '&lt;', '>': '&gt;' };
   const esc = (s) => s.replace(/[&<>]/g, (c) => ESC[c]);
-  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   const rand = (a, b) => a + Math.floor(Math.random() * (b - a));
+  const supportsIntersectionObserver = () => typeof window.IntersectionObserver === 'function';
+
+  function pause(ms, signal) {
+    return new Promise((resolve) => {
+      if (signal.aborted) {
+        resolve(false);
+        return;
+      }
+
+      let settled = false;
+      let timer;
+      const finish = (completed) => {
+        if (settled) return;
+        settled = true;
+        window.clearTimeout(timer);
+        signal.removeEventListener('abort', handleAbort);
+        resolve(completed);
+      };
+      const handleAbort = () => finish(false);
+      timer = window.setTimeout(() => finish(true), ms);
+      signal.addEventListener('abort', handleAbort, { once: true });
+    });
+  }
 
   /* ---- the highlight rules (mirror PrismTTY's token families) ---- */
   const RULES = [
@@ -156,42 +185,98 @@
   };
 
   /* ---- 1. animated hero terminal ---- */
-  async function runHero() {
-    const body = document.querySelector('[data-terminal]');
-    if (!body) return;
+  const renderHeroFallback = (body) => {
+    const markup = render(HERO, lineHTML);
+    if (body.innerHTML !== markup) body.innerHTML = markup;
+  };
 
-    if (reduceMotion) {
-      body.innerHTML = render(HERO, lineHTML);
-      return;
-    }
+  function canPlayHero() {
+    return !reduceMotion
+      && !document.hidden
+      && heroVisible
+      && supportsIntersectionObserver();
+  }
 
-    while (true) {
+  async function animateHero(body, signal) {
+    while (!signal.aborted && body.isConnected) {
       body.innerHTML = '';
       for (const line of HERO) {
-        const el = document.createElement('span');
-        el.className = 'tline';
-        body.appendChild(el);
+        if (signal.aborted) return;
+        const element = document.createElement('span');
+        element.className = 'tline';
+        body.appendChild(element);
 
         if (typeof line === 'object' && line.c) {
-          el.innerHTML = `<span class="hl-host">${esc(line.p)}</span><span class="t-cmd"></span><span class="cursor">.</span>`;
-          const cmd = el.querySelector('.t-cmd');
-          for (const ch of line.c) {
-            cmd.append(ch);
-            await sleep(rand(26, 64));
+          element.innerHTML = `<span class="hl-host">${esc(line.p)}</span><span class="t-cmd"></span><span class="cursor">.</span>`;
+          const command = element.querySelector('.t-cmd');
+          for (const character of line.c) {
+            if (signal.aborted) return;
+            command.append(character);
+            if (!await pause(rand(26, 64), signal)) return;
           }
-          el.querySelector('.cursor').remove();
-          await sleep(440);
+          element.querySelector('.cursor')?.remove();
+          if (!await pause(440, signal)) return;
         } else {
-          el.innerHTML = blank(highlight(line));
-          await sleep(line === '' ? 70 : 150);
+          element.innerHTML = blank(highlight(line));
+          if (!await pause(line === '' ? 70 : 150, signal)) return;
         }
       }
+
       const tail = document.createElement('span');
       tail.className = 'tline';
       tail.innerHTML = '<span class="hl-host">edge-sw1#</span><span class="cursor">.</span>';
       body.appendChild(tail);
-      await sleep(5200);
+      if (!await pause(5200, signal)) return;
     }
+  }
+
+  function stopHeroPlayback() {
+    const controller = heroController;
+    heroController = undefined;
+    controller?.abort();
+  }
+
+  function startHeroPlayback() {
+    const body = document.querySelector('[data-terminal]');
+    stopHeroPlayback();
+    if (!body) return;
+    if (!canPlayHero()) {
+      renderHeroFallback(body);
+      return;
+    }
+
+    const controller = new AbortController();
+    heroController = controller;
+    void animateHero(body, controller.signal).finally(() => {
+      if (heroController === controller) heroController = undefined;
+    });
+  }
+
+  function initHeroLifecycle() {
+    const preview = document.querySelector('#preview');
+    if (!preview || !supportsIntersectionObserver()) {
+      heroVisible = false;
+      return;
+    }
+
+    const box = preview.getBoundingClientRect();
+    heroVisible = box.bottom > 0 && box.top < window.innerHeight;
+    const observer = new IntersectionObserver(([entry]) => {
+      const visible = entry.isIntersecting && entry.intersectionRatio > 0;
+      if (visible === heroVisible) return;
+      heroVisible = visible;
+      startHeroPlayback();
+    }, { threshold: 0.1 });
+    observer.observe(preview);
+  }
+
+  function initHeroEntrance() {
+    const hero = document.querySelector('.hero');
+    if (!hero || reduceMotion || document.hidden) return;
+    hero.classList.add('hero-enter');
+    window.requestAnimationFrame(() => {
+      window.requestAnimationFrame(() => hero.classList.add('is-in'));
+    });
   }
 
   /* ---- 2. raw / highlighted compare slider ---- */
@@ -211,6 +296,27 @@
       button.setAttribute('aria-pressed', String(pressed));
     });
     root.dataset.compareSource = source;
+  }
+
+  function stopCompareObservation() {
+    compareObserver?.disconnect();
+    compareObserver = undefined;
+  }
+
+  function startCompareObservation() {
+    stopCompareObservation();
+    const root = document.querySelector('[data-compare]');
+    if (!root || reduceMotion || !supportsIntersectionObserver()) return;
+
+    compareObserver = new IntersectionObserver((entries) => {
+      if (reduceMotion || root.dataset.compareSource === 'user') return;
+      const visible = entries.filter((entry) => entry.isIntersecting)
+        .sort((a, b) => b.intersectionRatio - a.intersectionRatio)[0];
+      if (visible) setComparePosition(root, visible.target.dataset.position);
+    }, { rootMargin: '-28% 0px -42%', threshold: [0.2, 0.5, 0.8] });
+    document.querySelectorAll('[data-compare-step]').forEach((step) => {
+      compareObserver.observe(step);
+    });
   }
 
   function initCompare() {
@@ -245,21 +351,29 @@
       });
     });
 
-    if (!reduceMotion && 'IntersectionObserver' in window) {
-      const observer = new IntersectionObserver((entries) => {
-        if (root.dataset.compareSource === 'user') return;
-        const visible = entries.filter((entry) => entry.isIntersecting)
-          .sort((a, b) => b.intersectionRatio - a.intersectionRatio)[0];
-        if (visible) setComparePosition(root, visible.target.dataset.position);
-      }, { rootMargin: '-28% 0px -42%', threshold: [0.2, 0.5, 0.8] });
-      document.querySelectorAll('[data-compare-step]').forEach((step) => observer.observe(step));
-    }
-
     rangeControl.removeAttribute('hidden');
     mobileControls.removeAttribute('hidden');
   }
 
   /* ---- 3. interactive profile tabs ---- */
+  function animateProfileOutput(body) {
+    profileOutputAnimation?.cancel();
+    profileOutputAnimation = undefined;
+    if (reduceMotion || typeof body.animate !== 'function') return;
+
+    const animation = body.animate(
+      [
+        { opacity: 0.42, transform: 'translateY(5px)' },
+        { opacity: 1, transform: 'translateY(0)' },
+      ],
+      { duration: 280, easing: 'cubic-bezier(0.16, 1, 0.3, 1)' },
+    );
+    profileOutputAnimation = animation;
+    void animation.finished.catch(() => {}).finally(() => {
+      if (profileOutputAnimation === animation) profileOutputAnimation = undefined;
+    });
+  }
+
   function initProfiles() {
     const root = document.querySelector('[data-profiles]');
     if (!root) return;
@@ -280,6 +394,7 @@
       panel.setAttribute('aria-labelledby', tab.id);
       title.textContent = data.title;
       body.innerHTML = render(data.lines, lineHTML);
+      animateProfileOutput(body);
       if (focus) tab.focus();
     };
 
@@ -476,22 +591,72 @@
   }
 
   /* ---- scroll reveal ---- */
+  function revealElement(element) {
+    element.classList.add('is-in');
+    if (reduceMotion || typeof element.animate !== 'function') return;
+
+    const animation = element.animate(
+      [
+        { transform: 'translateY(18px)' },
+        { transform: 'translateY(0)' },
+      ],
+      { duration: 640, easing: 'cubic-bezier(0.16, 1, 0.3, 1)' },
+    );
+    revealAnimations.add(animation);
+    void animation.finished.catch(() => {}).finally(() => {
+      revealAnimations.delete(animation);
+    });
+  }
+
   function initReveal() {
-    const targets = document.querySelectorAll('.section, .command-band');
-    if (reduceMotion || !('IntersectionObserver' in window)) return;
-    targets.forEach((el) => el.classList.add('reveal'));
-    const io = new IntersectionObserver(
-      (entries, obs) => {
-        entries.forEach((e) => {
-          if (e.isIntersecting) {
-            e.target.classList.add('is-in');
-            obs.unobserve(e.target);
-          }
+    const targets = [...document.querySelectorAll('.section, .proof-rail, .command-band')];
+    targets.forEach((element) => {
+      element.classList.add('reveal');
+      element.addEventListener('focusin', () => {
+        element.classList.add('is-in');
+        revealObserver?.unobserve(element);
+      }, { once: true });
+    });
+
+    if (reduceMotion || !supportsIntersectionObserver()) {
+      targets.forEach((element) => element.classList.add('is-in'));
+      return;
+    }
+
+    revealObserver = new IntersectionObserver(
+      (entries) => {
+        entries.forEach((entry) => {
+          if (!entry.isIntersecting) return;
+          revealElement(entry.target);
+          revealObserver?.unobserve(entry.target);
         });
       },
       { rootMargin: '0px 0px -12% 0px', threshold: 0.08 }
     );
-    targets.forEach((el) => io.observe(el));
+    targets.forEach((element) => revealObserver.observe(element));
+  }
+
+  function updateMotionState() {
+    reduceMotion = motionQuery.matches;
+    const comparison = document.querySelector('[data-compare]');
+    if (reduceMotion) {
+      stopCompareObservation();
+      if (comparison && comparison.dataset.compareSource !== 'user') {
+        setComparePosition(comparison, 50, 'program');
+      }
+      profileOutputAnimation?.cancel();
+      profileOutputAnimation = undefined;
+      revealAnimations.forEach((animation) => animation.cancel());
+      revealAnimations.clear();
+      revealObserver?.disconnect();
+      revealObserver = undefined;
+      document.querySelectorAll('.reveal').forEach((element) => {
+        element.classList.add('is-in');
+      });
+    } else {
+      startCompareObservation();
+    }
+    startHeroPlayback();
   }
 
   /* ---- active nav state ---- */
@@ -501,7 +666,7 @@
     const sections = links
       .map((l) => document.querySelector(l.getAttribute('href')))
       .filter(Boolean);
-    if (!sections.length || !('IntersectionObserver' in window)) return;
+    if (!sections.length || !supportsIntersectionObserver()) return;
 
     const io = new IntersectionObserver(
       (entries) => {
@@ -528,5 +693,13 @@
   initCopy();
   initReveal();
   initNav();
-  runHero();
+  initHeroLifecycle();
+  initHeroEntrance();
+  if (typeof motionQuery.addEventListener === 'function') {
+    motionQuery.addEventListener('change', updateMotionState);
+  } else if (typeof motionQuery.addListener === 'function') {
+    motionQuery.addListener(updateMotionState);
+  }
+  document.addEventListener('visibilitychange', startHeroPlayback);
+  updateMotionState();
 })();

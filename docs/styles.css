@@ -247,6 +247,23 @@ img { display: block; max-width: 100%; }
 .hero-copy,
 .hero-instrument { min-width: 0; }
 .hero-copy { max-width: 560px; }
+.hero.hero-enter .hero-copy,
+.hero.hero-enter .hero-instrument {
+  opacity: 0;
+  transform: translateY(20px);
+  transition:
+    opacity 700ms var(--ease-out),
+    transform 700ms var(--ease-out);
+}
+.hero.hero-enter .hero-instrument {
+  transform: translateY(28px);
+  transition-delay: 90ms;
+}
+.hero.hero-enter.is-in .hero-copy,
+.hero.hero-enter.is-in .hero-instrument {
+  opacity: 1;
+  transform: none;
+}
 
 .eyebrow {
   margin: 0 0 18px;
@@ -508,36 +525,11 @@ h2 {
 }
 
 /* reveal on scroll */
-.reveal {
-  opacity: 0;
-  transform: translateY(18px);
-  transition: opacity 0.7s var(--ease), transform 0.7s var(--ease);
-}
-.reveal.is-in { opacity: 1; transform: none; }
-
-/* staggered child entrance inside revealed sections */
-.reveal .profile-notes article,
-.reveal .workflow-line article,
-.reveal .scope-statements article,
-.reveal .command-line {
-  opacity: 0;
-  transform: translateY(14px);
-  transition: opacity 0.55s var(--ease), transform 0.55s var(--ease);
-}
-.reveal.is-in .profile-notes article,
-.reveal.is-in .workflow-line article,
-.reveal.is-in .scope-statements article,
-.reveal.is-in .command-line {
+.reveal,
+.reveal.is-in {
   opacity: 1;
   transform: none;
 }
-.reveal.is-in .profile-notes article:nth-child(2),
-.reveal.is-in .workflow-line article:nth-child(2),
-.reveal.is-in .scope-statements article:nth-child(2),
-.reveal.is-in .command-line:nth-child(2) { transition-delay: 0.08s; }
-.reveal.is-in .profile-notes article:nth-child(3),
-.reveal.is-in .workflow-line article:nth-child(3),
-.reveal.is-in .command-line:nth-child(3) { transition-delay: 0.16s; }
 
 /* ---------- compare ---------- */
 .compare-story {
@@ -1093,6 +1085,8 @@ h2 {
     animation: none !important;
     transition: none !important;
   }
-  .reveal { opacity: 1; transform: none; }
+  .reveal,
+  .hero.hero-enter .hero-copy,
+  .hero.hero-enter .hero-instrument { opacity: 1; transform: none; }
   .cursor { opacity: 1; }
 }
