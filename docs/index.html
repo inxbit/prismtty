@@ -147,7 +147,7 @@
         </div>
         <div class="profile-layout">
           <div class="profile-demo">
-            <div class="profile-tabs" role="tablist" aria-label="Terminal profiles">
+            <div class="profile-tabs" role="tablist" aria-label="Terminal profiles" hidden>
               <button id="profile-tab-cisco" role="tab" type="button" data-profile-tab="cisco" aria-controls="profile-panel" aria-selected="true" tabindex="0">cisco</button>
               <button id="profile-tab-juniper" role="tab" type="button" data-profile-tab="juniper" aria-controls="profile-panel" aria-selected="false" tabindex="-1">juniper</button>
               <button id="profile-tab-fortinet" role="tab" type="button" data-profile-tab="fortinet" aria-controls="profile-panel" aria-selected="false" tabindex="-1">fortinet</button>
@@ -157,7 +157,7 @@
             <div class="instrument-shell">
               <div class="terminal" id="profile-panel" role="tabpanel" aria-labelledby="profile-tab-cisco" data-profile-panel>
                 <div class="terminal-bar"><span class="terminal-title" data-profile-title>ptty ssh edge-sw1.example.net</span></div>
-                <div class="terminal-body" data-profile-body aria-live="polite">
+                <div class="terminal-body" data-profile-body tabindex="0" aria-label="Profile terminal output">
                   <span class="tline"><span class="hl-host">edge-sw1#</span><span class="t-cmd">show ip interface brief</span></span>
                   <span class="tline">Interface              IP-Address      Status    Protocol</span>
                   <span class="tline"><span class="hl-iface">GigabitEthernet1/0/1</span>   <span class="hl-ip">192.0.2.10</span>      <span class="hl-up">up</span>        <span class="hl-up">up</span></span>

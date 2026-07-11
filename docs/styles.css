@@ -683,6 +683,7 @@ h2 {
   gap: 8px;
   margin-bottom: 14px;
 }
+.profile-tabs[hidden] { display: none; }
 .profile-tabs button {
   min-height: 40px;
   padding: 0 15px;
@@ -705,7 +706,12 @@ h2 {
   background: rgb(69 199 216 / 0.12);
   color: var(--text);
 }
-.profile-demo .terminal-body { min-height: 248px; }
+.profile-demo .terminal-body {
+  min-height: 248px;
+  overflow-x: auto;
+  white-space: pre;
+  word-break: normal;
+}
 .profile-notes {
   display: grid;
   align-content: start;

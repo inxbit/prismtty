@@ -263,6 +263,7 @@
   function initProfiles() {
     const root = document.querySelector('[data-profiles]');
     if (!root) return;
+    const tablist = root.querySelector('.profile-tabs');
     const tabs = [...root.querySelectorAll('[data-profile-tab]')];
     const panel = root.querySelector('[data-profile-panel]');
     const body = panel.querySelector('[data-profile-body]');
@@ -299,6 +300,7 @@
 
     const selected = tabs.find((tab) => tab.getAttribute('aria-selected') === 'true') || tabs[0];
     selectProfile(selected);
+    tablist.removeAttribute('hidden');
   }
 
   /* ---- copy buttons ---- */

@@ -36,13 +36,87 @@ test('profile tabs implement roving keyboard focus and update one tabpanel', asy
   await page.goto('/#profiles');
   const cisco = page.getByRole('tab', { name: 'cisco' });
   const juniper = page.getByRole('tab', { name: 'juniper' });
+  const linuxUnix = page.getByRole('tab', { name: 'linux-unix' });
+  const panel = page.getByRole('tabpanel');
+
+  const expectProfileState = async (tab, tabId) => {
+    await expect(tab).toBeFocused();
+    await expect(tab).toHaveAttribute('aria-selected', 'true');
+    await expect(tab).toHaveAttribute('tabindex', '0');
+    await expect(page.locator('[data-profile-tab][aria-selected="true"]')).toHaveCount(1);
+    await expect(page.locator('[data-profile-tab][tabindex="0"]')).toHaveCount(1);
+    await expect(panel).toHaveAttribute('aria-labelledby', tabId);
+  };
 
   await cisco.focus();
+  await cisco.press('ArrowLeft');
+  await expectProfileState(linuxUnix, 'profile-tab-linux-unix');
+
+  await linuxUnix.press('ArrowRight');
+  await expectProfileState(cisco, 'profile-tab-cisco');
+
+  await cisco.press('End');
+  await expectProfileState(linuxUnix, 'profile-tab-linux-unix');
+
+  await linuxUnix.press('Home');
+  await expectProfileState(cisco, 'profile-tab-cisco');
+
   await cisco.press('ArrowRight');
-  await expect(juniper).toBeFocused();
-  await expect(juniper).toHaveAttribute('aria-selected', 'true');
-  await expect(page.getByRole('tabpanel')).toContainText('ge-0/0/0');
-  await expect(page.getByRole('tabpanel')).toHaveAttribute('aria-labelledby', 'profile-tab-juniper');
+  await expectProfileState(juniper, 'profile-tab-juniper');
+  await expect(panel).toContainText('ge-0/0/0');
+  await expect(page.locator('[data-profile-body]')).not.toHaveAttribute('aria-live');
+});
+
+test('profile fallback keeps terminal output but hides inert tabs without JavaScript', async ({ browser }) => {
+  const context = await browser.newContext({
+    javaScriptEnabled: false,
+    viewport: { width: 390, height: 844 },
+  });
+  const page = await context.newPage();
+
+  try {
+    await page.goto('/#profiles');
+    await expect(page.locator('.profile-tabs')).toBeHidden();
+    await expect(page.getByRole('tab')).toHaveCount(0);
+    await expect(page.getByRole('tabpanel')).toHaveCount(1);
+    await expect(page.getByRole('tabpanel')).toHaveAttribute('aria-labelledby', 'profile-tab-cisco');
+    await expect(page.locator('[data-profile-title]')).toHaveText('ptty ssh edge-sw1.example.net');
+    await expect(page.locator('[data-profile-body] .tline')).toHaveCount(3);
+    await expect(page.locator('[data-profile-body]')).toContainText('GigabitEthernet1/0/1');
+  } finally {
+    await context.close();
+  }
+});
+
+test('profile terminal preserves columns in a contained focusable scroll region', async ({ page }) => {
+  await page.setViewportSize({ width: 320, height: 844 });
+  await page.goto('/#profiles');
+  const body = page.locator('[data-profile-body]');
+
+  await expect(body).toHaveAttribute('tabindex', '0');
+  await expect(body).toHaveAttribute('aria-label', 'Profile terminal output');
+  await expect(body).toHaveCSS('white-space', 'pre');
+  await expect(body).toHaveCSS('word-break', 'normal');
+
+  const widths = await body.evaluate((element) => ({
+    client: element.clientWidth,
+    scroll: element.scrollWidth,
+    viewport: window.innerWidth,
+    document: document.documentElement.scrollWidth,
+    body: document.body.scrollWidth,
+  }));
+  expect(widths.scroll).toBeGreaterThan(widths.client);
+  expect(widths.document).toBe(widths.viewport);
+  expect(widths.body).toBe(widths.viewport);
+
+  await body.focus();
+  await expect(body).toBeFocused();
+
+  const results = await new AxeBuilder({ page })
+    .include('#profiles')
+    .withRules('scrollable-region-focusable')
+    .analyze();
+  expect(results.violations).toEqual([]);
 });
 
 test('comparison reports highlighted output at boundary positions', async ({ page }) => {
