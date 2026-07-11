@@ -34,6 +34,8 @@ All notable changes to PrismTTY are documented here.
 
 - Test the declared Rust 1.85 minimum supported version in CI before release
   tags run the pinned release toolchain.
+- Pin `cargo-audit` to the latest Rust 1.85-compatible release in CI and
+  release validation so upstream tool updates cannot break publication.
 - Include untracked, non-ignored files in the privacy gate so new source and
   fixture files cannot bypass local pre-commit checks, and reject raw or
   conventionally compressed packet captures and trace artifacts that
