@@ -195,19 +195,50 @@
   }
 
   /* ---- 2. raw / highlighted compare slider ---- */
+  function setComparePosition(root, value, source = 'program') {
+    const normalized = Math.max(0, Math.min(100, Number(value)));
+    const controls = root.closest('.instrument-shell') || root;
+    const range = controls.querySelector('[data-compare-range]');
+    const output = controls.querySelector('[data-compare-output]');
+    root.style.setProperty('--compare-position', `${normalized}%`);
+    range.value = String(normalized);
+    range.setAttribute('aria-valuetext', `${normalized}% highlighted`);
+    output.value = `${normalized}% highlighted`;
+    root.dataset.compareSource = source;
+  }
+
   function initCompare() {
-    const wrap = document.querySelector('[data-compare]');
-    if (!wrap) return;
-    const raw = wrap.querySelector('[data-compare-raw]');
-    const hl = wrap.querySelector('[data-compare-hl]');
-    const range = wrap.querySelector('[data-compare-range]');
-
+    const root = document.querySelector('[data-compare]');
+    if (!root) return;
+    const controls = root.closest('.instrument-shell') || root;
+    const raw = root.querySelector('[data-compare-raw]');
+    const highlighted = root.querySelector('[data-compare-hl]');
+    const range = controls.querySelector('[data-compare-range]');
+    const buttons = controls.querySelectorAll('[data-compare-mode]');
     raw.innerHTML = render(COMPARE, rawHTML);
-    hl.innerHTML = render(COMPARE, lineHTML);
+    highlighted.innerHTML = render(COMPARE, lineHTML);
+    setComparePosition(root, range.value);
 
-    const setPos = (v) => wrap.style.setProperty('--pos', `${v}%`);
-    setPos(range.value);
-    range.addEventListener('input', () => setPos(range.value));
+    range.addEventListener('input', () => setComparePosition(root, range.value, 'user'));
+    buttons.forEach((button) => {
+      button.addEventListener('click', () => {
+        const position = button.dataset.compareMode === 'raw' ? 100 : 0;
+        setComparePosition(root, position, 'user');
+        buttons.forEach((item) => {
+          item.setAttribute('aria-pressed', String(item === button));
+        });
+      });
+    });
+
+    if (!reduceMotion && 'IntersectionObserver' in window) {
+      const observer = new IntersectionObserver((entries) => {
+        if (root.dataset.compareSource === 'user') return;
+        const visible = entries.filter((entry) => entry.isIntersecting)
+          .sort((a, b) => b.intersectionRatio - a.intersectionRatio)[0];
+        if (visible) setComparePosition(root, visible.target.dataset.position);
+      }, { rootMargin: '-28% 0px -42%', threshold: [0.2, 0.5, 0.8] });
+      document.querySelectorAll('[data-compare-step]').forEach((step) => observer.observe(step));
+    }
   }
 
   /* ---- 3. interactive profile tabs ---- */

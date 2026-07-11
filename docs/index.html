@@ -101,34 +101,42 @@
         </div>
       </section>
 
-      <section class="section compare-section" id="compare" aria-labelledby="compare-title">
-        <div class="section-heading compact">
-          <p class="eyebrow">// the difference</p>
-          <h2 id="compare-title">Drag the seam. Watch the noise turn into signal.</h2>
-          <p class="section-sub">
-            Same <code>show tech</code> dump, same monospace, same screen. The only thing
-            that changed is where your eyes land first.
-          </p>
-        </div>
-
-        <div class="compare" data-compare>
-          <pre class="compare-pane compare-raw" data-compare-raw aria-hidden="true"></pre>
-          <pre class="compare-pane compare-hl" data-compare-hl aria-hidden="true"></pre>
-          <div class="compare-divider" data-compare-divider aria-hidden="true">
-            <span class="compare-knob">⇄</span>
+      <section class="section compare-story" id="compare" aria-labelledby="compare-title">
+        <div class="compare-narrative">
+          <h2 id="compare-title">Read the change before the line.</h2>
+          <p>Same output, same commands. PrismTTY changes where your eyes land first.</p>
+          <div class="compare-checkpoints">
+            <article data-compare-step data-position="82">
+              <h3>Find the address</h3>
+              <p>Color separates interfaces and addresses from the table around them.</p>
+            </article>
+            <article data-compare-step data-position="48">
+              <h3>Catch the state</h3>
+              <p>Operational changes become visible before the row is fully read.</p>
+            </article>
+            <article data-compare-step data-position="8">
+              <h3>See the severity</h3>
+              <p>Prompts and syslog severity keep their place in the same output stream.</p>
+            </article>
           </div>
-          <label class="sr-only" for="compare-range">Reveal PrismTTY highlighting</label>
-          <input
-            class="compare-range"
-            id="compare-range"
-            type="range"
-            min="0"
-            max="100"
-            value="46"
-            data-compare-range
-          >
-          <span class="compare-tag compare-tag-left" aria-hidden="true">raw</span>
-          <span class="compare-tag compare-tag-right" aria-hidden="true">prismtty</span>
+        </div>
+        <div class="compare-stage">
+          <div class="instrument-shell">
+            <div class="compare" data-compare>
+              <pre class="compare-pane compare-raw" data-compare-raw aria-hidden="true"><span class="tline">edge-sw1#show ip interface brief</span><span class="tline">GigabitEthernet1/0/1   192.0.2.10   up</span><span class="tline">GigabitEthernet1/0/2   198.51.100.42   down</span></pre>
+              <pre class="compare-pane compare-hl" data-compare-hl aria-hidden="true"><span class="tline"><span class="hl-host">edge-sw1#</span>show ip interface brief</span><span class="tline"><span class="hl-iface">GigabitEthernet1/0/1</span>   <span class="hl-ip">192.0.2.10</span>   <span class="hl-up">up</span></span><span class="tline"><span class="hl-iface">GigabitEthernet1/0/2</span>   <span class="hl-ip">198.51.100.42</span>   <span class="hl-down">down</span></span></pre>
+              <div class="compare-divider" aria-hidden="true"><span></span></div>
+            </div>
+            <div class="compare-control">
+              <label for="compare-range">Highlighted output reveal</label>
+              <input id="compare-range" type="range" min="0" max="100" value="46" aria-valuetext="46% highlighted" data-compare-range>
+              <output for="compare-range" data-compare-output>46% highlighted</output>
+            </div>
+            <div class="compare-mobile-controls" role="group" aria-label="Comparison view">
+              <button type="button" data-compare-mode="raw" aria-pressed="false">Show raw output</button>
+              <button type="button" data-compare-mode="highlighted" aria-pressed="false">Show PrismTTY output</button>
+            </div>
+          </div>
         </div>
       </section>
 

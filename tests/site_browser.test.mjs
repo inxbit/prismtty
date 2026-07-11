@@ -32,6 +32,22 @@ test('shows the approved hero inside the first desktop viewport', async ({ page 
   expect(installBox.y + installBox.height).toBeLessThanOrEqual(900);
 });
 
+test('comparison responds to direct and mobile controls', async ({ page }) => {
+  await page.goto('/#compare');
+  const range = page.getByRole('slider', { name: 'Highlighted output reveal' });
+
+  await range.fill('72');
+  await expect(page.locator('[data-compare-output]')).toHaveText('72% highlighted');
+  await expect(page.locator('[data-compare]')).toHaveCSS('--compare-position', '72%');
+
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.reload();
+  await page.getByRole('button', { name: 'Show raw output' }).click();
+  await expect(page.locator('[data-compare]')).toHaveCSS('--compare-position', '100%');
+  await page.getByRole('button', { name: 'Show PrismTTY output' }).click();
+  await expect(page.locator('[data-compare]')).toHaveCSS('--compare-position', '0%');
+});
+
 test('has no unfocusable scrollable regions on mobile', async ({ page }) => {
   await page.setViewportSize({ width: 390, height: 844 });
   await page.goto('/');
