@@ -263,31 +263,42 @@
   function initProfiles() {
     const root = document.querySelector('[data-profiles]');
     if (!root) return;
-    const tabs = [...root.querySelectorAll('.profile-tab')];
-    const body = root.querySelector('[data-profile-body]');
-    const title = root.querySelector('[data-profile-title]');
+    const tabs = [...root.querySelectorAll('[data-profile-tab]')];
+    const panel = root.querySelector('[data-profile-panel]');
+    const body = panel.querySelector('[data-profile-body]');
+    const title = panel.querySelector('[data-profile-title]');
 
-    const show = (key) => {
-      const data = PROFILES[key];
+    const selectProfile = (tab, focus = false) => {
+      const data = PROFILES[tab.dataset.profileTab];
       if (!data) return;
-      const paint = () => {
-        body.innerHTML = render(data.lines, lineHTML);
-        title.textContent = data.title;
-        body.classList.remove('is-swapping');
-      };
-      if (reduceMotion) { paint(); return; }
-      body.classList.add('is-swapping');
-      setTimeout(paint, 150);
+      tabs.forEach((item) => {
+        const selected = item === tab;
+        item.setAttribute('aria-selected', String(selected));
+        item.tabIndex = selected ? 0 : -1;
+      });
+      panel.setAttribute('aria-labelledby', tab.id);
+      title.textContent = data.title;
+      body.innerHTML = render(data.lines, lineHTML);
+      if (focus) tab.focus();
     };
 
-    tabs.forEach((tab) => {
-      tab.addEventListener('click', () => {
-        tabs.forEach((t) => t.setAttribute('aria-selected', String(t === tab)));
-        show(tab.dataset.profile);
+    tabs.forEach((tab, index) => {
+      tab.addEventListener('click', () => selectProfile(tab));
+      tab.addEventListener('keydown', (event) => {
+        const keys = ['ArrowLeft', 'ArrowRight', 'Home', 'End'];
+        if (!keys.includes(event.key)) return;
+        event.preventDefault();
+        let nextIndex = index;
+        if (event.key === 'ArrowLeft') nextIndex = (index - 1 + tabs.length) % tabs.length;
+        if (event.key === 'ArrowRight') nextIndex = (index + 1) % tabs.length;
+        if (event.key === 'Home') nextIndex = 0;
+        if (event.key === 'End') nextIndex = tabs.length - 1;
+        selectProfile(tabs[nextIndex], true);
       });
     });
 
-    show(tabs.find((t) => t.getAttribute('aria-selected') === 'true')?.dataset.profile || 'cisco');
+    const selected = tabs.find((tab) => tab.getAttribute('aria-selected') === 'true') || tabs[0];
+    selectProfile(selected);
   }
 
   /* ---- copy buttons ---- */
@@ -313,9 +324,7 @@
   /* ---- cursor spotlight on panels ---- */
   function initSpotlight() {
     if (reduceMotion || window.matchMedia('(hover: none)').matches) return;
-    const panels = document.querySelectorAll(
-      '.feature-card, .install-card, .workflow-step, .scope-panel'
-    );
+    const panels = document.querySelectorAll('.install-card');
     panels.forEach((el) => {
       el.classList.add('spot');
       el.addEventListener('pointermove', (e) => {

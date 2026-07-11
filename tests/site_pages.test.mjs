@@ -50,7 +50,7 @@ test('GitHub Pages site has the expected static contract', () => {
   const html = read('docs/index.html');
   assert.match(html, /<title>PrismTTY - Terminal Output Highlighting<\/title>/);
   assert.match(html, /Readable network output, live in your terminal\./);
-  assert.match(html, /Live terminal highlighting, not device management\./);
+  assert.match(html, /Highlighting, with a clear boundary\./);
   assert.match(html, /feedback wanted/i);
   assert.match(html, /href="https:\/\/github\.com\/inxbit\/prismtty"/);
   assert.match(html, /href="https:\/\/crates\.io\/crates\/prismtty"/);
@@ -65,6 +65,9 @@ test('GitHub Pages site has the expected static contract', () => {
   assert.doesNotMatch(html, /terminal-badge|● live|spectrum-text|hero-facts/);
   assert.match(html, /data-compare\b/);
   assert.match(html, /data-profiles\b/);
+  assert.match(html, /id="scope"/);
+  assert.equal((html.match(/role="tabpanel"/g) ?? []).length, 1);
+  assert.doesNotMatch(html, /feature-kicker|step-number|profile-list/);
   assert.doesNotMatch(html, /show-tech\.txt \| prismtty/);
 
   const css = read('docs/styles.css');

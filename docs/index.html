@@ -140,101 +140,57 @@
         </div>
       </section>
 
-      <section class="section scope-section" id="scope" aria-labelledby="scope-title">
-        <div class="section-heading compact">
-          <p class="eyebrow">// scope</p>
-          <h2 id="scope-title">Live terminal highlighting, not device management.</h2>
+      <section class="section profiles-section" id="profiles" aria-labelledby="profiles-title" data-profiles>
+        <div class="section-copy">
+          <h2 id="profiles-title">One shell. The right context.</h2>
+          <p>PrismTTY follows prompts and login banners, then applies the profile that matches the system in front of you.</p>
         </div>
-        <div class="scope-grid">
-          <article class="scope-panel scope-yes">
-            <h3><span class="scope-tick" aria-hidden="true">+</span> What this is</h3>
-            <p>
-              PrismTTY highlights output already flowing through shells, SSH sessions,
-              pipes, and logs. It adds terminal color for prompts, interfaces, addresses,
-              protocol state, counters, severity, and common vendor terms.
-            </p>
-          </article>
-          <article class="scope-panel scope-no">
-            <h3><span class="scope-tick" aria-hidden="true">−</span> What this is not</h3>
-            <p>
-              It is not an NMS, a configuration management tool, a source of truth,
-              a SIEM, a log platform, or a device inventory system. It does not log in,
-              collect inventory, push configuration, or store operational data.
-            </p>
-          </article>
-        </div>
-      </section>
-
-      <section class="section features-section" aria-labelledby="features-title">
-        <div class="section-heading">
-          <p class="eyebrow">// built for real terminal work</p>
-          <h2 id="features-title">Color where operators need signal.</h2>
-        </div>
-        <div class="feature-grid">
-          <article class="feature-card">
-            <span class="feature-kicker">01</span>
-            <h3>Network-aware profiles</h3>
-            <p>
-              Clean-room rules highlight interfaces, addresses, operational state,
-              counters, prompts, syslog severity, and common vendor terms.
-            </p>
-          </article>
-          <article class="feature-card">
-            <span class="feature-kicker">02</span>
-            <h3>Interactive shell wrapping</h3>
-            <p>
-              Start one wrapped shell with <code>ptty /bin/zsh</code>, then use normal
-              SSH, telnet, and console workflows without changing habits.
-            </p>
-          </article>
-          <article class="feature-card">
-            <span class="feature-kicker">03</span>
-            <h3>ChromaTerm-compatible rules</h3>
-            <p>
-              Load existing YAML rules, add native profiles, validate profile files,
-              and reload long-running sessions after config changes.
-            </p>
-          </article>
-        </div>
-      </section>
-
-      <section class="section profiles-section" id="profiles" aria-labelledby="profiles-title">
-        <div class="section-heading compact">
-          <p class="eyebrow">// dynamic profile switching</p>
-          <h2 id="profiles-title">One wrapped shell follows changing device context.</h2>
-          <p class="section-sub">
-            PrismTTY watches login banners, prompts, and remote-jump commands, then
-            re-colors the same kind of output the way each vendor expects. Pick a profile:
-          </p>
-        </div>
-
-        <div class="profiles-demo" data-profiles>
-          <div class="profile-tabs" role="tablist" aria-label="Built-in profiles">
-            <button class="profile-tab" role="tab" data-profile="cisco" aria-selected="true">cisco</button>
-            <button class="profile-tab" role="tab" data-profile="juniper" aria-selected="false">juniper</button>
-            <button class="profile-tab" role="tab" data-profile="fortinet" aria-selected="false">fortinet</button>
-            <button class="profile-tab" role="tab" data-profile="arista" aria-selected="false">arista</button>
-            <button class="profile-tab" role="tab" data-profile="linux-unix" aria-selected="false">linux-unix</button>
-          </div>
-          <div class="terminal profile-terminal">
-            <div class="terminal-bar">
-              <span class="dots" aria-hidden="true"><i></i><i></i><i></i></span>
-              <span class="terminal-title" data-profile-title></span>
+        <div class="profile-layout">
+          <div class="profile-demo">
+            <div class="profile-tabs" role="tablist" aria-label="Terminal profiles">
+              <button id="profile-tab-cisco" role="tab" type="button" data-profile-tab="cisco" aria-controls="profile-panel" aria-selected="true" tabindex="0">cisco</button>
+              <button id="profile-tab-juniper" role="tab" type="button" data-profile-tab="juniper" aria-controls="profile-panel" aria-selected="false" tabindex="-1">juniper</button>
+              <button id="profile-tab-fortinet" role="tab" type="button" data-profile-tab="fortinet" aria-controls="profile-panel" aria-selected="false" tabindex="-1">fortinet</button>
+              <button id="profile-tab-arista" role="tab" type="button" data-profile-tab="arista" aria-controls="profile-panel" aria-selected="false" tabindex="-1">arista</button>
+              <button id="profile-tab-linux-unix" role="tab" type="button" data-profile-tab="linux-unix" aria-controls="profile-panel" aria-selected="false" tabindex="-1">linux-unix</button>
             </div>
-            <div class="terminal-body" data-profile-body aria-live="polite"></div>
+            <div class="instrument-shell">
+              <div class="terminal" id="profile-panel" role="tabpanel" aria-labelledby="profile-tab-cisco" data-profile-panel>
+                <div class="terminal-bar"><span class="terminal-title" data-profile-title>ptty ssh edge-sw1.example.net</span></div>
+                <div class="terminal-body" data-profile-body aria-live="polite">
+                  <span class="tline"><span class="hl-host">edge-sw1#</span><span class="t-cmd">show ip interface brief</span></span>
+                  <span class="tline">Interface              IP-Address      Status    Protocol</span>
+                  <span class="tline"><span class="hl-iface">GigabitEthernet1/0/1</span>   <span class="hl-ip">192.0.2.10</span>      <span class="hl-up">up</span>        <span class="hl-up">up</span></span>
+                </div>
+              </div>
+            </div>
+          </div>
+          <div class="profile-notes">
+            <article><h3>Network-aware profiles</h3><p>Clean-room rules identify interfaces, addresses, operational state, counters, prompts, and severity.</p></article>
+            <article><h3>Interactive shell wrapping</h3><p>Start one wrapped shell, then keep using SSH, telnet, and console commands normally.</p></article>
+            <article><h3>ChromaTerm-compatible rules</h3><p>Load existing YAML rules, validate custom profiles, and reload active sessions after changes.</p></article>
+            <details class="profile-disclosure">
+              <summary>All built-in profiles</summary>
+              <p>generic, linux-unix, cisco, juniper, fortinet, palo-alto, arista, arubacx, versa</p>
+            </details>
           </div>
         </div>
+      </section>
 
-        <div class="profile-list" aria-label="All built-in profiles">
-          <span>generic</span>
-          <span>linux-unix</span>
-          <span>cisco</span>
-          <span>juniper</span>
-          <span>fortinet</span>
-          <span>palo-alto</span>
-          <span>arista</span>
-          <span>arubacx</span>
-          <span>versa</span>
+      <section class="section scope-section" id="scope" aria-labelledby="scope-title">
+        <div class="section-copy"><h2 id="scope-title">Highlighting, with a clear boundary.</h2></div>
+        <div class="scope-statements">
+          <article><h3>What PrismTTY does</h3><p>It highlights output already flowing through shells, SSH sessions, pipes, and logs.</p></article>
+          <article><h3>What PrismTTY does not do</h3><p>It does not log in, collect inventory, push configuration, or store operational data.</p></article>
+        </div>
+      </section>
+
+      <section class="section workflow-section" aria-labelledby="workflow-title">
+        <div class="section-copy"><h2 id="workflow-title">Keep the workflow. Change the scan time.</h2></div>
+        <div class="workflow-line" aria-label="How PrismTTY works">
+          <article><h3>Wrap</h3><p>Run <code>ptty</code> around a shell or remote command.</p></article>
+          <article><h3>Detect</h3><p>Prompt and banner hints select the active profile.</p></article>
+          <article><h3>Highlight</h3><p>Useful tokens gain color while the original text stays intact.</p></article>
         </div>
       </section>
 
@@ -271,30 +227,6 @@
           <a href="https://github.com/inxbit/prismtty/releases">GitHub releases ↗</a>
           <a href="https://github.com/inxbit/homebrew-tap">Homebrew tap ↗</a>
         </div>
-      </section>
-
-      <section class="section workflow-section" aria-labelledby="workflow-title">
-        <div class="section-heading compact">
-          <p class="eyebrow">// workflow</p>
-          <h2 id="workflow-title">Designed to sit between you and noisy output.</h2>
-        </div>
-        <ol class="workflow">
-          <li class="workflow-step">
-            <span class="step-number">1</span>
-            <h3>Wrap the session</h3>
-            <p>Run <code>ptty</code> around a shell, SSH command, or console tool.</p>
-          </li>
-          <li class="workflow-step">
-            <span class="step-number">2</span>
-            <h3>Detect context</h3>
-            <p>Built-in profile hints recognize Unix and vendor prompts on the fly.</p>
-          </li>
-          <li class="workflow-step">
-            <span class="step-number">3</span>
-            <h3>Highlight output</h3>
-            <p>Addresses, interfaces, state, counters, and severity, colored in place.</p>
-          </li>
-        </ol>
       </section>
 
       <section class="section feedback-section" id="feedback" aria-labelledby="feedback-title">

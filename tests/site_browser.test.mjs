@@ -32,6 +32,19 @@ test('shows the approved hero inside the first desktop viewport', async ({ page 
   expect(installBox.y + installBox.height).toBeLessThanOrEqual(900);
 });
 
+test('profile tabs implement roving keyboard focus and update one tabpanel', async ({ page }) => {
+  await page.goto('/#profiles');
+  const cisco = page.getByRole('tab', { name: 'cisco' });
+  const juniper = page.getByRole('tab', { name: 'juniper' });
+
+  await cisco.focus();
+  await cisco.press('ArrowRight');
+  await expect(juniper).toBeFocused();
+  await expect(juniper).toHaveAttribute('aria-selected', 'true');
+  await expect(page.getByRole('tabpanel')).toContainText('ge-0/0/0');
+  await expect(page.getByRole('tabpanel')).toHaveAttribute('aria-labelledby', 'profile-tab-juniper');
+});
+
 test('comparison reports highlighted output at boundary positions', async ({ page }) => {
   await page.goto('/#compare');
   const range = page.getByRole('slider', { name: 'Highlighted output reveal' });
