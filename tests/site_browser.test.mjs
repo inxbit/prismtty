@@ -16,3 +16,17 @@ test('loads the PrismTTY landing page without local runtime errors', async ({ pa
   await expect(page.getByRole('heading', { level: 1 })).toBeVisible();
   expect(messages).toEqual([]);
 });
+
+test('shows the approved hero inside the first desktop viewport', async ({ page }) => {
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await page.goto('/');
+
+  await expect(page.getByRole('heading', { level: 1, name: 'Noise becomes signal.' })).toBeVisible();
+  const installLink = page.locator('.hero').getByRole('link', { name: 'Install', exact: true });
+  await expect(installLink).toBeVisible();
+  await expect(page.locator('[data-terminal] .tline')).not.toHaveCount(0);
+
+  const installBox = await installLink.boundingBox();
+  expect(installBox).not.toBeNull();
+  expect(installBox.y + installBox.height).toBeLessThanOrEqual(900);
+});

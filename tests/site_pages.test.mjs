@@ -58,14 +58,19 @@ test('GitHub Pages site has the expected static contract', () => {
   // The hero now demonstrates highlighting with JS-driven demos (live terminal,
   // raw/highlighted compare slider, profile tabs) instead of a static SVG image.
   assert.match(html, /data-terminal\b/);
+  assert.match(html, /Noise becomes signal\./);
+  assert.match(html, /class="proof-rail"/);
+  assert.match(html, /data-menu-trigger/);
+  assert.match(html, /data-terminal[^>]*>[\s\S]*class="tline"/);
+  assert.doesNotMatch(html, /terminal-badge|● live|spectrum-text|hero-facts/);
   assert.match(html, /data-compare\b/);
   assert.match(html, /data-profiles\b/);
   assert.doesNotMatch(html, /show-tech\.txt \| prismtty/);
 
   const css = read('docs/styles.css');
-  assert.match(css, /#22d3ee/);
-  assert.match(css, /#a3e635/);
-  assert.match(css, /#f472b6/);
+  assert.match(css, /#45c7d8/);
+  assert.match(css, /#8bd450/);
+  assert.match(css, /#e678a8/);
 
   const readme = read('README.md');
   assert.match(readme, /https:\/\/prismtty\.com\//);
