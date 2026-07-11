@@ -100,6 +100,38 @@ test('mobile menu traps focus and restores the trigger on Escape', async ({ page
   await expect(trigger).toBeFocused();
 });
 
+test('mobile menu keeps every destination inside a short landscape viewport', async ({ page }) => {
+  await page.setViewportSize({ width: 667, height: 375 });
+  await page.goto('/');
+  const trigger = page.locator('[data-menu-trigger]');
+  const nav = page.getByRole('navigation', { name: 'Primary navigation' });
+
+  await trigger.click();
+  await settleFiniteAnimations(page);
+
+  const geometry = await nav.evaluate((element) => {
+    const box = element.getBoundingClientRect();
+    const lastLink = element.lastElementChild.getBoundingClientRect();
+    return {
+      navTop: box.top,
+      navBottom: box.bottom,
+      navClientHeight: element.clientHeight,
+      navScrollHeight: element.scrollHeight,
+      lastLinkTop: lastLink.top,
+      lastLinkBottom: lastLink.bottom,
+      viewportHeight: innerHeight,
+      overflowY: getComputedStyle(element).overflowY,
+    };
+  });
+
+  expect(geometry.navTop).toBeGreaterThanOrEqual(92);
+  expect(geometry.navBottom).toBeLessThanOrEqual(geometry.viewportHeight - 12);
+  expect(geometry.navScrollHeight).toBeLessThanOrEqual(geometry.navClientHeight);
+  expect(geometry.lastLinkTop).toBeGreaterThanOrEqual(geometry.navTop);
+  expect(geometry.lastLinkBottom).toBeLessThanOrEqual(geometry.navBottom);
+  expect(geometry.overflowY).toBe('auto');
+});
+
 test('same-page mobile navigation closes before moving focus to its destination', async ({ page }) => {
   await page.setViewportSize({ width: 390, height: 844 });
   await page.goto('/');
@@ -186,6 +218,41 @@ test('copy failure gives truthful manual-copy feedback without shifting controls
   );
   await expect(button).toHaveText('Select command');
   expect(await commandRowGeometry(page)).toEqual(before);
+});
+
+test('pending clipboard writes keep the visible installation command stable', async ({ page }) => {
+  await page.addInitScript(() => {
+    Object.defineProperty(navigator.clipboard, 'writeText', {
+      configurable: true,
+      value: (text) => {
+        window.__copiedInstallCommand = text;
+        return new Promise((resolve) => {
+          window.__resolveInstallClipboard = resolve;
+        });
+      },
+    });
+  });
+  await page.goto('/#install');
+  const command = page.locator('[data-install-command]');
+  const cargo = page.getByRole('button', { name: 'Cargo' });
+  const copy = page.locator('[data-copy-command]');
+
+  await copy.click();
+  await expect(copy).toBeDisabled();
+  await expect(copy).toHaveAttribute('aria-busy', 'true');
+  await expect(cargo).toBeDisabled();
+  await cargo.evaluate((button) => button.click());
+  await expect(command).toHaveText('brew install inxbit/tap/prismtty');
+
+  await page.evaluate(() => window.__resolveInstallClipboard());
+
+  await expect(copy).toBeEnabled();
+  await expect(copy).not.toHaveAttribute('aria-busy');
+  await expect(cargo).toBeEnabled();
+  await expect(page.locator('[data-copy-status]')).toHaveText('Command copied');
+  expect(await page.evaluate(() => window.__copiedInstallCommand)).toBe(
+    await command.textContent(),
+  );
 });
 
 test('mobile fallback keeps navigation and Homebrew available without inert controls', async ({ browser }) => {

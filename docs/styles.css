@@ -741,6 +741,8 @@ h2 {
 }
 .install-methods button:hover { border-color: var(--accent); color: var(--text); }
 .install-methods button:active { transform: scale(0.97); }
+.install-methods button:disabled,
+.command-row button:disabled { opacity: 0.68; cursor: wait; }
 .install-methods button[aria-pressed="true"] {
   border-color: var(--accent);
   background: rgb(69 199 216 / 0.12);
@@ -951,6 +953,8 @@ h2 {
       0 24px 70px rgb(1 4 8 / 0.52);
     -webkit-backdrop-filter: blur(28px);
     backdrop-filter: blur(28px);
+    overflow-y: auto;
+    overscroll-behavior: contain;
     opacity: 0;
     visibility: hidden;
     pointer-events: none;
@@ -1054,6 +1058,18 @@ h2 {
   .compare-mobile-controls button[aria-pressed="true"] {
     border-color: var(--accent);
     color: var(--text);
+  }
+}
+
+@media (max-width: 767px) and (max-height: 480px) {
+  .mobile-nav-ready .site-nav {
+    align-content: start;
+    gap: 4px;
+    padding: 12px;
+  }
+  .mobile-nav-ready .site-nav a {
+    min-height: 44px;
+    font-size: 18px;
   }
 }
 

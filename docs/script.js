@@ -410,13 +410,23 @@
     const button = root?.querySelector('[data-copy-command]');
     const command = root?.querySelector('[data-install-command]');
     const status = root?.querySelector('[data-copy-status]');
+    const methodButtons = root ? [...root.querySelectorAll('[data-install-method]')] : [];
     if (!root || !button || !command || !status) return;
 
     let resetTimer;
+    let copySequence = 0;
     const resetButton = () => {
       window.clearTimeout(resetTimer);
       button.textContent = 'Copy command';
       button.removeAttribute('data-copy-state');
+    };
+    const setCopyPending = (pending) => {
+      button.disabled = pending;
+      methodButtons.forEach((methodButton) => {
+        methodButton.disabled = pending;
+      });
+      if (pending) button.setAttribute('aria-busy', 'true');
+      else button.removeAttribute('aria-busy');
     };
     const selectCommand = () => {
       command.focus();
@@ -430,22 +440,34 @@
 
     button.addEventListener('click', async () => {
       const text = command.textContent.trim();
+      const operation = ++copySequence;
+      resetButton();
+      setCopyPending(true);
+      status.textContent = 'Copying command';
+      button.textContent = 'Copying';
       try {
         if (!Object.values(INSTALL_METHODS).includes(text)) throw new Error('Unknown install command');
         await navigator.clipboard.writeText(text);
+        if (operation !== copySequence || command.textContent.trim() !== text) return;
         status.textContent = 'Command copied';
         button.textContent = 'Copied';
         button.dataset.copyState = 'success';
       } catch {
+        if (operation !== copySequence || command.textContent.trim() !== text) return;
         status.textContent = 'Select the command and copy it manually';
         button.textContent = 'Select command';
         button.dataset.copyState = 'failure';
         selectCommand();
+      } finally {
+        if (operation === copySequence) setCopyPending(false);
       }
+      if (operation !== copySequence) return;
       window.clearTimeout(resetTimer);
       resetTimer = window.setTimeout(resetButton, 1600);
     });
     root.addEventListener('installmethodchange', () => {
+      copySequence += 1;
+      setCopyPending(false);
       status.textContent = '';
       resetButton();
     });
