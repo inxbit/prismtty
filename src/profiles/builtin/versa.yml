@@ -19,7 +19,7 @@ profile:
     runtime_prompt: versa_user_at_host
 rules:
   - description: Versa prompt
-    regex: '(?m)^[A-Za-z0-9_.-]+@[A-Za-z0-9_.-]+[^>#\n]*[>#]'
+    regex: '(?m)^[A-Za-z0-9_.-]+@[A-Za-z0-9_.-]+(?:[ \t][^>#\r\n]*)?[>#](?=[ \t\r\n]|$)'
     color: f#00bfff
   - description: Versa object
     regex: '(?i)\b(vni-\d+|tvi-\d+/\d+|sdwan)\b'

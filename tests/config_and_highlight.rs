@@ -738,35 +738,36 @@ fn streaming_highlighter_keeps_char_split_ipv4_addresses_colored() {
 }
 
 #[test]
-fn streaming_highlighter_flushes_oversized_unterminated_escape_as_visible_text() {
+fn streaming_highlighter_bounds_oversized_unterminated_escapes() {
     let config = PrismConfig::default();
     let highlighter = Highlighter::from_config(config).expect("empty config compiles");
 
-    for (prefix, fill) in [
-        (b"\x1b]52;".as_slice(), b'A'),
-        (b"\x1b[".as_slice(), b'1'),
-        (b"\x1bP".as_slice(), b'A'),
+    for (prefix, terminator) in [
+        (b"\x1b]52;".as_slice(), b"\x07".as_slice()),
+        (b"\x1bP".as_slice(), b"\x1b\\".as_slice()),
     ] {
         let mut streaming = StreamingHighlighter::new(highlighter.clone());
         let mut input = prefix.to_vec();
-        input.extend(std::iter::repeat_n(fill, 20_000));
+        input.extend(std::iter::repeat_n(b'A', 20_000));
 
         let output = streaming.push(&input);
-
-        assert!(
-            !output.is_empty(),
-            "oversized incomplete escape stayed buffered for prefix {prefix:?}"
-        );
-        assert!(
-            !output.contains(&0x1b),
-            "oversized incomplete escape emitted a raw ESC byte for prefix {prefix:?}"
-        );
+        assert!(output.is_empty(), "string payload leaked for {prefix:?}");
+        let mut recovery = terminator.to_vec();
+        recovery.extend_from_slice(b"visible\n");
+        assert_eq!(streaming.push(&recovery), b"visible\n");
         assert!(streaming.finish().is_empty());
     }
+
+    let mut streaming = StreamingHighlighter::new(highlighter);
+    let mut csi = b"\x1b[".to_vec();
+    csi.extend(std::iter::repeat_n(b'1', 20_000));
+    let output = streaming.push(&csi);
+    assert!(!output.is_empty(), "oversized CSI stayed buffered");
+    assert!(!output.contains(&0x1b), "oversized CSI emitted raw ESC");
 }
 
 #[test]
-fn streaming_highlighter_neutralizes_earliest_oversized_unterminated_escape() {
+fn streaming_highlighter_discards_earliest_oversized_unterminated_string() {
     let config = PrismConfig::default();
     let highlighter = Highlighter::from_config(config).expect("empty config compiles");
     let mut streaming = StreamingHighlighter::new(highlighter);
@@ -777,15 +778,12 @@ fn streaming_highlighter_neutralizes_earliest_oversized_unterminated_escape() {
 
     let output = streaming.push(&input);
 
-    assert!(!output.is_empty());
-    assert!(
-        !output.contains(&0x1b),
-        "raw ESC from the first oversized unterminated OSC was emitted"
-    );
+    assert!(output.is_empty(), "unterminated OSC payload leaked");
+    assert_eq!(streaming.push(b"\x07visible\n"), b"visible\n");
 }
 
 #[test]
-fn streaming_highlighter_neutralizes_all_oversized_unterminated_escapes_in_large_direct_push() {
+fn streaming_highlighter_treats_nested_oversized_strings_as_payload() {
     let config = PrismConfig::default();
     let highlighter = Highlighter::from_config(config).expect("empty config compiles");
     let mut streaming = StreamingHighlighter::new(highlighter);
@@ -797,12 +795,32 @@ fn streaming_highlighter_neutralizes_all_oversized_unterminated_escapes_in_large
 
     let output = streaming.push(&input);
 
-    assert_eq!(output.len(), input.len());
-    assert!(
-        !output.contains(&0x1b),
-        "large direct push emitted raw ESC bytes from later unterminated OSC sequences"
-    );
+    assert!(output.is_empty(), "nested unterminated OSC payload leaked");
     assert!(streaming.finish().is_empty());
+}
+
+#[test]
+fn streaming_highlighter_bounds_unterminated_controls_across_many_small_pushes() {
+    let highlighter = Highlighter::from_config(PrismConfig::default()).expect("empty config");
+
+    for (prefix, terminator) in [
+        (b"\x1b]52;".as_slice(), b"\x07".as_slice()),
+        (b"\x1bP".as_slice(), b"\x1b\\".as_slice()),
+        (b"\x9d52;".as_slice(), b"\x07".as_slice()),
+    ] {
+        let mut streaming = StreamingHighlighter::new(highlighter.clone());
+        let mut output = streaming.push(prefix);
+        let payload = vec![b'x'; 17 * 1024];
+        for chunk in payload.chunks(127) {
+            output.extend(streaming.push(chunk));
+        }
+
+        assert!(output.is_empty(), "over-limit {prefix:?} payload leaked");
+        let mut recovery = terminator.to_vec();
+        recovery.extend_from_slice(b"visible\n");
+        assert_eq!(streaming.push(&recovery), b"visible\n");
+        assert!(streaming.finish().is_empty());
+    }
 }
 
 #[test]
@@ -2011,9 +2029,11 @@ fn linux_unix_profile_does_not_highlight_clock_times_as_ports() {
     let config = PrismConfig::from_profiles(&store, &["linux-unix"]).expect("linux profile loads");
     let highlighter = Highlighter::from_config(config).expect("rules compile");
 
-    let output = highlighter.highlight_str("at Wednesday 2026-05-06 10:07:20 PM\n");
+    let output = highlighter.highlight_str("at Wednesday 2026-05-06 10:07:20 PM, then 12:34\n");
 
     assert!(output.contains("10:07:20 PM"));
+    assert!(output.contains("12:34"));
+    assert!(!output.contains("\x1b[38;2;0;255;192m:34"));
 }
 
 #[test]

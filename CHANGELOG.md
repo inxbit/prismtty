@@ -2,6 +2,44 @@
 
 All notable changes to PrismTTY are documented here.
 
+## 1.2.0 - 2026-07-11
+
+### Library API
+
+- Add `RuleMatchError` and fallible `try_highlight_str`,
+  `try_highlight_bytes`, and `try_style_spans` APIs for callers that need to
+  surface bounded PCRE2 runtime failures. The existing infallible methods keep
+  their compatibility behavior by returning the original unstyled input, or
+  no styled spans, when a rule cannot be evaluated.
+
+### Security and Reliability
+
+- Preserve the SSH destination used for dynamic-profile cleanup when option
+  values contain quoted or backslash-escaped spaces or use OpenSSH's `-P` tag
+  option, so the real connection close marker returns to the local profile.
+- Keep bounded close-marker inspection aligned to complete output lines so a
+  truncated prose line cannot be mistaken for a remote teardown marker.
+- Kill signal-immune PTY descendants before reaping an exited process-group
+  leader, supervise Linux-only terminating signals during raw-mode cleanup,
+  and restore cooked terminal state before job-control suspension.
+- Recover visible output when raw ST follows malformed UTF-8 inside an
+  oversized terminal string, and cap incomplete non-string controls at 1 KiB
+  so byte-fragmented CSI input cannot trigger a 16 KiB quadratic rescan.
+- Run release validation and crate build verification without trusted-
+  publishing OIDC authority. The minimal publishing stage uses the previously
+  validated source with Cargo verification disabled, and existing GitHub
+  release assets are checked before irreversible crate publication.
+
+### Release and QA
+
+- Test the declared Rust 1.85 minimum supported version in CI before release
+  tags run the pinned release toolchain.
+- Include untracked, non-ignored files in the privacy gate so new source and
+  fixture files cannot bypass local pre-commit checks, and reject raw or
+  conventionally compressed packet captures and trace artifacts that
+  text-oriented scanning would skip.
+- Move the ARM macOS release artifact to the supported macOS 15 runner image.
+
 ## 1.1.1 - 2026-07-07
 
 ### Security and Reliability

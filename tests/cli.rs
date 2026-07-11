@@ -89,6 +89,34 @@ fn cli_usage_errors_include_context_without_pinning_clap_wording() {
 }
 
 #[test]
+fn cli_usage_errors_preserve_lines_and_prefix_untrusted_continuations() {
+    let output = Command::cargo_bin("prismtty")
+        .expect("binary exists")
+        .arg("--not-a-real-flag\nforged diagnostic")
+        .output()
+        .expect("command runs");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains('\n'),
+        "diagnostic was flattened: {stderr:?}"
+    );
+    assert!(
+        stderr.contains("Usage:"),
+        "usage line is missing: {stderr:?}"
+    );
+    assert!(
+        !stderr.contains("\\nUsage:"),
+        "usage newline was rendered as text: {stderr:?}"
+    );
+    assert!(
+        stderr.lines().all(|line| line.starts_with("prismtty:")),
+        "an untrusted continuation escaped the diagnostic prefix: {stderr:?}"
+    );
+}
+
+#[test]
 fn stdin_mode_highlights_with_forced_profile() {
     let mut cmd = Command::cargo_bin("prismtty").expect("binary exists");
     cmd.arg("--profile")
@@ -172,6 +200,74 @@ rules:
         .success()
         .stdout(predicate::str::contains("192.0.2.55"))
         .stdout(predicate::str::contains("\u{1b}[38;2;0;255;255m"));
+}
+
+#[test]
+fn sanitize_preserves_trailing_partial_utf8_as_binary_output() {
+    let mut cmd = Command::cargo_bin("prismtty").expect("binary exists");
+    cmd.arg("--sanitize").write_stdin(vec![b'a', 0xe2]);
+
+    let output = cmd.output().expect("command runs");
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(output.stdout, vec![b'a', 0xe2]);
+}
+
+#[test]
+fn filtered_modes_preserve_invalid_binary_and_all_partial_utf8_prefixes_at_eof() {
+    let mut empty_config = tempfile::NamedTempFile::new().expect("empty config");
+    writeln!(empty_config, "rules: []").expect("write empty config");
+    let inputs = [
+        vec![b'a', 0xff, 0xc0, 0xc2],
+        vec![b'a', 0xff, 0xe2, 0x9d],
+        vec![b'a', 0xff, 0xf0, 0x90, 0x80],
+    ];
+
+    for mode in ["--sanitize", "--strip-ansi"] {
+        for input in &inputs {
+            let mut cmd = Command::cargo_bin("prismtty").expect("binary exists");
+            cmd.arg(mode)
+                .arg("--config")
+                .arg(empty_config.path())
+                .write_stdin(input.clone());
+
+            let output = cmd.output().expect("command runs");
+            assert!(output.status.success(), "{mode}: {output:?}");
+            assert_eq!(
+                output.stdout.as_slice(),
+                input.as_slice(),
+                "{mode} changed {input:02x?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn raw_c1_filtering_contract_matches_strip_and_sanitize_modes() {
+    let mut empty_config = tempfile::NamedTempFile::new().expect("empty config");
+    writeln!(empty_config, "rules: []").expect("write empty config");
+    let input = b"safe\x9d0;hidden\x07after\x9b31mred\x9b0m\n";
+
+    for (args, expected) in [
+        (vec!["--strip-ansi"], b"safeafterred\n".as_slice()),
+        (
+            vec!["--sanitize"],
+            b"safeafter\x9b31mred\x9b0m\n".as_slice(),
+        ),
+        (
+            vec!["--strip-ansi", "--sanitize"],
+            b"safeafterred\n".as_slice(),
+        ),
+    ] {
+        let mut cmd = Command::cargo_bin("prismtty").expect("binary exists");
+        cmd.args(args)
+            .arg("--config")
+            .arg(empty_config.path())
+            .write_stdin(input.as_slice());
+        let output = cmd.output().expect("command runs");
+
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(output.stdout, expected);
+    }
 }
 
 #[test]
@@ -353,6 +449,23 @@ rules:
 }
 
 #[test]
+fn profiles_validate_rejects_one_detection_hint_over_the_metadata_limit() {
+    let mut file = tempfile::NamedTempFile::new().expect("temp file");
+    writeln!(file, "profile:\n  name: bounded-router\n  detection:").expect("write profile header");
+    for index in 0..33 {
+        writeln!(file, "    - hint-{index}").expect("write detection hint");
+    }
+    writeln!(file, "rules: []").expect("write profile rules");
+
+    let mut cmd = Command::cargo_bin("prismtty").expect("binary exists");
+    cmd.arg("profiles").arg("validate").arg(file.path());
+
+    cmd.assert().failure().stderr(predicate::str::contains(
+        "profile detection hint count is 33; limit is 32",
+    ));
+}
+
+#[test]
 fn profiles_validate_rejects_self_inheritance_cycle() {
     let mut file = tempfile::NamedTempFile::new().expect("temp file");
     writeln!(
@@ -440,6 +553,84 @@ fn profiles_test_highlights_a_fixture_file() {
 }
 
 #[test]
+fn profiles_test_neutralizes_partial_terminal_control_at_eof() {
+    let fixture = tempfile::NamedTempFile::new().expect("temp fixture");
+    fs::write(fixture.path(), b"safe\x1b[31").expect("fixture writes");
+
+    let output = Command::cargo_bin("prismtty")
+        .expect("binary exists")
+        .arg("profiles")
+        .arg("test")
+        .arg("generic")
+        .arg(fixture.path())
+        .output()
+        .expect("profiles test runs");
+
+    assert!(output.status.success(), "{:?}", output.stderr);
+    assert!(output.stdout.starts_with(b"safe"));
+    assert!(
+        !output.stdout.windows(5).any(|window| window == b"\x1b[31"),
+        "profiles test emitted an active incomplete CSI: {:?}",
+        output.stdout
+    );
+}
+
+#[test]
+fn profiles_test_rejects_oversized_fixture_files() {
+    let fixture = tempfile::NamedTempFile::new().expect("temp fixture");
+    fixture
+        .as_file()
+        .set_len(16 * 1024 * 1024 + 1)
+        .expect("sparse fixture size sets");
+
+    let mut cmd = Command::cargo_bin("prismtty").expect("binary exists");
+    cmd.arg("profiles")
+        .arg("test")
+        .arg("generic")
+        .arg(fixture.path());
+
+    cmd.assert()
+        .failure()
+        .stderr(predicate::str::contains("fixture file is too large"));
+}
+
+#[test]
+fn profiles_test_reports_bounded_regex_match_failures_at_eof() {
+    let xdg = tempfile::tempdir().expect("temp xdg config");
+    let profiles_dir = xdg.path().join("prismtty").join("profiles.d");
+    fs::create_dir_all(&profiles_dir).expect("create profiles.d");
+    fs::write(
+        profiles_dir.join("pathological.yml"),
+        r##"
+profile:
+  name: pathological
+  inherits: []
+rules:
+  - description: bounded pathological rule
+    regex: '^(a+)+$'
+    color: f#ff0000
+"##,
+    )
+    .expect("write profile");
+    let fixture = tempfile::NamedTempFile::new().expect("fixture");
+    let mut input = vec![b'a'; 511];
+    input.push(b'b');
+    fs::write(fixture.path(), input).expect("write fixture");
+
+    let mut cmd = Command::cargo_bin("prismtty").expect("binary exists");
+    cmd.env("XDG_CONFIG_HOME", xdg.path())
+        .arg("profiles")
+        .arg("test")
+        .arg("pathological")
+        .arg(fixture.path());
+
+    cmd.assert()
+        .failure()
+        .stderr(predicate::str::contains("bounded pathological rule"))
+        .stderr(predicate::str::contains("match failed"));
+}
+
+#[test]
 fn ptty_alias_supports_stdin_mode() {
     let mut cmd = Command::cargo_bin("ptty").expect("ptty binary exists");
     cmd.arg("--profile")
@@ -490,6 +681,29 @@ fn benchmark_reports_per_rule_timings() {
 }
 
 #[test]
+fn benchmark_reports_raw_bytes_read_before_sanitization() {
+    let mut empty_config = tempfile::NamedTempFile::new().expect("empty config");
+    writeln!(empty_config, "rules: []").expect("write empty config");
+    let input = b"safe\x1b]0;hidden-title\x07after\n";
+
+    let mut cmd = Command::cargo_bin("prismtty").expect("binary exists");
+    cmd.arg("--benchmark")
+        .arg("--sanitize")
+        .arg("--profile")
+        .arg("generic")
+        .arg("--config")
+        .arg(empty_config.path())
+        .write_stdin(input.as_slice());
+
+    cmd.assert()
+        .success()
+        .stderr(predicate::str::contains(format!(
+            "Processed {} bytes",
+            input.len()
+        )));
+}
+
+#[test]
 fn show_profile_reports_selected_profiles_to_stderr() {
     let mut empty_config = tempfile::NamedTempFile::new().expect("empty config");
     writeln!(empty_config, "rules: []").expect("write empty config");
@@ -504,6 +718,23 @@ fn show_profile_reports_selected_profiles_to_stderr() {
     cmd.assert().success().stderr(predicate::str::contains(
         "prismtty: profiles selected: generic, juniper",
     ));
+}
+
+#[test]
+fn raw_c1_string_payload_is_not_used_for_profile_detection() {
+    let mut empty_config = tempfile::NamedTempFile::new().expect("empty config");
+    writeln!(empty_config, "rules: []").expect("write empty config");
+
+    let mut cmd = Command::cargo_bin("prismtty").expect("binary exists");
+    cmd.arg("--show-profile")
+        .arg("--config")
+        .arg(empty_config.path())
+        .write_stdin(b"\x9d0;JUNOS 23.4\x07plain output\n".as_slice());
+    let output = cmd.output().expect("command runs");
+    let stderr = String::from_utf8(output.stderr).expect("stderr is UTF-8");
+
+    assert!(output.status.success());
+    assert!(!stderr.contains("juniper"), "{stderr:?}");
 }
 
 #[test]

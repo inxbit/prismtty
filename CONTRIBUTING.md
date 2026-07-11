@@ -8,14 +8,16 @@ Install Rust, PCRE2, and `pkg-config`, then run:
 
 ```sh
 cargo fmt --check
-cargo test
-cargo clippy --all-targets -- -D warnings
+cargo test --locked
+cargo clippy --locked --all-targets --all-features -- -D warnings
+bash scripts/privacy-scan.sh
+node --test tests/*.test.mjs
 ```
 
 Generated shell completions must stay in sync with the CLI:
 
 ```sh
-cargo run --features completion-generation --bin gen-completions
+cargo run --locked --features completion-generation --bin gen-completions
 git diff --exit-code completions/
 ```
 
@@ -29,11 +31,20 @@ When adding replay fixtures, use invented hostnames, documentation-range IP
 addresses, and the minimum command output needed to exercise the rule or parser
 behavior under test.
 
+The privacy gate accepts IPv4 documentation ranges, the IPv6 documentation
+prefix `2001:db8::/32`, the IPv4/IPv6 unspecified and loopback addresses, the
+synthetic subnet and wildcard masks used by fixtures, and the fixed link-local
+fixture `fe80::1`. It rejects other literal addresses, including private IPv4
+and IPv6 unique-local, link-local, and publicly routable addresses. Prefer
+invented hostnames or documentation-range addresses whenever an exact address
+shape matters.
+
 ## Pull Request Checklist
 
 - Run `cargo fmt --check`.
-- Run `cargo test`.
-- Run `cargo clippy --all-targets -- -D warnings`.
+- Run `cargo test --locked`.
+- Run `cargo clippy --locked --all-targets --all-features -- -D warnings`.
+- Run `bash scripts/privacy-scan.sh` and `node --test tests/*.test.mjs`.
 - Regenerate completions when CLI flags or command help changes.
 - Update `README.md` or `CHANGELOG.md` when user-facing behavior changes.
 - Keep release, Homebrew, and workflow changes reproducible from checked-in
@@ -51,4 +62,3 @@ Be careful around these boundaries:
 - GitHub Actions release publication and package checksums.
 
 Prefer small, reviewable changes with regression tests for these areas.
-

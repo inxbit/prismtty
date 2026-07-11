@@ -36,10 +36,10 @@ profile:
     runtime_prompt: cisco_host_marker
 rules:
   - description: Cisco prompt
-    regex: '(?m)^[A-Za-z0-9_.-]+(\([^)]+\))?[>#](?=\s|$|[a-z])'
+    regex: '(?m)^[A-Za-z0-9_.-]+(\([^\r\n)]+\))?[>#](?=[ \t\r\n]|$|[A-Za-z])'
     color: f#ffffff
   - description: Cisco interface
-    regex: '(?i)\b(((Hu(ndredGigabit)?|Fo(rtyGigabit)?|Te(nGigabit)?|Gi(gabit)?|Fa(st)?)(Ethernet)?)|Eth|Se(rial)?|Lo(opback)?|Tu(nnel)?|VL(AN)?|Po(rt-channel)?|Vi(rtual-(Template|Access))?|Mu(ltilink)?|Di(aler)?|(B|N)VI)((\d+/){0,2}\d+)(\.\d*)?\b'
+    regex: '(?i)\b(((Hu(ndredGigabit)?|Fo(rtyGigabit)?|Te(nGigabit)?|Gi(gabit)?|Fa(st)?)(Ethernet)?)|Eth|Se(rial)?|Lo(opback)?|Tu(nnel)?|VL(AN)?|Po(rt-channel)?|Vi(rtual-(Template|Access))?|Mu(ltilink)?|Di(aler)?|(B|N)VI)((\d+/){0,2}\d+)(\.\d+)?(?![.\d/])\b'
     color: f#0099ff
     exclusive: true
   - description: OSPF state

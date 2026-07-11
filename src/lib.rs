@@ -20,7 +20,8 @@ pub(crate) mod profile_runtime;
 pub mod profiles;
 /// Terminal style parsing and ANSI color rendering.
 pub mod style;
+pub(crate) mod terminal_text;
 
 pub use config::PrismConfig;
-pub use highlight::{Highlighter, StreamingHighlighter, StyledSpan};
+pub use highlight::{Highlighter, RuleMatchError, StreamingHighlighter, StyledSpan};
 pub use profiles::ProfileStore;

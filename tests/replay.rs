@@ -6,11 +6,13 @@ use std::fs;
 use std::path::{Component, Path, PathBuf};
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ReplayExpectations {
     fixtures: BTreeMap<String, FixtureExpectation>,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct FixtureExpectation {
     synthetic: bool,
     expected_profiles: Vec<String>,
@@ -18,11 +20,12 @@ struct FixtureExpectation {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct TokenExpectation {
     text: String,
     foreground: Option<String>,
     #[serde(default)]
-    bold: bool,
+    bold: Option<bool>,
     /// Assert the token is present in the visible output but covered by no
     /// styled span (guards against over-broad rules / false positives).
     #[serde(default)]
@@ -71,6 +74,58 @@ fn replay_expectations_are_valid_and_synthetic_only() {
 }
 
 #[test]
+fn replay_expectation_schema_rejects_unknown_fields() {
+    let malformed_expectations = [
+        (
+            "top-level expectation",
+            "unexpected_root",
+            r#"
+fixtures: {}
+unexpected_root: true
+"#,
+        ),
+        (
+            "fixture expectation",
+            "unexpected_fixture",
+            r#"
+fixtures:
+  sample.txt:
+    synthetic: true
+    expected_profiles: []
+    tokens: []
+    unexpected_fixture: true
+"#,
+        ),
+        (
+            "token expectation",
+            "unexpected_token",
+            r#"
+fixtures:
+  sample.txt:
+    synthetic: true
+    expected_profiles: []
+    tokens:
+      - text: sample
+        foreground: null
+        unexpected_token: true
+"#,
+        ),
+    ];
+
+    for (context, field, input) in malformed_expectations {
+        let error = match serde_norway::from_str::<ReplayExpectations>(input) {
+            Ok(parsed) => panic!("{context} accepted unknown field {field}: {parsed:?}"),
+            Err(error) => error,
+        };
+        let message = error.to_string();
+        assert!(
+            message.contains("unknown field") && message.contains(field),
+            "{context} returned an unexpected error for {field}: {message}"
+        );
+    }
+}
+
+#[test]
 fn replay_fixtures_detect_expected_profiles() {
     let store = ProfileStore::builtin();
     let expectations = load_expectations();
@@ -104,11 +159,25 @@ fn replay_fixtures_keep_expected_token_styles_across_chunking_modes() {
             .unwrap_or_else(|err| panic!("{fixture} highlighter failed to compile: {err}"));
 
         for mode in chunk_modes(&expected.tokens) {
-            let output = replay_bytes(highlighter.clone(), &input, &mode);
+            let output = replay_bytes(highlighter.clone(), &input, &mode, true);
+            let full_style_output = replay_bytes(highlighter.clone(), &input, &mode, false);
             let visible_text = visible_text_from_ansi(&output);
             let spans = styled_spans_from_ansi(&output);
+            let full_style_visible_text = visible_text_from_ansi(&full_style_output);
+            let full_style_spans = styled_spans_from_ansi(&full_style_output);
+            assert_eq!(
+                full_style_visible_text, visible_text,
+                "{fixture} {mode:?}: interactive and full renderers changed visible text"
+            );
             for token in &expected.tokens {
-                assert_token(&fixture, &mode, &visible_text, &spans, token);
+                assert_token(
+                    &fixture,
+                    &mode,
+                    &visible_text,
+                    &spans,
+                    &full_style_spans,
+                    token,
+                );
             }
         }
     }
@@ -176,8 +245,17 @@ fn chunk_modes(tokens: &[TokenExpectation]) -> Vec<ChunkMode> {
     modes
 }
 
-fn replay_bytes(highlighter: Highlighter, input: &[u8], mode: &ChunkMode) -> Vec<u8> {
-    let mut streaming = StreamingHighlighter::new_interactive(highlighter);
+fn replay_bytes(
+    highlighter: Highlighter,
+    input: &[u8],
+    mode: &ChunkMode,
+    interactive: bool,
+) -> Vec<u8> {
+    let mut streaming = if interactive {
+        StreamingHighlighter::new_interactive(highlighter)
+    } else {
+        StreamingHighlighter::new(highlighter)
+    };
     let mut output = Vec::new();
 
     match mode {
@@ -226,8 +304,11 @@ fn assert_token(
     mode: &ChunkMode,
     visible_text: &str,
     spans: &[StyledSpan],
+    full_style_spans: &[StyledSpan],
     expected: &TokenExpectation,
 ) {
+    assert_bold_expectation(fixture, mode, visible_text, full_style_spans, expected);
+
     if expected.unstyled {
         let occurrences = count_occurrences(visible_text, &expected.text);
         assert_eq!(
@@ -290,11 +371,131 @@ fn assert_token(
             span
         );
     }
+}
 
-    // Replay runs through the interactive renderer, which deliberately lowers
-    // PrismTTY-added styles to foreground colors so it never has to generate
-    // interactive attribute reset tails around tokens.
-    let _bold_expected_in_full_renderer = expected.bold;
+fn assert_bold_expectation(
+    fixture: &str,
+    mode: &ChunkMode,
+    visible_text: &str,
+    spans: &[StyledSpan],
+    expected: &TokenExpectation,
+) {
+    let Some(expected_bold) = expected.bold else {
+        return;
+    };
+
+    let occurrences = count_occurrences(visible_text, &expected.text);
+    assert_eq!(
+        occurrences, 1,
+        "{fixture} {mode:?}: bold token {:?} must appear exactly once in visible output",
+        expected.text
+    );
+    let token_start = visible_text
+        .find(&expected.text)
+        .expect("bold token exists after occurrence count");
+    let token_end = token_start + expected.text.len();
+    let mut bold_coverage = vec![false; token_end - token_start];
+    for span in spans.iter().filter(|span| span.style.bold) {
+        let overlap_start = span.start.max(token_start);
+        let overlap_end = span.end.min(token_end);
+        if overlap_start >= overlap_end {
+            continue;
+        }
+        for covered in &mut bold_coverage
+            [overlap_start.saturating_sub(token_start)..overlap_end.saturating_sub(token_start)]
+        {
+            *covered = true;
+        }
+    }
+    let bold_matches = if expected_bold {
+        bold_coverage.iter().all(|covered| *covered)
+    } else {
+        bold_coverage.iter().all(|covered| !*covered)
+    };
+    assert!(
+        bold_matches,
+        "{fixture} {mode:?}: token {:?} has wrong bold state; spans={spans:?}",
+        expected.text
+    );
+}
+
+#[test]
+fn replay_oracle_rejects_a_bold_mismatch() {
+    let visible_text = "Established";
+    let spans = vec![StyledSpan {
+        text: visible_text.to_string(),
+        start: 0,
+        end: visible_text.len(),
+        style: Style {
+            foreground: Some(Rgb { r: 1, g: 2, b: 3 }),
+            ..Style::default()
+        },
+    }];
+    let expected = TokenExpectation {
+        text: visible_text.to_string(),
+        foreground: Some("#010203".to_string()),
+        bold: Some(true),
+        unstyled: false,
+    };
+
+    let mismatch = std::panic::catch_unwind(|| {
+        assert_token(
+            "bold-mismatch.txt",
+            &ChunkMode::Whole,
+            visible_text,
+            &spans,
+            &spans,
+            &expected,
+        );
+    });
+
+    assert!(mismatch.is_err(), "replay oracle accepted a bold mismatch");
+}
+
+#[test]
+fn replay_oracle_rejects_partial_bold_coverage() {
+    let visible_text = "Established";
+    let spans = vec![StyledSpan {
+        text: "E".to_string(),
+        start: 0,
+        end: 1,
+        style: Style {
+            bold: true,
+            ..Style::default()
+        },
+    }];
+    let expected = TokenExpectation {
+        text: visible_text.to_string(),
+        foreground: None,
+        bold: Some(true),
+        unstyled: false,
+    };
+
+    let mismatch = std::panic::catch_unwind(|| {
+        assert_bold_expectation(
+            "partial-bold.txt",
+            &ChunkMode::Whole,
+            visible_text,
+            &spans,
+            &expected,
+        );
+    });
+
+    assert!(
+        mismatch.is_err(),
+        "replay oracle accepted one-byte bold coverage for a whole token"
+    );
+}
+
+#[test]
+fn replay_oracle_handles_string_controls_and_raw_c1_sequences() {
+    let input = b"a\x1b]0;hidden\x07b\x1bPignored\x1b\\c\x9d0;secret\x9cd\x9b1me\x9b0mf\x1b(Bg";
+
+    assert_eq!(visible_text_from_ansi(input), "abcdefg");
+    let spans = styled_spans_from_ansi(input);
+    assert_eq!(spans.len(), 1, "unexpected styled spans: {spans:?}");
+    assert_eq!(spans[0].text, "e");
+    assert!(spans[0].style.bold);
 }
 
 fn count_occurrences(haystack: &str, needle: &str) -> usize {
@@ -318,7 +519,10 @@ fn visible_text_from_ansi(input: &[u8]) -> String {
     let mut visible = Vec::new();
     let mut idx = 0;
     while idx < input.len() {
-        if input[idx] == 0x1b {
+        if let Some(width) = valid_utf8_width_at(input, idx) {
+            visible.extend_from_slice(&input[idx..idx + width]);
+            idx += width;
+        } else if is_terminal_control(input[idx]) {
             idx = ansi_end(input, idx);
         } else {
             visible.push(input[idx]);
@@ -337,7 +541,14 @@ fn styled_spans_from_ansi(input: &[u8]) -> Vec<StyledSpan> {
     let mut idx = 0;
 
     while idx < input.len() {
-        if input[idx] == 0x1b {
+        if let Some(width) = valid_utf8_width_at(input, idx) {
+            if text.is_empty() {
+                text_start = visible_idx;
+            }
+            text.extend_from_slice(&input[idx..idx + width]);
+            visible_idx += width;
+            idx += width;
+        } else if is_terminal_control(input[idx]) {
             push_visible_span(&mut spans, &mut text, text_start, visible_idx, &current);
             let end = ansi_end(input, idx);
             apply_sgr(&input[idx..end], &mut current);
@@ -378,16 +589,29 @@ fn push_visible_span(
 }
 
 fn apply_sgr(sequence: &[u8], style: &mut Style) {
-    if !sequence.starts_with(b"\x1b[") || sequence.last() != Some(&b'm') {
+    let params_start = if sequence.starts_with(b"\x1b[") {
+        2
+    } else if sequence.starts_with(b"\x9b") {
+        1
+    } else {
+        return;
+    };
+    if sequence.last() != Some(&b'm') {
         return;
     }
-    let params = String::from_utf8_lossy(&sequence[2..sequence.len() - 1]);
+    let params = String::from_utf8_lossy(&sequence[params_start..sequence.len() - 1]);
     let numbers: Vec<u16> = if params.is_empty() {
         vec![0]
     } else {
         params
             .split(';')
-            .filter_map(|part| part.parse::<u16>().ok())
+            .filter_map(|part| {
+                if part.is_empty() {
+                    Some(0)
+                } else {
+                    part.parse::<u16>().ok()
+                }
+            })
             .collect()
     };
     let mut idx = 0;
@@ -431,13 +655,29 @@ fn apply_sgr(sequence: &[u8], style: &mut Style) {
 }
 
 fn ansi_end(input: &[u8], start: usize) -> usize {
+    if input[start] != 0x1b {
+        return match input[start] {
+            0x9b => csi_end(input, start + 1),
+            0x9d => string_control_end(input, start + 1, true),
+            0x90 | 0x98 | 0x9e | 0x9f => string_control_end(input, start + 1, false),
+            _ => (start + 1).min(input.len()),
+        };
+    }
     if start + 1 >= input.len() {
         return input.len();
     }
-    if input[start + 1] != b'[' {
-        return (start + 2).min(input.len());
+    match input[start + 1] {
+        b'[' => csi_end(input, start + 2),
+        b']' => string_control_end(input, start + 2, true),
+        b'P' | b'X' | b'^' | b'_' => string_control_end(input, start + 2, false),
+        b'(' | b')' | b'*' | b'+' | b'-' | b'.' | b'/' | b'#' | b'%' => {
+            (start + 3).min(input.len())
+        }
+        _ => (start + 2).min(input.len()),
     }
-    let mut idx = start + 2;
+}
+
+fn csi_end(input: &[u8], mut idx: usize) -> usize {
     while idx < input.len() {
         let byte = input[idx];
         idx += 1;
@@ -446,4 +686,36 @@ fn ansi_end(input: &[u8], start: usize) -> usize {
         }
     }
     idx
+}
+
+fn string_control_end(input: &[u8], mut idx: usize, allows_bel: bool) -> usize {
+    while idx < input.len() {
+        if let Some(width) = valid_utf8_width_at(input, idx) {
+            idx += width;
+            continue;
+        }
+        if (allows_bel && input[idx] == 0x07) || input[idx] == 0x9c {
+            return idx + 1;
+        }
+        if input[idx] == 0x1b && input.get(idx + 1) == Some(&b'\\') {
+            return idx + 2;
+        }
+        idx += 1;
+    }
+    input.len()
+}
+
+fn valid_utf8_width_at(input: &[u8], idx: usize) -> Option<usize> {
+    let width = match input[idx] {
+        0xc2..=0xdf => 2,
+        0xe0..=0xef => 3,
+        0xf0..=0xf4 => 4,
+        _ => return None,
+    };
+    let end = idx.checked_add(width)?;
+    (end <= input.len() && std::str::from_utf8(&input[idx..end]).is_ok()).then_some(width)
+}
+
+fn is_terminal_control(byte: u8) -> bool {
+    byte == 0x1b || (0x80..=0x9f).contains(&byte)
 }

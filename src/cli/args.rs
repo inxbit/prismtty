@@ -4,6 +4,8 @@ use std::path::PathBuf;
 
 use clap::{ArgAction, CommandFactory, Parser};
 
+use crate::terminal_text::escape_untrusted;
+
 use super::CliError;
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -104,11 +106,10 @@ struct RawArgs {
 }
 
 pub(super) fn parse_args(args: Vec<OsString>) -> Result<(Options, Action), CliError> {
-    let command_forced_by_delimiter = args
+    let command_suffix_after_delimiter = args
         .iter()
         .position(|arg| arg == "--")
-        .and_then(|idx| args.get(idx + 1))
-        .cloned();
+        .map(|idx| args[idx + 1..].to_vec());
     let raw = RawArgs::try_parse_from(std::iter::once(OsString::from("prismtty")).chain(args))
         .map_err(|error| CliError::Usage(error.to_string()))?;
 
@@ -141,9 +142,10 @@ pub(super) fn parse_args(args: Vec<OsString>) -> Result<(Options, Action), CliEr
         trace_io: raw.trace_io,
     };
 
-    if raw.command.first().is_some_and(|arg| arg == "profiles")
-        && command_forced_by_delimiter.as_ref() != raw.command.first()
-    {
+    let command_forced_by_delimiter = command_suffix_after_delimiter
+        .as_deref()
+        .is_some_and(|suffix| suffix == raw.command.as_slice());
+    if raw.command.first().is_some_and(|arg| arg == "profiles") && !command_forced_by_delimiter {
         return parse_profiles_command(options, &raw.command[1..]);
     }
 
@@ -221,7 +223,8 @@ fn parse_profiles_command(
             ))
         }
         other => Err(CliError::Usage(format!(
-            "unknown profiles subcommand '{other}'"
+            "unknown profiles subcommand '{}'",
+            escape_untrusted(other)
         ))),
     }
 }
@@ -457,6 +460,21 @@ mod tests {
         assert_eq!(
             action,
             super::Action::ProfilesValidate(std::path::PathBuf::from("custom.yml"))
+        );
+    }
+
+    #[test]
+    fn parser_contract_profiles_fixture_named_profiles_is_not_forced_command() {
+        let (_options, action) =
+            super::parse_args(os_args(&["profiles", "test", "cisco", "--", "profiles"]))
+                .expect("profiles test fixture matching command name parses");
+
+        assert_eq!(
+            action,
+            super::Action::ProfilesTest {
+                profile: "cisco".to_string(),
+                fixture: std::path::PathBuf::from("profiles"),
+            }
         );
     }
 
