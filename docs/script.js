@@ -197,13 +197,19 @@
   /* ---- 2. raw / highlighted compare slider ---- */
   function setComparePosition(root, value, source = 'program') {
     const normalized = Math.max(0, Math.min(100, Number(value)));
+    const highlightedPercentage = 100 - normalized;
     const controls = root.closest('.instrument-shell') || root;
     const range = controls.querySelector('[data-compare-range]');
     const output = controls.querySelector('[data-compare-output]');
     root.style.setProperty('--compare-position', `${normalized}%`);
     range.value = String(normalized);
-    range.setAttribute('aria-valuetext', `${normalized}% highlighted`);
-    output.value = `${normalized}% highlighted`;
+    range.setAttribute('aria-valuetext', `${highlightedPercentage}% highlighted`);
+    output.value = `${highlightedPercentage}% highlighted`;
+    controls.querySelectorAll('[data-compare-mode]').forEach((button) => {
+      const pressed = (button.dataset.compareMode === 'raw' && normalized === 100)
+        || (button.dataset.compareMode === 'highlighted' && normalized === 0);
+      button.setAttribute('aria-pressed', String(pressed));
+    });
     root.dataset.compareSource = source;
   }
 
@@ -215,18 +221,27 @@
     const highlighted = root.querySelector('[data-compare-hl]');
     const range = controls.querySelector('[data-compare-range]');
     const buttons = controls.querySelectorAll('[data-compare-mode]');
+    const rangeControl = controls.querySelector('.compare-control');
+    const mobileControls = controls.querySelector('.compare-mobile-controls');
     raw.innerHTML = render(COMPARE, rawHTML);
     highlighted.innerHTML = render(COMPARE, lineHTML);
     setComparePosition(root, range.value);
+
+    let syncingScroll = false;
+    const syncScroll = (source, target) => {
+      if (syncingScroll || target.scrollLeft === source.scrollLeft) return;
+      syncingScroll = true;
+      target.scrollLeft = source.scrollLeft;
+      syncingScroll = false;
+    };
+    raw.addEventListener('scroll', () => syncScroll(raw, highlighted), { passive: true });
+    highlighted.addEventListener('scroll', () => syncScroll(highlighted, raw), { passive: true });
 
     range.addEventListener('input', () => setComparePosition(root, range.value, 'user'));
     buttons.forEach((button) => {
       button.addEventListener('click', () => {
         const position = button.dataset.compareMode === 'raw' ? 100 : 0;
         setComparePosition(root, position, 'user');
-        buttons.forEach((item) => {
-          item.setAttribute('aria-pressed', String(item === button));
-        });
       });
     });
 
@@ -239,6 +254,9 @@
       }, { rootMargin: '-28% 0px -42%', threshold: [0.2, 0.5, 0.8] });
       document.querySelectorAll('[data-compare-step]').forEach((step) => observer.observe(step));
     }
+
+    rangeControl.removeAttribute('hidden');
+    mobileControls.removeAttribute('hidden');
   }
 
   /* ---- 3. interactive profile tabs ---- */

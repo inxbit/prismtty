@@ -658,6 +658,8 @@ h2 {
   accent-color: var(--accent);
 }
 .compare-mobile-controls { display: none; }
+.compare-control[hidden],
+.compare-mobile-controls[hidden] { display: none; }
 
 /* ---------- scope ---------- */
 .scope-grid {
