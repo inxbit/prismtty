@@ -41,15 +41,17 @@ examples that preserve only the token shape needed to reproduce the issue.
   typed passwords. The file is created owner-only (0600), but treat it as
   sensitive and delete it after debugging.
 - User-supplied rule regexes run against every byte of terminal output.
-  PrismTTY bounds each match (PCRE2 match limits, 8 KiB read chunks), so a
-  pathological pattern cannot hang it, but expensive patterns (for example
-  unanchored lookaheads such as `(?=.*foo)`) can slow throughput severely on
-  very long lines. PrismTTY warns once per session when a rule crosses five
-  seconds of cumulative matching time; use `--benchmark` to identify slow
-  rules in a config.
+  PrismTTY reads output in 8 KiB chunks, but chunking alone is not a per-match
+  execution budget. Every compiled rule also receives an application-owned
+  PCRE2 match limit of 100,000 and depth limit of 1,000. Limit and other runtime
+  match errors are counted in rule telemetry and surfaced once per session.
+  These limits are defense in depth, not proof that every accepted pattern is
+  cheap: expensive patterns (for example unanchored lookaheads such as
+  `(?=.*foo)`) can still consume substantial CPU on long lines. PrismTTY also
+  warns once per session when a rule crosses five seconds of cumulative
+  matching time; use `--benchmark` to identify slow rules in a config.
 - By default PrismTTY is a transparent wrapper: escape sequences from the
   wrapped program pass through unchanged, exactly like `ssh` or `tmux`. When
   working against untrusted remote devices, `--sanitize` strips string-type
   escapes (window title, OSC 52 clipboard, DCS/SOS/PM/APC payloads) from
   program output while leaving colors and cursor control intact.
-

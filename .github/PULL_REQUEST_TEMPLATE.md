@@ -5,8 +5,10 @@
 ## Validation
 
 - [ ] `cargo fmt --check`
-- [ ] `cargo test`
-- [ ] `cargo clippy --all-targets -- -D warnings`
+- [ ] `cargo test --locked`
+- [ ] `cargo clippy --locked --all-targets --all-features -- -D warnings`
+- [ ] `bash scripts/privacy-scan.sh`
+- [ ] `node --test tests/*.test.mjs`
 - [ ] Regenerated completions if CLI flags or command help changed
 - [ ] Updated `README.md` or `CHANGELOG.md` for user-facing behavior changes
 
@@ -18,4 +20,3 @@
 ## Release/Packaging
 
 - [ ] Release, Homebrew, or workflow changes remain reproducible from checked-in scripts
-

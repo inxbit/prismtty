@@ -1,3 +1,11 @@
+_prismtty_compgen() {
+    local candidate
+    COMPREPLY=()
+    while IFS= read -r candidate; do
+        COMPREPLY+=("${candidate}")
+    done < <(compgen "$@")
+}
+
 _prismtty() {
     local i cur prev opts cmd
     COMPREPLY=()
@@ -40,41 +48,41 @@ _prismtty() {
         prismtty)
             opts="-h -v -V -b -r -R -p -c --help --version --benchmark --reload --rgb --pcre --no-auto-detect --no-dynamic-profile --no-minimal-reset --strip-ansi --sanitize --show-profile --local-echo --trace-io --profile --config profiles"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 1 ]] ; then
-                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                _prismtty_compgen -W "${opts}" -- "${cur}"
                 return 0
             fi
             case "${prev}" in
                 --trace-io)
-                    COMPREPLY=($(compgen -f "${cur}"))
+                    _prismtty_compgen -f -- "${cur}"
                     return 0
                     ;;
                 --profile)
-                    COMPREPLY=($(compgen -f "${cur}"))
+                    _prismtty_compgen -f -- "${cur}"
                     return 0
                     ;;
                 -p)
-                    COMPREPLY=($(compgen -f "${cur}"))
+                    _prismtty_compgen -f -- "${cur}"
                     return 0
                     ;;
                 --config)
-                    COMPREPLY=($(compgen -f "${cur}"))
+                    _prismtty_compgen -f -- "${cur}"
                     return 0
                     ;;
                 -c)
-                    COMPREPLY=($(compgen -f "${cur}"))
+                    _prismtty_compgen -f -- "${cur}"
                     return 0
                     ;;
                 *)
                     COMPREPLY=()
                     ;;
             esac
-            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            _prismtty_compgen -W "${opts}" -- "${cur}"
             return 0
             ;;
         prismtty__subcmd__profiles)
             opts="list show validate test"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
-                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                _prismtty_compgen -W "${opts}" -- "${cur}"
                 return 0
             fi
             case "${prev}" in
@@ -82,13 +90,13 @@ _prismtty() {
                     COMPREPLY=()
                     ;;
             esac
-            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            _prismtty_compgen -W "${opts}" -- "${cur}"
             return 0
             ;;
         prismtty__subcmd__profiles__subcmd__list)
             opts=""
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
-                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                _prismtty_compgen -W "${opts}" -- "${cur}"
                 return 0
             fi
             case "${prev}" in
@@ -96,13 +104,13 @@ _prismtty() {
                     COMPREPLY=()
                     ;;
             esac
-            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            _prismtty_compgen -W "${opts}" -- "${cur}"
             return 0
             ;;
         prismtty__subcmd__profiles__subcmd__show)
             opts=""
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
-                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                _prismtty_compgen -W "${opts}" -- "${cur}"
                 return 0
             fi
             case "${prev}" in
@@ -110,13 +118,13 @@ _prismtty() {
                     COMPREPLY=()
                     ;;
             esac
-            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            _prismtty_compgen -W "${opts}" -- "${cur}"
             return 0
             ;;
         prismtty__subcmd__profiles__subcmd__test)
             opts=""
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
-                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                _prismtty_compgen -W "${opts}" -- "${cur}"
                 return 0
             fi
             case "${prev}" in
@@ -124,13 +132,13 @@ _prismtty() {
                     COMPREPLY=()
                     ;;
             esac
-            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            _prismtty_compgen -W "${opts}" -- "${cur}"
             return 0
             ;;
         prismtty__subcmd__profiles__subcmd__validate)
             opts=""
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
-                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                _prismtty_compgen -W "${opts}" -- "${cur}"
                 return 0
             fi
             case "${prev}" in
@@ -138,7 +146,7 @@ _prismtty() {
                     COMPREPLY=()
                     ;;
             esac
-            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            _prismtty_compgen -W "${opts}" -- "${cur}"
             return 0
             ;;
     esac
@@ -192,41 +200,41 @@ _ptty() {
         ptty)
             opts="-h -v -V -b -r -R -p -c --help --version --benchmark --reload --rgb --pcre --no-auto-detect --no-dynamic-profile --no-minimal-reset --strip-ansi --sanitize --show-profile --local-echo --trace-io --profile --config profiles"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 1 ]] ; then
-                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                _prismtty_compgen -W "${opts}" -- "${cur}"
                 return 0
             fi
             case "${prev}" in
                 --trace-io)
-                    COMPREPLY=($(compgen -f "${cur}"))
+                    _prismtty_compgen -f -- "${cur}"
                     return 0
                     ;;
                 --profile)
-                    COMPREPLY=($(compgen -f "${cur}"))
+                    _prismtty_compgen -f -- "${cur}"
                     return 0
                     ;;
                 -p)
-                    COMPREPLY=($(compgen -f "${cur}"))
+                    _prismtty_compgen -f -- "${cur}"
                     return 0
                     ;;
                 --config)
-                    COMPREPLY=($(compgen -f "${cur}"))
+                    _prismtty_compgen -f -- "${cur}"
                     return 0
                     ;;
                 -c)
-                    COMPREPLY=($(compgen -f "${cur}"))
+                    _prismtty_compgen -f -- "${cur}"
                     return 0
                     ;;
                 *)
                     COMPREPLY=()
                     ;;
             esac
-            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            _prismtty_compgen -W "${opts}" -- "${cur}"
             return 0
             ;;
         ptty__subcmd__profiles)
             opts="list show validate test"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
-                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                _prismtty_compgen -W "${opts}" -- "${cur}"
                 return 0
             fi
             case "${prev}" in
@@ -234,13 +242,13 @@ _ptty() {
                     COMPREPLY=()
                     ;;
             esac
-            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            _prismtty_compgen -W "${opts}" -- "${cur}"
             return 0
             ;;
         ptty__subcmd__profiles__subcmd__list)
             opts=""
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
-                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                _prismtty_compgen -W "${opts}" -- "${cur}"
                 return 0
             fi
             case "${prev}" in
@@ -248,13 +256,13 @@ _ptty() {
                     COMPREPLY=()
                     ;;
             esac
-            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            _prismtty_compgen -W "${opts}" -- "${cur}"
             return 0
             ;;
         ptty__subcmd__profiles__subcmd__show)
             opts=""
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
-                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                _prismtty_compgen -W "${opts}" -- "${cur}"
                 return 0
             fi
             case "${prev}" in
@@ -262,13 +270,13 @@ _ptty() {
                     COMPREPLY=()
                     ;;
             esac
-            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            _prismtty_compgen -W "${opts}" -- "${cur}"
             return 0
             ;;
         ptty__subcmd__profiles__subcmd__test)
             opts=""
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
-                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                _prismtty_compgen -W "${opts}" -- "${cur}"
                 return 0
             fi
             case "${prev}" in
@@ -276,13 +284,13 @@ _ptty() {
                     COMPREPLY=()
                     ;;
             esac
-            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            _prismtty_compgen -W "${opts}" -- "${cur}"
             return 0
             ;;
         ptty__subcmd__profiles__subcmd__validate)
             opts=""
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
-                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                _prismtty_compgen -W "${opts}" -- "${cur}"
                 return 0
             fi
             case "${prev}" in
@@ -290,7 +298,7 @@ _ptty() {
                     COMPREPLY=()
                     ;;
             esac
-            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            _prismtty_compgen -W "${opts}" -- "${cur}"
             return 0
             ;;
     esac
@@ -344,41 +352,41 @@ _ct() {
         ct)
             opts="-h -v -V -b -r -R -p -c --help --version --benchmark --reload --rgb --pcre --no-auto-detect --no-dynamic-profile --no-minimal-reset --strip-ansi --sanitize --show-profile --local-echo --trace-io --profile --config profiles"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 1 ]] ; then
-                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                _prismtty_compgen -W "${opts}" -- "${cur}"
                 return 0
             fi
             case "${prev}" in
                 --trace-io)
-                    COMPREPLY=($(compgen -f "${cur}"))
+                    _prismtty_compgen -f -- "${cur}"
                     return 0
                     ;;
                 --profile)
-                    COMPREPLY=($(compgen -f "${cur}"))
+                    _prismtty_compgen -f -- "${cur}"
                     return 0
                     ;;
                 -p)
-                    COMPREPLY=($(compgen -f "${cur}"))
+                    _prismtty_compgen -f -- "${cur}"
                     return 0
                     ;;
                 --config)
-                    COMPREPLY=($(compgen -f "${cur}"))
+                    _prismtty_compgen -f -- "${cur}"
                     return 0
                     ;;
                 -c)
-                    COMPREPLY=($(compgen -f "${cur}"))
+                    _prismtty_compgen -f -- "${cur}"
                     return 0
                     ;;
                 *)
                     COMPREPLY=()
                     ;;
             esac
-            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            _prismtty_compgen -W "${opts}" -- "${cur}"
             return 0
             ;;
         ct__subcmd__profiles)
             opts="list show validate test"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
-                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                _prismtty_compgen -W "${opts}" -- "${cur}"
                 return 0
             fi
             case "${prev}" in
@@ -386,13 +394,13 @@ _ct() {
                     COMPREPLY=()
                     ;;
             esac
-            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            _prismtty_compgen -W "${opts}" -- "${cur}"
             return 0
             ;;
         ct__subcmd__profiles__subcmd__list)
             opts=""
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
-                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                _prismtty_compgen -W "${opts}" -- "${cur}"
                 return 0
             fi
             case "${prev}" in
@@ -400,13 +408,13 @@ _ct() {
                     COMPREPLY=()
                     ;;
             esac
-            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            _prismtty_compgen -W "${opts}" -- "${cur}"
             return 0
             ;;
         ct__subcmd__profiles__subcmd__show)
             opts=""
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
-                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                _prismtty_compgen -W "${opts}" -- "${cur}"
                 return 0
             fi
             case "${prev}" in
@@ -414,13 +422,13 @@ _ct() {
                     COMPREPLY=()
                     ;;
             esac
-            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            _prismtty_compgen -W "${opts}" -- "${cur}"
             return 0
             ;;
         ct__subcmd__profiles__subcmd__test)
             opts=""
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
-                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                _prismtty_compgen -W "${opts}" -- "${cur}"
                 return 0
             fi
             case "${prev}" in
@@ -428,13 +436,13 @@ _ct() {
                     COMPREPLY=()
                     ;;
             esac
-            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            _prismtty_compgen -W "${opts}" -- "${cur}"
             return 0
             ;;
         ct__subcmd__profiles__subcmd__validate)
             opts=""
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
-                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                _prismtty_compgen -W "${opts}" -- "${cur}"
                 return 0
             fi
             case "${prev}" in
@@ -442,7 +450,7 @@ _ct() {
                     COMPREPLY=()
                     ;;
             esac
-            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            _prismtty_compgen -W "${opts}" -- "${cur}"
             return 0
             ;;
     esac

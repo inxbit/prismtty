@@ -8,9 +8,12 @@
 //! instead surface it once the child goes idle.
 #![cfg(unix)]
 
+use std::fs::File;
 use std::io::{Read, Write};
+use std::os::fd::FromRawFd;
+use std::path::Path;
 use std::sync::{
-    Arc,
+    Arc, Mutex,
     atomic::{AtomicBool, Ordering},
     mpsc,
 };
@@ -19,6 +22,441 @@ use std::time::{Duration, Instant};
 
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use prismtty::highlight::strip_ansi;
+
+const CAPTURE_POLL_INTERVAL: Duration = Duration::from_millis(20);
+const RECEIVE_POLL_INTERVAL: Duration = Duration::from_millis(50);
+const CAPTURE_BYTE_LIMIT: usize = 1024 * 1024;
+const CLEANUP_WAIT_LIMIT: Duration = Duration::from_secs(2);
+const THREAD_JOIN_LIMIT: Duration = Duration::from_millis(250);
+
+struct PtyChildGuard {
+    child: Option<Box<dyn portable_pty::Child + Send + Sync>>,
+    pid: libc::pid_t,
+}
+
+impl PtyChildGuard {
+    fn new(child: Box<dyn portable_pty::Child + Send + Sync>) -> Self {
+        let pid = child.process_id().expect("PTY child pid") as libc::pid_t;
+        Self {
+            child: Some(child),
+            pid,
+        }
+    }
+
+    fn pid(&self) -> libc::pid_t {
+        self.pid
+    }
+
+    fn terminate_and_wait(&mut self) {
+        let Some(mut child) = self.child.take() else {
+            return;
+        };
+        // forkpty children are session and process-group leaders. Kill both the
+        // group and direct pid so cleanup remains reliable if that assumption
+        // changes in portable-pty.
+        unsafe {
+            libc::kill(-self.pid, libc::SIGKILL);
+            libc::kill(self.pid, libc::SIGKILL);
+        }
+        let _ = child.kill();
+        let deadline = Instant::now() + CLEANUP_WAIT_LIMIT;
+        while Instant::now() < deadline {
+            match child.try_wait() {
+                Ok(Some(_)) | Err(_) => return,
+                Ok(None) => thread::sleep(Duration::from_millis(20)),
+            }
+        }
+    }
+}
+
+impl Drop for PtyChildGuard {
+    fn drop(&mut self) {
+        self.terminate_and_wait();
+    }
+}
+
+struct CaptureTask {
+    receiver: mpsc::Receiver<()>,
+    output: Arc<Mutex<Vec<u8>>>,
+    stop: Arc<AtomicBool>,
+    finished: Arc<AtomicBool>,
+    completion: mpsc::Receiver<()>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+impl CaptureTask {
+    fn start(master: &dyn portable_pty::MasterPty) -> Self {
+        let master_fd = master.as_raw_fd().expect("PTY master fd");
+        let reader_fd = unsafe { libc::dup(master_fd) };
+        assert!(
+            reader_fd >= 0,
+            "duplicate PTY master fd: {}",
+            std::io::Error::last_os_error()
+        );
+        let mut reader = unsafe { File::from_raw_fd(reader_fd) };
+
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let thread_output = Arc::clone(&output);
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_stop = Arc::clone(&stop);
+        let finished = Arc::new(AtomicBool::new(false));
+        let thread_finished = Arc::clone(&finished);
+        let (completion_tx, completion) = mpsc::sync_channel(1);
+        let thread = thread::spawn(move || {
+            struct Finished(Arc<AtomicBool>, mpsc::SyncSender<()>);
+            impl Drop for Finished {
+                fn drop(&mut self) {
+                    self.0.store(true, Ordering::Release);
+                    let _ = self.1.try_send(());
+                }
+            }
+            let _finished = Finished(thread_finished, completion_tx);
+            let mut buf = [0u8; 256];
+            while !thread_stop.load(Ordering::Acquire) {
+                let mut poll_fd = libc::pollfd {
+                    fd: reader_fd,
+                    events: libc::POLLIN | libc::POLLHUP | libc::POLLERR,
+                    revents: 0,
+                };
+                let ready = unsafe {
+                    libc::poll(
+                        &mut poll_fd,
+                        1,
+                        CAPTURE_POLL_INTERVAL.as_millis() as libc::c_int,
+                    )
+                };
+                if ready < 0 {
+                    if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                        continue;
+                    }
+                    break;
+                }
+                if ready == 0 {
+                    continue;
+                }
+                match reader.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        let mut output = thread_output
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        let remaining = CAPTURE_BYTE_LIMIT.saturating_sub(output.len());
+                        if remaining > 0 {
+                            output.extend_from_slice(&buf[..n.min(remaining)]);
+                        }
+                        drop(output);
+                        if matches!(
+                            sender.try_send(()),
+                            Err(mpsc::TrySendError::Disconnected(()))
+                        ) {
+                            break;
+                        }
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                    // PTY masters commonly report EIO after their slave closes.
+                    Err(_) => break,
+                }
+            }
+        });
+
+        Self {
+            receiver,
+            output,
+            stop,
+            finished,
+            completion,
+            thread: Some(thread),
+        }
+    }
+
+    fn wait_until(&self, timeout: Duration, mut predicate: impl FnMut(&[u8]) -> bool) -> Vec<u8> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            {
+                let output = self
+                    .output
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if predicate(&output) {
+                    return output.clone();
+                }
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return self
+                    .output
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone();
+            }
+            let wait = deadline
+                .saturating_duration_since(now)
+                .min(RECEIVE_POLL_INTERVAL);
+            match self.receiver.recv_timeout(wait) {
+                Ok(()) => {}
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    return self
+                        .output
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .clone();
+                }
+            }
+        }
+    }
+
+    fn finished_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.finished)
+    }
+
+    fn stop_bounded(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        let completed = self.completion.recv_timeout(THREAD_JOIN_LIMIT).is_ok()
+            || self.finished.load(Ordering::Acquire);
+        if completed {
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
+        } else {
+            // Dropping a JoinHandle detaches it. The thread owns its reader and
+            // stop flag, so a pathological platform read cannot hang teardown.
+            self.thread.take();
+        }
+    }
+}
+
+impl Drop for CaptureTask {
+    fn drop(&mut self) {
+        self.stop_bounded();
+    }
+}
+
+struct PtySession {
+    child: PtyChildGuard,
+    capture: CaptureTask,
+}
+
+impl PtySession {
+    fn new(
+        child: Box<dyn portable_pty::Child + Send + Sync>,
+        master: &dyn portable_pty::MasterPty,
+    ) -> Self {
+        Self {
+            child: PtyChildGuard::new(child),
+            capture: CaptureTask::start(master),
+        }
+    }
+
+    fn pid(&self) -> libc::pid_t {
+        self.child.pid()
+    }
+
+    fn capture(&self) -> &CaptureTask {
+        &self.capture
+    }
+}
+
+impl Drop for PtySession {
+    fn drop(&mut self) {
+        // Keep draining output while the child group is terminated, then stop
+        // the reader. Both operations are bounded.
+        self.child.terminate_and_wait();
+        self.capture.stop_bounded();
+    }
+}
+
+struct TypingTask {
+    stop: Arc<AtomicBool>,
+    completion: mpsc::Receiver<()>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+impl TypingTask {
+    fn start(mut writer: Box<dyn Write + Send>, typed: &'static [u8]) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_stop = Arc::clone(&stop);
+        let (completion_tx, completion) = mpsc::sync_channel(1);
+        let thread = thread::spawn(move || {
+            while !thread_stop.load(Ordering::Acquire) {
+                if writer.write_all(typed).is_err() || writer.flush().is_err() {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(30));
+            }
+            let _ = completion_tx.try_send(());
+        });
+        Self {
+            stop,
+            completion,
+            thread: Some(thread),
+        }
+    }
+}
+
+impl Drop for TypingTask {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        if self.completion.recv_timeout(THREAD_JOIN_LIMIT).is_ok() {
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
+        } else {
+            self.thread.take();
+        }
+    }
+}
+
+fn wait_for_condition(timeout: Duration, mut condition: impl FnMut() -> bool) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if condition() {
+            return true;
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return false;
+        }
+        thread::sleep(
+            deadline
+                .saturating_duration_since(now)
+                .min(Duration::from_millis(10)),
+        );
+    }
+}
+
+fn process_exists(pid: libc::pid_t) -> bool {
+    unsafe { libc::kill(pid, 0) == 0 }
+}
+
+fn visible_output(output: &[u8]) -> String {
+    String::from_utf8_lossy(&strip_ansi(output)).into_owned()
+}
+
+fn trace_output_bytes(path: &Path) -> Vec<u8> {
+    let Ok(trace) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    trace
+        .lines()
+        .filter_map(|line| line.split_once(" OUT ").map(|(_, bytes)| bytes))
+        .flat_map(|bytes| bytes.split_whitespace())
+        .filter_map(|byte| u8::from_str_radix(byte, 16).ok())
+        .collect()
+}
+
+fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+    !needle.is_empty()
+        && haystack
+            .windows(needle.len())
+            .any(|window| window == needle)
+}
+
+#[test]
+fn harness_reaps_child_and_joins_reader_on_early_error() {
+    let started = Instant::now();
+    let (result, child_pid, reader_finished): (
+        Result<(), &'static str>,
+        libc::pid_t,
+        Arc<AtomicBool>,
+    ) = {
+        let pair = native_pty_system()
+            .openpty(PtySize::default())
+            .expect("openpty");
+        let mut builder = CommandBuilder::new("sh");
+        builder.arg("-c");
+        builder.arg("trap '' HUP TERM; while true; do sleep 1; done");
+        let child = pair
+            .slave
+            .spawn_command(builder)
+            .expect("spawn guarded child");
+        drop(pair.slave);
+        let session = PtySession::new(child, &*pair.master);
+        let child_pid = session.pid();
+        let reader_finished = session.capture().finished_flag();
+
+        (Err("intentional early error"), child_pid, reader_finished)
+    };
+
+    assert_eq!(result, Err("intentional early error"));
+    assert!(
+        started.elapsed() < CLEANUP_WAIT_LIMIT + THREAD_JOIN_LIMIT + Duration::from_millis(250),
+        "early-error RAII cleanup exceeded its bounded wait"
+    );
+    assert!(
+        wait_for_condition(Duration::from_secs(2), || !process_exists(child_pid)),
+        "child survived guard cleanup after an early error"
+    );
+    assert!(
+        reader_finished.load(Ordering::Acquire),
+        "capture thread was not joined on the early-error path"
+    );
+}
+
+#[test]
+fn typing_cleanup_is_bounded_when_a_writer_is_stuck() {
+    use std::sync::Condvar;
+
+    struct GatedWriter {
+        entered: Arc<AtomicBool>,
+        exited: Arc<AtomicBool>,
+        gate: Arc<(Mutex<bool>, Condvar)>,
+    }
+
+    impl Write for GatedWriter {
+        fn write(&mut self, _buffer: &[u8]) -> std::io::Result<usize> {
+            self.entered.store(true, Ordering::Release);
+            let (lock, wake) = &*self.gate;
+            let mut released = lock.lock().unwrap();
+            while !*released {
+                released = wake.wait(released).unwrap();
+            }
+            self.exited.store(true, Ordering::Release);
+            Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "injected blocked writer released",
+            ))
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let entered = Arc::new(AtomicBool::new(false));
+    let exited = Arc::new(AtomicBool::new(false));
+    let gate = Arc::new((Mutex::new(false), Condvar::new()));
+    let task = TypingTask::start(
+        Box::new(GatedWriter {
+            entered: Arc::clone(&entered),
+            exited: Arc::clone(&exited),
+            gate: Arc::clone(&gate),
+        }),
+        b"x",
+    );
+    assert!(
+        wait_for_condition(Duration::from_secs(1), || entered.load(Ordering::Acquire)),
+        "typing thread did not enter injected blocking write"
+    );
+
+    let (drop_tx, drop_rx) = mpsc::sync_channel(1);
+    let dropper = thread::spawn(move || {
+        drop(task);
+        let _ = drop_tx.send(());
+    });
+    let bounded = drop_rx.recv_timeout(THREAD_JOIN_LIMIT + Duration::from_millis(250));
+    let (lock, wake) = &*gate;
+    *lock.lock().unwrap() = true;
+    wake.notify_all();
+    dropper.join().expect("typing dropper joins after release");
+
+    assert!(bounded.is_ok(), "typing cleanup blocked on a stuck writer");
+    assert!(
+        wait_for_condition(Duration::from_secs(1), || exited.load(Ordering::Acquire)),
+        "detached typing thread did not exit after its writer was released"
+    );
+}
 
 /// A pasted command (no trailing newline) must become fully visible without any
 /// further input. `cat` keeps the wrapped PTY in canonical echo mode, so the
@@ -39,50 +477,17 @@ fn pasted_line_is_fully_visible_without_extra_input() {
     builder.arg("-c");
     builder.arg("printf 'READY\\n'; exec cat");
 
-    let mut child = pair.slave.spawn_command(builder).expect("spawn ptty cat");
+    let child = pair.slave.spawn_command(builder).expect("spawn ptty cat");
     drop(pair.slave);
 
-    let mut reader = pair.master.try_clone_reader().expect("clone reader");
     let mut writer = pair.master.take_writer().expect("take writer");
-
-    // Stream echoed output from a thread so a blocking read on the buggy path
-    // (token never flushed) cannot hang the test; the main thread bounds the
-    // wait. Each read publishes the current visible (ANSI-stripped) text.
-    let (tx, rx) = mpsc::channel::<String>();
-    thread::spawn(move || {
-        let mut acc = Vec::new();
-        let mut buf = [0u8; 256];
-        loop {
-            match reader.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => {
-                    acc.extend_from_slice(&buf[..n]);
-                    let visible = String::from_utf8_lossy(&strip_ansi(&acc)).into_owned();
-                    if tx.send(visible).is_err() {
-                        break;
-                    }
-                }
-                Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(_) => break,
-            }
-        }
-    });
+    let session = PtySession::new(child, &*pair.master);
 
     // Wait until prismtty is forwarding child output before sending the paste.
-    let ready_deadline = Instant::now() + Duration::from_secs(5);
-    let mut visible = String::new();
-    while Instant::now() < ready_deadline {
-        match rx.recv_timeout(Duration::from_millis(200)) {
-            Ok(latest) => {
-                visible = latest;
-                if visible.contains("READY") {
-                    break;
-                }
-            }
-            Err(mpsc::RecvTimeoutError::Timeout) => continue,
-            Err(mpsc::RecvTimeoutError::Disconnected) => break,
-        }
-    }
+    let ready = session.capture().wait_until(Duration::from_secs(5), |out| {
+        visible_output(out).contains("READY")
+    });
+    let mut visible = visible_output(&ready);
     assert!(
         visible.contains("READY"),
         "wrapped command was not ready before paste; saw: {visible:?}"
@@ -98,22 +503,10 @@ fn pasted_line_is_fully_visible_without_extra_input() {
     // Wait for the full line to surface. Crucially we send NO further bytes, so
     // the trailing token can only appear via prismtty's idle flush.
     let target = "update add test.example.com 3600 A 192.0.2.1";
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while Instant::now() < deadline {
-        match rx.recv_timeout(Duration::from_millis(200)) {
-            Ok(latest) => {
-                visible = latest;
-                if visible.contains(target) {
-                    break;
-                }
-            }
-            Err(mpsc::RecvTimeoutError::Timeout) => continue,
-            Err(mpsc::RecvTimeoutError::Disconnected) => break,
-        }
-    }
-
-    let _ = child.kill();
-    let _ = child.wait();
+    let output = session.capture().wait_until(Duration::from_secs(5), |out| {
+        visible_output(out).contains(target)
+    });
+    visible = visible_output(&output);
 
     assert!(
         visible.contains(target),
@@ -154,6 +547,9 @@ fn contains_sgr_span(haystack: &[u8], token: &[u8]) -> bool {
 /// "...Vlan11" + "91" across two reads with an inter-write gap).
 #[test]
 fn split_program_output_token_keeps_single_highlight_span() {
+    let trace_dir = tempfile::tempdir().expect("trace tempdir");
+    let trace_path = trace_dir.path().join("split.trace");
+    let continue_path = trace_dir.path().join("continue");
     let pair = native_pty_system()
         .openpty(PtySize {
             rows: 24,
@@ -164,57 +560,38 @@ fn split_program_output_token_keeps_single_highlight_span() {
         .expect("openpty");
 
     let mut builder = CommandBuilder::new(env!("CARGO_BIN_EXE_ptty"));
+    builder.arg("--trace-io");
+    builder.arg(&trace_path);
     builder.arg("-p");
     builder.arg("cisco");
+    builder.env("PRISMTTY_TEST_CONTINUE", &continue_path);
     builder.arg("sh");
     builder.arg("-c");
-    // First write is >8 bytes and ends mid-token; the gap lets prismtty read it
-    // (and go idle) before the rest arrives, so the token genuinely spans reads.
-    builder
-        .arg("printf 'show: Vlan11'; sleep 0.25; printf '91 New TZ GW to Internal\\n'; sleep 0.3");
+    // The child cannot emit the suffix until the test has observed the prefix in
+    // prismtty's raw I/O trace. This proves the token crossed two downstream read
+    // boundaries without relying on a scheduler-dependent sleep.
+    builder.arg(
+        "printf 'show: Vlan11'; while [ ! -f \"$PRISMTTY_TEST_CONTINUE\" ]; do sleep 0.01; done; printf '91 New TZ GW to Internal\\n'",
+    );
 
-    let mut child = pair.slave.spawn_command(builder).expect("spawn ptty");
+    let child = pair.slave.spawn_command(builder).expect("spawn ptty");
     drop(pair.slave);
 
     // Pure program output: we never write to the master, so no input echo is
     // pending and the idle flush must leave the buffered token alone.
-    let mut reader = pair.master.try_clone_reader().expect("clone reader");
-    let (tx, rx) = mpsc::channel::<Vec<u8>>();
-    thread::spawn(move || {
-        let mut acc = Vec::new();
-        let mut buf = [0u8; 256];
-        loop {
-            match reader.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => {
-                    acc.extend_from_slice(&buf[..n]);
-                    if tx.send(acc.clone()).is_err() {
-                        break;
-                    }
-                }
-                Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(_) => break,
-            }
-        }
+    let session = PtySession::new(child, &*pair.master);
+    let prefix_crossed_boundary = wait_for_condition(Duration::from_secs(5), || {
+        contains_bytes(&trace_output_bytes(&trace_path), b"show: Vlan11")
     });
+    assert!(
+        prefix_crossed_boundary,
+        "raw trace never recorded the token prefix before the continuation gate"
+    );
+    std::fs::write(&continue_path, b"continue").expect("release continuation gate");
 
-    let deadline = Instant::now() + Duration::from_secs(5);
-    let mut out = Vec::new();
-    while Instant::now() < deadline {
-        match rx.recv_timeout(Duration::from_millis(200)) {
-            Ok(latest) => {
-                out = latest;
-                if contains_sgr_span(&out, b"Vlan1191") {
-                    break;
-                }
-            }
-            Err(mpsc::RecvTimeoutError::Timeout) => continue,
-            Err(mpsc::RecvTimeoutError::Disconnected) => break,
-        }
-    }
-
-    let _ = child.kill();
-    let _ = child.wait();
+    let out = session.capture().wait_until(Duration::from_secs(5), |out| {
+        contains_sgr_span(out, b"Vlan1191")
+    });
 
     assert!(
         contains_sgr_span(&out, b"Vlan1191"),
@@ -245,66 +622,23 @@ fn echo_off_split_stream_while_typing(typed: &'static [u8]) -> Vec<u8> {
     builder.arg("-c");
     builder.arg(
         "stty -echo; i=0; while [ $i -lt 12 ]; do printf 'aaaaaaaa Vlan11'; \
-         sleep 0.12; printf '91 bbbb\\n'; sleep 0.12; i=$((i+1)); done",
+         sleep 0.12; printf '91 bbbb\\n'; sleep 0.12; i=$((i+1)); done; printf 'STREAM_DONE\\n'",
     );
 
-    let mut child = pair.slave.spawn_command(builder).expect("spawn ptty");
+    let child = pair.slave.spawn_command(builder).expect("spawn ptty");
     drop(pair.slave);
 
-    let mut reader = pair.master.try_clone_reader().expect("clone reader");
-    let mut writer = pair.master.take_writer().expect("take writer");
+    let writer = pair.master.take_writer().expect("take writer");
+    let session = PtySession::new(child, &*pair.master);
 
     // Type throughout, then stop explicitly. Linux PTYs can keep accepting
     // master writes briefly after the child exits, so do not rely on write
     // failure as the only thread-exit signal.
-    let stop_typing = Arc::new(AtomicBool::new(false));
-    let typer_stop = Arc::clone(&stop_typing);
-    let typer = thread::spawn(move || {
-        while !typer_stop.load(Ordering::Relaxed) {
-            if writer.write_all(typed).is_err() || writer.flush().is_err() {
-                break;
-            }
-            thread::sleep(Duration::from_millis(30));
-        }
+    let typer = TypingTask::start(writer, typed);
+    let out = session.capture().wait_until(Duration::from_secs(8), |out| {
+        visible_output(out).contains("STREAM_DONE")
     });
-
-    let (tx, rx) = mpsc::channel::<Vec<u8>>();
-    thread::spawn(move || {
-        let mut acc = Vec::new();
-        let mut buf = [0u8; 256];
-        loop {
-            match reader.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => {
-                    acc.extend_from_slice(&buf[..n]);
-                    if tx.send(acc.clone()).is_err() {
-                        break;
-                    }
-                }
-                Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(_) => break,
-            }
-        }
-    });
-
-    let deadline = Instant::now() + Duration::from_secs(8);
-    let mut out = Vec::new();
-    loop {
-        match rx.recv_timeout(Duration::from_millis(200)) {
-            Ok(latest) => out = latest,
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                if Instant::now() >= deadline {
-                    break;
-                }
-            }
-            Err(mpsc::RecvTimeoutError::Disconnected) => break,
-        }
-    }
-
-    let _ = child.kill();
-    let _ = child.wait();
-    stop_typing.store(true, Ordering::Relaxed);
-    let _ = typer.join();
+    drop(typer);
     out
 }
 
@@ -360,49 +694,18 @@ fn raw_mode_paste_line_is_visible_without_extra_input() {
     builder.arg("-c");
     builder.arg("stty raw -echo 2>/dev/null; printf 'READY\\n'; exec cat");
 
-    let mut child = pair
+    let child = pair
         .slave
         .spawn_command(builder)
         .expect("spawn ptty raw cat");
     drop(pair.slave);
 
-    let mut reader = pair.master.try_clone_reader().expect("clone reader");
     let mut writer = pair.master.take_writer().expect("take writer");
-
-    let (tx, rx) = mpsc::channel::<String>();
-    thread::spawn(move || {
-        let mut acc = Vec::new();
-        let mut buf = [0u8; 256];
-        loop {
-            match reader.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => {
-                    acc.extend_from_slice(&buf[..n]);
-                    let visible = String::from_utf8_lossy(&strip_ansi(&acc)).into_owned();
-                    if tx.send(visible).is_err() {
-                        break;
-                    }
-                }
-                Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(_) => break,
-            }
-        }
+    let session = PtySession::new(child, &*pair.master);
+    let ready = session.capture().wait_until(Duration::from_secs(5), |out| {
+        visible_output(out).contains("READY")
     });
-
-    let ready_deadline = Instant::now() + Duration::from_secs(5);
-    let mut visible = String::new();
-    while Instant::now() < ready_deadline {
-        match rx.recv_timeout(Duration::from_millis(200)) {
-            Ok(latest) => {
-                visible = latest;
-                if visible.contains("READY") {
-                    break;
-                }
-            }
-            Err(mpsc::RecvTimeoutError::Timeout) => continue,
-            Err(mpsc::RecvTimeoutError::Disconnected) => break,
-        }
-    }
+    let mut visible = visible_output(&ready);
     assert!(
         visible.contains("READY"),
         "raw-mode child was not ready before paste; saw: {visible:?}"
@@ -415,22 +718,10 @@ fn raw_mode_paste_line_is_visible_without_extra_input() {
     writer.flush().expect("flush paste");
 
     let target = "update add test.example.com 3600 A 192.0.2.1";
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while Instant::now() < deadline {
-        match rx.recv_timeout(Duration::from_millis(200)) {
-            Ok(latest) => {
-                visible = latest;
-                if visible.contains(target) {
-                    break;
-                }
-            }
-            Err(mpsc::RecvTimeoutError::Timeout) => continue,
-            Err(mpsc::RecvTimeoutError::Disconnected) => break,
-        }
-    }
-
-    let _ = child.kill();
-    let _ = child.wait();
+    let output = session.capture().wait_until(Duration::from_secs(5), |out| {
+        visible_output(out).contains(target)
+    });
+    visible = visible_output(&output);
 
     assert!(
         visible.contains(target),
@@ -458,49 +749,18 @@ fn raw_mode_typed_chars_are_visible_without_extra_input() {
     builder.arg("-c");
     builder.arg("stty raw -echo 2>/dev/null; printf 'READY\\n'; exec cat");
 
-    let mut child = pair
+    let child = pair
         .slave
         .spawn_command(builder)
         .expect("spawn ptty raw cat");
     drop(pair.slave);
 
-    let mut reader = pair.master.try_clone_reader().expect("clone reader");
     let mut writer = pair.master.take_writer().expect("take writer");
-
-    let (tx, rx) = mpsc::channel::<String>();
-    thread::spawn(move || {
-        let mut acc = Vec::new();
-        let mut buf = [0u8; 256];
-        loop {
-            match reader.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => {
-                    acc.extend_from_slice(&buf[..n]);
-                    let visible = String::from_utf8_lossy(&strip_ansi(&acc)).into_owned();
-                    if tx.send(visible).is_err() {
-                        break;
-                    }
-                }
-                Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(_) => break,
-            }
-        }
+    let session = PtySession::new(child, &*pair.master);
+    let ready = session.capture().wait_until(Duration::from_secs(5), |out| {
+        visible_output(out).contains("READY")
     });
-
-    let ready_deadline = Instant::now() + Duration::from_secs(5);
-    let mut visible = String::new();
-    while Instant::now() < ready_deadline {
-        match rx.recv_timeout(Duration::from_millis(200)) {
-            Ok(latest) => {
-                visible = latest;
-                if visible.contains("READY") {
-                    break;
-                }
-            }
-            Err(mpsc::RecvTimeoutError::Timeout) => continue,
-            Err(mpsc::RecvTimeoutError::Disconnected) => break,
-        }
-    }
+    let mut visible = visible_output(&ready);
     assert!(
         visible.contains("READY"),
         "raw-mode child was not ready before typing; saw: {visible:?}"
@@ -508,32 +768,24 @@ fn raw_mode_typed_chars_are_visible_without_extra_input() {
 
     // A single delimiter-less token typed one byte at a time. With no space or
     // newline ever following, the only path to visibility is the idle flush.
-    for byte in b"showversion" {
+    let target = b"showversion";
+    for (idx, byte) in target.iter().enumerate() {
         writer.write_all(&[*byte]).expect("write byte");
         writer.flush().expect("flush byte");
-        thread::sleep(Duration::from_millis(40));
+        let prefix = &target[..=idx];
+        let output = session.capture().wait_until(Duration::from_secs(2), |out| {
+            contains_bytes(visible_output(out).as_bytes(), prefix)
+        });
+        visible = visible_output(&output);
+        assert!(
+            contains_bytes(visible.as_bytes(), prefix),
+            "typed prefix {:?} did not cross the idle boundary; saw: {visible:?}",
+            String::from_utf8_lossy(prefix)
+        );
     }
-
-    let target = "showversion";
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while Instant::now() < deadline {
-        match rx.recv_timeout(Duration::from_millis(200)) {
-            Ok(latest) => {
-                visible = latest;
-                if visible.contains(target) {
-                    break;
-                }
-            }
-            Err(mpsc::RecvTimeoutError::Timeout) => continue,
-            Err(mpsc::RecvTimeoutError::Disconnected) => break,
-        }
-    }
-
-    let _ = child.kill();
-    let _ = child.wait();
 
     assert!(
-        visible.contains(target),
+        visible.contains("showversion"),
         "raw-mode typed token never surfaced without a delimiter; saw: {visible:?}"
     );
 }

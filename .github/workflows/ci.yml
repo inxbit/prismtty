@@ -28,6 +28,22 @@ jobs:
           rust-version: "1.85"
           command: check advisories licenses bans sources
 
+  msrv:
+    name: Minimum supported Rust
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # stable toolchain
+        with:
+          toolchain: 1.85.0
+      - name: Install PCRE2
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libpcre2-dev pkg-config
+      - run: cargo test --locked
+
   test:
     name: Test
     runs-on: ${{ matrix.os }}
@@ -52,11 +68,11 @@ jobs:
             sudo apt-get install -y libpcre2-dev pkg-config
           fi
       - run: cargo fmt --check
-      - run: cargo clippy --all-targets --all-features -- -D warnings
-      - run: cargo test
+      - run: cargo clippy --locked --all-targets --all-features -- -D warnings
+      - run: cargo test --locked
       - name: Verify generated completions
         run: |
-          cargo run --features completion-generation --bin gen-completions
+          cargo run --locked --features completion-generation --bin gen-completions
           git diff --exit-code completions/
       - name: Privacy scan
         run: bash scripts/privacy-scan.sh
@@ -78,4 +94,4 @@ jobs:
             echo "Generated Homebrew formula has placeholder checksums or unsupported artifacts."
             exit 1
           fi
-      - run: cargo build --release
+      - run: cargo build --locked --release

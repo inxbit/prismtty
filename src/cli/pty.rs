@@ -6,7 +6,7 @@ use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::process::ExitCode;
 use std::sync::{
     Arc, Mutex,
-    atomic::{AtomicI32, AtomicPtr, Ordering},
+    atomic::{AtomicI32, Ordering},
     mpsc::{self, SyncSender},
 };
 use std::thread;
@@ -39,17 +39,101 @@ const PROFILE_INPUT_QUEUE_CAPACITY: usize = 1024;
 /// against buffered echo. A buffered token is small (≤512 bytes), so this only
 /// needs to cover the tail of the latest input; older input is dropped.
 const RECENT_INPUT_WINDOW: usize = 4096;
-const TERMINATING_SIGNALS: [libc::c_int; 4] =
-    [libc::SIGTERM, libc::SIGHUP, libc::SIGQUIT, libc::SIGINT];
+/// Maximum incomplete control-sequence bytes retained by local echo between
+/// reads. Real keyboard CSI sequences are far smaller; the cap prevents a
+/// marker-free sequence from growing and being rescanned without bound.
+const MAX_LOCAL_ECHO_PENDING_BYTES: usize = 256;
+/// Catchable asynchronous signals whose default disposition terminates a
+/// macOS or Linux process. Rust deliberately ignores SIGPIPE, synchronous
+/// fault/core signals cannot safely return to the faulting instruction for
+/// deferred cleanup, and SIGKILL/SIGSTOP cannot be caught.
+#[cfg(not(target_os = "linux"))]
+const TERMINATING_SIGNALS: [libc::c_int; 11] = [
+    libc::SIGTERM,
+    libc::SIGHUP,
+    libc::SIGQUIT,
+    libc::SIGINT,
+    libc::SIGUSR1,
+    libc::SIGUSR2,
+    libc::SIGALRM,
+    libc::SIGVTALRM,
+    libc::SIGPROF,
+    libc::SIGXCPU,
+    libc::SIGXFSZ,
+];
+#[cfg(all(
+    target_os = "linux",
+    not(any(
+        target_arch = "mips",
+        target_arch = "mips32r6",
+        target_arch = "mips64",
+        target_arch = "mips64r6",
+        target_arch = "sparc",
+        target_arch = "sparc64"
+    ))
+))]
+const TERMINATING_SIGNALS: [libc::c_int; 14] = [
+    libc::SIGTERM,
+    libc::SIGHUP,
+    libc::SIGQUIT,
+    libc::SIGINT,
+    libc::SIGUSR1,
+    libc::SIGUSR2,
+    libc::SIGALRM,
+    libc::SIGVTALRM,
+    libc::SIGPROF,
+    libc::SIGXCPU,
+    libc::SIGXFSZ,
+    libc::SIGPWR,
+    libc::SIGSTKFLT,
+    libc::SIGIO,
+];
+#[cfg(all(
+    target_os = "linux",
+    any(
+        target_arch = "mips",
+        target_arch = "mips32r6",
+        target_arch = "mips64",
+        target_arch = "mips64r6",
+        target_arch = "sparc",
+        target_arch = "sparc64"
+    )
+))]
+const TERMINATING_SIGNALS: [libc::c_int; 13] = [
+    libc::SIGTERM,
+    libc::SIGHUP,
+    libc::SIGQUIT,
+    libc::SIGINT,
+    libc::SIGUSR1,
+    libc::SIGUSR2,
+    libc::SIGALRM,
+    libc::SIGVTALRM,
+    libc::SIGPROF,
+    libc::SIGXCPU,
+    libc::SIGXFSZ,
+    libc::SIGPWR,
+    libc::SIGIO,
+];
+const JOB_CONTROL_SIGNALS: [libc::c_int; 3] = [libc::SIGTSTP, libc::SIGTTIN, libc::SIGTTOU];
 const RAW_SIGNAL_STOP_BYTE: u8 = 0;
 const RESIZE_STOP_BYTE: u8 = b'q';
 const RESIZE_WAKE_BYTE: u8 = b'r';
 
-static RAW_MODE_FD: AtomicI32 = AtomicI32::new(-1);
-static RAW_MODE_ORIGINAL: AtomicPtr<libc::termios> = AtomicPtr::new(std::ptr::null_mut());
 static RAW_MODE_SIGNAL_WRITE_FD: AtomicI32 = AtomicI32::new(-1);
 static RESIZE_SIGNAL_WRITE_FD: AtomicI32 = AtomicI32::new(-1);
 static FORWARD_CHILD_PID: AtomicI32 = AtomicI32::new(0);
+static FORWARD_CHILD_LOCK: Mutex<()> = Mutex::new(());
+
+fn forward_child_lock() -> std::sync::MutexGuard<'static, ()> {
+    FORWARD_CHILD_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn set_forward_child_pid(pid: libc::pid_t) {
+    let _guard = forward_child_lock();
+    FORWARD_CHILD_PID.store(pid, Ordering::SeqCst);
+}
 
 /// Maps a raw process exit code to a process exit byte, clamping codes above
 /// 255 instead of truncating them (so e.g. 256 stays non-zero rather than
@@ -70,14 +154,60 @@ fn exit_code_from_wait(status: nix::sys::wait::WaitStatus) -> u8 {
     }
 }
 
-/// Reaps the wrapped child and returns its process-exit byte. Prefers a direct
-/// `waitpid` so a terminating signal becomes `128 + signal`, falling back to
-/// portable-pty's status when the pid is unavailable.
+fn wait_for_child_exit_without_reaping(pid: libc::pid_t) -> io::Result<()> {
+    loop {
+        let mut info = unsafe { std::mem::zeroed::<libc::siginfo_t>() };
+        let result = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                pid as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WNOWAIT,
+            )
+        };
+        if result == 0 {
+            return Ok(());
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
+}
+
+fn child_exit_is_waitable(pid: libc::pid_t) -> io::Result<bool> {
+    loop {
+        let mut info = unsafe { std::mem::zeroed::<libc::siginfo_t>() };
+        let result = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                pid as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WNOWAIT | libc::WNOHANG,
+            )
+        };
+        if result == 0 {
+            return Ok(unsafe { info.si_pid() } != 0);
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
+}
+
+/// Reaps the wrapped child and returns its process-exit byte. Waits without
+/// reaping first so the process-group id remains signalable while the PTY read
+/// loop is ending, then serializes the final reap with signal forwarding. This
+/// closes the otherwise orphan-prone gap between PTY EOF and child exit.
 fn reap_child(child: &mut Box<dyn portable_pty::Child + Send + Sync>) -> Result<u8, CliError> {
     if let Some(pid) = child.process_id() {
-        if let Ok(status) = nix::sys::wait::waitpid(nix::unistd::Pid::from_raw(pid as i32), None) {
-            return Ok(exit_code_from_wait(status));
-        }
+        let pid = pid as libc::pid_t;
+        wait_for_child_exit_without_reaping(pid)?;
+        let _guard = forward_child_lock();
+        let status = nix::sys::wait::waitpid(nix::unistd::Pid::from_raw(pid), None);
+        FORWARD_CHILD_PID.store(0, Ordering::SeqCst);
+        return Ok(exit_code_from_wait(status?));
     }
     let status = child.wait()?;
     Ok(exit_code_byte(status.exit_code()))
@@ -96,23 +226,59 @@ const CHILD_EXIT_GRACE: Duration = Duration::from_secs(2);
 /// child still cannot be reaped, give up; the process is exiting and init
 /// will reap the remains.
 fn terminate_and_reap_child(child: &mut Box<dyn portable_pty::Child + Send + Sync>) {
-    use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
-
     let Some(pid) = child.process_id() else {
         let _ = child.try_wait();
         return;
     };
-    let pid = pid as i32;
-    for signal in [libc::SIGHUP, libc::SIGKILL] {
-        unsafe { libc::kill(-pid, signal) };
-        let deadline = Instant::now() + CHILD_EXIT_GRACE;
-        while Instant::now() < deadline {
-            match waitpid(nix::unistd::Pid::from_raw(pid), Some(WaitPidFlag::WNOHANG)) {
-                Ok(WaitStatus::StillAlive) => thread::sleep(Duration::from_millis(20)),
-                _ => return,
+    terminate_and_reap_process_group(pid as libc::pid_t, libc::SIGHUP);
+}
+
+fn terminate_and_reap_process_group(pid: libc::pid_t, initial_signal: libc::c_int) {
+    use nix::errno::Errno;
+    use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
+
+    unsafe {
+        libc::kill(-pid, initial_signal);
+    }
+    let child_pid = nix::unistd::Pid::from_raw(pid);
+    let deadline = Instant::now() + CHILD_EXIT_GRACE;
+    while Instant::now() < deadline {
+        match child_exit_is_waitable(pid) {
+            Ok(true) => {
+                // Keep the leader waitable until the final group signal so its
+                // process-group id cannot be reused while descendants remain.
+                unsafe {
+                    libc::kill(-pid, libc::SIGKILL);
+                }
+                let _ = waitpid(child_pid, None);
+                return;
             }
+            Err(error) if error.raw_os_error() == Some(libc::ECHILD) => return,
+            Ok(false) | Err(_) => thread::sleep(Duration::from_millis(20)),
         }
     }
+
+    unsafe {
+        libc::kill(-pid, libc::SIGKILL);
+        libc::kill(pid, libc::SIGKILL);
+    }
+    let reap_deadline = Instant::now() + CHILD_EXIT_GRACE;
+    while Instant::now() < reap_deadline {
+        match waitpid(child_pid, Some(WaitPidFlag::WNOHANG)) {
+            Ok(WaitStatus::StillAlive) => thread::sleep(Duration::from_millis(20)),
+            Ok(_) | Err(Errno::ECHILD) => break,
+            Err(_) => thread::sleep(Duration::from_millis(20)),
+        }
+    }
+}
+
+/// Claims failure-path cleanup under the same lock used by signal forwarding.
+/// A signal watcher either wins the lock and owns termination, or waits until
+/// this path has reaped the child and cleared the registered pid.
+fn terminate_and_reap_registered_child(child: &mut Box<dyn portable_pty::Child + Send + Sync>) {
+    let _guard = forward_child_lock();
+    FORWARD_CHILD_PID.store(0, Ordering::SeqCst);
+    terminate_and_reap_child(child);
 }
 
 /// Passes a fallible post-spawn setup step through; on failure, terminates and
@@ -123,8 +289,7 @@ fn cleanup_child_on_err<T, E>(
     child: &mut Box<dyn portable_pty::Child + Send + Sync>,
 ) -> Result<T, E> {
     if result.is_err() {
-        terminate_and_reap_child(child);
-        FORWARD_CHILD_PID.store(0, Ordering::SeqCst);
+        terminate_and_reap_registered_child(child);
     }
     result
 }
@@ -133,6 +298,7 @@ fn cleanup_child_on_err<T, E>(
 /// so a `kill` of prismtty reaches the child instead of orphaning it. The child
 /// is a PTY session leader, so its process-group id equals its pid.
 fn forward_signal_to_child(signal: u8) {
+    let _guard = forward_child_lock();
     let pid = FORWARD_CHILD_PID.load(Ordering::SeqCst);
     if pid > 0 {
         unsafe {
@@ -141,17 +307,98 @@ fn forward_signal_to_child(signal: u8) {
     }
 }
 
-/// Runs `body`, catching a panic so it surfaces as a clear diagnostic instead
-/// of silently killing a detached worker thread (which could otherwise leave
-/// the session wedged with no error). Returns `false` if `body` panicked. When
-/// `restore_terminal` is set (the stdin forwarder), a panic also restores
-/// cooked mode so the user is not stranded in raw mode.
-fn run_supervised(name: &str, restore_terminal: bool, body: impl FnOnce()) -> bool {
-    if std::panic::catch_unwind(std::panic::AssertUnwindSafe(body)).is_ok() {
+fn process_group_exists(pid: libc::pid_t) -> bool {
+    if unsafe { libc::kill(-pid, 0) } == 0 {
         return true;
     }
-    if restore_terminal {
-        restore_raw_mode_from_signal_state();
+    io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+/// Forwards a terminating signal to the wrapped PTY process group, allows a
+/// bounded graceful exit, then kills any signal-immune descendants and reaps
+/// the process-group leader before the wrapper exits from its signal watcher.
+fn terminate_and_reap_forwarded_child(signal: libc::c_int) {
+    let _guard = forward_child_lock();
+    let pid = FORWARD_CHILD_PID.load(Ordering::SeqCst);
+    if pid <= 0 {
+        return;
+    }
+    FORWARD_CHILD_PID.store(0, Ordering::SeqCst);
+    terminate_and_reap_process_group(pid, signal);
+}
+
+fn wake_main_loop_after_input_failure() {
+    let _guard = forward_child_lock();
+    let pid = FORWARD_CHILD_PID.load(Ordering::SeqCst);
+    if pid <= 0 {
+        return;
+    }
+    unsafe {
+        libc::kill(-pid, libc::SIGHUP);
+    }
+    let deadline = Instant::now() + Duration::from_millis(100);
+    while Instant::now() < deadline && process_group_exists(pid) {
+        thread::sleep(Duration::from_millis(10));
+    }
+    if process_group_exists(pid) {
+        unsafe {
+            libc::kill(-pid, libc::SIGKILL);
+            libc::kill(pid, libc::SIGKILL);
+        }
+    }
+}
+
+fn record_input_worker_failure(
+    state: &Mutex<Option<io::Error>>,
+    error: io::Error,
+    wake_session: impl FnOnce(),
+) {
+    let mut stored = state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if stored.is_none() {
+        *stored = Some(error);
+    }
+    drop(stored);
+    wake_session();
+}
+
+fn run_input_worker(
+    state: &Mutex<Option<io::Error>>,
+    body: impl FnOnce() -> io::Result<()>,
+    wake_session: impl FnOnce(),
+) {
+    let error = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(body)) {
+        Ok(Ok(())) => return,
+        Ok(Err(error)) => error,
+        Err(_) => io::Error::other("input forwarding thread stopped unexpectedly (panic)"),
+    };
+    record_input_worker_failure(state, error, wake_session);
+}
+
+fn take_input_worker_failure(state: &Mutex<Option<io::Error>>) -> Option<io::Error> {
+    state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take()
+}
+
+fn with_terminal_restored_for_job_control(
+    restore: impl FnOnce() -> io::Result<()>,
+    suspend: impl FnOnce(),
+    reapply: impl FnOnce() -> io::Result<()>,
+) -> io::Result<()> {
+    restore()?;
+    suspend();
+    reapply()
+}
+
+/// Runs `body`, catching a panic so it surfaces as a clear diagnostic instead
+/// of silently killing a detached worker thread (which could otherwise leave
+/// the session wedged with no error). Returns `false` if `body` panicked.
+fn run_supervised(name: &str, body: impl FnOnce()) -> bool {
+    if std::panic::catch_unwind(std::panic::AssertUnwindSafe(body)).is_ok() {
+        return true;
     }
     eprintln!("prismtty: the {name} thread stopped unexpectedly (panic)");
     false
@@ -160,11 +407,10 @@ fn run_supervised(name: &str, restore_terminal: bool, body: impl FnOnce()) -> bo
 /// Spawns a worker thread whose body is run under [`run_supervised`].
 fn spawn_supervised(
     name: &'static str,
-    restore_terminal: bool,
     body: impl FnOnce() + Send + 'static,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
-        run_supervised(name, restore_terminal, body);
+        run_supervised(name, body);
     })
 }
 
@@ -185,18 +431,12 @@ pub(super) fn run_command(options: Options, command: Vec<OsString>) -> Result<Ex
         configure_child_pty(&*pair.master)?;
     }
 
+    let mut signal_mask = SessionSignalMask::block()?;
+    let mut terminal_session = TerminalSession::start(interactive)?;
     let mut child = pair.slave.spawn_command(builder)?;
     drop(pair.slave);
-    FORWARD_CHILD_PID.store(
-        child.process_id().map(|pid| pid as i32).unwrap_or(0),
-        Ordering::SeqCst,
-    );
-
-    let raw_mode = if interactive {
-        Some(cleanup_child_on_err(RawModeGuard::enable(), &mut child)?)
-    } else {
-        None
-    };
+    set_forward_child_pid(child.process_id().map(|pid| pid as i32).unwrap_or(0));
+    cleanup_child_on_err(signal_mask.restore(), &mut child)?;
 
     let trace = cleanup_child_on_err(IoTrace::open(options.trace_io.as_deref()), &mut child)?;
     let (profile_input_tx, profile_input_rx) = if dynamic_profile_enabled(&options, interactive) {
@@ -227,21 +467,29 @@ pub(super) fn run_command(options: Options, command: Vec<OsString>) -> Result<Ex
     // the in-progress line (cleared on submit/abort) and is never emitted to the
     // screen, so a non-echoed secret is never drawn even if it is briefly held.
     let recent_input = Arc::new(Mutex::new(Vec::new()));
-    if raw_mode.is_some() {
+    let input_worker_failure = Arc::new(Mutex::new(None));
+    if interactive {
         let mut writer = cleanup_child_on_err(pair.master.take_writer(), &mut child)?;
         let trace = trace.clone();
         let local_echo = options.local_echo;
         let recent_input = Arc::clone(&recent_input);
-        spawn_supervised("input forwarding", true, move || {
-            let stdin = io::stdin();
-            let mut stdin = stdin.lock();
-            let _ = forward_stdin_to_pty(
-                &mut stdin,
-                &mut writer,
-                local_echo,
-                trace,
-                profile_input_tx,
-                &recent_input,
+        let input_worker_failure = Arc::clone(&input_worker_failure);
+        thread::spawn(move || {
+            run_input_worker(
+                &input_worker_failure,
+                || {
+                    let stdin = io::stdin();
+                    let mut stdin = stdin.lock();
+                    forward_stdin_to_pty(
+                        &mut stdin,
+                        &mut writer,
+                        local_echo,
+                        trace,
+                        profile_input_tx,
+                        &recent_input,
+                    )
+                },
+                wake_main_loop_after_input_failure,
             );
         });
     }
@@ -279,15 +527,18 @@ pub(super) fn run_command(options: Options, command: Vec<OsString>) -> Result<Ex
             let mut sink = [0u8; 4096];
             while matches!(reader.read(&mut sink), Ok(n) if n > 0) {}
         });
-        terminate_and_reap_child(&mut child);
-        1
+        terminate_and_reap_registered_child(&mut child);
+        Ok(1)
     } else {
-        reap_child(&mut child)?
+        reap_child(&mut child)
     };
-    FORWARD_CHILD_PID.store(0, Ordering::SeqCst);
-    drop(raw_mode);
+    let input_worker_failure = take_input_worker_failure(&input_worker_failure);
+    terminal_session.stop();
+    if let Some(error) = input_worker_failure {
+        return Err(error.into());
+    }
     stream_result?;
-    Ok(ExitCode::from(exit))
+    Ok(ExitCode::from(exit?))
 }
 
 fn parent_terminal_is_iterm() -> bool {
@@ -484,7 +735,10 @@ impl LocalEchoState {
                 }
                 LocalEchoStep::Skip(next_idx) => idx = next_idx,
                 LocalEchoStep::Incomplete => {
-                    self.pending.extend_from_slice(&bytes[idx..]);
+                    let incomplete = &bytes[idx..];
+                    if incomplete.len() <= MAX_LOCAL_ECHO_PENDING_BYTES {
+                        self.pending.extend_from_slice(incomplete);
+                    }
                     break;
                 }
             }
@@ -530,15 +784,141 @@ fn local_echo_escape_step(input: &[u8], idx: usize) -> LocalEchoStep {
     LocalEchoStep::Skip(end + 1)
 }
 
-struct RawModeGuard {
+struct SessionSignalMask {
+    previous: libc::sigset_t,
+    active: bool,
+}
+
+impl SessionSignalMask {
+    fn block() -> io::Result<Self> {
+        let mut blocked = unsafe { mem::zeroed::<libc::sigset_t>() };
+        let mut previous = unsafe { mem::zeroed::<libc::sigset_t>() };
+        unsafe {
+            libc::sigemptyset(&mut blocked);
+            for signal in TERMINATING_SIGNALS.into_iter().chain(JOB_CONTROL_SIGNALS) {
+                libc::sigaddset(&mut blocked, signal);
+            }
+        }
+        let result = unsafe { libc::pthread_sigmask(libc::SIG_BLOCK, &blocked, &mut previous) };
+        if result != 0 {
+            return Err(io::Error::from_raw_os_error(result));
+        }
+        Ok(Self {
+            previous,
+            active: true,
+        })
+    }
+
+    fn restore(&mut self) -> io::Result<()> {
+        if !self.active {
+            return Ok(());
+        }
+        let result = unsafe {
+            libc::pthread_sigmask(libc::SIG_SETMASK, &self.previous, std::ptr::null_mut())
+        };
+        if result != 0 {
+            return Err(io::Error::from_raw_os_error(result));
+        }
+        self.active = false;
+        Ok(())
+    }
+}
+
+impl Drop for SessionSignalMask {
+    fn drop(&mut self) {
+        let _ = self.restore();
+    }
+}
+
+#[derive(Clone, Copy)]
+struct RawModeState {
     stdin_fd: RawFd,
-    original: Box<libc::termios>,
-    signal_watcher: RawSignalWatcher,
-    previous_signal_handlers: Vec<(libc::c_int, libc::sigaction)>,
+    original: libc::termios,
+    raw: libc::termios,
+}
+
+enum RawModeLifecycle {
+    Inactive,
+    Active(RawModeState),
+    Suspended(RawModeState),
+    Terminating,
+}
+
+impl RawModeLifecycle {
+    /// Applies raw attributes only while startup is still active. The caller
+    /// holds the lifecycle mutex across both this transition and `apply`, so a
+    /// terminating signal cannot restore cooked mode and then lose a race to
+    /// a late raw-mode activation.
+    fn activate_with(
+        &mut self,
+        terminal: RawModeState,
+        apply: impl FnOnce(&RawModeState) -> io::Result<()>,
+    ) -> io::Result<bool> {
+        match self {
+            Self::Inactive => {
+                apply(&terminal)?;
+                *self = Self::Active(terminal);
+                Ok(true)
+            }
+            Self::Terminating => Ok(false),
+            Self::Active(_) | Self::Suspended(_) => Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "raw terminal mode is already active",
+            )),
+        }
+    }
+
+    /// Marks termination before restoring attributes. `restore` runs while
+    /// the lifecycle mutex is held, preventing activation or job-control
+    /// reapplication from racing after cooked mode has been restored.
+    fn begin_termination_with(
+        &mut self,
+        restore: impl FnOnce(Option<&RawModeState>) -> io::Result<()>,
+    ) -> io::Result<()> {
+        match self {
+            Self::Active(terminal) => {
+                restore(Some(terminal))?;
+                *self = Self::Terminating;
+            }
+            Self::Inactive | Self::Suspended(_) | Self::Terminating => {
+                restore(None)?;
+                *self = Self::Terminating;
+            }
+        }
+        Ok(())
+    }
+
+    fn suspend_with(
+        &mut self,
+        restore: impl FnOnce(&RawModeState) -> io::Result<()>,
+    ) -> io::Result<()> {
+        if let Self::Active(terminal) = *self {
+            restore(&terminal)?;
+            *self = Self::Suspended(terminal);
+        }
+        Ok(())
+    }
+
+    fn resume_with(
+        &mut self,
+        apply: impl FnOnce(&RawModeState) -> io::Result<()>,
+    ) -> io::Result<()> {
+        if let Self::Suspended(terminal) = *self {
+            apply(&terminal)?;
+            *self = Self::Active(terminal);
+        }
+        Ok(())
+    }
+}
+
+type SharedRawModeState = Arc<Mutex<RawModeLifecycle>>;
+
+struct RawModeGuard {
+    state: SharedRawModeState,
 }
 
 impl RawModeGuard {
-    fn enable() -> Result<Self, CliError> {
+    fn enable(state: SharedRawModeState) -> Result<Self, CliError> {
         let stdin = io::stdin();
         let stdin_fd = stdin.as_fd().as_raw_fd();
         let original = terminal_attrs(stdin_fd)?;
@@ -546,46 +926,33 @@ impl RawModeGuard {
         unsafe {
             libc::cfmakeraw(&mut raw);
         }
-        set_terminal_attrs(stdin_fd, &raw)?;
-        let signal_watcher = match RawSignalWatcher::start() {
-            Ok(watcher) => watcher,
-            Err(error) => {
-                let _ = set_terminal_attrs(stdin_fd, &original);
-                return Err(error.into());
-            }
-        };
-
-        let mut guard = Self {
+        let terminal = RawModeState {
             stdin_fd,
-            original: Box::new(original),
-            signal_watcher,
-            previous_signal_handlers: Vec::new(),
+            original,
+            raw,
         };
-        guard.activate_signal_restore();
-        for signal in TERMINATING_SIGNALS {
-            let previous = install_signal_handler(signal, restore_raw_mode_for_signal, 0)?;
-            guard.previous_signal_handlers.push((signal, previous));
+        let activated = state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .activate_with(terminal, |terminal| {
+                set_terminal_attrs_retrying_eintr(terminal.stdin_fd, &terminal.raw)
+            })?;
+        if !activated {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "terminal session terminated during raw-mode startup",
+            )
+            .into());
         }
-        Ok(guard)
-    }
-
-    fn activate_signal_restore(&mut self) {
-        RAW_MODE_FD.store(self.stdin_fd, Ordering::SeqCst);
-        RAW_MODE_ORIGINAL.store(self.original.as_mut(), Ordering::SeqCst);
-    }
-
-    fn deactivate_signal_restore(&mut self) {
-        RAW_MODE_ORIGINAL.store(std::ptr::null_mut(), Ordering::SeqCst);
-        RAW_MODE_FD.store(-1, Ordering::SeqCst);
+        Ok(Self { state })
     }
 }
 
 impl Drop for RawModeGuard {
     fn drop(&mut self) {
-        let _ = set_terminal_attrs(self.stdin_fd, &self.original);
-        self.deactivate_signal_restore();
-        restore_signal_handlers(&self.previous_signal_handlers);
-        self.signal_watcher.stop();
+        if let Err(error) = terminate_raw_mode_from_signal_state(&self.state) {
+            eprintln!("prismtty: could not restore terminal during cleanup: {error}");
+        }
     }
 }
 
@@ -596,14 +963,67 @@ extern "C" fn restore_raw_mode_for_signal(signal: libc::c_int) {
     }
 }
 
-fn restore_raw_mode_from_signal_state() {
-    let fd = RAW_MODE_FD.load(Ordering::SeqCst);
-    let original = RAW_MODE_ORIGINAL.load(Ordering::SeqCst);
-    if fd >= 0 && !original.is_null() {
-        unsafe {
-            libc::tcsetattr(fd, libc::TCSANOW, original);
+fn terminate_raw_mode_from_signal_state(state: &Mutex<RawModeLifecycle>) -> io::Result<()> {
+    state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .begin_termination_with(|active| {
+            if let Some(active) = active {
+                restore_terminal_attrs(active.stdin_fd, &active.original)?;
+            }
+            Ok(())
+        })
+}
+
+fn suspend_raw_mode_from_signal_state(state: &Mutex<RawModeLifecycle>) -> io::Result<()> {
+    state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .suspend_with(|active| restore_terminal_attrs(active.stdin_fd, &active.original))
+}
+
+fn reapply_raw_mode_from_signal_state(state: &Mutex<RawModeLifecycle>) -> io::Result<()> {
+    state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .resume_with(|suspended| {
+            set_terminal_attrs_retrying_eintr(suspended.stdin_fd, &suspended.raw)
+        })
+}
+
+fn set_terminal_attrs_retrying_eintr(fd: RawFd, attrs: &libc::termios) -> io::Result<()> {
+    loop {
+        if unsafe { libc::tcsetattr(fd, libc::TCSANOW, attrs) } == 0 {
+            return Ok(());
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error);
         }
     }
+}
+
+/// Restores cooked attributes while blocking SIGTTOU in the calling thread.
+/// A background wrapper must be able to restore its terminal before stopping;
+/// otherwise `tcsetattr` recursively queues SIGTTOU and never reaches SIGSTOP.
+fn restore_terminal_attrs(fd: RawFd, attrs: &libc::termios) -> io::Result<()> {
+    let mut blocked = unsafe { mem::zeroed::<libc::sigset_t>() };
+    let mut previous = unsafe { mem::zeroed::<libc::sigset_t>() };
+    unsafe {
+        libc::sigemptyset(&mut blocked);
+        libc::sigaddset(&mut blocked, libc::SIGTTOU);
+    }
+    let block_result = unsafe { libc::pthread_sigmask(libc::SIG_BLOCK, &blocked, &mut previous) };
+    if block_result != 0 {
+        return Err(io::Error::from_raw_os_error(block_result));
+    }
+    let result = set_terminal_attrs_retrying_eintr(fd, attrs);
+    let restore_result =
+        unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, &previous, std::ptr::null_mut()) };
+    if result.is_ok() && restore_result != 0 {
+        return Err(io::Error::from_raw_os_error(restore_result));
+    }
+    result
 }
 
 fn terminal_attrs(fd: RawFd) -> io::Result<libc::termios> {
@@ -615,21 +1035,15 @@ fn terminal_attrs(fd: RawFd) -> io::Result<libc::termios> {
     }
 }
 
-fn set_terminal_attrs(fd: RawFd, attrs: &libc::termios) -> io::Result<()> {
-    if unsafe { libc::tcsetattr(fd, libc::TCSANOW, attrs) } == 0 {
-        Ok(())
-    } else {
-        Err(io::Error::last_os_error())
-    }
-}
-
-struct RawSignalWatcher {
+struct SessionSignalWatcher {
     write_fd: RawFd,
     thread: Option<thread::JoinHandle<()>>,
+    previous_signal_handlers: Vec<(libc::c_int, libc::sigaction)>,
+    raw_mode_state: SharedRawModeState,
 }
 
-impl RawSignalWatcher {
-    fn start() -> io::Result<Self> {
+impl SessionSignalWatcher {
+    fn start(raw_mode_state: SharedRawModeState) -> io::Result<Self> {
         let (read_fd, write_fd) = pipe_fds()?;
         if let Err(error) = set_fd_nonblocking(write_fd) {
             close_fd(read_fd);
@@ -637,16 +1051,37 @@ impl RawSignalWatcher {
             return Err(error);
         }
         RAW_MODE_SIGNAL_WRITE_FD.store(write_fd, Ordering::SeqCst);
-        let thread = spawn_supervised("signal handler", false, move || {
-            restore_raw_mode_on_signals(read_fd)
+        let mut previous_signal_handlers = Vec::new();
+        for signal in TERMINATING_SIGNALS.into_iter().chain(JOB_CONTROL_SIGNALS) {
+            match install_signal_handler(signal, restore_raw_mode_for_signal, libc::SA_RESTART) {
+                Ok(previous) => previous_signal_handlers.push((signal, previous)),
+                Err(error) => {
+                    restore_signal_handlers(&previous_signal_handlers);
+                    RAW_MODE_SIGNAL_WRITE_FD.store(-1, Ordering::SeqCst);
+                    close_fd(read_fd);
+                    close_fd(write_fd);
+                    return Err(error);
+                }
+            }
+        }
+        let thread_state = Arc::clone(&raw_mode_state);
+        let thread = spawn_supervised("signal handler", move || {
+            handle_session_signals(read_fd, thread_state)
         });
         Ok(Self {
             write_fd,
             thread: Some(thread),
+            previous_signal_handlers,
+            raw_mode_state,
         })
     }
 
     fn stop(&mut self) {
+        if let Err(error) = terminate_raw_mode_from_signal_state(&self.raw_mode_state) {
+            eprintln!("prismtty: could not restore terminal during cleanup: {error}");
+        }
+        restore_signal_handlers(&self.previous_signal_handlers);
+        self.previous_signal_handlers.clear();
         RAW_MODE_SIGNAL_WRITE_FD.store(-1, Ordering::SeqCst);
         if self.write_fd >= 0 {
             write_signal_byte(self.write_fd, RAW_SIGNAL_STOP_BYTE);
@@ -659,22 +1094,80 @@ impl RawSignalWatcher {
     }
 }
 
-impl Drop for RawSignalWatcher {
+impl Drop for SessionSignalWatcher {
     fn drop(&mut self) {
         self.stop();
     }
 }
 
-fn restore_raw_mode_on_signals(read_fd: RawFd) {
-    while let Some(bytes) = read_signal_bytes(read_fd) {
-        if bytes.contains(&RAW_SIGNAL_STOP_BYTE) {
-            break;
+/// Owns signal supervision and raw mode as one ordered lifecycle. The signal
+/// watcher is installed before raw mode is entered, and is always stopped and
+/// joined before the shared termios state is released.
+struct TerminalSession {
+    signal_watcher: Option<SessionSignalWatcher>,
+    raw_mode: Option<RawModeGuard>,
+}
+
+impl TerminalSession {
+    fn start(interactive: bool) -> Result<Self, CliError> {
+        let raw_mode_state = Arc::new(Mutex::new(RawModeLifecycle::Inactive));
+        let signal_watcher = SessionSignalWatcher::start(Arc::clone(&raw_mode_state))?;
+        let raw_mode = if interactive {
+            Some(RawModeGuard::enable(raw_mode_state)?)
+        } else {
+            None
+        };
+        Ok(Self {
+            signal_watcher: Some(signal_watcher),
+            raw_mode,
+        })
+    }
+
+    fn stop(&mut self) {
+        if let Some(mut signal_watcher) = self.signal_watcher.take() {
+            signal_watcher.stop();
         }
-        if let Some(signal) = bytes.into_iter().next() {
-            restore_raw_mode_from_signal_state();
-            forward_signal_to_child(signal);
-            unsafe {
-                libc::_exit(128 + libc::c_int::from(signal));
+        drop(self.raw_mode.take());
+    }
+}
+
+impl Drop for TerminalSession {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+fn handle_session_signals(read_fd: RawFd, raw_mode_state: SharedRawModeState) {
+    while let Some(bytes) = read_signal_bytes(read_fd) {
+        for signal in bytes {
+            if signal == RAW_SIGNAL_STOP_BYTE {
+                close_fd(read_fd);
+                return;
+            }
+            let signal = libc::c_int::from(signal);
+            if TERMINATING_SIGNALS.contains(&signal) {
+                if let Err(error) = terminate_raw_mode_from_signal_state(&raw_mode_state) {
+                    eprintln!("prismtty: could not restore terminal before exit: {error}");
+                }
+                terminate_and_reap_forwarded_child(signal);
+                unsafe {
+                    libc::_exit(128 + signal);
+                }
+            }
+            if JOB_CONTROL_SIGNALS.contains(&signal) {
+                if let Err(error) = with_terminal_restored_for_job_control(
+                    || suspend_raw_mode_from_signal_state(&raw_mode_state),
+                    || {
+                        forward_signal_to_child(libc::SIGSTOP as u8);
+                        unsafe {
+                            libc::kill(libc::getpid(), libc::SIGSTOP);
+                        }
+                        forward_signal_to_child(libc::SIGCONT as u8);
+                    },
+                    || reapply_raw_mode_from_signal_state(&raw_mode_state),
+                ) {
+                    eprintln!("prismtty: job-control terminal transition failed: {error}");
+                }
             }
         }
     }
@@ -738,7 +1231,7 @@ impl PtyResizeWatcher {
                 return Err(error);
             }
         };
-        let thread = spawn_supervised("resize watcher", false, move || {
+        let thread = spawn_supervised("resize watcher", move || {
             resize_pty_on_signals(master, read_fd)
         });
         Ok(Self {
@@ -883,14 +1376,18 @@ fn restore_signal_handler(signal: libc::c_int, previous: &libc::sigaction) {
 #[cfg(test)]
 mod tests {
     use std::io::Cursor;
-    use std::sync::Mutex;
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    };
 
     use nix::sys::termios::{InputFlags, LocalFlags, OutputFlags};
 
     #[test]
     fn supervised_run_catches_a_panicking_body() {
-        assert!(super::run_supervised("test-thread", false, || {}));
-        assert!(!super::run_supervised("test-thread", false, || panic!(
+        assert!(super::run_supervised("test-thread", || {}));
+        assert!(!super::run_supervised("test-thread", || panic!(
             "intentional test panic"
         )));
     }
@@ -960,6 +1457,44 @@ mod tests {
         assert!(echo.push(b"\x1b").is_empty());
         assert!(echo.push(b"[A").is_empty());
         assert_eq!(echo.push(b"show\r"), b"show\r\n");
+    }
+
+    #[test]
+    fn local_echo_state_bounds_incomplete_csi_and_recovers() {
+        let mut echo = super::LocalEchoState::default();
+        let mut incomplete = b"\x1b[".to_vec();
+        incomplete.resize(super::MAX_LOCAL_ECHO_PENDING_BYTES, b'1');
+
+        assert!(echo.push(&incomplete).is_empty());
+        assert_eq!(
+            echo.pending.len(),
+            super::MAX_LOCAL_ECHO_PENDING_BYTES,
+            "pending CSI is retained up to the documented limit"
+        );
+        assert!(echo.push(b"1").is_empty());
+        assert!(
+            echo.pending.is_empty(),
+            "the first byte beyond the limit resets the incomplete CSI"
+        );
+        assert_eq!(
+            echo.push(b"show"),
+            b"show",
+            "printable input after recovery is echoed normally"
+        );
+    }
+
+    #[test]
+    fn local_echo_state_does_not_retain_oversized_marker_free_input() {
+        let mut echo = super::LocalEchoState::default();
+        let input = vec![b'1'; super::MAX_LOCAL_ECHO_PENDING_BYTES * 8];
+        let mut csi = b"\x1b[".to_vec();
+        csi.extend_from_slice(&input);
+
+        assert!(echo.push(&csi).is_empty());
+        assert!(
+            echo.pending.len() <= super::MAX_LOCAL_ECHO_PENDING_BYTES,
+            "retained local-echo state must stay bounded"
+        );
     }
 
     #[test]
@@ -1058,13 +1593,153 @@ mod tests {
 
     #[test]
     fn raw_mode_registers_cleanup_for_catchable_termination_signals() {
-        let source = include_str!("pty.rs");
-        let runtime_source = source.split("mod tests").next().unwrap_or(source);
-
-        assert!(runtime_source.contains("restore_raw_mode_for_signal"));
-        for signal in ["SIGTERM", "SIGHUP", "SIGQUIT", "SIGINT"] {
-            assert!(runtime_source.contains(signal), "missing {signal} handler");
+        for signal in [
+            libc::SIGTERM,
+            libc::SIGHUP,
+            libc::SIGQUIT,
+            libc::SIGINT,
+            libc::SIGUSR1,
+            libc::SIGUSR2,
+            libc::SIGALRM,
+            libc::SIGVTALRM,
+            libc::SIGPROF,
+            libc::SIGXCPU,
+            libc::SIGXFSZ,
+        ] {
+            assert!(
+                super::TERMINATING_SIGNALS.contains(&signal),
+                "missing signal {signal} handler"
+            );
         }
+        #[cfg(target_os = "linux")]
+        for signal in [libc::SIGPWR, libc::SIGIO] {
+            assert!(
+                super::TERMINATING_SIGNALS.contains(&signal),
+                "missing Linux signal {signal} handler"
+            );
+        }
+        #[cfg(all(
+            target_os = "linux",
+            not(any(
+                target_arch = "mips",
+                target_arch = "mips32r6",
+                target_arch = "mips64",
+                target_arch = "mips64r6",
+                target_arch = "sparc",
+                target_arch = "sparc64"
+            ))
+        ))]
+        assert!(super::TERMINATING_SIGNALS.contains(&libc::SIGSTKFLT));
+        assert!(!super::TERMINATING_SIGNALS.contains(&libc::SIGKILL));
+        assert!(!super::TERMINATING_SIGNALS.contains(&libc::SIGSTOP));
+    }
+
+    #[test]
+    fn child_spawn_is_covered_by_blocked_signal_supervision() {
+        let source = include_str!("pty.rs");
+        let run_command = source
+            .split("pub(super) fn run_command")
+            .nth(1)
+            .expect("run_command exists")
+            .split("fn parent_terminal_is_iterm")
+            .next()
+            .expect("run_command boundary exists");
+        let blocked = run_command
+            .find("SessionSignalMask::block")
+            .expect("session signals are blocked");
+        let supervised = run_command
+            .find("TerminalSession::start")
+            .expect("signal watcher starts");
+        let spawned = run_command.find("spawn_command").expect("child is spawned");
+        let published = run_command
+            .find("set_forward_child_pid")
+            .expect("child pid is published");
+        let unblocked = run_command
+            .find("signal_mask.restore")
+            .expect("session signals are unblocked");
+
+        assert!(blocked < supervised);
+        assert!(supervised < spawned);
+        assert!(spawned < published);
+        assert!(published < unblocked);
+    }
+
+    #[test]
+    fn termination_that_wins_startup_race_cancels_raw_mode_activation() {
+        let state = Arc::new(Mutex::new(super::RawModeLifecycle::Inactive));
+        let (termination_marked_tx, termination_marked_rx) = mpsc::sync_channel(0);
+        let (finish_termination_tx, finish_termination_rx) = mpsc::sync_channel(0);
+        let termination_state = Arc::clone(&state);
+        let termination = std::thread::spawn(move || {
+            termination_state
+                .lock()
+                .unwrap()
+                .begin_termination_with(|active| {
+                    assert!(active.is_none(), "startup had not activated raw mode");
+                    termination_marked_tx.send(()).unwrap();
+                    finish_termination_rx.recv().unwrap();
+                    Ok(())
+                })
+                .unwrap();
+        });
+        termination_marked_rx.recv().unwrap();
+
+        let applied = Arc::new(AtomicBool::new(false));
+        let activation_applied = Arc::clone(&applied);
+        let activation_state = Arc::clone(&state);
+        let (activation_ready_tx, activation_ready_rx) = mpsc::sync_channel(0);
+        let activation = std::thread::spawn(move || {
+            let terminal = super::RawModeState {
+                stdin_fd: -1,
+                original: unsafe { std::mem::zeroed() },
+                raw: unsafe { std::mem::zeroed() },
+            };
+            activation_ready_tx.send(()).unwrap();
+            activation_state
+                .lock()
+                .unwrap()
+                .activate_with(terminal, |_| {
+                    activation_applied.store(true, Ordering::Release);
+                    Ok(())
+                })
+                .unwrap()
+        });
+
+        activation_ready_rx.recv().unwrap();
+        finish_termination_tx.send(()).unwrap();
+        termination.join().unwrap();
+        assert!(
+            !activation.join().unwrap(),
+            "late activation was not cancelled"
+        );
+        assert!(
+            !applied.load(Ordering::Acquire),
+            "raw termios was applied after termination began"
+        );
+    }
+
+    #[test]
+    fn failed_terminal_restore_keeps_original_state_for_cleanup_retry() {
+        let terminal = super::RawModeState {
+            stdin_fd: -1,
+            original: unsafe { std::mem::zeroed() },
+            raw: unsafe { std::mem::zeroed() },
+        };
+        let mut lifecycle = super::RawModeLifecycle::Active(terminal);
+
+        let error = lifecycle
+            .begin_termination_with(|_| Err(std::io::Error::other("injected restore failure")))
+            .expect_err("restore failure must surface");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::Other);
+        assert!(matches!(lifecycle, super::RawModeLifecycle::Active(_)));
+        lifecycle
+            .begin_termination_with(|active| {
+                assert!(active.is_some(), "retry retains the original termios state");
+                Ok(())
+            })
+            .expect("cleanup retry succeeds");
+        assert!(matches!(lifecycle, super::RawModeLifecycle::Terminating));
     }
 
     #[test]
@@ -1074,17 +1749,151 @@ mod tests {
             .split("extern \"C\" fn restore_raw_mode_for_signal")
             .nth(1)
             .expect("signal handler exists")
-            .split("fn restore_raw_mode_from_signal_state")
+            .split("fn terminate_raw_mode_from_signal_state")
             .next()
             .expect("handler ends before restore helper");
 
         assert!(
-            !handler_source.contains("restore_raw_mode_from_signal_state"),
+            !handler_source.contains("terminate_raw_mode_from_signal_state"),
             "signal handler should delegate restore work out of signal context"
         );
         assert!(
             !handler_source.contains("tcsetattr"),
             "signal handler must not call non-async-signal-safe terminal APIs"
+        );
+    }
+
+    #[test]
+    fn job_control_transition_restores_before_suspend_and_reapplies_after_resume() {
+        let events = Mutex::new(Vec::new());
+        super::with_terminal_restored_for_job_control(
+            || {
+                events.lock().unwrap().push("restore");
+                Ok(())
+            },
+            || events.lock().unwrap().push("suspend"),
+            || {
+                events.lock().unwrap().push("reapply");
+                Ok(())
+            },
+        )
+        .expect("job-control transition succeeds");
+
+        assert_eq!(
+            events.into_inner().unwrap(),
+            ["restore", "suspend", "reapply"]
+        );
+    }
+
+    #[test]
+    fn failed_job_control_restore_does_not_suspend() {
+        let suspended = AtomicBool::new(false);
+        let reapplied = AtomicBool::new(false);
+
+        let error = super::with_terminal_restored_for_job_control(
+            || Err(std::io::Error::other("injected restore failure")),
+            || suspended.store(true, Ordering::Release),
+            || {
+                reapplied.store(true, Ordering::Release);
+                Ok(())
+            },
+        )
+        .expect_err("failed restore must abort suspension");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::Other);
+        assert!(!suspended.load(Ordering::Acquire));
+        assert!(!reapplied.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn input_worker_failure_is_reported_and_wakes_the_session() {
+        struct BrokenWriter;
+        impl std::io::Write for BrokenWriter {
+            fn write(&mut self, _buffer: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "injected PTY write failure",
+                ))
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let mut input = Cursor::new(b"show version\n".to_vec());
+        let mut output = BrokenWriter;
+        let recent_input = Mutex::new(Vec::new());
+        let state = Mutex::new(None);
+        let mut woke_session = false;
+        super::run_input_worker(
+            &state,
+            || {
+                super::forward_stdin_to_pty(
+                    &mut input,
+                    &mut output,
+                    false,
+                    super::IoTrace::open(None).expect("trace disabled"),
+                    None,
+                    &recent_input,
+                )
+            },
+            || woke_session = true,
+        );
+
+        assert!(
+            woke_session,
+            "main PTY loop was not woken after worker failure"
+        );
+        assert_eq!(
+            super::take_input_worker_failure(&state)
+                .expect("main PTY loop receives the worker failure")
+                .kind(),
+            std::io::ErrorKind::BrokenPipe
+        );
+    }
+
+    #[test]
+    fn input_worker_panic_is_reported_and_wakes_the_session() {
+        let state = Mutex::new(None);
+        let mut woke_session = false;
+        super::run_input_worker(
+            &state,
+            || -> std::io::Result<()> { panic!("injected input worker panic") },
+            || woke_session = true,
+        );
+
+        assert!(
+            woke_session,
+            "main PTY loop was not woken after worker panic"
+        );
+        assert_eq!(
+            super::take_input_worker_failure(&state)
+                .expect("main PTY loop receives the worker panic")
+                .kind(),
+            std::io::ErrorKind::Other
+        );
+    }
+
+    #[test]
+    fn signal_restore_state_uses_owned_shared_storage() {
+        let source = include_str!("pty.rs");
+        let runtime_source = source.split("mod tests").next().unwrap_or(source);
+
+        assert!(
+            !runtime_source.contains("AtomicPtr"),
+            "signal restoration must not dereference raw pointers into a dropping guard"
+        );
+        let worker_source = runtime_source
+            .split("fn run_input_worker")
+            .nth(1)
+            .expect("input worker helper exists")
+            .split("fn take_input_worker_failure")
+            .next()
+            .expect("input worker helper has a boundary");
+        assert!(
+            !worker_source.contains("restore_raw_mode"),
+            "detached input workers must leave terminal restoration to the owning teardown"
         );
     }
 

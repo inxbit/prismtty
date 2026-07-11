@@ -1,9 +1,39 @@
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { existsSync, readFileSync } from 'node:fs';
+import {
+  chmodSync,
+  existsSync,
+  mkdtempSync,
+  mkdirSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs';
+import { tmpdir } from 'node:os';
 import test from 'node:test';
 
 const read = (path) => readFileSync(path, 'utf8');
+
+function workflowStepBody(workflow, stepName) {
+  const lines = workflow.split('\n');
+  const nameIndex = lines.findIndex(
+    (line) => line.trim() === `- name: ${stepName}`,
+  );
+  assert.notEqual(nameIndex, -1, `${stepName} exists`);
+  const runIndex = lines.findIndex(
+    (line, index) => index > nameIndex && line.trim() === 'run: |',
+  );
+  assert.notEqual(runIndex, -1, `${stepName} has a shell body`);
+  const body = [];
+  for (const line of lines.slice(runIndex + 1)) {
+    if (line && !line.startsWith('          ')) {
+      break;
+    }
+    body.push(line ? line.slice(10) : '');
+  }
+  return body.join('\n');
+}
 
 test('GitHub Pages site has the expected static contract', () => {
   assert.equal(existsSync('docs/index.html'), true);
@@ -75,4 +105,71 @@ test('site pages ship a strict CSP and self-hosted fonts', () => {
     `sha256-${createHash('sha256').update(s, 'utf8').digest('base64')}`;
   assert.ok(csp.includes(`'${hash(styleBlock)}'`), 'stale 404 style hash');
   assert.ok(csp.includes(`'${hash(scriptBlock)}'`), 'stale 404 script hash');
+});
+
+test('Pages production deployment is main-only and globally serialized', () => {
+  const workflow = read('.github/workflows/pages.yml');
+  const mainOnly =
+    "github.event_name != 'pull_request' && github.ref == 'refs/heads/main'";
+
+  assert.match(workflow, /workflow_dispatch:/);
+  assert.equal(workflow.split(`if: ${mainOnly}`).length - 1, 2);
+  assert.match(
+    workflow,
+    /deploy:\n[\s\S]*?concurrency:\n\s+group: pages-production\n(?:\s+#.*\n)*\s+cancel-in-progress: false/,
+  );
+  assert.doesNotMatch(workflow, /^\s+queue:/m);
+  assert.doesNotMatch(workflow, /group: pages-\$\{\{ github\.ref \}\}/);
+  assert.match(workflow, /- name: Check current Pages content/);
+  assert.match(workflow, /if: steps\.main-revision\.outputs\.current == 'true'/);
+});
+
+test('Pages freshness gate allows later non-Pages commits and skips newer docs', () => {
+  const workflow = read('.github/workflows/pages.yml');
+  const directory = mkdtempSync(`${tmpdir()}/prismtty-pages-`);
+  const fakeBin = `${directory}/bin`;
+  const output = `${directory}/step-output`;
+
+  try {
+    mkdirSync(fakeBin);
+    writeFileSync(
+      `${fakeBin}/git`,
+      `#!/usr/bin/env bash
+set -euo pipefail
+case "$1" in
+  fetch) exit 0 ;;
+  rev-parse)
+    if [[ "$2" == "refs/remotes/origin/main:docs" ]]; then
+      printf '%s\n' "$FAKE_CURRENT_DOCS_TREE"
+    else
+      printf '%s\n' "$FAKE_BUILT_DOCS_TREE"
+    fi
+    ;;
+  *) exit 2 ;;
+esac
+`,
+    );
+    chmodSync(`${fakeBin}/git`, 0o755);
+    const env = {
+      ...process.env,
+      PATH: `${fakeBin}:${process.env.PATH}`,
+      FAKE_BUILT_DOCS_TREE: 'docs-tree-a',
+      FAKE_CURRENT_DOCS_TREE: 'docs-tree-a',
+      GITHUB_OUTPUT: output,
+      GITHUB_SHA: 'older-pages-commit',
+    };
+    const body = workflowStepBody(workflow, 'Check current Pages content');
+
+    let result = spawnSync('bash', ['-c', body], { env, encoding: 'utf8' });
+    assert.equal(result.status, 0, result.stderr || result.stdout);
+    assert.match(read(output), /current=true/);
+
+    writeFileSync(output, '');
+    env.FAKE_CURRENT_DOCS_TREE = 'docs-tree-b';
+    result = spawnSync('bash', ['-c', body], { env, encoding: 'utf8' });
+    assert.equal(result.status, 0, result.stderr || result.stdout);
+    assert.match(read(output), /current=false/);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
 });

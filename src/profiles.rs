@@ -5,7 +5,9 @@
 
 use crate::config::{ConfigError, RuleSpec, parse_builtin_profile_yaml};
 use serde::{Deserialize, Deserializer, de};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::fmt;
+use thiserror::Error;
 
 const BUNDLED_PROFILES: &[(&str, &str)] = &[
     ("generic.yml", include_str!("profiles/builtin/generic.yml")),
@@ -30,6 +32,185 @@ const BUNDLED_PROFILES: &[(&str, &str)] = &[
 
 /// Default runtime priority assigned to user-loaded profiles.
 pub const USER_PROFILE_RUNTIME_PRIORITY: u16 = 100;
+
+/// Per-entry byte bound for user profile inheritance names and detection hints.
+pub(crate) const MAX_PROFILE_METADATA_ENTRY_BYTES: usize = 256;
+/// Maximum unique detection hints retained by one profile.
+pub(crate) const MAX_PROFILE_DETECTION_HINTS: usize = 32;
+/// Maximum normalized detection-hint bytes retained by one profile.
+pub(crate) const MAX_PROFILE_DETECTION_BYTES: usize = 4 * 1024;
+/// Maximum unique inheritance entries retained by one profile.
+pub(crate) const MAX_PROFILE_INHERITANCE_ENTRIES: usize = 32;
+/// Maximum normalized inheritance-name bytes retained by one profile.
+pub(crate) const MAX_PROFILE_INHERITANCE_BYTES: usize = 4 * 1024;
+/// Maximum detection hints retained across the complete profile store.
+pub(crate) const MAX_STORE_DETECTION_HINTS: usize = 512;
+/// Maximum normalized detection-hint bytes retained across the profile store.
+pub(crate) const MAX_STORE_DETECTION_BYTES: usize = 64 * 1024;
+/// Maximum inheritance edges retained across the complete profile store.
+pub(crate) const MAX_STORE_INHERITANCE_ENTRIES: usize = 512;
+/// Maximum normalized inheritance-name bytes retained across the profile store.
+pub(crate) const MAX_STORE_INHERITANCE_BYTES: usize = 64 * 1024;
+
+#[derive(Clone, Copy)]
+struct MetadataBudget {
+    metadata: &'static str,
+    count_measurement: &'static str,
+    entry_measurement: &'static str,
+    total_measurement: &'static str,
+    max_entries: usize,
+    max_entry_bytes: usize,
+    max_total_bytes: usize,
+}
+
+const DETECTION_METADATA_BUDGET: MetadataBudget = MetadataBudget {
+    metadata: "detection",
+    count_measurement: "hint count",
+    entry_measurement: "hint entry bytes",
+    total_measurement: "hint bytes",
+    max_entries: MAX_PROFILE_DETECTION_HINTS,
+    max_entry_bytes: MAX_PROFILE_METADATA_ENTRY_BYTES,
+    max_total_bytes: MAX_PROFILE_DETECTION_BYTES,
+};
+
+const INHERITANCE_METADATA_BUDGET: MetadataBudget = MetadataBudget {
+    metadata: "inheritance",
+    count_measurement: "entry count",
+    entry_measurement: "entry bytes",
+    total_measurement: "entry bytes",
+    max_entries: MAX_PROFILE_INHERITANCE_ENTRIES,
+    max_entry_bytes: MAX_PROFILE_METADATA_ENTRY_BYTES,
+    max_total_bytes: MAX_PROFILE_INHERITANCE_BYTES,
+};
+
+const UNBOUNDED_INHERITANCE_METADATA: MetadataBudget = MetadataBudget {
+    metadata: "inheritance",
+    count_measurement: "entry count",
+    entry_measurement: "entry bytes",
+    total_measurement: "entry bytes",
+    max_entries: usize::MAX,
+    max_entry_bytes: usize::MAX,
+    max_total_bytes: usize::MAX,
+};
+
+const UNBOUNDED_DETECTION_METADATA: MetadataBudget = MetadataBudget {
+    metadata: "detection",
+    count_measurement: "hint count",
+    entry_measurement: "hint entry bytes",
+    total_measurement: "hint bytes",
+    max_entries: usize::MAX,
+    max_entry_bytes: usize::MAX,
+    max_total_bytes: usize::MAX,
+};
+
+#[derive(Debug, Error)]
+#[error("{scope} {metadata} {measurement} is {actual}; limit is {limit}")]
+pub(crate) struct ProfileMetadataLimitError {
+    scope: &'static str,
+    metadata: &'static str,
+    measurement: &'static str,
+    actual: usize,
+    limit: usize,
+}
+
+/// Normalizes, de-duplicates, and bounds metadata before a parsed profile can
+/// be retained or considered by auto-detection.
+pub(crate) fn normalize_and_validate_profile_metadata(
+    inherits: Vec<String>,
+    detection: Vec<String>,
+) -> Result<(Vec<String>, Vec<String>), ProfileMetadataLimitError> {
+    Ok((
+        normalize_metadata_entries(inherits, false, INHERITANCE_METADATA_BUDGET)?,
+        normalize_metadata_entries(detection, true, DETECTION_METADATA_BUDGET)?,
+    ))
+}
+
+fn normalize_profile_metadata_unbounded(
+    inherits: Vec<String>,
+    detection: Vec<String>,
+) -> (Vec<String>, Vec<String>) {
+    let inherits = normalize_metadata_entries(inherits, false, UNBOUNDED_INHERITANCE_METADATA)
+        .expect("in-memory profile metadata cannot exceed usize limits");
+    let detection = normalize_metadata_entries(detection, true, UNBOUNDED_DETECTION_METADATA)
+        .expect("in-memory profile metadata cannot exceed usize limits");
+    (inherits, detection)
+}
+
+fn normalize_metadata_entries(
+    entries: Vec<String>,
+    ascii_case_insensitive: bool,
+    budget: MetadataBudget,
+) -> Result<Vec<String>, ProfileMetadataLimitError> {
+    let mut normalized = Vec::new();
+    let mut seen = BTreeSet::new();
+    let mut total_bytes = 0usize;
+
+    for entry in entries {
+        if entry.len() > budget.max_entry_bytes {
+            return Err(metadata_limit(
+                "profile",
+                budget.metadata,
+                budget.entry_measurement,
+                entry.len(),
+                budget.max_entry_bytes,
+            ));
+        }
+        let entry = entry.trim();
+        if entry.is_empty() {
+            continue;
+        }
+        let key = if ascii_case_insensitive {
+            entry.to_ascii_lowercase()
+        } else {
+            entry.to_string()
+        };
+        if !seen.insert(key) {
+            continue;
+        }
+
+        let next_count = normalized.len().saturating_add(1);
+        if next_count > budget.max_entries {
+            return Err(metadata_limit(
+                "profile",
+                budget.metadata,
+                budget.count_measurement,
+                next_count,
+                budget.max_entries,
+            ));
+        }
+        let next_total_bytes = total_bytes.saturating_add(entry.len());
+        if next_total_bytes > budget.max_total_bytes {
+            return Err(metadata_limit(
+                "profile",
+                budget.metadata,
+                budget.total_measurement,
+                next_total_bytes,
+                budget.max_total_bytes,
+            ));
+        }
+
+        normalized.push(entry.to_string());
+        total_bytes = next_total_bytes;
+    }
+
+    Ok(normalized)
+}
+
+fn metadata_limit(
+    scope: &'static str,
+    metadata: &'static str,
+    measurement: &'static str,
+    actual: usize,
+    limit: usize,
+) -> ProfileMetadataLimitError {
+    ProfileMetadataLimitError {
+        scope,
+        metadata,
+        measurement,
+        actual,
+        limit,
+    }
+}
 
 pub(crate) fn is_generic_profile_set(profiles: &[String]) -> bool {
     profiles.len() == 1 && profiles.first().is_some_and(|profile| profile == "generic")
@@ -211,10 +392,323 @@ pub enum PromptConfidence {
     SingleFromBaselineOrRemoteHint,
 }
 
+const DETECTION_BOUNDARY_SYMBOL: u16 = u8::MAX as u16 + 1;
+const NO_DETECTION_STATE: usize = usize::MAX;
+
+#[derive(Clone, Copy)]
+struct DetectionTransition {
+    symbol: u16,
+    target: usize,
+}
+
+#[derive(Clone, Default)]
+struct DetectionNode {
+    transitions: Vec<DetectionTransition>,
+    failure: usize,
+    output_link: usize,
+    profile_outputs: Vec<usize>,
+}
+
+#[derive(Clone)]
+struct DetectionMatcher {
+    nodes: Vec<DetectionNode>,
+    profile_count: usize,
+    profiles_with_hints: usize,
+    pattern_count: usize,
+}
+
+impl Default for DetectionMatcher {
+    fn default() -> Self {
+        Self {
+            nodes: vec![DetectionNode {
+                output_link: NO_DETECTION_STATE,
+                ..DetectionNode::default()
+            }],
+            profile_count: 0,
+            profiles_with_hints: 0,
+            pattern_count: 0,
+        }
+    }
+}
+
+impl fmt::Debug for DetectionMatcher {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DetectionMatcher")
+            .field("node_count", &self.nodes.len())
+            .field("profile_count", &self.profile_count)
+            .field("profiles_with_hints", &self.profiles_with_hints)
+            .field("pattern_count", &self.pattern_count)
+            .finish()
+    }
+}
+
+#[derive(Default)]
+struct DetectionScanMetrics {
+    bytes_examined: usize,
+    symbols_examined: usize,
+    transition_lookups: usize,
+    failure_steps: usize,
+    output_checks: usize,
+}
+
+#[cfg(test)]
+struct DetectionMatcherStructure {
+    node_count: usize,
+    edge_count: usize,
+    transition_slots: usize,
+    pattern_count: usize,
+}
+
+impl DetectionMatcher {
+    fn from_profiles(profiles: &BTreeMap<String, Profile>) -> Self {
+        let mut matcher = Self {
+            profile_count: profiles.len(),
+            ..Self::default()
+        };
+
+        for (profile_index, (name, profile)) in profiles.iter().enumerate() {
+            if name == "generic" {
+                continue;
+            }
+            let patterns_before = matcher.pattern_count;
+            for hint in &profile.detection {
+                matcher.insert_pattern(hint, profile_index);
+            }
+            if matcher.pattern_count > patterns_before {
+                matcher.profiles_with_hints += 1;
+            }
+        }
+        matcher.build_failure_links();
+        matcher
+    }
+
+    fn insert_pattern(&mut self, hint: &str, profile_index: usize) {
+        if hint.is_empty() {
+            return;
+        }
+
+        let mut state = 0usize;
+        let mut previous_word = None;
+        for byte in hint.bytes() {
+            let word = is_detection_word_byte(byte);
+            if previous_word.is_some_and(|previous| previous != word)
+                || (previous_word.is_none() && word)
+            {
+                state = self.ensure_transition(state, DETECTION_BOUNDARY_SYMBOL);
+            }
+            state = self.ensure_transition(state, u16::from(byte.to_ascii_lowercase()));
+            previous_word = Some(word);
+        }
+        if previous_word == Some(true) {
+            state = self.ensure_transition(state, DETECTION_BOUNDARY_SYMBOL);
+        }
+
+        if !self.nodes[state].profile_outputs.contains(&profile_index) {
+            self.nodes[state].profile_outputs.push(profile_index);
+            self.pattern_count += 1;
+        }
+    }
+
+    fn ensure_transition(&mut self, state: usize, symbol: u16) -> usize {
+        match self.nodes[state]
+            .transitions
+            .binary_search_by_key(&symbol, |transition| transition.symbol)
+        {
+            Ok(index) => self.nodes[state].transitions[index].target,
+            Err(index) => {
+                let target = self.nodes.len();
+                self.nodes.push(DetectionNode {
+                    output_link: NO_DETECTION_STATE,
+                    ..DetectionNode::default()
+                });
+                self.nodes[state]
+                    .transitions
+                    .insert(index, DetectionTransition { symbol, target });
+                target
+            }
+        }
+    }
+
+    fn transition(&self, state: usize, symbol: u16) -> Option<usize> {
+        self.nodes[state]
+            .transitions
+            .binary_search_by_key(&symbol, |transition| transition.symbol)
+            .ok()
+            .map(|index| self.nodes[state].transitions[index].target)
+    }
+
+    fn build_failure_links(&mut self) {
+        let mut pending = VecDeque::new();
+        let root_children = self.nodes[0]
+            .transitions
+            .iter()
+            .map(|transition| transition.target)
+            .collect::<Vec<_>>();
+        for child in root_children {
+            self.nodes[child].failure = 0;
+            self.nodes[child].output_link = NO_DETECTION_STATE;
+            pending.push_back(child);
+        }
+
+        while let Some(state) = pending.pop_front() {
+            let transitions = self.nodes[state].transitions.clone();
+            for transition in transitions {
+                let mut fallback = self.nodes[state].failure;
+                let failure = loop {
+                    if let Some(target) = self.transition(fallback, transition.symbol) {
+                        break target;
+                    }
+                    if fallback == 0 {
+                        break 0;
+                    }
+                    fallback = self.nodes[fallback].failure;
+                };
+                let output_link = if self.nodes[failure].profile_outputs.is_empty() {
+                    self.nodes[failure].output_link
+                } else {
+                    failure
+                };
+                self.nodes[transition.target].failure = failure;
+                self.nodes[transition.target].output_link = output_link;
+                pending.push_back(transition.target);
+            }
+        }
+    }
+
+    fn matching_profiles(&self, haystack: &[u8]) -> Vec<bool> {
+        self.scan_internal::<false>(haystack).0
+    }
+
+    fn scan_internal<const COUNT_OPERATIONS: bool>(
+        &self,
+        haystack: &[u8],
+    ) -> (Vec<bool>, DetectionScanMetrics) {
+        let mut matches = vec![false; self.profile_count];
+        let mut metrics = DetectionScanMetrics::default();
+        if self.profiles_with_hints == 0 {
+            return (matches, metrics);
+        }
+
+        let mut state = 0usize;
+        let mut matched_profiles = 0usize;
+        let mut previous_word = None;
+        for byte in haystack.iter().copied() {
+            if COUNT_OPERATIONS {
+                metrics.bytes_examined += 1;
+            }
+            let word = is_detection_word_byte(byte);
+            if (previous_word.is_some_and(|previous| previous != word)
+                || (previous_word.is_none() && word))
+                && self.advance_symbol::<COUNT_OPERATIONS>(
+                    DETECTION_BOUNDARY_SYMBOL,
+                    &mut state,
+                    &mut matches,
+                    &mut matched_profiles,
+                    &mut metrics,
+                )
+            {
+                return (matches, metrics);
+            }
+            if self.advance_symbol::<COUNT_OPERATIONS>(
+                u16::from(byte.to_ascii_lowercase()),
+                &mut state,
+                &mut matches,
+                &mut matched_profiles,
+                &mut metrics,
+            ) {
+                return (matches, metrics);
+            }
+            previous_word = Some(word);
+        }
+        if previous_word == Some(true) {
+            self.advance_symbol::<COUNT_OPERATIONS>(
+                DETECTION_BOUNDARY_SYMBOL,
+                &mut state,
+                &mut matches,
+                &mut matched_profiles,
+                &mut metrics,
+            );
+        }
+        (matches, metrics)
+    }
+
+    fn advance_symbol<const COUNT_OPERATIONS: bool>(
+        &self,
+        symbol: u16,
+        state: &mut usize,
+        matches: &mut [bool],
+        matched_profiles: &mut usize,
+        metrics: &mut DetectionScanMetrics,
+    ) -> bool {
+        if COUNT_OPERATIONS {
+            metrics.symbols_examined += 1;
+        }
+        loop {
+            if COUNT_OPERATIONS {
+                metrics.transition_lookups += 1;
+            }
+            if let Some(target) = self.transition(*state, symbol) {
+                *state = target;
+                break;
+            }
+            if *state == 0 {
+                break;
+            }
+            *state = self.nodes[*state].failure;
+            if COUNT_OPERATIONS {
+                metrics.failure_steps += 1;
+            }
+        }
+
+        let mut output_state = *state;
+        loop {
+            for profile_index in &self.nodes[output_state].profile_outputs {
+                if COUNT_OPERATIONS {
+                    metrics.output_checks += 1;
+                }
+                if !matches[*profile_index] {
+                    matches[*profile_index] = true;
+                    *matched_profiles += 1;
+                    if *matched_profiles == self.profiles_with_hints {
+                        return true;
+                    }
+                }
+            }
+            let next = self.nodes[output_state].output_link;
+            if next == NO_DETECTION_STATE {
+                break;
+            }
+            output_state = next;
+        }
+        false
+    }
+
+    #[cfg(test)]
+    fn scan_with_metrics(&self, haystack: &[u8]) -> (Vec<bool>, DetectionScanMetrics) {
+        self.scan_internal::<true>(haystack)
+    }
+
+    #[cfg(test)]
+    fn structure(&self) -> DetectionMatcherStructure {
+        DetectionMatcherStructure {
+            node_count: self.nodes.len(),
+            edge_count: self.nodes.iter().map(|node| node.transitions.len()).sum(),
+            transition_slots: self
+                .nodes
+                .iter()
+                .map(|node| node.transitions.capacity())
+                .sum(),
+            pattern_count: self.pattern_count,
+        }
+    }
+}
+
 /// Collection of built-in and user-registered profiles.
 #[derive(Clone, Debug, Default)]
 pub struct ProfileStore {
     profiles: BTreeMap<String, Profile>,
+    detection_matcher: DetectionMatcher,
 }
 
 impl ProfileStore {
@@ -236,6 +730,7 @@ impl ProfileStore {
             };
             store.profiles.insert(profile.name.clone(), profile);
         }
+        store.rebuild_detection_matcher();
         store
     }
 
@@ -257,8 +752,12 @@ impl ProfileStore {
         self.profiles.get(name)
     }
 
-    /// Registers a user profile, returning `true` if it shadowed an existing
-    /// (built-in or earlier user) profile of the same name.
+    /// Registers a trusted programmatic profile, returning `true` if it
+    /// shadowed an existing profile of the same name.
+    ///
+    /// CLI-loaded profile files use the fallible, resource-bounded insertion
+    /// path after parsing. This compatibility API still normalizes and
+    /// de-duplicates metadata, but does not reject an in-memory caller's data.
     pub fn insert_profile(
         &mut self,
         name: String,
@@ -266,7 +765,33 @@ impl ProfileStore {
         detection: Vec<String>,
         rules: Vec<RuleSpec>,
     ) -> bool {
-        self.profiles
+        let (inherits, detection) = normalize_profile_metadata_unbounded(inherits, detection);
+        self.insert_normalized_profile(name, inherits, detection, rules)
+    }
+
+    /// Registers a parsed user profile after enforcing complete-store metadata
+    /// budgets. Replacements are charged only for their new metadata.
+    pub(crate) fn try_insert_user_profile(
+        &mut self,
+        name: String,
+        inherits: Vec<String>,
+        detection: Vec<String>,
+        rules: Vec<RuleSpec>,
+    ) -> Result<bool, ProfileMetadataLimitError> {
+        let (inherits, detection) = normalize_and_validate_profile_metadata(inherits, detection)?;
+        self.validate_store_metadata_limits(&name, &inherits, &detection)?;
+        Ok(self.insert_normalized_profile(name, inherits, detection, rules))
+    }
+
+    fn insert_normalized_profile(
+        &mut self,
+        name: String,
+        inherits: Vec<String>,
+        detection: Vec<String>,
+        rules: Vec<RuleSpec>,
+    ) -> bool {
+        let shadowed = self
+            .profiles
             .insert(
                 name.clone(),
                 Profile {
@@ -277,7 +802,60 @@ impl ProfileStore {
                     rules,
                 },
             )
-            .is_some()
+            .is_some();
+        self.rebuild_detection_matcher();
+        shadowed
+    }
+
+    fn rebuild_detection_matcher(&mut self) {
+        self.detection_matcher = DetectionMatcher::from_profiles(&self.profiles);
+    }
+
+    fn validate_store_metadata_limits(
+        &self,
+        replaced_name: &str,
+        inherits: &[String],
+        detection: &[String],
+    ) -> Result<(), ProfileMetadataLimitError> {
+        let mut inheritance_count = inherits.len();
+        let mut inheritance_bytes = metadata_bytes(inherits);
+        let mut detection_count = detection.len();
+        let mut detection_bytes = metadata_bytes(detection);
+
+        for (name, profile) in &self.profiles {
+            if name == replaced_name {
+                continue;
+            }
+            inheritance_count = inheritance_count.saturating_add(profile.inherits.len());
+            inheritance_bytes = inheritance_bytes.saturating_add(metadata_bytes(&profile.inherits));
+            detection_count = detection_count.saturating_add(profile.detection.len());
+            detection_bytes = detection_bytes.saturating_add(metadata_bytes(&profile.detection));
+        }
+
+        validate_store_metadata_limit(
+            "detection",
+            "hint count",
+            detection_count,
+            MAX_STORE_DETECTION_HINTS,
+        )?;
+        validate_store_metadata_limit(
+            "detection",
+            "hint bytes",
+            detection_bytes,
+            MAX_STORE_DETECTION_BYTES,
+        )?;
+        validate_store_metadata_limit(
+            "inheritance",
+            "entry count",
+            inheritance_count,
+            MAX_STORE_INHERITANCE_ENTRIES,
+        )?;
+        validate_store_metadata_limit(
+            "inheritance",
+            "entry bytes",
+            inheritance_bytes,
+            MAX_STORE_INHERITANCE_BYTES,
+        )
     }
 
     /// Detects likely profiles from a startup sample, always including `generic`.
@@ -287,13 +865,16 @@ impl ProfileStore {
     }
 
     pub(crate) fn detect_profiles_with_lowercase(&self, sample: &str, lower: &str) -> Vec<String> {
+        let hint_matches = self.detection_matcher.matching_profiles(lower.as_bytes());
         let mut detected: Vec<String> = self
             .profiles
             .iter()
-            .filter(|(name, profile)| {
-                name.as_str() != "generic" && profile.matches_startup_detection(sample, lower)
+            .enumerate()
+            .filter(|(profile_index, (name, profile))| {
+                name.as_str() != "generic"
+                    && profile.matches_startup_detection(sample, hint_matches[*profile_index])
             })
-            .map(|(name, _profile)| name.clone())
+            .map(|(_profile_index, (name, _profile))| name.clone())
             .collect();
         self.sort_profiles_by_priority(&mut detected);
 
@@ -309,8 +890,62 @@ impl ProfileStore {
         loaded: &mut BTreeSet<String>,
         rules: &mut Vec<RuleSpec>,
     ) -> Result<(), ConfigError> {
-        let mut resolving = Vec::new();
-        self.append_profile_rules_inner(profile_name, loaded, &mut resolving, rules)
+        if loaded.contains(profile_name) {
+            return Ok(());
+        }
+
+        let rule_start = rules.len();
+        let loaded_before = loaded.clone();
+        let Some(profile) = self.profiles.get(profile_name) else {
+            return Err(ConfigError::UnknownProfile(profile_name.to_string()));
+        };
+        rules.extend(profile.rules.clone());
+
+        // Each frame stores the profile being resolved and the next parent to
+        // visit. A profile can appear at most once in the active path, so stack
+        // use is bounded by the registered graph instead of the process stack.
+        let mut resolving = vec![(profile_name.to_string(), 0usize)];
+        while let Some((current_name, next_parent)) = resolving.last().cloned() {
+            let current = self
+                .profiles
+                .get(&current_name)
+                .expect("only registered profiles enter the resolver stack");
+
+            if next_parent >= current.inherits.len() {
+                resolving.pop();
+                loaded.insert(current_name);
+                continue;
+            }
+
+            resolving.last_mut().expect("resolver stack is non-empty").1 += 1;
+            let parent_name = current.inherits[next_parent].clone();
+            if loaded.contains(&parent_name) {
+                continue;
+            }
+            if let Some(cycle_start) = resolving
+                .iter()
+                .position(|(resolving_name, _)| resolving_name == &parent_name)
+            {
+                let mut cycle: Vec<String> = resolving[cycle_start..]
+                    .iter()
+                    .map(|(name, _)| name.clone())
+                    .collect();
+                cycle.push(parent_name);
+                rules.truncate(rule_start);
+                *loaded = loaded_before;
+                return Err(ConfigError::CyclicProfileInheritance(cycle.join(" -> ")));
+            }
+
+            let Some(parent) = self.profiles.get(&parent_name) else {
+                rules.truncate(rule_start);
+                *loaded = loaded_before;
+                return Err(ConfigError::UnknownProfile(parent_name));
+            };
+            rules.extend(parent.rules.clone());
+            resolving.push((parent_name, 0));
+        }
+
+        Ok(())
     }
 
     pub(crate) fn top_level_profile_names<'a>(
@@ -346,68 +981,22 @@ impl ProfileStore {
         profile_name: &str,
         ancestor: &str,
     ) -> Result<bool, ConfigError> {
+        let mut pending = vec![profile_name.to_string()];
         let mut seen = BTreeSet::new();
-        self.profile_inherits_profile_inner(profile_name, ancestor, &mut seen)
-    }
-
-    fn profile_inherits_profile_inner(
-        &self,
-        profile_name: &str,
-        ancestor: &str,
-        seen: &mut BTreeSet<String>,
-    ) -> Result<bool, ConfigError> {
-        if !seen.insert(profile_name.to_string()) {
-            return Ok(false);
-        }
-        let profile = self
-            .profiles
-            .get(profile_name)
-            .ok_or_else(|| ConfigError::UnknownProfile(profile_name.to_string()))?;
-        for parent in &profile.inherits {
-            if parent == ancestor || self.profile_inherits_profile_inner(parent, ancestor, seen)? {
+        while let Some(current_name) = pending.pop() {
+            if !seen.insert(current_name.clone()) {
+                continue;
+            }
+            let profile = self
+                .profiles
+                .get(&current_name)
+                .ok_or_else(|| ConfigError::UnknownProfile(current_name.clone()))?;
+            if profile.inherits.iter().any(|parent| parent == ancestor) {
                 return Ok(true);
             }
+            pending.extend(profile.inherits.iter().rev().cloned());
         }
         Ok(false)
-    }
-
-    fn append_profile_rules_inner(
-        &self,
-        profile_name: &str,
-        loaded: &mut BTreeSet<String>,
-        resolving: &mut Vec<String>,
-        rules: &mut Vec<RuleSpec>,
-    ) -> Result<(), ConfigError> {
-        if loaded.contains(profile_name) {
-            return Ok(());
-        }
-        if let Some(cycle_start) = resolving
-            .iter()
-            .position(|resolving_name| resolving_name.as_str() == profile_name)
-        {
-            let mut cycle = resolving[cycle_start..].to_vec();
-            cycle.push(profile_name.to_string());
-            return Err(ConfigError::CyclicProfileInheritance(cycle.join(" -> ")));
-        }
-
-        let profile = self
-            .profiles
-            .get(profile_name)
-            .ok_or_else(|| ConfigError::UnknownProfile(profile_name.to_string()))?;
-
-        resolving.push(profile_name.to_string());
-        let rule_start = rules.len();
-        rules.extend(profile.rules.clone());
-        for parent in &profile.inherits {
-            if let Err(error) = self.append_profile_rules_inner(parent, loaded, resolving, rules) {
-                rules.truncate(rule_start);
-                resolving.pop();
-                return Err(error);
-            }
-        }
-        resolving.pop();
-        loaded.insert(profile.name.clone());
-        Ok(())
     }
 
     pub(crate) fn active_specific_profile<'a>(&self, profiles: &'a [String]) -> Option<&'a str> {
@@ -508,10 +1097,8 @@ impl ProfileStore {
 }
 
 impl Profile {
-    fn matches_startup_detection(&self, sample: &str, lower: &str) -> bool {
-        self.detection
-            .iter()
-            .any(|hint| lower.contains(&hint.to_ascii_lowercase()))
+    fn matches_startup_detection(&self, sample: &str, detection_hint_matched: bool) -> bool {
+        detection_hint_matched
             || self.matches_strong_signal(sample)
             || self.matches_startup_prompt(sample)
     }
@@ -537,6 +1124,34 @@ impl Profile {
     fn matches_runtime_prompt(&self, text: &str) -> bool {
         self.runtime.runtime_prompt.matches_runtime(text)
     }
+}
+
+fn metadata_bytes(entries: &[String]) -> usize {
+    entries
+        .iter()
+        .fold(0usize, |total, entry| total.saturating_add(entry.len()))
+}
+
+fn validate_store_metadata_limit(
+    metadata: &'static str,
+    measurement: &'static str,
+    actual: usize,
+    limit: usize,
+) -> Result<(), ProfileMetadataLimitError> {
+    if actual > limit {
+        return Err(metadata_limit(
+            "profile store",
+            metadata,
+            measurement,
+            actual,
+            limit,
+        ));
+    }
+    Ok(())
+}
+
+fn is_detection_word_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_'
 }
 
 impl PromptMatcherKind {
@@ -816,6 +1431,323 @@ mod tests {
     use std::fs;
     use std::path::Path;
 
+    fn fixed_length_entries(prefix: &str, count: usize, length: usize) -> Vec<String> {
+        (0..count)
+            .map(|index| {
+                let label = format!("{prefix}-{index:04}-");
+                assert!(label.len() <= length, "test label must fit entry length");
+                format!("{label}{}", "x".repeat(length - label.len()))
+            })
+            .collect()
+    }
+
+    fn reference_contains_detection_hint(haystack: &str, hint: &str) -> bool {
+        let needle = hint.as_bytes();
+        if needle.is_empty() || needle.len() > haystack.len() {
+            return false;
+        }
+
+        haystack
+            .as_bytes()
+            .windows(needle.len())
+            .enumerate()
+            .any(|(start, window)| {
+                if !window.eq_ignore_ascii_case(needle) {
+                    return false;
+                }
+                let end = start + needle.len();
+                let starts_on_boundary = !super::is_detection_word_byte(needle[0])
+                    || start == 0
+                    || !super::is_detection_word_byte(haystack.as_bytes()[start - 1]);
+                let ends_on_boundary = !super::is_detection_word_byte(needle[needle.len() - 1])
+                    || end == haystack.len()
+                    || !super::is_detection_word_byte(haystack.as_bytes()[end]);
+                starts_on_boundary && ends_on_boundary
+            })
+    }
+
+    fn reference_hint_profiles(store: &ProfileStore, sample: &str) -> Vec<String> {
+        let mut detected = store
+            .profiles
+            .iter()
+            .filter(|(name, profile)| {
+                name.as_str() != "generic"
+                    && profile
+                        .detection
+                        .iter()
+                        .any(|hint| reference_contains_detection_hint(sample, hint))
+            })
+            .map(|(name, _)| name.clone())
+            .collect::<Vec<_>>();
+        store.sort_profiles_by_priority(&mut detected);
+
+        let mut with_generic = vec!["generic".to_string()];
+        with_generic.extend(detected);
+        with_generic
+    }
+
+    fn next_generated(seed: &mut u64) -> u64 {
+        *seed = seed
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        *seed
+    }
+
+    fn generated_ascii(seed: &mut u64, max_len: usize) -> String {
+        const ALPHABET: &[u8] = b"abCDxyZ019_ -.:/";
+        let len = (next_generated(seed) as usize) % (max_len + 1);
+        (0..len)
+            .map(|_| {
+                let index = (next_generated(seed) as usize) % ALPHABET.len();
+                ALPHABET[index] as char
+            })
+            .collect()
+    }
+
+    fn generated_ascii_case(seed: &mut u64, value: &str) -> String {
+        value
+            .bytes()
+            .map(|byte| {
+                (if next_generated(seed) & 1 == 0 {
+                    byte.to_ascii_lowercase()
+                } else {
+                    byte.to_ascii_uppercase()
+                }) as char
+            })
+            .collect()
+    }
+
+    #[test]
+    fn per_profile_detection_metadata_accepts_exact_limits_and_rejects_one_over() {
+        let exact_count = fixed_length_entries("hint", super::MAX_PROFILE_DETECTION_HINTS, 16);
+        let (_, normalized) =
+            super::normalize_and_validate_profile_metadata(Vec::new(), exact_count)
+                .expect("exact detection count limit should be accepted");
+        assert_eq!(normalized.len(), super::MAX_PROFILE_DETECTION_HINTS);
+
+        let count_error = super::normalize_and_validate_profile_metadata(
+            Vec::new(),
+            fixed_length_entries("hint", super::MAX_PROFILE_DETECTION_HINTS + 1, 16),
+        )
+        .expect_err("one hint above the count limit must be rejected");
+        assert!(count_error.to_string().contains("detection hint count"));
+
+        let exact_bytes = fixed_length_entries(
+            "hint",
+            super::MAX_PROFILE_DETECTION_BYTES / super::MAX_PROFILE_METADATA_ENTRY_BYTES,
+            super::MAX_PROFILE_METADATA_ENTRY_BYTES,
+        );
+        super::normalize_and_validate_profile_metadata(Vec::new(), exact_bytes.clone())
+            .expect("exact detection byte limit should be accepted");
+
+        let mut one_byte_over = exact_bytes;
+        one_byte_over.push("z".to_string());
+        let byte_error = super::normalize_and_validate_profile_metadata(Vec::new(), one_byte_over)
+            .expect_err("one byte above the detection byte limit must be rejected");
+        assert!(byte_error.to_string().contains("detection hint bytes"));
+
+        super::normalize_and_validate_profile_metadata(
+            Vec::new(),
+            vec!["x".repeat(super::MAX_PROFILE_METADATA_ENTRY_BYTES)],
+        )
+        .expect("an exact-length detection hint should be accepted");
+        let entry_error = super::normalize_and_validate_profile_metadata(
+            Vec::new(),
+            vec!["x".repeat(super::MAX_PROFILE_METADATA_ENTRY_BYTES + 1)],
+        )
+        .expect_err("an oversized detection hint must be rejected");
+        assert!(
+            entry_error
+                .to_string()
+                .contains("detection hint entry bytes")
+        );
+    }
+
+    #[test]
+    fn per_profile_inheritance_metadata_accepts_exact_limits_and_rejects_one_over() {
+        let exact_count =
+            fixed_length_entries("parent", super::MAX_PROFILE_INHERITANCE_ENTRIES, 16);
+        let (normalized, _) =
+            super::normalize_and_validate_profile_metadata(exact_count, Vec::new())
+                .expect("exact inheritance count limit should be accepted");
+        assert_eq!(normalized.len(), super::MAX_PROFILE_INHERITANCE_ENTRIES);
+
+        let count_error = super::normalize_and_validate_profile_metadata(
+            fixed_length_entries("parent", super::MAX_PROFILE_INHERITANCE_ENTRIES + 1, 16),
+            Vec::new(),
+        )
+        .expect_err("one parent above the count limit must be rejected");
+        assert!(count_error.to_string().contains("inheritance entry count"));
+
+        let exact_bytes = fixed_length_entries(
+            "parent",
+            super::MAX_PROFILE_INHERITANCE_BYTES / super::MAX_PROFILE_METADATA_ENTRY_BYTES,
+            super::MAX_PROFILE_METADATA_ENTRY_BYTES,
+        );
+        super::normalize_and_validate_profile_metadata(exact_bytes.clone(), Vec::new())
+            .expect("exact inheritance byte limit should be accepted");
+
+        let mut one_byte_over = exact_bytes;
+        one_byte_over.push("z".to_string());
+        let byte_error = super::normalize_and_validate_profile_metadata(one_byte_over, Vec::new())
+            .expect_err("one byte above the inheritance byte limit must be rejected");
+        assert!(byte_error.to_string().contains("inheritance entry bytes"));
+
+        super::normalize_and_validate_profile_metadata(
+            vec!["x".repeat(super::MAX_PROFILE_METADATA_ENTRY_BYTES)],
+            Vec::new(),
+        )
+        .expect("an exact-length inheritance name should be accepted");
+        let entry_error = super::normalize_and_validate_profile_metadata(
+            vec!["x".repeat(super::MAX_PROFILE_METADATA_ENTRY_BYTES + 1)],
+            Vec::new(),
+        )
+        .expect_err("an oversized inheritance name must be rejected");
+        assert!(entry_error.to_string().contains("inheritance entry bytes"));
+    }
+
+    #[test]
+    fn store_detection_metadata_accepts_exact_aggregate_limits_and_replacements() {
+        let mut count_store = ProfileStore::default();
+        let profile_count = super::MAX_STORE_DETECTION_HINTS / super::MAX_PROFILE_DETECTION_HINTS;
+        for profile_index in 0..profile_count {
+            count_store
+                .try_insert_user_profile(
+                    format!("count-{profile_index}"),
+                    Vec::new(),
+                    fixed_length_entries(
+                        &format!("h{profile_index}"),
+                        super::MAX_PROFILE_DETECTION_HINTS,
+                        16,
+                    ),
+                    Vec::new(),
+                )
+                .expect("aggregate detection count up to the exact limit should be accepted");
+        }
+        assert!(
+            count_store
+                .try_insert_user_profile(
+                    "count-0".to_string(),
+                    Vec::new(),
+                    fixed_length_entries("replacement", super::MAX_PROFILE_DETECTION_HINTS, 20,),
+                    Vec::new(),
+                )
+                .expect("replacing a profile must subtract its old metadata first")
+        );
+        let count_error = count_store
+            .try_insert_user_profile(
+                "one-over".to_string(),
+                Vec::new(),
+                vec!["z".to_string()],
+                Vec::new(),
+            )
+            .expect_err("one hint above the store count limit must be rejected");
+        assert!(
+            count_error
+                .to_string()
+                .contains("store detection hint count")
+        );
+
+        let mut byte_store = ProfileStore::default();
+        let entries_per_profile =
+            super::MAX_PROFILE_DETECTION_BYTES / super::MAX_PROFILE_METADATA_ENTRY_BYTES;
+        let profile_count = super::MAX_STORE_DETECTION_BYTES / super::MAX_PROFILE_DETECTION_BYTES;
+        for profile_index in 0..profile_count {
+            byte_store
+                .try_insert_user_profile(
+                    format!("bytes-{profile_index}"),
+                    Vec::new(),
+                    fixed_length_entries(
+                        &format!("b{profile_index}"),
+                        entries_per_profile,
+                        super::MAX_PROFILE_METADATA_ENTRY_BYTES,
+                    ),
+                    Vec::new(),
+                )
+                .expect("aggregate detection bytes up to the exact limit should be accepted");
+        }
+        let byte_error = byte_store
+            .try_insert_user_profile(
+                "one-over".to_string(),
+                Vec::new(),
+                vec!["z".to_string()],
+                Vec::new(),
+            )
+            .expect_err("one byte above the store detection limit must be rejected");
+        assert!(
+            byte_error
+                .to_string()
+                .contains("store detection hint bytes")
+        );
+    }
+
+    #[test]
+    fn store_inheritance_metadata_accepts_exact_aggregate_limits() {
+        let mut count_store = ProfileStore::default();
+        let profile_count =
+            super::MAX_STORE_INHERITANCE_ENTRIES / super::MAX_PROFILE_INHERITANCE_ENTRIES;
+        for profile_index in 0..profile_count {
+            count_store
+                .try_insert_user_profile(
+                    format!("count-{profile_index}"),
+                    fixed_length_entries(
+                        &format!("p{profile_index}"),
+                        super::MAX_PROFILE_INHERITANCE_ENTRIES,
+                        16,
+                    ),
+                    Vec::new(),
+                    Vec::new(),
+                )
+                .expect("aggregate inheritance count up to the exact limit should be accepted");
+        }
+        let count_error = count_store
+            .try_insert_user_profile(
+                "one-over".to_string(),
+                vec!["z".to_string()],
+                Vec::new(),
+                Vec::new(),
+            )
+            .expect_err("one parent above the store count limit must be rejected");
+        assert!(
+            count_error
+                .to_string()
+                .contains("store inheritance entry count")
+        );
+
+        let mut byte_store = ProfileStore::default();
+        let entries_per_profile =
+            super::MAX_PROFILE_INHERITANCE_BYTES / super::MAX_PROFILE_METADATA_ENTRY_BYTES;
+        let profile_count =
+            super::MAX_STORE_INHERITANCE_BYTES / super::MAX_PROFILE_INHERITANCE_BYTES;
+        for profile_index in 0..profile_count {
+            byte_store
+                .try_insert_user_profile(
+                    format!("bytes-{profile_index}"),
+                    fixed_length_entries(
+                        &format!("p{profile_index}"),
+                        entries_per_profile,
+                        super::MAX_PROFILE_METADATA_ENTRY_BYTES,
+                    ),
+                    Vec::new(),
+                    Vec::new(),
+                )
+                .expect("aggregate inheritance bytes up to the exact limit should be accepted");
+        }
+        let byte_error = byte_store
+            .try_insert_user_profile(
+                "one-over".to_string(),
+                vec!["z".to_string()],
+                Vec::new(),
+                Vec::new(),
+            )
+            .expect_err("one byte above the store inheritance limit must be rejected");
+        assert!(
+            byte_error
+                .to_string()
+                .contains("store inheritance entry bytes")
+        );
+    }
+
     #[test]
     fn insert_profile_reports_shadowing_a_builtin() {
         let mut store = ProfileStore::builtin();
@@ -1015,6 +1947,202 @@ mod tests {
         assert!(
             !helper_source.contains("to_ascii_lowercase"),
             "case-insensitive signal helpers should avoid lowercase String allocations"
+        );
+    }
+
+    #[test]
+    fn multi_pattern_detection_matches_simple_reference_across_generated_cases() {
+        let mut store = ProfileStore::default();
+        store.insert_profile(
+            "fixed-boundaries".to_string(),
+            Vec::new(),
+            vec![
+                "junos".to_string(),
+                "-edge".to_string(),
+                "v1.".to_string(),
+                "_id".to_string(),
+                "id_".to_string(),
+                "Café".to_string(),
+            ],
+            Vec::new(),
+        );
+
+        let mut seed = 0x6a09_e667_f3bc_c909_u64;
+        for profile_index in 0..12 {
+            let hints = (0..8)
+                .map(|_| {
+                    let generated = generated_ascii(&mut seed, 20);
+                    if generated.trim().is_empty() {
+                        format!("hint-{profile_index}")
+                    } else {
+                        generated
+                    }
+                })
+                .collect();
+            store.insert_profile(
+                format!("generated-{profile_index:02}"),
+                Vec::new(),
+                hints,
+                Vec::new(),
+            );
+        }
+
+        let normalized_hints = store
+            .profiles
+            .values()
+            .flat_map(|profile| profile.detection.iter().cloned())
+            .collect::<Vec<_>>();
+        let fixed_samples = [
+            "prefix JUNOS suffix",
+            "prejunosx",
+            "router-edge",
+            "routerx-edge",
+            "release v1. ready",
+            "release v1.x",
+            "_id id_",
+            "x_idy xid_x",
+            "CAFé",
+            "CAFÉ",
+            "",
+        ];
+        for sample in fixed_samples {
+            assert_eq!(
+                store.detect_profiles(sample),
+                reference_hint_profiles(&store, sample),
+                "fixed sample mismatch for {sample:?}"
+            );
+        }
+
+        const NEIGHBORS: &[&str] = &["", "x", " ", "-", "_", "/"];
+        for case in 0..1_000 {
+            let mut sample = generated_ascii(&mut seed, 160);
+            if case % 3 == 0 {
+                let hint = &normalized_hints
+                    [(next_generated(&mut seed) as usize) % normalized_hints.len()];
+                let prefix = NEIGHBORS[(next_generated(&mut seed) as usize) % NEIGHBORS.len()];
+                let suffix = NEIGHBORS[(next_generated(&mut seed) as usize) % NEIGHBORS.len()];
+                sample.push_str(prefix);
+                sample.push_str(&generated_ascii_case(&mut seed, hint));
+                sample.push_str(suffix);
+                sample.push_str(&generated_ascii(&mut seed, 80));
+            }
+
+            assert_eq!(
+                store.detect_profiles(&sample),
+                reference_hint_profiles(&store, &sample),
+                "generated sample {case} mismatch for {sample:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn aggregate_detection_scan_has_sparse_linear_structure() {
+        let mut store = ProfileStore::default();
+        for profile_index in 0..16 {
+            let hints = (0..super::MAX_PROFILE_DETECTION_HINTS)
+                .map(|hint_index| {
+                    let index = profile_index * super::MAX_PROFILE_DETECTION_HINTS + hint_index;
+                    format!("{}z{index:03}", "a".repeat(28))
+                })
+                .collect();
+            store
+                .try_insert_user_profile(
+                    format!("profile-{profile_index:02}"),
+                    Vec::new(),
+                    hints,
+                    Vec::new(),
+                )
+                .expect("exact aggregate hint count remains valid");
+        }
+
+        let haystack = "a".repeat(64 * 1024);
+        let (matched_profiles, metrics) = store
+            .detection_matcher
+            .scan_with_metrics(haystack.as_bytes());
+        let structure = store.detection_matcher.structure();
+
+        assert!(!matched_profiles.into_iter().any(|matched| matched));
+        assert_eq!(metrics.bytes_examined, haystack.len());
+        assert!(
+            metrics.transition_lookups <= metrics.symbols_examined * 2,
+            "aggregate scan performed {} transition lookups for {} symbols",
+            metrics.transition_lookups,
+            metrics.symbols_examined
+        );
+        assert!(metrics.failure_steps <= haystack.len());
+        assert_eq!(metrics.output_checks, 0);
+        assert_eq!(structure.pattern_count, super::MAX_STORE_DETECTION_HINTS);
+        assert_eq!(structure.edge_count + 1, structure.node_count);
+        assert!(
+            structure.transition_slots <= structure.edge_count.saturating_mul(4).max(1),
+            "sparse edges retained {} slots for {} transitions",
+            structure.transition_slots,
+            structure.edge_count
+        );
+    }
+
+    #[test]
+    fn word_boundaries_prune_overlapping_output_floods() {
+        let mut store = ProfileStore::default();
+        for profile_index in 0..16 {
+            let hints = (1..=super::MAX_PROFILE_DETECTION_HINTS)
+                .map(|length| "a".repeat(length))
+                .collect();
+            store
+                .try_insert_user_profile(
+                    format!("profile-{profile_index:02}"),
+                    Vec::new(),
+                    hints,
+                    Vec::new(),
+                )
+                .expect("overlapping hints fit the aggregate metadata budget");
+        }
+
+        let haystack = "a".repeat(64 * 1024);
+        let (matched_profiles, metrics) = store
+            .detection_matcher
+            .scan_with_metrics(haystack.as_bytes());
+
+        assert!(!matched_profiles.into_iter().any(|matched| matched));
+        assert_eq!(metrics.bytes_examined, haystack.len());
+        assert!(metrics.symbols_examined <= haystack.len() + 2);
+        assert!(metrics.transition_lookups <= metrics.symbols_examined * 2);
+        assert_eq!(
+            metrics.output_checks, 0,
+            "word-internal suffixes must not become boundary-valid outputs"
+        );
+    }
+
+    #[test]
+    fn detection_matcher_rebuilds_after_insert_replace_and_clone() {
+        let mut store = ProfileStore::default();
+        store.insert_profile(
+            "router".to_string(),
+            Vec::new(),
+            vec!["first-os".to_string()],
+            Vec::new(),
+        );
+        assert_eq!(
+            store.detect_profiles("FIRST-OS ready"),
+            vec!["generic", "router"]
+        );
+
+        assert!(store.insert_profile(
+            "router".to_string(),
+            Vec::new(),
+            vec!["second-os".to_string()],
+            Vec::new(),
+        ));
+        assert_eq!(store.detect_profiles("first-os ready"), vec!["generic"]);
+        assert_eq!(
+            store.detect_profiles("SECOND-OS ready"),
+            vec!["generic", "router"]
+        );
+
+        let cloned = store.clone();
+        assert_eq!(
+            cloned.detect_profiles("second-os ready"),
+            vec!["generic", "router"]
         );
     }
 

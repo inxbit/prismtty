@@ -2,8 +2,10 @@
 
 use std::collections::BTreeMap;
 
+use crate::terminal_text::escape_untrusted;
+
 /// Terminal style attributes applied to highlighted spans.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct Style {
     /// Optional foreground color.
     pub foreground: Option<Rgb>,
@@ -24,7 +26,7 @@ pub struct Style {
 }
 
 /// RGB color value.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Rgb {
     /// Red channel.
     pub r: u8,
@@ -81,7 +83,12 @@ impl Style {
                     let color = resolve_palette_color(palette, &token[2..])?;
                     set_color(&mut style.background, color, "background")?;
                 }
-                _ => return Err(format!("unsupported style token '{token}'")),
+                _ => {
+                    return Err(format!(
+                        "unsupported style token '{}'",
+                        escape_untrusted(&token)
+                    ));
+                }
             }
         }
 
@@ -244,24 +251,25 @@ pub fn parse_palette(input: &BTreeMap<String, String>) -> Result<BTreeMap<String
     let mut palette = BTreeMap::new();
     for (name, value) in input {
         let name = name.to_ascii_lowercase();
+        let display_name = escape_untrusted(&name);
         if !is_palette_name(&name) {
             return Err(format!(
-                "palette color name '{name}' must contain only alphanumerics, dashes, and underscores"
+                "palette color name '{display_name}' must contain only alphanumerics, dashes, and underscores"
             ));
         }
         if matches!(
             name.as_str(),
             "fg" | "bg" | "blink" | "bold" | "invert" | "italic" | "strike" | "underline"
         ) {
-            return Err(format!("palette color name '{name}' is reserved"));
+            return Err(format!("palette color name '{display_name}' is reserved"));
         }
         if palette.contains_key(&name) {
-            return Err(format!("palette color '{name}' is duplicated"));
+            return Err(format!("palette color '{display_name}' is duplicated"));
         }
         let hex = value
             .trim()
             .strip_prefix('#')
-            .ok_or_else(|| format!("palette color '{name}' must be in #123abc format"))?;
+            .ok_or_else(|| format!("palette color '{display_name}' must be in #123abc format"))?;
         palette.insert(name, parse_rgb(hex)?);
     }
     Ok(palette)
@@ -279,12 +287,14 @@ fn resolve_palette_color(
     palette: Option<&BTreeMap<String, Rgb>>,
     name: &str,
 ) -> Result<Rgb, String> {
-    let palette = palette
-        .ok_or_else(|| format!("palette color '{name}' used, but no palette was specified"))?;
+    let display_name = escape_untrusted(name);
+    let palette = palette.ok_or_else(|| {
+        format!("palette color '{display_name}' used, but no palette was specified")
+    })?;
     palette
         .get(name)
         .copied()
-        .ok_or_else(|| format!("palette color '{name}' not found"))
+        .ok_or_else(|| format!("palette color '{display_name}' not found"))
 }
 
 fn is_palette_name(name: &str) -> bool {
@@ -295,11 +305,12 @@ fn is_palette_name(name: &str) -> bool {
 }
 
 fn parse_rgb(hex: &str) -> Result<Rgb, String> {
+    let display_hex = escape_untrusted(hex);
     if hex.len() != 6 {
-        return Err(format!("expected 6 hex digits in '#{hex}'"));
+        return Err(format!("expected 6 hex digits in '#{display_hex}'"));
     }
     if !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        return Err(format!("invalid hex color '#{hex}'"));
+        return Err(format!("invalid hex color '#{display_hex}'"));
     }
     let r = parse_channel(&hex[0..2])?;
     let g = parse_channel(&hex[2..4])?;
@@ -392,5 +403,20 @@ mod tests {
 
         assert!(result.is_ok(), "malformed local style should not panic");
         assert!(result.expect("parse completed").is_err());
+    }
+
+    #[test]
+    fn public_style_errors_escape_terminal_controls() {
+        let palette_error =
+            Style::parse("f.\u{1b}]0;title\u{7}").expect_err("missing palette should fail");
+        let rgb_error =
+            Style::parse("f#12\u{1b}]0;title\u{7}").expect_err("invalid RGB should fail");
+
+        for message in [palette_error, rgb_error] {
+            assert!(!message.contains('\u{1b}'), "{message:?}");
+            assert!(!message.contains('\u{7}'), "{message:?}");
+            assert!(message.contains("\\x1b"), "{message:?}");
+            assert!(message.contains("\\x07"), "{message:?}");
+        }
     }
 }

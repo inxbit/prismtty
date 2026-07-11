@@ -5,9 +5,11 @@
 
 use crate::profiles::{ProfileRuntimeMeta, ProfileStore};
 use crate::style::{Style, parse_palette};
+use crate::terminal_text::escape_untrusted;
 use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs;
+use std::fs::OpenOptions;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
@@ -83,7 +85,7 @@ pub struct PrismConfig {
 }
 
 /// One highlight rule before PCRE2 compilation.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct RuleSpec {
     /// Human-readable rule name used in errors and benchmark reports.
     pub description: String,
@@ -96,7 +98,7 @@ pub struct RuleSpec {
 }
 
 /// Capture group reference used by capture-specific styles.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum CaptureRef {
     /// Numeric capture group index, including `0` for the whole match.
     Index(usize),
@@ -105,7 +107,7 @@ pub enum CaptureRef {
 }
 
 /// Style target for a highlight rule.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum RuleStyle {
     /// Apply one style to the whole regex match.
     Whole(Style),
@@ -227,34 +229,50 @@ impl PrismConfig {
 /// cannot be slurped without limit.
 const MAX_CONFIG_FILE_BYTES: u64 = 1024 * 1024;
 
-/// Reads a config / profile file as UTF-8, rejecting anything larger than
-/// [`MAX_CONFIG_FILE_BYTES`].
-fn read_config_file(path: &Path) -> std::io::Result<String> {
+/// Largest fixture accepted by the profiles test command.
+pub(crate) const MAX_PROFILE_TEST_FILE_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Reads one bounded regular file without allowing a FIFO open to block.
+pub(crate) fn read_bounded_regular_file(
+    path: &Path,
+    max_bytes: u64,
+    kind: &str,
+) -> std::io::Result<Vec<u8>> {
     use std::io::Read as _;
-    let file = fs::File::open(path)?;
+
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_NONBLOCK)
+        .open(path)?;
     let metadata = file.metadata()?;
     if !metadata.file_type().is_file() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
-            format!("config path is not a regular file: {}", path.display()),
+            format!("{kind} path is not a regular file: {}", path.display()),
         ));
     }
     let len = metadata.len();
-    if len > MAX_CONFIG_FILE_BYTES {
+    if len > max_bytes {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            format!("config file is too large ({len} bytes; limit {MAX_CONFIG_FILE_BYTES})"),
+            format!("{kind} file is too large ({len} bytes; limit {max_bytes})"),
         ));
     }
-    let mut input = Vec::new();
-    file.take(MAX_CONFIG_FILE_BYTES + 1)
-        .read_to_end(&mut input)?;
-    if input.len() as u64 > MAX_CONFIG_FILE_BYTES {
+    let mut input = Vec::with_capacity(len as usize);
+    file.take(max_bytes + 1).read_to_end(&mut input)?;
+    if input.len() as u64 > max_bytes {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            format!("config file is too large (more than {MAX_CONFIG_FILE_BYTES} bytes)"),
+            format!("{kind} file is too large (more than {max_bytes} bytes)"),
         ));
     }
+    Ok(input)
+}
+
+/// Reads a config / profile file as UTF-8, rejecting anything larger than
+/// [`MAX_CONFIG_FILE_BYTES`].
+fn read_config_file(path: &Path) -> std::io::Result<String> {
+    let input = read_bounded_regular_file(path, MAX_CONFIG_FILE_BYTES, "config")?;
     String::from_utf8(input)
         .map_err(|source| std::io::Error::new(std::io::ErrorKind::InvalidData, source))
 }
@@ -262,15 +280,38 @@ fn read_config_file(path: &Path) -> std::io::Result<String> {
 /// Loads and validates a native PrismTTY profile YAML file from disk.
 pub fn load_profile_file(path: impl AsRef<Path>) -> Result<LoadedProfileFile, ConfigError> {
     let path = path.as_ref();
-    let input = read_config_file(path).map_err(|source| ConfigError::Read {
+    let input = read_profile_file_contents(path)?;
+    parse_profile_file_contents(path, &input)
+}
+
+/// Reads one user profile through the same bounded regular-file path used by
+/// [`load_profile_file`]. Directory loaders can retain this exact snapshot,
+/// enforce an aggregate byte budget, and only then parse it without reopening
+/// a path that may have changed in between.
+pub(crate) fn read_profile_file_contents(path: &Path) -> Result<String, ConfigError> {
+    read_config_file(path).map_err(|source| ConfigError::Read {
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
+/// Parses a previously read user-profile snapshot while preserving the file
+/// path in YAML diagnostics.
+pub(crate) fn parse_profile_file_contents(
+    path: &Path,
+    input: &str,
+) -> Result<LoadedProfileFile, ConfigError> {
+    let doc: RulesDoc = serde_norway::from_str(input).map_err(|source| ConfigError::YamlFile {
         path: path.to_path_buf(),
         source,
     })?;
-    let doc: RulesDoc = serde_norway::from_str(&input).map_err(|source| ConfigError::YamlFile {
-        path: path.to_path_buf(),
-        source,
-    })?;
-    profile_file_from_doc(doc, ProfileYamlMode::User)
+    match profile_file_from_doc(doc, ProfileYamlMode::User) {
+        Err(ConfigError::Yaml(source)) => Err(ConfigError::YamlFile {
+            path: path.to_path_buf(),
+            source,
+        }),
+        result => result,
+    }
 }
 
 /// Parses native PrismTTY profile YAML from a string.
@@ -327,6 +368,15 @@ fn profile_file_from_doc(
     if meta.name.trim().is_empty() {
         return Err(ConfigError::MissingProfileName);
     }
+    let (inherits, detection) =
+        crate::profiles::normalize_and_validate_profile_metadata(meta.inherits, meta.detection)
+            .map_err(|error| {
+                ConfigError::Yaml(<serde_norway::Error as serde::de::Error>::custom(
+                    error.to_string(),
+                ))
+            })?;
+    meta.inherits = inherits;
+    meta.detection = detection;
     let runtime = meta.runtime.take();
     match mode {
         ProfileYamlMode::User if runtime.is_some() => {
@@ -385,7 +435,7 @@ fn parse_color_doc(
             for (group, spec) in captures {
                 let group = parse_capture_ref(description, group)?;
                 let spec = spec.as_str().ok_or_else(|| ConfigError::InvalidStyle {
-                    description: description.to_string(),
+                    description: escape_untrusted(description),
                     message: "capture color must be a string".to_string(),
                 })?;
                 parsed.insert(group, parse_style(description, spec, palette)?);
@@ -393,7 +443,7 @@ fn parse_color_doc(
             Ok(RuleStyle::Captures(parsed))
         }
         _ => Err(ConfigError::InvalidStyle {
-            description: description.to_string(),
+            description: escape_untrusted(description),
             message: "color must be a string or capture-group mapping".to_string(),
         }),
     }
@@ -407,16 +457,16 @@ fn parse_capture_ref(
         serde_norway::Value::Number(number) => {
             let Some(group) = number.as_u64() else {
                 return Err(ConfigError::InvalidCaptureKey {
-                    description: description.to_string(),
-                    key: number.to_string(),
+                    description: escape_untrusted(description),
+                    key: escape_untrusted(&number.to_string()),
                 });
             };
             Ok(CaptureRef::Index(group as usize))
         }
         serde_norway::Value::String(name) => parse_capture_ref_string(description, name),
         other => Err(ConfigError::InvalidCaptureKey {
-            description: description.to_string(),
-            key: format!("{other:?}"),
+            description: escape_untrusted(description),
+            key: escape_untrusted(&format!("{other:?}")),
         }),
     }
 }
@@ -425,8 +475,8 @@ fn parse_capture_ref_string(description: &str, name: String) -> Result<CaptureRe
     if name.bytes().all(|byte| byte.is_ascii_digit()) {
         return name.parse::<usize>().map(CaptureRef::Index).map_err(|_| {
             ConfigError::InvalidCaptureKey {
-                description: description.to_string(),
-                key: name,
+                description: escape_untrusted(description),
+                key: escape_untrusted(&name),
             }
         });
     }
@@ -435,8 +485,8 @@ fn parse_capture_ref_string(description: &str, name: String) -> Result<CaptureRe
         Ok(CaptureRef::Name(name))
     } else {
         Err(ConfigError::InvalidCaptureKey {
-            description: description.to_string(),
-            key: name,
+            description: escape_untrusted(description),
+            key: escape_untrusted(&name),
         })
     }
 }
@@ -457,8 +507,8 @@ fn parse_style(
 ) -> Result<Style, ConfigError> {
     let palette = (!palette.is_empty()).then_some(palette);
     Style::parse_with_palette(spec, palette).map_err(|message| ConfigError::InvalidStyle {
-        description: description.to_string(),
-        message,
+        description: escape_untrusted(description),
+        message: escape_untrusted(&message),
     })
 }
 
@@ -501,6 +551,32 @@ mod tests {
     }
 
     #[test]
+    fn read_config_file_rejects_fifo_without_waiting_for_a_writer() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        use std::time::{Duration, Instant};
+
+        let dir = tempfile::tempdir().expect("tempdir creates");
+        let fifo = dir.path().join("config.fifo");
+        let path = CString::new(fifo.as_os_str().as_bytes()).expect("path has no NUL");
+        // SAFETY: path is a valid NUL-terminated string owned for the duration
+        // of this call and the mode contains only ordinary permission bits.
+        let result = unsafe { nix::libc::mkfifo(path.as_ptr(), 0o600) };
+        assert_eq!(
+            result,
+            0,
+            "mkfifo failed: {}",
+            std::io::Error::last_os_error()
+        );
+
+        let started = Instant::now();
+        let error = super::read_config_file(&fifo).expect_err("FIFO must be rejected");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
     fn user_profile_runtime_is_reserved() {
         let yaml = r#"
 profile:
@@ -516,6 +592,47 @@ rules: []
         let err = parse_profile_yaml(yaml).expect_err("user profile.runtime must be rejected");
 
         assert_eq!(err.to_string(), RESERVED_PROFILE_RUNTIME_MESSAGE);
+    }
+
+    #[test]
+    fn profile_metadata_is_normalized_and_deduplicated() {
+        let yaml = r#"
+profile:
+  name: custom-router
+  inherits: [" generic ", generic, "base", "base ", ""]
+  detection: [" JUNOS ", junos, "jUnOs", " IOS ", ""]
+rules: []
+"#;
+
+        let loaded = parse_profile_yaml(yaml).expect("bounded profile metadata should parse");
+
+        assert_eq!(loaded.meta.inherits, ["generic", "base"]);
+        assert_eq!(loaded.meta.detection, ["JUNOS", "IOS"]);
+    }
+
+    #[test]
+    fn profile_parser_rejects_metadata_one_over_the_limit_with_safe_diagnostics() {
+        let mut yaml =
+            String::from("profile:\n  name: \"bad\\u001b]0;title\\u0007\"\n  detection:\n");
+        for index in 0..=crate::profiles::MAX_PROFILE_DETECTION_HINTS {
+            yaml.push_str(&format!("    - hint-{index}\n"));
+        }
+        yaml.push_str("rules: []\n");
+
+        let message = parse_profile_yaml(&yaml)
+            .expect_err("one unique hint above the limit must fail during parsing")
+            .to_string();
+
+        assert_eq!(
+            message,
+            format!(
+                "failed to parse YAML: profile detection hint count is {}; limit is {}",
+                crate::profiles::MAX_PROFILE_DETECTION_HINTS + 1,
+                crate::profiles::MAX_PROFILE_DETECTION_HINTS
+            )
+        );
+        assert!(!message.contains('\u{1b}'), "{message:?}");
+        assert!(!message.contains('\u{7}'), "{message:?}");
     }
 
     #[test]
@@ -579,5 +696,25 @@ rules:
             err.to_string(),
             "rule 'named capture' has invalid capture key: bad-name"
         );
+    }
+
+    #[test]
+    fn config_diagnostics_escape_untrusted_terminal_metadata() {
+        let yaml = r#"
+rules:
+  - description: "bad\u001b]0;title\u0007"
+    regex: '(?P<name>\w+)'
+    color:
+      "bad\u001b[31m": f#ffffff
+"#;
+
+        let message = PrismConfig::from_chromaterm_yaml(yaml)
+            .expect_err("invalid capture name should fail")
+            .to_string();
+
+        assert!(!message.contains('\u{1b}'), "{message:?}");
+        assert!(!message.contains('\u{7}'), "{message:?}");
+        assert!(message.contains("\\x1b"), "{message:?}");
+        assert!(message.contains("\\x07"), "{message:?}");
     }
 }

@@ -3,24 +3,36 @@ use std::path::{Path, PathBuf};
 
 use directories::BaseDirs;
 
-use crate::config::{PrismConfig, load_profile_file};
-use crate::highlight::{Highlighter, strip_ansi};
+use crate::config::{PrismConfig, parse_profile_file_contents, read_profile_file_contents};
+use crate::highlight::{Highlighter, RuleIdentityRegistry, strip_ansi};
 use crate::profiles::{ProfileStore, is_generic_profile_set};
 use crate::style::ColorMode;
+use crate::terminal_text::escape_untrusted;
 
 use super::CliError;
 use super::args::Options;
+
+/// User profile directories are configuration inputs, not bulk data stores.
+/// Bound both directory fan-out and aggregate bytes before parsing any file so
+/// startup and dynamic detection cannot be made to retain an unbounded profile
+/// graph from a hostile or accidentally populated profiles.d directory.
+const MAX_PROFILES_D_FILES: usize = 128;
+const MAX_PROFILES_D_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_PROFILES_D_ENTRIES: usize = 1024;
 
 pub(super) fn build_highlighter_for_profiles_with_store(
     options: &Options,
     store: &ProfileStore,
     profile_names: &[String],
     interactive: bool,
+    overlay_config: &PrismConfig,
+    rule_identities: &mut RuleIdentityRegistry,
 ) -> Result<Highlighter, CliError> {
-    let config = build_config_for_profiles_with_store(options, store, profile_names)?;
-    Ok(Highlighter::from_config_with_color_mode(
+    let config = build_config_for_profiles_with_store(store, profile_names, overlay_config)?;
+    Ok(Highlighter::from_config_with_color_mode_and_identities(
         config,
         color_mode(options, interactive),
+        rule_identities,
     )?)
 }
 
@@ -63,13 +75,16 @@ pub(super) fn select_profile_names_with_store(
 }
 
 pub(super) fn build_config_for_profiles_with_store(
-    options: &Options,
     store: &ProfileStore,
     profile_names: &[String],
+    overlay_config: &PrismConfig,
 ) -> Result<PrismConfig, CliError> {
     let profile_refs: Vec<&str> = profile_names.iter().map(String::as_str).collect();
-    let mut config = PrismConfig::from_profiles(store, &profile_refs)?;
+    Ok(PrismConfig::from_profiles(store, &profile_refs)?.merge(overlay_config.clone()))
+}
 
+pub(super) fn load_overlay_config(options: &Options) -> Result<PrismConfig, CliError> {
+    let mut config = PrismConfig::default();
     if let Some(path) = &options.config {
         config = config.merge(PrismConfig::from_chromaterm_file(path)?);
     } else {
@@ -132,10 +147,12 @@ impl ProfileReporter {
             return None;
         }
         self.last_reported = Some(profile_names.to_vec());
-        Some(format!(
-            "prismtty: profiles selected: {}",
-            profile_names.join(", ")
-        ))
+        let display_names = profile_names
+            .iter()
+            .map(|name| escape_untrusted(name))
+            .collect::<Vec<_>>()
+            .join(", ");
+        Some(format!("prismtty: profiles selected: {}", display_names))
     }
 }
 
@@ -143,13 +160,16 @@ pub(super) fn profile_store() -> Result<ProfileStore, CliError> {
     let mut store = ProfileStore::builtin();
     for loaded in load_profiles_d()? {
         let name = loaded.meta.name.clone();
-        let shadowed = store.insert_profile(
-            loaded.meta.name,
-            loaded.meta.inherits,
-            loaded.meta.detection,
-            loaded.rules,
-        );
+        let shadowed = store
+            .try_insert_user_profile(
+                loaded.meta.name,
+                loaded.meta.inherits,
+                loaded.meta.detection,
+                loaded.rules,
+            )
+            .map_err(|error| CliError::Usage(error.to_string()))?;
         if shadowed {
+            let name = escape_untrusted(&name);
             eprintln!(
                 "prismtty: user profile '{name}' from profiles.d overrides the built-in profile of the same name"
             );
@@ -192,34 +212,74 @@ fn load_profiles_d_from_config_dir(
     }
 
     let mut entries = Vec::new();
+    let mut directory_entry_count = 0_usize;
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
+        directory_entry_count = directory_entry_count.saturating_add(1);
+        enforce_profiles_d_entry_budget(directory_entry_count)?;
         let path = entry.path();
         // `fs::metadata` follows symlinks (unlike `DirEntry::file_type`) so
         // symlinked profiles install by dotfile managers are discovered; a
         // broken symlink is skipped like any other non-file entry.
-        let is_file = fs::metadata(&path)
-            .map(|metadata| metadata.is_file())
-            .unwrap_or(false);
-        if is_file && is_yaml(&path) {
+        let Ok(metadata) = fs::metadata(&path) else {
+            continue;
+        };
+        if metadata.is_file() && is_yaml(&path) {
+            enforce_profiles_d_budget(entries.len() + 1, 0)?;
             entries.push(path);
         }
     }
     entries.sort();
 
+    // Read each path exactly once, retain that bounded snapshot, and enforce
+    // the aggregate against bytes actually read before parsing any YAML. This
+    // prevents a symlink target or regular file from growing/swapping between
+    // a metadata pass and a later reopen.
+    let mut sources = Vec::with_capacity(entries.len());
+    let mut aggregate_bytes = 0_u64;
     for path in entries {
-        let loaded = load_profile_file(path)?;
+        let input = read_profile_file_contents(&path)?;
+        aggregate_bytes = aggregate_bytes.saturating_add(input.len() as u64);
+        enforce_profiles_d_budget(sources.len() + 1, aggregate_bytes)?;
+        sources.push((path, input));
+    }
+
+    for (path, input) in sources {
+        let loaded = parse_profile_file_contents(&path, &input)?;
         profiles.push(loaded);
     }
 
     Ok(profiles)
 }
 
+fn enforce_profiles_d_budget(file_count: usize, aggregate_bytes: u64) -> Result<(), CliError> {
+    if file_count > MAX_PROFILES_D_FILES {
+        return Err(CliError::Usage(format!(
+            "profiles.d contains {file_count} profile files; limit is {MAX_PROFILES_D_FILES}"
+        )));
+    }
+    if aggregate_bytes > MAX_PROFILES_D_BYTES {
+        return Err(CliError::Usage(format!(
+            "profiles.d aggregate size is {aggregate_bytes} bytes; limit is {MAX_PROFILES_D_BYTES} bytes"
+        )));
+    }
+    Ok(())
+}
+
+fn enforce_profiles_d_entry_budget(entry_count: usize) -> Result<(), CliError> {
+    if entry_count > MAX_PROFILES_D_ENTRIES {
+        return Err(CliError::Usage(format!(
+            "profiles.d contains more than {MAX_PROFILES_D_ENTRIES} directory entries"
+        )));
+    }
+    Ok(())
+}
+
 fn config_base_dir() -> Option<PathBuf> {
-    if let Some(path) = std::env::var_os("XDG_CONFIG_HOME")
-        && !path.is_empty()
-    {
-        return Some(PathBuf::from(path));
+    if let Some(path) = std::env::var_os("XDG_CONFIG_HOME") {
+        if !path.is_empty() {
+            return Some(PathBuf::from(path));
+        }
     }
     BaseDirs::new().map(|base_dirs| base_dirs.home_dir().join(".config"))
 }
@@ -234,6 +294,77 @@ fn is_yaml(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use std::fs;
+
+    #[test]
+    fn profiles_d_budget_accepts_exact_limits() {
+        assert!(
+            super::enforce_profiles_d_budget(
+                super::MAX_PROFILES_D_FILES,
+                super::MAX_PROFILES_D_BYTES,
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn profiles_d_budget_rejects_excess_files_or_bytes() {
+        let too_many = super::enforce_profiles_d_budget(
+            super::MAX_PROFILES_D_FILES + 1,
+            super::MAX_PROFILES_D_BYTES,
+        )
+        .expect_err("one extra profile file must be rejected")
+        .to_string();
+        assert!(too_many.contains("profile files"), "{too_many}");
+
+        let too_large = super::enforce_profiles_d_budget(
+            super::MAX_PROFILES_D_FILES,
+            super::MAX_PROFILES_D_BYTES + 1,
+        )
+        .expect_err("one extra aggregate byte must be rejected")
+        .to_string();
+        assert!(too_large.contains("aggregate size"), "{too_large}");
+    }
+
+    #[test]
+    fn profiles_d_directory_entry_budget_has_an_exact_boundary() {
+        assert!(super::enforce_profiles_d_entry_budget(super::MAX_PROFILES_D_ENTRIES).is_ok());
+        let error = super::enforce_profiles_d_entry_budget(super::MAX_PROFILES_D_ENTRIES + 1)
+            .expect_err("one extra directory entry must be rejected")
+            .to_string();
+        assert!(error.contains("directory entries"), "{error}");
+    }
+
+    #[test]
+    fn load_profiles_d_rejects_excess_files_before_parsing() {
+        let temp = tempfile::tempdir().expect("tempdir creates");
+        let profiles_dir = temp.path().join("prismtty").join("profiles.d");
+        fs::create_dir_all(&profiles_dir).expect("profiles.d creates");
+        for index in 0..=super::MAX_PROFILES_D_FILES {
+            fs::write(profiles_dir.join(format!("{index:03}.yaml")), b"")
+                .expect("empty profile placeholder writes");
+        }
+
+        let error = super::load_profiles_d_from_config_dir(temp.path())
+            .expect_err("directory fan-out must be rejected before YAML parsing")
+            .to_string();
+        assert!(error.contains("profile files"), "{error}");
+    }
+
+    #[test]
+    fn load_profiles_d_stops_enumerating_excess_non_profile_entries() {
+        let temp = tempfile::tempdir().expect("tempdir creates");
+        let profiles_dir = temp.path().join("prismtty").join("profiles.d");
+        fs::create_dir_all(&profiles_dir).expect("profiles.d creates");
+        for index in 0..=super::MAX_PROFILES_D_ENTRIES {
+            fs::write(profiles_dir.join(format!("backup-{index:04}.txt")), b"")
+                .expect("non-profile placeholder writes");
+        }
+
+        let error = super::load_profiles_d_from_config_dir(temp.path())
+            .expect_err("directory traversal fan-out must be bounded")
+            .to_string();
+        assert!(error.contains("directory entries"), "{error}");
+    }
 
     #[test]
     fn interactive_color_mode_keeps_truecolor_when_terminal_supports_it() {
@@ -265,6 +396,19 @@ mod tests {
         assert_eq!(
             reporter.message_for(&["generic".to_string(), "cisco".to_string()]),
             Some("prismtty: profiles selected: generic, cisco".to_string())
+        );
+    }
+
+    #[test]
+    fn profile_reporter_escapes_untrusted_profile_names() {
+        let mut reporter = super::ProfileReporter::new(true, false);
+        let message = reporter
+            .message_for(&["router\u{1b}]0;title\u{7}".to_string()])
+            .expect("forced profile is reported");
+
+        assert_eq!(
+            message,
+            "prismtty: profiles selected: router\\x1b]0;title\\x07"
         );
     }
 

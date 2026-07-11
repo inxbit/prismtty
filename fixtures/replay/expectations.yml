@@ -107,6 +107,7 @@ fixtures:
         foreground: "#0099ff"
       - text: "ptvi-1"
         foreground: "#0099ff"
+        bold: false
       - text: "Established"
         foreground: "#4da6ff"
         bold: true
