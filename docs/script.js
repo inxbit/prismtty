@@ -303,38 +303,154 @@
     tablist.removeAttribute('hidden');
   }
 
-  /* ---- copy buttons ---- */
-  function initCopy() {
-    document.querySelectorAll('[data-copy]').forEach((btn) => {
-      const original = btn.textContent;
-      btn.addEventListener('click', async () => {
-        try {
-          await navigator.clipboard.writeText(btn.dataset.copy);
-          btn.textContent = 'Copied ✓';
-        } catch {
-          btn.textContent = 'Select all';
+  /* ---- mobile navigation ---- */
+  function initMobileMenu() {
+    const header = document.querySelector('[data-site-header]');
+    const trigger = header?.querySelector('[data-menu-trigger]');
+    const nav = header?.querySelector('[data-site-nav]');
+    const label = trigger?.querySelector('.sr-only');
+    const links = nav ? [...nav.querySelectorAll('a')] : [];
+    if (!trigger || !nav || !label || !links.length) return;
+
+    const close = (restoreFocus = false) => {
+      trigger.setAttribute('aria-expanded', 'false');
+      label.textContent = 'Open navigation';
+      document.body.classList.remove('menu-open');
+      if (restoreFocus) trigger.focus();
+    };
+    const open = () => {
+      trigger.setAttribute('aria-expanded', 'true');
+      label.textContent = 'Close navigation';
+      document.body.classList.add('menu-open');
+      links[0].focus();
+    };
+
+    trigger.addEventListener('click', () => {
+      if (trigger.getAttribute('aria-expanded') === 'true') close(true);
+      else open();
+    });
+    document.addEventListener('keydown', (event) => {
+      const openNow = trigger.getAttribute('aria-expanded') === 'true';
+      if (event.key === 'Escape' && openNow) {
+        close(true);
+        return;
+      }
+      if (event.key !== 'Tab' || !openNow) return;
+      const focusable = [trigger, ...links];
+      const currentIndex = focusable.indexOf(document.activeElement);
+      if (event.shiftKey && currentIndex <= 0) {
+        event.preventDefault();
+        focusable[focusable.length - 1].focus();
+      } else if (!event.shiftKey && currentIndex === focusable.length - 1) {
+        event.preventDefault();
+        focusable[0].focus();
+      }
+    });
+    links.forEach((link) => {
+      link.addEventListener('click', () => {
+        const href = link.getAttribute('href');
+        const destination = href?.startsWith('#') ? document.querySelector(href) : null;
+        if (destination) {
+          const hadTabindex = destination.hasAttribute('tabindex');
+          if (!hadTabindex) destination.setAttribute('tabindex', '-1');
+          destination.focus({ preventScroll: true });
+          if (!hadTabindex) {
+            destination.addEventListener('blur', () => destination.removeAttribute('tabindex'), { once: true });
+          }
         }
-        btn.classList.add('copied');
-        setTimeout(() => {
-          btn.textContent = original;
-          btn.classList.remove('copied');
-        }, 1600);
+        close();
       });
     });
+    const desktopQuery = window.matchMedia('(min-width: 768px)');
+    const handleViewportChange = (event) => {
+      if (event.matches) close();
+    };
+    if ('addEventListener' in desktopQuery) desktopQuery.addEventListener('change', handleViewportChange);
+    else desktopQuery.addListener(handleViewportChange);
+
+    close();
+    document.body.classList.add('mobile-nav-ready');
+    trigger.removeAttribute('hidden');
   }
 
-  /* ---- cursor spotlight on panels ---- */
-  function initSpotlight() {
-    if (reduceMotion || window.matchMedia('(hover: none)').matches) return;
-    const panels = document.querySelectorAll('.install-card');
-    panels.forEach((el) => {
-      el.classList.add('spot');
-      el.addEventListener('pointermove', (e) => {
-        const r = el.getBoundingClientRect();
-        el.style.setProperty('--mx', `${e.clientX - r.left}px`);
-        el.style.setProperty('--my', `${e.clientY - r.top}px`);
+  /* ---- installation method and copy feedback ---- */
+  const INSTALL_METHODS = {
+    homebrew: 'brew install inxbit/tap/prismtty',
+    cargo: 'cargo install prismtty',
+  };
+
+  function initInstallMethods() {
+    const root = document.querySelector('.install-section');
+    const group = root?.querySelector('.install-methods');
+    const buttons = root ? [...root.querySelectorAll('[data-install-method]')] : [];
+    const command = root?.querySelector('[data-install-command]');
+    if (!root || !group || !command || !buttons.length) return;
+    if (buttons.some((button) => !INSTALL_METHODS[button.dataset.installMethod])) return;
+
+    const selectMethod = (button) => {
+      buttons.forEach((item) => {
+        item.setAttribute('aria-pressed', String(item === button));
+      });
+      command.textContent = INSTALL_METHODS[button.dataset.installMethod];
+    };
+    buttons.forEach((button) => {
+      button.addEventListener('click', () => {
+        selectMethod(button);
+        root.dispatchEvent(new Event('installmethodchange'));
       });
     });
+
+    const selected = buttons.find((button) => button.getAttribute('aria-pressed') === 'true') || buttons[0];
+    selectMethod(selected);
+    group.removeAttribute('hidden');
+  }
+
+  function initCopy() {
+    const root = document.querySelector('.install-section');
+    const button = root?.querySelector('[data-copy-command]');
+    const command = root?.querySelector('[data-install-command]');
+    const status = root?.querySelector('[data-copy-status]');
+    if (!root || !button || !command || !status) return;
+
+    let resetTimer;
+    const resetButton = () => {
+      window.clearTimeout(resetTimer);
+      button.textContent = 'Copy command';
+      button.removeAttribute('data-copy-state');
+    };
+    const selectCommand = () => {
+      command.focus();
+      const selection = window.getSelection();
+      if (!selection) return;
+      const range = document.createRange();
+      range.selectNodeContents(command);
+      selection.removeAllRanges();
+      selection.addRange(range);
+    };
+
+    button.addEventListener('click', async () => {
+      const text = command.textContent.trim();
+      try {
+        if (!Object.values(INSTALL_METHODS).includes(text)) throw new Error('Unknown install command');
+        await navigator.clipboard.writeText(text);
+        status.textContent = 'Command copied';
+        button.textContent = 'Copied';
+        button.dataset.copyState = 'success';
+      } catch {
+        status.textContent = 'Select the command and copy it manually';
+        button.textContent = 'Select command';
+        button.dataset.copyState = 'failure';
+        selectCommand();
+      }
+      window.clearTimeout(resetTimer);
+      resetTimer = window.setTimeout(resetButton, 1600);
+    });
+    root.addEventListener('installmethodchange', () => {
+      status.textContent = '';
+      resetButton();
+    });
+
+    button.removeAttribute('hidden');
   }
 
   /* ---- scroll reveal ---- */
@@ -358,7 +474,8 @@
 
   /* ---- active nav state ---- */
   function initNav() {
-    const links = [...document.querySelectorAll('.site-nav a[href^="#"]')];
+    const nav = document.querySelector('[data-site-nav]');
+    const links = nav ? [...nav.querySelectorAll('a[href^="#"]')] : [];
     const sections = links
       .map((l) => document.querySelector(l.getAttribute('href')))
       .filter(Boolean);
@@ -370,19 +487,23 @@
           .filter((e) => e.isIntersecting)
           .sort((a, b) => b.intersectionRatio - a.intersectionRatio)[0];
         if (!visible) return;
-        links.forEach((l) =>
-          l.classList.toggle('is-active', l.getAttribute('href') === `#${visible.target.id}`)
-        );
+        links.forEach((link) => {
+          const active = link.getAttribute('href') === `#${visible.target.id}`;
+          link.classList.toggle('is-active', active);
+          if (active) link.setAttribute('aria-current', 'location');
+          else link.removeAttribute('aria-current');
+        });
       },
       { rootMargin: '-18% 0px -62% 0px', threshold: [0.1, 0.25, 0.5] }
     );
     sections.forEach((s) => io.observe(s));
   }
 
+  initMobileMenu();
   initCompare();
   initProfiles();
+  initInstallMethods();
   initCopy();
-  initSpotlight();
   initReveal();
   initNav();
   runHero();

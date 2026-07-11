@@ -1,6 +1,31 @@
 import { expect, test } from '@playwright/test';
 import AxeBuilder from '@axe-core/playwright';
 
+async function commandRowGeometry(page) {
+  return page.locator('.command-row').evaluate((row) => {
+    const rowBox = row.getBoundingClientRect();
+    const buttonBox = row.querySelector('[data-copy-command]').getBoundingClientRect();
+    return {
+      rowWidth: rowBox.width,
+      rowHeight: rowBox.height,
+      buttonX: buttonBox.x - rowBox.x,
+      buttonY: buttonBox.y - rowBox.y,
+      buttonWidth: buttonBox.width,
+      buttonHeight: buttonBox.height,
+    };
+  });
+}
+
+async function settleFiniteAnimations(page) {
+  await page.evaluate(async () => {
+    const finite = document.getAnimations().filter((animation) => {
+      const endTime = animation.effect?.getComputedTiming().endTime;
+      return Number.isFinite(endTime);
+    });
+    await Promise.all(finite.map((animation) => animation.finished.catch(() => {})));
+  });
+}
+
 test('loads the PrismTTY landing page without local runtime errors', async ({ page }) => {
   const messages = [];
   page.on('console', (message) => {
@@ -30,6 +55,192 @@ test('shows the approved hero inside the first desktop viewport', async ({ page 
   const installBox = await installLink.boundingBox();
   expect(installBox).not.toBeNull();
   expect(installBox.y + installBox.height).toBeLessThanOrEqual(900);
+});
+
+test('mobile menu traps focus and restores the trigger on Escape', async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.goto('/');
+  const trigger = page.locator('[data-menu-trigger]');
+  const nav = page.getByRole('navigation', { name: 'Primary navigation' });
+  const firstLink = nav.getByRole('link', { name: 'Demo' });
+  const lastLink = nav.getByRole('link', { name: 'GitHub' });
+
+  await trigger.click();
+  await expect(trigger).toHaveAttribute('aria-expanded', 'true');
+  await expect(trigger).toHaveAccessibleName('Close navigation');
+  await expect(nav).toBeVisible();
+  await expect(firstLink).toBeFocused();
+  await settleFiniteAnimations(page);
+
+  const overlayBox = await nav.boundingBox();
+  expect(overlayBox).not.toBeNull();
+  expect(overlayBox.x).toBeGreaterThanOrEqual(12);
+  expect(overlayBox.y).toBeGreaterThanOrEqual(92);
+  expect(overlayBox.x + overlayBox.width).toBeLessThanOrEqual(378);
+  expect(overlayBox.y + overlayBox.height).toBeLessThanOrEqual(832);
+  expect(overlayBox.height).toBeGreaterThanOrEqual(700);
+  const linkBoxes = await nav.locator('a').evaluateAll((links) => links.map((link) => {
+    const box = link.getBoundingClientRect();
+    return { top: box.top, bottom: box.bottom };
+  }));
+  for (let index = 1; index < linkBoxes.length; index += 1) {
+    expect(linkBoxes[index].top).toBeGreaterThanOrEqual(linkBoxes[index - 1].bottom);
+  }
+
+  await page.keyboard.press('Shift+Tab');
+  await expect(trigger).toBeFocused();
+  await page.keyboard.press('Shift+Tab');
+  await expect(lastLink).toBeFocused();
+  await page.keyboard.press('Tab');
+  await expect(trigger).toBeFocused();
+
+  await page.keyboard.press('Escape');
+  await expect(trigger).toHaveAttribute('aria-expanded', 'false');
+  await expect(trigger).toHaveAccessibleName('Open navigation');
+  await expect(trigger).toBeFocused();
+});
+
+test('same-page mobile navigation closes before moving focus to its destination', async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.goto('/');
+  const trigger = page.locator('[data-menu-trigger]');
+  const compareLink = page.locator('[data-site-nav] a[href="#compare"]');
+  const destination = page.locator('#compare');
+
+  await trigger.click();
+  await compareLink.click();
+
+  await expect(page).toHaveURL(/#compare$/);
+  await expect(trigger).toHaveAttribute('aria-expanded', 'false');
+  await expect(destination).toBeFocused();
+  await expect(compareLink).toHaveAttribute('aria-current', 'location');
+});
+
+test('active navigation exposes one current location as sections change', async ({ page }) => {
+  await page.goto('/#install');
+  const nav = page.getByRole('navigation', { name: 'Primary navigation' });
+  const installLink = nav.getByRole('link', { name: 'Install' });
+
+  await expect(installLink).toHaveAttribute('aria-current', 'location');
+  await expect(nav.locator('[aria-current="location"]')).toHaveCount(1);
+
+  await page.locator('#profiles').scrollIntoViewIfNeeded();
+  await expect(nav.getByRole('link', { name: 'Profiles' })).toHaveAttribute(
+    'aria-current',
+    'location',
+  );
+  await expect(installLink).not.toHaveAttribute('aria-current', 'location');
+});
+
+test('install methods update one pressed state and the visible fixed command', async ({ page }) => {
+  await page.goto('/#install');
+  const homebrew = page.getByRole('button', { name: 'Homebrew' });
+  const cargo = page.getByRole('button', { name: 'Cargo' });
+  const command = page.locator('[data-install-command]');
+
+  await expect(homebrew).toHaveAttribute('aria-pressed', 'true');
+  await expect(cargo).toHaveAttribute('aria-pressed', 'false');
+  await expect(command).toHaveText('brew install inxbit/tap/prismtty');
+
+  await cargo.click();
+  await expect(homebrew).toHaveAttribute('aria-pressed', 'false');
+  await expect(cargo).toHaveAttribute('aria-pressed', 'true');
+  await expect(command).toHaveText('cargo install prismtty');
+  await expect(page.locator('[data-install-method][aria-pressed="true"]')).toHaveCount(1);
+});
+
+test('copy success reports the visible command without shifting its controls', async ({ page, context }) => {
+  await context.grantPermissions(['clipboard-read', 'clipboard-write']);
+  await page.goto('/#install');
+  await page.getByRole('button', { name: 'Cargo' }).click();
+  const button = page.locator('[data-copy-command]');
+  await page.evaluate(() => document.fonts.ready);
+  await button.scrollIntoViewIfNeeded();
+  const before = await commandRowGeometry(page);
+
+  await button.click();
+
+  await expect(page.locator('[data-copy-status]')).toHaveText('Command copied');
+  await expect(button).toHaveText('Copied');
+  expect(await page.evaluate(() => navigator.clipboard.readText())).toBe('cargo install prismtty');
+  expect(await commandRowGeometry(page)).toEqual(before);
+});
+
+test('copy failure gives truthful manual-copy feedback without shifting controls', async ({ page }) => {
+  await page.addInitScript(() => {
+    Object.defineProperty(navigator.clipboard, 'writeText', {
+      configurable: true,
+      value: async () => { throw new DOMException('Denied', 'NotAllowedError'); },
+    });
+  });
+  await page.goto('/#install');
+  const button = page.locator('[data-copy-command]');
+  await page.evaluate(() => document.fonts.ready);
+  await button.scrollIntoViewIfNeeded();
+  const before = await commandRowGeometry(page);
+
+  await button.click();
+
+  await expect(page.locator('[data-copy-status]')).toHaveText(
+    'Select the command and copy it manually',
+  );
+  await expect(button).toHaveText('Select command');
+  expect(await commandRowGeometry(page)).toEqual(before);
+});
+
+test('mobile fallback keeps navigation and Homebrew available without inert controls', async ({ browser }) => {
+  const context = await browser.newContext({
+    javaScriptEnabled: false,
+    viewport: { width: 320, height: 844 },
+  });
+  const page = await context.newPage();
+
+  try {
+    await page.goto('/#install');
+    const nav = page.getByRole('navigation', { name: 'Primary navigation' });
+    await expect(nav).toBeVisible();
+    for (const name of ['Demo', 'Compare', 'Profiles', 'Install', 'GitHub']) {
+      await expect(nav.getByRole('link', { name })).toBeVisible();
+    }
+    await expect(page.getByRole('button', { name: 'Open navigation' })).toHaveCount(0);
+    await expect(page.getByRole('button', { name: 'Homebrew' })).toHaveCount(0);
+    await expect(page.getByRole('button', { name: 'Cargo' })).toHaveCount(0);
+    await expect(page.getByRole('button', { name: 'Copy command' })).toHaveCount(0);
+    await expect(page.locator('[data-install-command]')).toHaveText(
+      'brew install inxbit/tap/prismtty',
+    );
+  } finally {
+    await context.close();
+  }
+});
+
+test('install command is a labelled focusable scroll region without page overflow', async ({ page }) => {
+  for (const width of [320, 390]) {
+    await page.setViewportSize({ width, height: 844 });
+    await page.goto('/#install');
+    const command = page.locator('[data-install-command]');
+
+    await expect(command).toHaveAttribute('tabindex', '0');
+    await expect(command).toHaveAttribute('role', 'region');
+    await expect(command).toHaveAccessibleName('Installation command');
+    await expect(command).toHaveCSS('white-space', 'nowrap');
+    const widths = await command.evaluate((element) => ({
+      client: element.clientWidth,
+      scroll: element.scrollWidth,
+      viewport: window.innerWidth,
+      document: document.documentElement.scrollWidth,
+      body: document.body.scrollWidth,
+    }));
+    expect(widths.scroll).toBeGreaterThan(widths.client);
+    expect(widths.document).toBe(widths.viewport);
+    expect(widths.body).toBe(widths.viewport);
+    await command.focus();
+    await expect(command).toBeFocused();
+
+    await settleFiniteAnimations(page);
+    const results = await new AxeBuilder({ page }).analyze();
+    expect(results.violations).toEqual([]);
+  }
 });
 
 test('profile tabs implement roving keyboard focus and update one tabpanel', async ({ page }) => {

@@ -36,7 +36,7 @@
           <img class="brand-logo" src="assets/prismtty-lockup.svg" alt="" width="68" height="30">
           <span class="brand-name">Prism<span class="tty">TTY</span></span>
         </a>
-        <button class="menu-trigger" type="button" aria-expanded="false" aria-controls="site-nav" data-menu-trigger>
+        <button class="menu-trigger" type="button" aria-expanded="false" aria-controls="site-nav" data-menu-trigger hidden>
           <span class="sr-only">Open navigation</span>
           <span class="menu-lines" aria-hidden="true"><i></i><i></i></span>
         </button>
@@ -195,60 +195,37 @@
       </section>
 
       <section class="section install-section" id="install" aria-labelledby="install-title">
-        <div class="section-heading compact">
-          <p class="eyebrow">// install</p>
-          <h2 id="install-title">Up and highlighting in one line.</h2>
+        <div class="section-copy">
+          <h2 id="install-title">One command away.</h2>
+          <p>Install PrismTTY, then wrap the shell you already use.</p>
         </div>
-        <div class="install-grid">
-          <article class="install-card">
-            <div class="install-card-header">
-              <h3>Homebrew</h3>
-              <button class="copy-button" type="button" data-copy="brew install inxbit/tap/prismtty">Copy</button>
+        <div class="instrument-shell install-shell">
+          <div class="install-core">
+            <div class="install-methods" role="group" aria-label="Installation method" hidden>
+              <button type="button" data-install-method="homebrew" aria-pressed="true">Homebrew</button>
+              <button type="button" data-install-method="cargo" aria-pressed="false">Cargo</button>
             </div>
-            <pre><code>brew install inxbit/tap/prismtty</code></pre>
-          </article>
-          <article class="install-card">
-            <div class="install-card-header">
-              <h3>Cargo</h3>
-              <button class="copy-button" type="button" data-copy="cargo install prismtty">Copy</button>
+            <div class="command-row">
+              <code data-install-command role="region" aria-label="Installation command" tabindex="0">brew install inxbit/tap/prismtty</code>
+              <button type="button" data-copy-command hidden>Copy command</button>
             </div>
-            <pre><code>cargo install prismtty</code></pre>
-          </article>
-          <article class="install-card">
-            <div class="install-card-header">
-              <h3>Start a wrapped shell</h3>
-              <button class="copy-button" type="button" data-copy="ptty /bin/zsh">Copy</button>
-            </div>
-            <pre><code>ptty /bin/zsh</code></pre>
-          </article>
+            <p class="sr-only" aria-live="polite" data-copy-status></p>
+            <p class="quick-start">Start a wrapped shell with <code>ptty /bin/zsh</code></p>
+          </div>
         </div>
-        <div class="install-links">
-          <a href="https://crates.io/crates/prismtty">crates.io package ↗</a>
-          <a href="https://github.com/inxbit/prismtty/releases">GitHub releases ↗</a>
-          <a href="https://github.com/inxbit/homebrew-tap">Homebrew tap ↗</a>
-        </div>
+        <nav class="install-links" aria-label="Package links">
+          <a href="https://crates.io/crates/prismtty">crates.io</a>
+          <a href="https://github.com/inxbit/prismtty/releases">Releases</a>
+          <a href="https://github.com/inxbit/homebrew-tap">Homebrew tap</a>
+        </nav>
       </section>
 
       <section class="section feedback-section" id="feedback" aria-labelledby="feedback-title">
-        <div class="section-heading compact">
-          <p class="eyebrow">// feedback wanted</p>
-          <h2 id="feedback-title">Profile coverage gets better with real-world testing.</h2>
+        <div class="feedback-copy">
+          <h2 id="feedback-title">Help sharpen the profiles.</h2>
+          <p><span class="sr-only">Feedback wanted. </span>Real-world testing across Cisco, Juniper, Fortinet, Palo Alto, Arista, Aruba, Versa, Linux, and custom systems improves coverage.</p>
         </div>
-        <p class="section-sub feedback-copy">
-          Testing help is especially useful across the built-in profile set and custom
-          profile files for other vendors, appliances, and terminal workflows.
-        </p>
-        <div class="feedback-list" aria-label="Profiles and vendors wanted for testing">
-          <span>Cisco IOS / IOS XE / IOS XR / NX-OS / ASA</span>
-          <span>Juniper Junos</span>
-          <span>Fortinet FortiGate / FortiOS</span>
-          <span>Palo Alto PAN-OS</span>
-          <span>Arista EOS</span>
-          <span>Aruba CX</span>
-          <span>Versa</span>
-          <span>Linux / Unix</span>
-          <span>Custom vendor profiles</span>
-        </div>
+        <a class="button primary" href="https://github.com/inxbit/prismtty/issues/new/choose">Share profile feedback</a>
       </section>
     </main>
 
@@ -257,11 +234,13 @@
         <img class="brand-logo" src="assets/prismtty-lockup.svg" alt="" width="54" height="24">
         <span>Prism<span class="tty">TTY</span></span>
       </div>
-      <p class="footer-note">MIT licensed · clean-room profiles · no telemetry.</p>
+      <p class="footer-note">MIT licensed. Clean-room profiles. No telemetry.</p>
       <nav class="footer-links" aria-label="Footer">
         <a href="https://github.com/inxbit/prismtty/blob/main/README.md">Docs</a>
-        <a href="https://github.com/inxbit/prismtty">GitHub ↗</a>
-        <a href="https://crates.io/crates/prismtty">crates.io ↗</a>
+        <a href="https://github.com/inxbit/prismtty">GitHub</a>
+        <a href="https://crates.io/crates/prismtty">crates.io</a>
+        <a href="https://github.com/inxbit/prismtty/blob/main/LICENSE">License</a>
+        <a href="https://github.com/inxbit/prismtty/blob/main/SECURITY.md">Security</a>
       </nav>
     </footer>
   </body>
