@@ -12,6 +12,7 @@
 *.key
 *.pcap
 *.pcapng
+/.worktrees/
 
 # Plan-review artifacts (transient, never commit)
 /PLAN.md
