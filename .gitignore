@@ -12,7 +12,11 @@
 *.key
 *.pcap
 *.pcapng
+/.worktrees/
 
 # Plan-review artifacts (transient, never commit)
 /PLAN.md
 /PLAN-REVIEW-LOG.md
+/node_modules/
+/playwright-report/
+/test-results/

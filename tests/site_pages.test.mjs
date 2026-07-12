@@ -50,7 +50,7 @@ test('GitHub Pages site has the expected static contract', () => {
   const html = read('docs/index.html');
   assert.match(html, /<title>PrismTTY - Terminal Output Highlighting<\/title>/);
   assert.match(html, /Readable network output, live in your terminal\./);
-  assert.match(html, /Live terminal highlighting, not device management\./);
+  assert.match(html, /Highlighting, with a clear boundary\./);
   assert.match(html, /feedback wanted/i);
   assert.match(html, /href="https:\/\/github\.com\/inxbit\/prismtty"/);
   assert.match(html, /href="https:\/\/crates\.io\/crates\/prismtty"/);
@@ -58,14 +58,26 @@ test('GitHub Pages site has the expected static contract', () => {
   // The hero now demonstrates highlighting with JS-driven demos (live terminal,
   // raw/highlighted compare slider, profile tabs) instead of a static SVG image.
   assert.match(html, /data-terminal\b/);
+  assert.match(html, /Noise becomes signal\./);
+  assert.match(html, /class="proof-rail"/);
+  assert.match(html, /data-menu-trigger/);
+  assert.match(html, /data-terminal[^>]*>[\s\S]*class="tline"/);
+  assert.match(html, /data-terminal[^>]*>[\s\S]*?GigabitEthernet1\/0\/2[\s\S]*?<\/div>/);
+  assert.match(html, /data-compare-raw[^>]*>[\s\S]*?GigabitEthernet1\/0\/2[\s\S]*?<\/pre>/);
+  assert.match(html, /data-compare-hl[^>]*>[\s\S]*?GigabitEthernet1\/0\/2[\s\S]*?<\/pre>/);
+  assert.match(html, /data-profile-body[^>]*>[\s\S]*?GigabitEthernet1\/0\/1[\s\S]*?<\/div>/);
+  assert.doesNotMatch(html, /terminal-badge|● live|spectrum-text|hero-facts/);
   assert.match(html, /data-compare\b/);
   assert.match(html, /data-profiles\b/);
+  assert.match(html, /id="scope"/);
+  assert.equal((html.match(/role="tabpanel"/g) ?? []).length, 1);
+  assert.doesNotMatch(html, /feature-kicker|step-number|profile-list/);
   assert.doesNotMatch(html, /show-tech\.txt \| prismtty/);
 
   const css = read('docs/styles.css');
-  assert.match(css, /#22d3ee/);
-  assert.match(css, /#a3e635/);
-  assert.match(css, /#f472b6/);
+  assert.match(css, /#45c7d8/);
+  assert.match(css, /#8bd450/);
+  assert.match(css, /#e678a8/);
 
   const readme = read('README.md');
   assert.match(readme, /https:\/\/prismtty\.com\//);
@@ -105,6 +117,147 @@ test('site pages ship a strict CSP and self-hosted fonts', () => {
     `sha256-${createHash('sha256').update(s, 'utf8').digest('base64')}`;
   assert.ok(csp.includes(`'${hash(styleBlock)}'`), 'stale 404 style hash');
   assert.ok(csp.includes(`'${hash(scriptBlock)}'`), 'stale 404 script hash');
+});
+
+test('site metadata, crawlers, 404, and social card match the release', () => {
+  const index = read('docs/index.html');
+  const cargoVersion = read('Cargo.toml').match(/^version\s*=\s*"([^"]+)"/m)[1];
+  const imageAlt = 'PrismTTY highlighting network terminal output in a dark terminal interface';
+
+  assert.match(index, /<meta property="og:url" content="https:\/\/prismtty\.com\/">/);
+  assert.match(index, /<meta property="og:site_name" content="PrismTTY">/);
+  assert.match(index, /<meta property="og:image:type" content="image\/png">/);
+  assert.match(index, new RegExp(`<meta property="og:image:alt" content="${imageAlt}">`));
+  assert.match(index, /<meta name="twitter:title" content="PrismTTY - Terminal Output Highlighting">/);
+  assert.match(index, /<meta name="twitter:description" content="Readable network output, live in your terminal\.">/);
+  assert.match(index, new RegExp(`<meta name="twitter:image:alt" content="${imageAlt}">`));
+
+  const structuredDataBlock = index.match(
+    /<script type="application\/ld\+json">([\s\S]*?)<\/script>/,
+  );
+  assert.ok(structuredDataBlock, 'SoftwareApplication JSON-LD exists');
+  const structuredData = JSON.parse(structuredDataBlock[1]);
+  assert.equal(structuredData['@context'], 'https://schema.org');
+  assert.equal(structuredData['@type'], 'SoftwareApplication');
+  assert.equal(structuredData.name, 'PrismTTY');
+  assert.deepEqual(structuredData.operatingSystem, ['macOS', 'Linux']);
+  assert.equal(structuredData.softwareVersion, cargoVersion);
+  assert.equal(
+    structuredData.downloadUrl,
+    `https://github.com/inxbit/prismtty/releases/tag/v${cargoVersion}`,
+  );
+
+  const indexCsp = index.match(
+    /Content-Security-Policy"\s*content="([^"]+)"/,
+  )[1];
+  const structuredDataHash = `sha256-${createHash('sha256')
+    .update(structuredDataBlock[1], 'utf8')
+    .digest('base64')}`;
+  assert.ok(indexCsp.includes(`'${structuredDataHash}'`), 'stale JSON-LD script hash');
+  assert.doesNotMatch(indexCsp, /unsafe-inline/);
+
+  assert.equal(existsSync('docs/robots.txt'), true);
+  assert.equal(
+    read('docs/robots.txt'),
+    'User-agent: *\nAllow: /\n\nSitemap: https://prismtty.com/sitemap.xml\n',
+  );
+  assert.equal(existsSync('docs/sitemap.xml'), true);
+  const sitemap = read('docs/sitemap.xml');
+  assert.equal((sitemap.match(/<loc>https:\/\/prismtty\.com\/<\/loc>/g) ?? []).length, 1);
+  assert.match(sitemap, /<lastmod>2026-07-11<\/lastmod>/);
+  assert.doesNotMatch(sitemap, /changefreq|priority|www\.prismtty\.com/);
+
+  const notFound = read('docs/404.html');
+  assert.match(notFound, /<meta name="theme-color" content="#07090d">/);
+  assert.match(notFound, /class="instrument-shell nf-shell"/);
+  assert.match(notFound, /class="terminal-lights"/);
+  assert.match(notFound, /class="button secondary"/);
+  assert.doesNotMatch(notFound, /class="dots"|class="button ghost"|GitHub ↗/);
+
+  const socialSvg = read('docs/assets/prismtty-social-card.svg');
+  assert.match(socialSvg, /viewBox="0 0 1200 630"/);
+  assert.match(socialSvg, /<title[^>]*>[^<]+<\/title>/);
+  assert.match(socialSvg, /<desc[^>]*>[^<]+<\/desc>/);
+  assert.match(socialSvg, /\.\/fonts\/space-grotesk-latin\.woff2/);
+  assert.match(socialSvg, /\.\/fonts\/jetbrains-mono-latin\.woff2/);
+  assert.match(socialSvg, /Noise becomes[\s\S]*signal\./);
+  assert.doesNotMatch(socialSvg, /font-family:\s*Inter|fonts\.googleapis|id="beam"|skewX/);
+
+  const socialPng = readFileSync('docs/assets/prismtty-social-card.png');
+  assert.deepEqual(
+    [...socialPng.subarray(0, 8)],
+    [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a],
+  );
+  assert.equal(socialPng.readUInt32BE(16), 1200);
+  assert.equal(socialPng.readUInt32BE(20), 630);
+});
+
+test('final site design and contributor commands stay aligned', () => {
+  const index = read('docs/index.html');
+  const notFound = read('docs/404.html');
+  const script = read('docs/script.js');
+  const css = read('docs/styles.css');
+  const socialSvg = read('docs/assets/prismtty-social-card.svg');
+  const contributing = read('CONTRIBUTING.md');
+  const pullRequestTemplate = read('.github/PULL_REQUEST_TEMPLATE.md');
+  const ciWorkflow = read('.github/workflows/ci.yml');
+  const releaseWorkflow = read('.github/workflows/release.yml');
+
+  assert.doesNotMatch(`${index}${notFound}${script}${css}`, /[—–]/);
+  assert.match(index, /No product telemetry\./);
+  assert.doesNotMatch(index, />No telemetry\.</);
+  assert.match(socialSvg, /no product telemetry/);
+  assert.doesNotMatch(socialSvg, /zero telemetry/);
+
+  const headingRule = css.match(/(?:^|\n)h2\s*\{([^}]*)\}/)[1];
+  assert.match(headingRule, /font-family:\s*var\(--sans\)/);
+  const commandBandRule = css.match(/\.command-band\s*\{([^}]*)\}/)[1];
+  const workflowRule = css.match(/\.workflow-line\s*\{([^}]*)\}/)[1];
+  assert.doesNotMatch(commandBandRule, /repeat\(3/);
+  assert.doesNotMatch(workflowRule, /repeat\(3/);
+  assert.doesNotMatch(css, /\.terminal-lights i:nth-child/);
+  assert.doesNotMatch(css, /\.command-row button\[data-copy-state="failure"\][^{]*\{[^}]*var\(--amber\)/);
+  assert.doesNotMatch(css, /\.install-links a\s*\{[^}]*color:\s*var\(--cyan\)/);
+  assert.doesNotMatch(css, /code\s*\{[^}]*#a5e8f5/);
+  const skipLinkRule = css.match(/\.skip-link\s*\{([^}]*)\}/)[1];
+  assert.match(skipLinkRule, /transition:\s*transform/);
+  assert.doesNotMatch(skipLinkRule, /transition:\s*top/);
+
+  const profileDemo = index.match(/<div class="profile-demo">([\s\S]*?)<div class="profile-notes">/)[1];
+  assert.doesNotMatch(profileDemo, /class="instrument-shell"/);
+  assert.match(index, /<ol class="workflow-line" aria-label="How PrismTTY works">/);
+  assert.equal((index.match(/<li><h3>/g) || []).length, 3);
+
+  for (const validationSurface of [
+    contributing,
+    pullRequestTemplate,
+    ciWorkflow,
+    releaseWorkflow,
+  ]) {
+    assert.doesNotMatch(validationSurface, /node --test tests\/\*\.test\.mjs/);
+  }
+  assert.match(contributing, /npm test/);
+  assert.match(pullRequestTemplate, /npm test/);
+  for (const file of [
+    'tests/bash_completion.test.mjs',
+    'tests/privacy_scan.test.mjs',
+    'tests/release_security.test.mjs',
+  ]) {
+    const pattern = new RegExp(file.replaceAll('.', '\\.'));
+    assert.match(contributing, pattern);
+    assert.match(pullRequestTemplate, pattern);
+    assert.match(ciWorkflow, pattern);
+    assert.match(releaseWorkflow, pattern);
+  }
+  assert.match(ciWorkflow, /tests\/site_pages\.test\.mjs/);
+  assert.match(releaseWorkflow, /tests\/site_pages\.test\.mjs/);
+
+  assert.match(
+    index,
+    /data-compare-raw[^>]*role="region"[^>]*aria-label="Comparison terminal output"[^>]*tabindex="0"/,
+  );
+  assert.doesNotMatch(index, /data-compare-raw[^>]*aria-hidden="true"/);
+  assert.match(index, /data-compare-hl[^>]*aria-hidden="true"/);
 });
 
 test('Pages production deployment is main-only and globally serialized', () => {
