@@ -8,8 +8,7 @@
 - [ ] `cargo test --locked`
 - [ ] `cargo clippy --locked --all-targets --all-features -- -D warnings`
 - [ ] `bash scripts/privacy-scan.sh`
-- [ ] `node --test tests/bash_completion.test.mjs tests/privacy_scan.test.mjs tests/release_security.test.mjs`
-- [ ] `npm test`
+- [ ] `node --test tests/*.test.mjs`
 - [ ] Regenerated completions if CLI flags or command help changed
 - [ ] Updated `README.md` or `CHANGELOG.md` for user-facing behavior changes
 
