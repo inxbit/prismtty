@@ -7,11 +7,11 @@
          recompute them if either block changes. -->
     <meta
       http-equiv="Content-Security-Policy"
-      content="default-src 'none'; script-src 'sha256-Lep2Au0iMvS6WBqz1Xhod2g6EwC/UOgWhYU5KB4dyTk='; style-src 'self' 'sha256-k+svvbR4VN8FPxLfjZ2pgfdCp0xtuuWpCw2gupEcWkI='; img-src 'self' data:; font-src 'self'; base-uri 'none'; form-action 'none'"
+      content="default-src 'none'; script-src 'sha256-Lep2Au0iMvS6WBqz1Xhod2g6EwC/UOgWhYU5KB4dyTk='; style-src 'self' 'sha256-SUlS3l3jfxe8lJuyLPXT+eUxMPzShCWBb5YQf3m4HMc='; img-src 'self' data:; font-src 'self'; base-uri 'none'; form-action 'none'"
     >
     <title>404 - PrismTTY</title>
     <meta name="robots" content="noindex">
-    <meta name="theme-color" content="#07090d">
+    <meta name="theme-color" content="#020617">
     <link rel="icon" href="/assets/prismtty-mark.svg" type="image/svg+xml">
     <link rel="stylesheet" href="/styles.css">
     <style>
@@ -21,45 +21,38 @@
         min-height: 100dvh;
         padding: 24px;
       }
-      .nf-shell { width: min(640px, 100%); }
-      .nf-terminal { width: 100%; }
-      .nf-terminal .terminal-body {
-        min-height: 0;
-        padding: clamp(22px, 5vw, 34px);
-        white-space: normal;
+      .nf-terminal { width: min(560px, 100%); }
+      .nf-terminal .terminal-body { min-height: 0; white-space: normal; }
+      .nf-code {
+        margin: 0 0 6px;
+        font-family: var(--mono);
+        font-size: 13px;
+        color: var(--subtle);
       }
-      .nf-terminal .t-cmd { overflow-wrap: anywhere; }
-      .nf-actions {
-        display: flex;
-        flex-wrap: wrap;
-        gap: 10px;
-        margin-top: 22px;
-      }
+      .nf-actions { margin-top: 18px; display: flex; gap: 10px; flex-wrap: wrap; }
     </style>
   </head>
   <body>
     <div class="grain" aria-hidden="true"></div>
     <main class="nf-wrap">
       <h1 class="sr-only">404: page not found</h1>
-      <div class="instrument-shell nf-shell">
-        <figure class="terminal nf-terminal">
-          <div class="terminal-bar">
-            <span class="terminal-lights" aria-hidden="true"><i></i><i></i><i></i></span>
-            <span class="terminal-title">ptty /bin/zsh</span>
+      <figure class="terminal nf-terminal">
+        <div class="terminal-bar">
+          <span class="dots" aria-hidden="true"><i></i><i></i><i></i></span>
+          <span class="terminal-title">ptty /bin/zsh</span>
+        </div>
+        <div class="terminal-body">
+          <span class="tline"><span class="hl-host">visitor@prismtty.com%</span> <span class="t-cmd">open <span id="nf-path">this page</span></span></span>
+          <span class="tline"><span class="hl-down">open: no such file or directory (404)</span></span>
+          <span class="tline">&nbsp;</span>
+          <span class="tline">The page you asked for is not routed here.</span>
+          <span class="tline">&nbsp;</span>
+          <div class="nf-actions">
+            <a class="button primary" href="/">Back to prismtty.com</a>
+            <a class="button ghost" href="https://github.com/inxbit/prismtty">GitHub ↗</a>
           </div>
-          <div class="terminal-body">
-            <span class="tline"><span class="hl-host">visitor@prismtty.com%</span> <span class="t-cmd">open <span id="nf-path">this page</span></span></span>
-            <span class="tline"><span class="hl-down">open: no such file or directory (404)</span></span>
-            <span class="tline">&nbsp;</span>
-            <span class="tline">The page you asked for is not routed here.</span>
-            <span class="tline">&nbsp;</span>
-            <div class="nf-actions">
-              <a class="button primary" href="/">Back to prismtty.com</a>
-              <a class="button secondary" href="https://github.com/inxbit/prismtty">GitHub</a>
-            </div>
-          </div>
-        </figure>
-      </div>
+        </div>
+      </figure>
     </main>
     <script>
       var el = document.getElementById('nf-path');

@@ -1,4 +1,4 @@
-/* PrismTTY site - a miniature of what the tool does.
+/* PrismTTY site — a miniature of what the tool does.
    One small rule-based highlighter feeds three surfaces:
    the animated hero terminal, the raw/highlighted compare slider,
    and the interactive profile tabs. No dependencies. */
@@ -6,40 +6,11 @@
 (() => {
   'use strict';
 
-  const motionQuery = window.matchMedia('(prefers-reduced-motion: reduce)');
-  let reduceMotion = motionQuery.matches;
-  let heroVisible = true;
-  let heroController;
-  let compareObserver;
-  let revealObserver;
-  let profileOutputAnimation;
-  const revealAnimations = new Set();
+  const reduceMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
   const ESC = { '&': '&amp;', '<': '&lt;', '>': '&gt;' };
   const esc = (s) => s.replace(/[&<>]/g, (c) => ESC[c]);
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   const rand = (a, b) => a + Math.floor(Math.random() * (b - a));
-  const supportsIntersectionObserver = () => typeof window.IntersectionObserver === 'function';
-
-  function pause(ms, signal) {
-    return new Promise((resolve) => {
-      if (signal.aborted) {
-        resolve(false);
-        return;
-      }
-
-      let settled = false;
-      let timer;
-      const finish = (completed) => {
-        if (settled) return;
-        settled = true;
-        window.clearTimeout(timer);
-        signal.removeEventListener('abort', handleAbort);
-        resolve(completed);
-      };
-      const handleAbort = () => finish(false);
-      timer = window.setTimeout(() => finish(true), ms);
-      signal.addEventListener('abort', handleAbort, { once: true });
-    });
-  }
 
   /* ---- the highlight rules (mirror PrismTTY's token families) ---- */
   const RULES = [
@@ -185,487 +156,153 @@
   };
 
   /* ---- 1. animated hero terminal ---- */
-  const renderHeroFallback = (body) => {
-    const markup = render(HERO, lineHTML);
-    if (body.innerHTML !== markup) body.innerHTML = markup;
-  };
+  async function runHero() {
+    const body = document.querySelector('[data-terminal]');
+    if (!body) return;
 
-  function canPlayHero() {
-    return !reduceMotion
-      && !document.hidden
-      && heroVisible
-      && supportsIntersectionObserver();
-  }
+    if (reduceMotion) {
+      body.innerHTML = render(HERO, lineHTML);
+      return;
+    }
 
-  async function animateHero(body, signal) {
-    while (!signal.aborted && body.isConnected) {
+    while (true) {
       body.innerHTML = '';
       for (const line of HERO) {
-        if (signal.aborted) return;
-        const element = document.createElement('span');
-        element.className = 'tline';
-        body.appendChild(element);
+        const el = document.createElement('span');
+        el.className = 'tline';
+        body.appendChild(el);
 
         if (typeof line === 'object' && line.c) {
-          element.innerHTML = `<span class="hl-host">${esc(line.p)}</span><span class="t-cmd"></span><span class="cursor">.</span>`;
-          const command = element.querySelector('.t-cmd');
-          for (const character of line.c) {
-            if (signal.aborted) return;
-            command.append(character);
-            if (!await pause(rand(26, 64), signal)) return;
+          el.innerHTML = `<span class="hl-host">${esc(line.p)}</span><span class="t-cmd"></span><span class="cursor">.</span>`;
+          const cmd = el.querySelector('.t-cmd');
+          for (const ch of line.c) {
+            cmd.append(ch);
+            await sleep(rand(26, 64));
           }
-          element.querySelector('.cursor')?.remove();
-          if (!await pause(440, signal)) return;
+          el.querySelector('.cursor').remove();
+          await sleep(440);
         } else {
-          element.innerHTML = blank(highlight(line));
-          if (!await pause(line === '' ? 70 : 150, signal)) return;
+          el.innerHTML = blank(highlight(line));
+          await sleep(line === '' ? 70 : 150);
         }
       }
-
       const tail = document.createElement('span');
       tail.className = 'tline';
       tail.innerHTML = '<span class="hl-host">edge-sw1#</span><span class="cursor">.</span>';
       body.appendChild(tail);
-      if (!await pause(5200, signal)) return;
+      await sleep(5200);
     }
-  }
-
-  function stopHeroPlayback() {
-    const controller = heroController;
-    heroController = undefined;
-    controller?.abort();
-  }
-
-  function startHeroPlayback() {
-    const body = document.querySelector('[data-terminal]');
-    stopHeroPlayback();
-    if (!body) return;
-    if (!canPlayHero()) {
-      renderHeroFallback(body);
-      return;
-    }
-
-    const controller = new AbortController();
-    heroController = controller;
-    void animateHero(body, controller.signal).finally(() => {
-      if (heroController === controller) heroController = undefined;
-    });
-  }
-
-  function initHeroLifecycle() {
-    const preview = document.querySelector('#preview');
-    if (!preview || !supportsIntersectionObserver()) {
-      heroVisible = false;
-      return;
-    }
-
-    const box = preview.getBoundingClientRect();
-    heroVisible = box.bottom > 0 && box.top < window.innerHeight;
-    const observer = new IntersectionObserver(([entry]) => {
-      const visible = entry.isIntersecting && entry.intersectionRatio > 0;
-      if (visible === heroVisible) return;
-      heroVisible = visible;
-      startHeroPlayback();
-    }, { threshold: 0.1 });
-    observer.observe(preview);
-  }
-
-  function initHeroEntrance() {
-    const hero = document.querySelector('.hero');
-    if (!hero || reduceMotion || document.hidden) return;
-    hero.classList.add('hero-enter');
-    window.requestAnimationFrame(() => {
-      window.requestAnimationFrame(() => hero.classList.add('is-in'));
-    });
   }
 
   /* ---- 2. raw / highlighted compare slider ---- */
-  function setComparePosition(root, value, source = 'program') {
-    const normalized = Math.max(0, Math.min(100, Number(value)));
-    const controls = root.closest('.instrument-shell') || root;
-    const range = controls.querySelector('[data-compare-range]');
-    const output = controls.querySelector('[data-compare-output]');
-    root.style.setProperty('--compare-position', `${normalized}%`);
-    range.value = String(normalized);
-    range.setAttribute('aria-valuetext', `${normalized}% raw output`);
-    output.value = `${normalized}% raw output`;
-    controls.querySelectorAll('[data-compare-mode]').forEach((button) => {
-      const pressed = (button.dataset.compareMode === 'raw' && normalized === 100)
-        || (button.dataset.compareMode === 'highlighted' && normalized === 0);
-      button.setAttribute('aria-pressed', String(pressed));
-    });
-    root.dataset.compareSource = source;
-  }
-
-  function stopCompareObservation() {
-    compareObserver?.disconnect();
-    compareObserver = undefined;
-  }
-
-  function startCompareObservation() {
-    stopCompareObservation();
-    const root = document.querySelector('[data-compare]');
-    if (!root || reduceMotion || !supportsIntersectionObserver()) return;
-
-    compareObserver = new IntersectionObserver((entries) => {
-      if (reduceMotion || root.dataset.compareSource === 'user') return;
-      const visible = entries.filter((entry) => entry.isIntersecting)
-        .sort((a, b) => b.intersectionRatio - a.intersectionRatio)[0];
-      if (visible) setComparePosition(root, visible.target.dataset.position);
-    }, { rootMargin: '-28% 0px -42%', threshold: [0.2, 0.5, 0.8] });
-    document.querySelectorAll('[data-compare-step]').forEach((step) => {
-      compareObserver.observe(step);
-    });
-  }
-
   function initCompare() {
-    const root = document.querySelector('[data-compare]');
-    if (!root) return;
-    const controls = root.closest('.instrument-shell') || root;
-    const raw = root.querySelector('[data-compare-raw]');
-    const highlighted = root.querySelector('[data-compare-hl]');
-    const range = controls.querySelector('[data-compare-range]');
-    const buttons = controls.querySelectorAll('[data-compare-mode]');
-    const rangeControl = controls.querySelector('.compare-control');
-    const mobileControls = controls.querySelector('.compare-mobile-controls');
+    const wrap = document.querySelector('[data-compare]');
+    if (!wrap) return;
+    const raw = wrap.querySelector('[data-compare-raw]');
+    const hl = wrap.querySelector('[data-compare-hl]');
+    const range = wrap.querySelector('[data-compare-range]');
+
     raw.innerHTML = render(COMPARE, rawHTML);
-    highlighted.innerHTML = render(COMPARE, lineHTML);
-    setComparePosition(root, range.value);
+    hl.innerHTML = render(COMPARE, lineHTML);
 
-    let syncingScroll = false;
-    const syncScroll = (source, target) => {
-      if (syncingScroll || target.scrollLeft === source.scrollLeft) return;
-      syncingScroll = true;
-      target.scrollLeft = source.scrollLeft;
-      syncingScroll = false;
-    };
-    raw.addEventListener('scroll', () => syncScroll(raw, highlighted), { passive: true });
-    highlighted.addEventListener('scroll', () => syncScroll(highlighted, raw), { passive: true });
-
-    range.addEventListener('input', () => setComparePosition(root, range.value, 'user'));
-    buttons.forEach((button) => {
-      button.addEventListener('click', () => {
-        const position = button.dataset.compareMode === 'raw' ? 100 : 0;
-        setComparePosition(root, position, 'user');
-      });
-    });
-
-    rangeControl.removeAttribute('hidden');
-    mobileControls.removeAttribute('hidden');
+    const setPos = (v) => wrap.style.setProperty('--pos', `${v}%`);
+    setPos(range.value);
+    range.addEventListener('input', () => setPos(range.value));
   }
 
   /* ---- 3. interactive profile tabs ---- */
-  function animateProfileOutput(body) {
-    profileOutputAnimation?.cancel();
-    profileOutputAnimation = undefined;
-    if (reduceMotion || typeof body.animate !== 'function') return;
-
-    const animation = body.animate(
-      [
-        { opacity: 0.42, transform: 'translateY(5px)' },
-        { opacity: 1, transform: 'translateY(0)' },
-      ],
-      { duration: 280, easing: 'cubic-bezier(0.16, 1, 0.3, 1)' },
-    );
-    profileOutputAnimation = animation;
-    void animation.finished.catch(() => {}).finally(() => {
-      if (profileOutputAnimation === animation) profileOutputAnimation = undefined;
-    });
-  }
-
   function initProfiles() {
     const root = document.querySelector('[data-profiles]');
     if (!root) return;
-    const tablist = root.querySelector('.profile-tabs');
-    const tabs = [...root.querySelectorAll('[data-profile-tab]')];
-    const panel = root.querySelector('[data-profile-panel]');
-    const body = panel.querySelector('[data-profile-body]');
-    const title = panel.querySelector('[data-profile-title]');
+    const tabs = [...root.querySelectorAll('.profile-tab')];
+    const body = root.querySelector('[data-profile-body]');
+    const title = root.querySelector('[data-profile-title]');
 
-    const selectProfile = (tab, focus = false) => {
-      const data = PROFILES[tab.dataset.profileTab];
+    const show = (key) => {
+      const data = PROFILES[key];
       if (!data) return;
-      tabs.forEach((item) => {
-        const selected = item === tab;
-        item.setAttribute('aria-selected', String(selected));
-        item.tabIndex = selected ? 0 : -1;
-      });
-      panel.setAttribute('aria-labelledby', tab.id);
-      title.textContent = data.title;
-      body.innerHTML = render(data.lines, lineHTML);
-      animateProfileOutput(body);
-      if (focus) tab.focus();
+      const paint = () => {
+        body.innerHTML = render(data.lines, lineHTML);
+        title.textContent = data.title;
+        body.classList.remove('is-swapping');
+      };
+      if (reduceMotion) { paint(); return; }
+      body.classList.add('is-swapping');
+      setTimeout(paint, 150);
     };
 
-    tabs.forEach((tab, index) => {
-      tab.addEventListener('click', () => selectProfile(tab));
-      tab.addEventListener('keydown', (event) => {
-        const keys = ['ArrowLeft', 'ArrowRight', 'Home', 'End'];
-        if (!keys.includes(event.key)) return;
-        event.preventDefault();
-        let nextIndex = index;
-        if (event.key === 'ArrowLeft') nextIndex = (index - 1 + tabs.length) % tabs.length;
-        if (event.key === 'ArrowRight') nextIndex = (index + 1) % tabs.length;
-        if (event.key === 'Home') nextIndex = 0;
-        if (event.key === 'End') nextIndex = tabs.length - 1;
-        selectProfile(tabs[nextIndex], true);
+    tabs.forEach((tab) => {
+      tab.addEventListener('click', () => {
+        tabs.forEach((t) => t.setAttribute('aria-selected', String(t === tab)));
+        show(tab.dataset.profile);
       });
     });
 
-    const selected = tabs.find((tab) => tab.getAttribute('aria-selected') === 'true') || tabs[0];
-    selectProfile(selected);
-    tablist.removeAttribute('hidden');
+    show(tabs.find((t) => t.getAttribute('aria-selected') === 'true')?.dataset.profile || 'cisco');
   }
 
-  /* ---- mobile navigation ---- */
-  function initMobileMenu() {
-    const header = document.querySelector('[data-site-header]');
-    const trigger = header?.querySelector('[data-menu-trigger]');
-    const nav = header?.querySelector('[data-site-nav]');
-    const label = trigger?.querySelector('.sr-only');
-    const links = nav ? [...nav.querySelectorAll('a')] : [];
-    if (!trigger || !nav || !label || !links.length) return;
-
-    const close = (restoreFocus = false) => {
-      trigger.setAttribute('aria-expanded', 'false');
-      label.textContent = 'Open navigation';
-      document.body.classList.remove('menu-open');
-      if (restoreFocus) trigger.focus();
-    };
-    const open = () => {
-      trigger.setAttribute('aria-expanded', 'true');
-      label.textContent = 'Close navigation';
-      document.body.classList.add('menu-open');
-      links[0].focus();
-    };
-
-    trigger.addEventListener('click', () => {
-      if (trigger.getAttribute('aria-expanded') === 'true') close(true);
-      else open();
-    });
-    document.addEventListener('keydown', (event) => {
-      const openNow = trigger.getAttribute('aria-expanded') === 'true';
-      if (event.key === 'Escape' && openNow) {
-        close(true);
-        return;
-      }
-      if (event.key !== 'Tab' || !openNow) return;
-      const focusable = [trigger, ...links];
-      const currentIndex = focusable.indexOf(document.activeElement);
-      if (event.shiftKey && currentIndex <= 0) {
-        event.preventDefault();
-        focusable[focusable.length - 1].focus();
-      } else if (!event.shiftKey && currentIndex === focusable.length - 1) {
-        event.preventDefault();
-        focusable[0].focus();
-      }
-    });
-    links.forEach((link) => {
-      link.addEventListener('click', () => {
-        const href = link.getAttribute('href');
-        const destination = href?.startsWith('#') ? document.querySelector(href) : null;
-        if (destination) {
-          const hadTabindex = destination.hasAttribute('tabindex');
-          if (!hadTabindex) destination.setAttribute('tabindex', '-1');
-          destination.focus({ preventScroll: true });
-          if (!hadTabindex) {
-            destination.addEventListener('blur', () => destination.removeAttribute('tabindex'), { once: true });
-          }
-        }
-        close();
-      });
-    });
-    const desktopQuery = window.matchMedia('(min-width: 768px)');
-    const handleViewportChange = (event) => {
-      if (event.matches) close();
-    };
-    if ('addEventListener' in desktopQuery) desktopQuery.addEventListener('change', handleViewportChange);
-    else desktopQuery.addListener(handleViewportChange);
-
-    close();
-    document.body.classList.add('mobile-nav-ready');
-    trigger.removeAttribute('hidden');
-  }
-
-  /* ---- installation method and copy feedback ---- */
-  const INSTALL_METHODS = {
-    homebrew: 'brew install inxbit/tap/prismtty',
-    cargo: 'cargo install prismtty',
-  };
-
-  function initInstallMethods() {
-    const root = document.querySelector('.install-section');
-    const group = root?.querySelector('.install-methods');
-    const buttons = root ? [...root.querySelectorAll('[data-install-method]')] : [];
-    const command = root?.querySelector('[data-install-command]');
-    if (!root || !group || !command || !buttons.length) return;
-    if (buttons.some((button) => !INSTALL_METHODS[button.dataset.installMethod])) return;
-
-    const selectMethod = (button) => {
-      buttons.forEach((item) => {
-        item.setAttribute('aria-pressed', String(item === button));
-      });
-      command.textContent = INSTALL_METHODS[button.dataset.installMethod];
-    };
-    buttons.forEach((button) => {
-      button.addEventListener('click', () => {
-        selectMethod(button);
-        root.dispatchEvent(new Event('installmethodchange'));
-      });
-    });
-
-    const selected = buttons.find((button) => button.getAttribute('aria-pressed') === 'true') || buttons[0];
-    selectMethod(selected);
-    group.removeAttribute('hidden');
-  }
-
+  /* ---- copy buttons ---- */
   function initCopy() {
-    const root = document.querySelector('.install-section');
-    const button = root?.querySelector('[data-copy-command]');
-    const command = root?.querySelector('[data-install-command]');
-    const status = root?.querySelector('[data-copy-status]');
-    const methodButtons = root ? [...root.querySelectorAll('[data-install-method]')] : [];
-    if (!root || !button || !command || !status) return;
-
-    let resetTimer;
-    let copySequence = 0;
-    const resetButton = () => {
-      window.clearTimeout(resetTimer);
-      button.textContent = 'Copy command';
-      button.removeAttribute('data-copy-state');
-    };
-    const setCopyPending = (pending) => {
-      button.disabled = pending;
-      methodButtons.forEach((methodButton) => {
-        methodButton.disabled = pending;
+    document.querySelectorAll('[data-copy]').forEach((btn) => {
+      const original = btn.textContent;
+      btn.addEventListener('click', async () => {
+        try {
+          await navigator.clipboard.writeText(btn.dataset.copy);
+          btn.textContent = 'Copied ✓';
+        } catch {
+          btn.textContent = 'Select all';
+        }
+        btn.classList.add('copied');
+        setTimeout(() => {
+          btn.textContent = original;
+          btn.classList.remove('copied');
+        }, 1600);
       });
-      if (pending) button.setAttribute('aria-busy', 'true');
-      else button.removeAttribute('aria-busy');
-    };
-    const selectCommand = () => {
-      command.focus();
-      const selection = window.getSelection();
-      if (!selection) return;
-      const range = document.createRange();
-      range.selectNodeContents(command);
-      selection.removeAllRanges();
-      selection.addRange(range);
-    };
-
-    button.addEventListener('click', async () => {
-      const text = command.textContent.trim();
-      const operation = ++copySequence;
-      resetButton();
-      setCopyPending(true);
-      status.textContent = 'Copying command';
-      button.textContent = 'Copying';
-      try {
-        if (!Object.values(INSTALL_METHODS).includes(text)) throw new Error('Unknown install command');
-        await navigator.clipboard.writeText(text);
-        if (operation !== copySequence || command.textContent.trim() !== text) return;
-        status.textContent = 'Command copied';
-        button.textContent = 'Copied';
-        button.dataset.copyState = 'success';
-      } catch {
-        if (operation !== copySequence || command.textContent.trim() !== text) return;
-        status.textContent = 'Select the command and copy it manually';
-        button.textContent = 'Select command';
-        button.dataset.copyState = 'failure';
-        selectCommand();
-      } finally {
-        if (operation === copySequence) setCopyPending(false);
-      }
-      if (operation !== copySequence) return;
-      window.clearTimeout(resetTimer);
-      resetTimer = window.setTimeout(resetButton, 1600);
     });
-    root.addEventListener('installmethodchange', () => {
-      copySequence += 1;
-      setCopyPending(false);
-      status.textContent = '';
-      resetButton();
-    });
+  }
 
-    button.removeAttribute('hidden');
+  /* ---- cursor spotlight on panels ---- */
+  function initSpotlight() {
+    if (reduceMotion || window.matchMedia('(hover: none)').matches) return;
+    const panels = document.querySelectorAll(
+      '.feature-card, .install-card, .workflow-step, .scope-panel'
+    );
+    panels.forEach((el) => {
+      el.classList.add('spot');
+      el.addEventListener('pointermove', (e) => {
+        const r = el.getBoundingClientRect();
+        el.style.setProperty('--mx', `${e.clientX - r.left}px`);
+        el.style.setProperty('--my', `${e.clientY - r.top}px`);
+      });
+    });
   }
 
   /* ---- scroll reveal ---- */
-  function revealElement(element) {
-    element.classList.add('is-in');
-    if (reduceMotion || typeof element.animate !== 'function') return;
-
-    const animation = element.animate(
-      [
-        { transform: 'translateY(18px)' },
-        { transform: 'translateY(0)' },
-      ],
-      { duration: 640, easing: 'cubic-bezier(0.16, 1, 0.3, 1)' },
-    );
-    revealAnimations.add(animation);
-    void animation.finished.catch(() => {}).finally(() => {
-      revealAnimations.delete(animation);
-    });
-  }
-
   function initReveal() {
-    const targets = [...document.querySelectorAll('.section, .proof-rail, .command-band')];
-    targets.forEach((element) => {
-      element.classList.add('reveal');
-      element.addEventListener('focusin', () => {
-        element.classList.add('is-in');
-        revealObserver?.unobserve(element);
-      }, { once: true });
-    });
-
-    if (reduceMotion || !supportsIntersectionObserver()) {
-      targets.forEach((element) => element.classList.add('is-in'));
-      return;
-    }
-
-    revealObserver = new IntersectionObserver(
-      (entries) => {
-        entries.forEach((entry) => {
-          if (!entry.isIntersecting) return;
-          revealElement(entry.target);
-          revealObserver?.unobserve(entry.target);
+    const targets = document.querySelectorAll('.section, .command-band');
+    if (reduceMotion || !('IntersectionObserver' in window)) return;
+    targets.forEach((el) => el.classList.add('reveal'));
+    const io = new IntersectionObserver(
+      (entries, obs) => {
+        entries.forEach((e) => {
+          if (e.isIntersecting) {
+            e.target.classList.add('is-in');
+            obs.unobserve(e.target);
+          }
         });
       },
       { rootMargin: '0px 0px -12% 0px', threshold: 0.08 }
     );
-    targets.forEach((element) => revealObserver.observe(element));
-  }
-
-  function updateMotionState() {
-    reduceMotion = motionQuery.matches;
-    const comparison = document.querySelector('[data-compare]');
-    if (reduceMotion) {
-      stopCompareObservation();
-      if (comparison && comparison.dataset.compareSource !== 'user') {
-        setComparePosition(comparison, 50, 'program');
-      }
-      profileOutputAnimation?.cancel();
-      profileOutputAnimation = undefined;
-      revealAnimations.forEach((animation) => animation.cancel());
-      revealAnimations.clear();
-      revealObserver?.disconnect();
-      revealObserver = undefined;
-      document.querySelectorAll('.reveal').forEach((element) => {
-        element.classList.add('is-in');
-      });
-    } else {
-      startCompareObservation();
-    }
-    startHeroPlayback();
+    targets.forEach((el) => io.observe(el));
   }
 
   /* ---- active nav state ---- */
   function initNav() {
-    const nav = document.querySelector('[data-site-nav]');
-    const links = nav ? [...nav.querySelectorAll('a[href^="#"]')] : [];
+    const links = [...document.querySelectorAll('.site-nav a[href^="#"]')];
     const sections = links
       .map((l) => document.querySelector(l.getAttribute('href')))
       .filter(Boolean);
-    if (!sections.length || !supportsIntersectionObserver()) return;
+    if (!sections.length || !('IntersectionObserver' in window)) return;
 
     const io = new IntersectionObserver(
       (entries) => {
@@ -673,32 +310,20 @@
           .filter((e) => e.isIntersecting)
           .sort((a, b) => b.intersectionRatio - a.intersectionRatio)[0];
         if (!visible) return;
-        links.forEach((link) => {
-          const active = link.getAttribute('href') === `#${visible.target.id}`;
-          link.classList.toggle('is-active', active);
-          if (active) link.setAttribute('aria-current', 'location');
-          else link.removeAttribute('aria-current');
-        });
+        links.forEach((l) =>
+          l.classList.toggle('is-active', l.getAttribute('href') === `#${visible.target.id}`)
+        );
       },
       { rootMargin: '-18% 0px -62% 0px', threshold: [0.1, 0.25, 0.5] }
     );
     sections.forEach((s) => io.observe(s));
   }
 
-  initMobileMenu();
   initCompare();
   initProfiles();
-  initInstallMethods();
   initCopy();
+  initSpotlight();
   initReveal();
   initNav();
-  initHeroLifecycle();
-  initHeroEntrance();
-  if (typeof motionQuery.addEventListener === 'function') {
-    motionQuery.addEventListener('change', updateMotionState);
-  } else if (typeof motionQuery.addListener === 'function') {
-    motionQuery.addListener(updateMotionState);
-  }
-  document.addEventListener('visibilitychange', startHeroPlayback);
-  updateMotionState();
+  runHero();
 })();
