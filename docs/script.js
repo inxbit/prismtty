@@ -1,4 +1,4 @@
-/* PrismTTY site — a miniature of what the tool does.
+/* PrismTTY site - a miniature of what the tool does.
    One small rule-based highlighter feeds three surfaces:
    the animated hero terminal, the raw/highlighted compare slider,
    and the interactive profile tabs. No dependencies. */
@@ -282,14 +282,13 @@
   /* ---- 2. raw / highlighted compare slider ---- */
   function setComparePosition(root, value, source = 'program') {
     const normalized = Math.max(0, Math.min(100, Number(value)));
-    const highlightedPercentage = 100 - normalized;
     const controls = root.closest('.instrument-shell') || root;
     const range = controls.querySelector('[data-compare-range]');
     const output = controls.querySelector('[data-compare-output]');
     root.style.setProperty('--compare-position', `${normalized}%`);
     range.value = String(normalized);
-    range.setAttribute('aria-valuetext', `${highlightedPercentage}% highlighted`);
-    output.value = `${highlightedPercentage}% highlighted`;
+    range.setAttribute('aria-valuetext', `${normalized}% raw output`);
+    output.value = `${normalized}% raw output`;
     controls.querySelectorAll('[data-compare-mode]').forEach((button) => {
       const pressed = (button.dataset.compareMode === 'raw' && normalized === 100)
         || (button.dataset.compareMode === 'highlighted' && normalized === 0);

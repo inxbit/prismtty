@@ -11,7 +11,11 @@ cargo fmt --check
 cargo test --locked
 cargo clippy --locked --all-targets --all-features -- -D warnings
 bash scripts/privacy-scan.sh
-node --test tests/*.test.mjs
+node --test \
+  tests/bash_completion.test.mjs \
+  tests/privacy_scan.test.mjs \
+  tests/release_security.test.mjs
+npm test
 ```
 
 Generated shell completions must stay in sync with the CLI:
@@ -44,7 +48,7 @@ shape matters.
 - Run `cargo fmt --check`.
 - Run `cargo test --locked`.
 - Run `cargo clippy --locked --all-targets --all-features -- -D warnings`.
-- Run `bash scripts/privacy-scan.sh` and `node --test tests/*.test.mjs`.
+- Run `bash scripts/privacy-scan.sh`, the explicit Node tests above, and `npm test`.
 - Regenerate completions when CLI flags or command help changes.
 - Update `README.md` or `CHANGELOG.md` when user-facing behavior changes.
 - Keep release, Homebrew, and workflow changes reproducible from checked-in

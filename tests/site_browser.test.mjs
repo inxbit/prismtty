@@ -157,6 +157,35 @@ test('shows the approved hero inside the first desktop viewport', async ({ page 
   expect(installBox.y + installBox.height).toBeLessThanOrEqual(900);
 });
 
+for (const viewport of [
+  { width: 768, height: 1024 },
+  { width: 1024, height: 768 },
+  { width: 1440, height: 900 },
+]) {
+  test(`keeps the desktop hero headline to two lines at ${viewport.width}px`, async ({ page }) => {
+    await page.setViewportSize(viewport);
+    await page.goto('/');
+    await page.evaluate(() => document.fonts.ready);
+
+    const lineCount = await page.locator('#hero-title').evaluate((heading) => {
+      const range = document.createRange();
+      range.selectNodeContents(heading);
+      const lineTops = [...range.getClientRects()]
+        .filter((rect) => rect.width > 0 && rect.height > 0)
+        .map((rect) => Math.round(rect.top));
+      return new Set(lineTops).size;
+    });
+    expect(lineCount).toBeLessThanOrEqual(2);
+
+    const installBox = await page.locator('.hero').getByRole('link', {
+      name: 'Install',
+      exact: true,
+    }).boundingBox();
+    expect(installBox).not.toBeNull();
+    expect(installBox.y + installBox.height).toBeLessThanOrEqual(viewport.height);
+  });
+}
+
 test('motion preference changes make the hero complete and stable without a reload', async ({ page }) => {
   await page.emulateMedia({ reducedMotion: 'no-preference' });
   await page.goto('/');
@@ -264,7 +293,7 @@ test('user comparison state survives live motion preference changes', async ({ p
   await page.emulateMedia({ reducedMotion: 'reduce' });
   await page.goto('/#compare');
   const comparison = page.locator('[data-compare]');
-  const range = page.getByRole('slider', { name: 'Highlighted output reveal' });
+  const range = page.getByRole('slider', { name: 'Raw output reveal' });
 
   await expect(comparison).toHaveCSS('--compare-position', '50%');
   await range.fill('72');
@@ -615,8 +644,9 @@ test('profile fallback keeps terminal output but hides inert tabs without JavaSc
 test('profile terminal preserves columns in a contained focusable scroll region', async ({ page }) => {
   await page.setViewportSize({ width: 320, height: 844 });
   await page.goto('/#profiles');
-  const body = page.locator('[data-profile-body]');
+  const body = page.getByRole('region', { name: 'Profile terminal output' });
 
+  await expect(body).toHaveAttribute('data-profile-body', '');
   await expect(body).toHaveAttribute('tabindex', '0');
   await expect(body).toHaveAttribute('aria-label', 'Profile terminal output');
   await expect(body).toHaveCSS('white-space', 'pre');
@@ -635,6 +665,7 @@ test('profile terminal preserves columns in a contained focusable scroll region'
 
   await body.focus();
   await expect(body).toBeFocused();
+  await expect(body).toHaveCSS('outline-offset', '-4px');
 
   const results = await new AxeBuilder({ page })
     .include('#profiles')
@@ -643,9 +674,9 @@ test('profile terminal preserves columns in a contained focusable scroll region'
   expect(results.violations).toEqual([]);
 });
 
-test('comparison reports highlighted output at boundary positions', async ({ page }) => {
+test('comparison reports raw output at boundary positions and follows arrow direction', async ({ page }) => {
   await page.goto('/#compare');
-  const range = page.getByRole('slider', { name: 'Highlighted output reveal' });
+  const range = page.getByRole('slider', { name: 'Raw output reveal' });
   const rangeElement = page.locator('[data-compare-range]');
   const output = page.locator('[data-compare-output]');
   const root = page.locator('[data-compare]');
@@ -654,35 +685,41 @@ test('comparison reports highlighted output at boundary positions', async ({ pag
   const softExpect = expect.configure({ soft: true, timeout: 1_000 });
 
   await range.fill('72');
-  await softExpect(output).toHaveText('28% highlighted');
-  await softExpect(rangeElement).toHaveAttribute('aria-valuetext', '28% highlighted');
+  await softExpect(output).toHaveText('72% raw output');
+  await softExpect(rangeElement).toHaveAttribute('aria-valuetext', '72% raw output');
   await expect(root).toHaveCSS('--compare-position', '72%');
   await expect(rawButton).toHaveAttribute('aria-pressed', 'false');
   await expect(highlightedButton).toHaveAttribute('aria-pressed', 'false');
 
+  await range.focus();
+  await range.press('ArrowRight');
+  await softExpect(output).toHaveText('73% raw output');
+  await softExpect(rangeElement).toHaveAttribute('aria-valuetext', '73% raw output');
+  await expect(root).toHaveCSS('--compare-position', '73%');
+
   await page.setViewportSize({ width: 390, height: 844 });
   await expect(rawButton).toBeVisible();
   await expect(highlightedButton).toBeVisible();
-  await softExpect(output).toHaveText('28% highlighted');
+  await softExpect(output).toHaveText('73% raw output');
 
   await rawButton.click();
   await expect(root).toHaveCSS('--compare-position', '100%');
-  await softExpect(output).toHaveText('0% highlighted');
-  await softExpect(rangeElement).toHaveAttribute('aria-valuetext', '0% highlighted');
+  await softExpect(output).toHaveText('100% raw output');
+  await softExpect(rangeElement).toHaveAttribute('aria-valuetext', '100% raw output');
   await expect(rawButton).toHaveAttribute('aria-pressed', 'true');
   await expect(highlightedButton).toHaveAttribute('aria-pressed', 'false');
 
   await highlightedButton.click();
   await expect(root).toHaveCSS('--compare-position', '0%');
-  await softExpect(output).toHaveText('100% highlighted');
-  await softExpect(rangeElement).toHaveAttribute('aria-valuetext', '100% highlighted');
+  await softExpect(output).toHaveText('0% raw output');
+  await softExpect(rangeElement).toHaveAttribute('aria-valuetext', '0% raw output');
   await expect(rawButton).toHaveAttribute('aria-pressed', 'false');
   await expect(highlightedButton).toHaveAttribute('aria-pressed', 'true');
 });
 
 test('comparison keeps pressed state aligned across viewport changes', async ({ page }) => {
   await page.goto('/#compare');
-  const range = page.getByRole('slider', { name: 'Highlighted output reveal' });
+  const range = page.getByRole('slider', { name: 'Raw output reveal' });
   const rawButton = page.locator('[data-compare-mode="raw"]');
   const highlightedButton = page.locator('[data-compare-mode="highlighted"]');
 
@@ -731,6 +768,27 @@ test('comparison keeps raw and highlighted pane scrolling aligned', async ({ pag
   await softExpect.poll(() => raw.evaluate((pane) => pane.scrollLeft)).toBe(highlightedTarget);
 });
 
+test('comparison exposes one focusable scrollable transcript', async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.goto('/#compare');
+  const raw = page.locator('[data-compare-raw]');
+  const highlighted = page.locator('[data-compare-hl]');
+  const transcript = page.getByRole('region', { name: 'Comparison terminal output' });
+
+  await expect(transcript).toHaveAttribute('data-compare-raw', '');
+  await expect(transcript).not.toHaveAttribute('aria-hidden');
+  await expect(highlighted).toHaveAttribute('aria-hidden', 'true');
+  await expect(transcript).toHaveAttribute('tabindex', '0');
+  await transcript.focus();
+  await expect(transcript).toBeFocused();
+  await expect(transcript).toHaveCSS('outline-offset', '-4px');
+  const dimensions = await transcript.evaluate((element) => ({
+    client: element.clientWidth,
+    scroll: element.scrollWidth,
+  }));
+  expect(dimensions.scroll).toBeGreaterThan(dimensions.client);
+});
+
 test('comparison fallback hides inert controls without JavaScript', async ({ browser }) => {
   const context = await browser.newContext({
     javaScriptEnabled: false,
@@ -744,7 +802,7 @@ test('comparison fallback hides inert controls without JavaScript', async ({ bro
     await expect(page.locator('[data-compare-raw] .tline')).toHaveCount(3);
     await expect(page.locator('[data-compare-hl] .tline')).toHaveCount(3);
     await softExpect(page.locator('.compare-control')).toBeHidden();
-    await softExpect(page.getByRole('slider', { name: 'Highlighted output reveal' })).toHaveCount(0);
+    await softExpect(page.getByRole('slider', { name: 'Raw output reveal' })).toHaveCount(0);
 
     await page.setViewportSize({ width: 390, height: 844 });
     await softExpect(page.locator('.compare-mobile-controls')).toBeHidden();
@@ -764,4 +822,59 @@ test('has no unfocusable scrollable regions on mobile', async ({ page }) => {
     .analyze();
 
   expect(results.violations).toEqual([]);
+});
+
+test('mobile and compact desktop controls meet the 44 pixel touch target contract', async ({ page }) => {
+  for (const viewport of [
+    { width: 390, height: 844 },
+    { width: 768, height: 1024 },
+    { width: 1024, height: 768 },
+  ]) {
+    await page.setViewportSize(viewport);
+    await page.goto('/');
+    if (viewport.width < 768) await page.locator('[data-menu-trigger]').click();
+    const controls = page.locator([
+      '.skip-link',
+      '.brand',
+      '[data-menu-trigger]',
+      '.site-nav a',
+      '[data-compare-range]',
+      '[data-profile-tab]',
+      '.profile-disclosure summary',
+      '[data-install-method]',
+      '[data-install-command]',
+      '[data-copy-command]',
+      '.button',
+      '.install-links a',
+      '.footer-links a',
+      '.compare-mobile-controls button',
+    ].join(','));
+
+    const undersized = await controls.evaluateAll((elements) => elements
+      .filter((element) => {
+        const style = getComputedStyle(element);
+        return style.display !== 'none'
+          && style.visibility !== 'hidden'
+          && element.getClientRects().length > 0;
+      })
+      .map((element) => {
+        const box = element.getBoundingClientRect();
+        return {
+          label: element.getAttribute('aria-label') || element.textContent.trim(),
+          width: box.width,
+          height: box.height,
+        };
+      })
+      .filter(({ width, height }) => width < 44 || height < 44));
+
+    expect(undersized, `${viewport.width}px touch targets`).toEqual([]);
+  }
+});
+
+test('workflow steps expose ordered structure to assistive technology', async ({ page }) => {
+  await page.goto('/#scope');
+  const workflow = page.getByRole('list', { name: 'How PrismTTY works' });
+
+  await expect(workflow).toBeVisible();
+  await expect(workflow.getByRole('listitem')).toHaveCount(3);
 });

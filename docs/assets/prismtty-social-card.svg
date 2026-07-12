@@ -98,6 +98,6 @@
 
     <rect x="650" y="494" width="452" height="46" rx="11" fill="#0d1117" stroke="#202b36"/>
     <circle cx="674" cy="517" r="4" fill="#45c7d8"/>
-    <text x="690" y="522" class="mono terminal-title">9 profiles / zero telemetry</text>
+    <text x="690" y="522" class="mono terminal-title">9 profiles / no product telemetry</text>
   </g>
 </svg>

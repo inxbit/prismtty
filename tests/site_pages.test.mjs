@@ -192,6 +192,74 @@ test('site metadata, crawlers, 404, and social card match the release', () => {
   assert.equal(socialPng.readUInt32BE(20), 630);
 });
 
+test('final site design and contributor commands stay aligned', () => {
+  const index = read('docs/index.html');
+  const notFound = read('docs/404.html');
+  const script = read('docs/script.js');
+  const css = read('docs/styles.css');
+  const socialSvg = read('docs/assets/prismtty-social-card.svg');
+  const contributing = read('CONTRIBUTING.md');
+  const pullRequestTemplate = read('.github/PULL_REQUEST_TEMPLATE.md');
+  const ciWorkflow = read('.github/workflows/ci.yml');
+  const releaseWorkflow = read('.github/workflows/release.yml');
+
+  assert.doesNotMatch(`${index}${notFound}${script}${css}`, /[—–]/);
+  assert.match(index, /No product telemetry\./);
+  assert.doesNotMatch(index, />No telemetry\.</);
+  assert.match(socialSvg, /no product telemetry/);
+  assert.doesNotMatch(socialSvg, /zero telemetry/);
+
+  const headingRule = css.match(/(?:^|\n)h2\s*\{([^}]*)\}/)[1];
+  assert.match(headingRule, /font-family:\s*var\(--sans\)/);
+  const commandBandRule = css.match(/\.command-band\s*\{([^}]*)\}/)[1];
+  const workflowRule = css.match(/\.workflow-line\s*\{([^}]*)\}/)[1];
+  assert.doesNotMatch(commandBandRule, /repeat\(3/);
+  assert.doesNotMatch(workflowRule, /repeat\(3/);
+  assert.doesNotMatch(css, /\.terminal-lights i:nth-child/);
+  assert.doesNotMatch(css, /\.command-row button\[data-copy-state="failure"\][^{]*\{[^}]*var\(--amber\)/);
+  assert.doesNotMatch(css, /\.install-links a\s*\{[^}]*color:\s*var\(--cyan\)/);
+  assert.doesNotMatch(css, /code\s*\{[^}]*#a5e8f5/);
+  const skipLinkRule = css.match(/\.skip-link\s*\{([^}]*)\}/)[1];
+  assert.match(skipLinkRule, /transition:\s*transform/);
+  assert.doesNotMatch(skipLinkRule, /transition:\s*top/);
+
+  const profileDemo = index.match(/<div class="profile-demo">([\s\S]*?)<div class="profile-notes">/)[1];
+  assert.doesNotMatch(profileDemo, /class="instrument-shell"/);
+  assert.match(index, /<ol class="workflow-line" aria-label="How PrismTTY works">/);
+  assert.equal((index.match(/<li><h3>/g) || []).length, 3);
+
+  for (const validationSurface of [
+    contributing,
+    pullRequestTemplate,
+    ciWorkflow,
+    releaseWorkflow,
+  ]) {
+    assert.doesNotMatch(validationSurface, /node --test tests\/\*\.test\.mjs/);
+  }
+  assert.match(contributing, /npm test/);
+  assert.match(pullRequestTemplate, /npm test/);
+  for (const file of [
+    'tests/bash_completion.test.mjs',
+    'tests/privacy_scan.test.mjs',
+    'tests/release_security.test.mjs',
+  ]) {
+    const pattern = new RegExp(file.replaceAll('.', '\\.'));
+    assert.match(contributing, pattern);
+    assert.match(pullRequestTemplate, pattern);
+    assert.match(ciWorkflow, pattern);
+    assert.match(releaseWorkflow, pattern);
+  }
+  assert.match(ciWorkflow, /tests\/site_pages\.test\.mjs/);
+  assert.match(releaseWorkflow, /tests\/site_pages\.test\.mjs/);
+
+  assert.match(
+    index,
+    /data-compare-raw[^>]*role="region"[^>]*aria-label="Comparison terminal output"[^>]*tabindex="0"/,
+  );
+  assert.doesNotMatch(index, /data-compare-raw[^>]*aria-hidden="true"/);
+  assert.match(index, /data-compare-hl[^>]*aria-hidden="true"/);
+});
+
 test('Pages production deployment is main-only and globally serialized', () => {
   const workflow = read('.github/workflows/pages.yml');
   const mainOnly =

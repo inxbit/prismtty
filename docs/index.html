@@ -145,14 +145,14 @@
         <div class="compare-stage">
           <div class="instrument-shell">
             <div class="compare" data-compare>
-              <pre class="compare-pane compare-raw" data-compare-raw aria-hidden="true"><span class="tline">edge-sw1#show ip interface brief</span><span class="tline">GigabitEthernet1/0/1   192.0.2.10   up</span><span class="tline">GigabitEthernet1/0/2   198.51.100.42   down</span></pre>
+              <pre class="compare-pane compare-raw" data-compare-raw role="region" aria-label="Comparison terminal output" tabindex="0"><span class="tline">edge-sw1#show ip interface brief</span><span class="tline">GigabitEthernet1/0/1   192.0.2.10   up</span><span class="tline">GigabitEthernet1/0/2   198.51.100.42   down</span></pre>
               <pre class="compare-pane compare-hl" data-compare-hl aria-hidden="true"><span class="tline"><span class="hl-host">edge-sw1#</span>show ip interface brief</span><span class="tline"><span class="hl-iface">GigabitEthernet1/0/1</span>   <span class="hl-ip">192.0.2.10</span>   <span class="hl-up">up</span></span><span class="tline"><span class="hl-iface">GigabitEthernet1/0/2</span>   <span class="hl-ip">198.51.100.42</span>   <span class="hl-down">down</span></span></pre>
               <div class="compare-divider" aria-hidden="true"><span></span></div>
             </div>
             <div class="compare-control" hidden>
-              <label for="compare-range">Highlighted output reveal</label>
-              <input id="compare-range" type="range" min="0" max="100" value="46" aria-valuetext="54% highlighted" data-compare-range>
-              <output for="compare-range" data-compare-output>54% highlighted</output>
+              <label for="compare-range">Raw output reveal</label>
+              <input id="compare-range" type="range" min="0" max="100" value="46" aria-valuetext="46% raw output" data-compare-range>
+              <output for="compare-range" data-compare-output>46% raw output</output>
             </div>
             <div class="compare-mobile-controls" role="group" aria-label="Comparison view" hidden>
               <button type="button" data-compare-mode="raw" aria-pressed="false">Show raw output</button>
@@ -176,14 +176,12 @@
               <button id="profile-tab-arista" role="tab" type="button" data-profile-tab="arista" aria-controls="profile-panel" aria-selected="false" tabindex="-1">arista</button>
               <button id="profile-tab-linux-unix" role="tab" type="button" data-profile-tab="linux-unix" aria-controls="profile-panel" aria-selected="false" tabindex="-1">linux-unix</button>
             </div>
-            <div class="instrument-shell">
-              <div class="terminal" id="profile-panel" role="tabpanel" aria-labelledby="profile-tab-cisco" data-profile-panel>
-                <div class="terminal-bar"><span class="terminal-title" data-profile-title>ptty ssh edge-sw1.example.net</span></div>
-                <div class="terminal-body" data-profile-body tabindex="0" aria-label="Profile terminal output">
-                  <span class="tline"><span class="hl-host">edge-sw1#</span><span class="t-cmd">show ip interface brief</span></span>
-                  <span class="tline">Interface              IP-Address      Status    Protocol</span>
-                  <span class="tline"><span class="hl-iface">GigabitEthernet1/0/1</span>   <span class="hl-ip">192.0.2.10</span>      <span class="hl-up">up</span>        <span class="hl-up">up</span></span>
-                </div>
+            <div class="terminal" id="profile-panel" role="tabpanel" aria-labelledby="profile-tab-cisco" data-profile-panel>
+              <div class="terminal-bar"><span class="terminal-title" data-profile-title>ptty ssh edge-sw1.example.net</span></div>
+              <div class="terminal-body" data-profile-body role="region" tabindex="0" aria-label="Profile terminal output">
+                <span class="tline"><span class="hl-host">edge-sw1#</span><span class="t-cmd">show ip interface brief</span></span>
+                <span class="tline">Interface              IP-Address      Status    Protocol</span>
+                <span class="tline"><span class="hl-iface">GigabitEthernet1/0/1</span>   <span class="hl-ip">192.0.2.10</span>      <span class="hl-up">up</span>        <span class="hl-up">up</span></span>
               </div>
             </div>
           </div>
@@ -209,11 +207,11 @@
 
       <section class="section workflow-section" aria-labelledby="workflow-title">
         <div class="section-copy"><h2 id="workflow-title">Keep the workflow. Change the scan time.</h2></div>
-        <div class="workflow-line" aria-label="How PrismTTY works">
-          <article><h3>Wrap</h3><p>Run <code>ptty</code> around a shell or remote command.</p></article>
-          <article><h3>Detect</h3><p>Prompt and banner hints select the active profile.</p></article>
-          <article><h3>Highlight</h3><p>Useful tokens gain color while the original text stays intact.</p></article>
-        </div>
+        <ol class="workflow-line" aria-label="How PrismTTY works">
+          <li><h3>Wrap</h3><p>Run <code>ptty</code> around a shell or remote command.</p></li>
+          <li><h3>Detect</h3><p>Prompt and banner hints select the active profile.</p></li>
+          <li><h3>Highlight</h3><p>Useful tokens gain color while the original text stays intact.</p></li>
+        </ol>
       </section>
 
       <section class="section install-section" id="install" aria-labelledby="install-title">
@@ -256,7 +254,7 @@
         <img class="brand-logo" src="assets/prismtty-lockup.svg" alt="" width="54" height="24">
         <span>Prism<span class="tty">TTY</span></span>
       </div>
-      <p class="footer-note">MIT licensed. Clean-room profiles. No telemetry.</p>
+      <p class="footer-note">MIT licensed. Clean-room profiles. No product telemetry.</p>
       <nav class="footer-links" aria-label="Footer">
         <a href="https://github.com/inxbit/prismtty/blob/main/README.md">Docs</a>
         <a href="https://github.com/inxbit/prismtty">GitHub</a>

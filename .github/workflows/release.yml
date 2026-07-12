@@ -67,7 +67,12 @@ jobs:
           git diff --exit-code completions/
 
       - name: Verify static site and release policies
-        run: node --test tests/*.test.mjs
+        run: >-
+          node --test
+          tests/bash_completion.test.mjs
+          tests/privacy_scan.test.mjs
+          tests/release_security.test.mjs
+          tests/site_pages.test.mjs
 
       - name: Package
         run: bash scripts/package-release.sh "${{ matrix.target_name }}"
