@@ -1726,15 +1726,9 @@ fn visible_byte_map_and_ansi_ranges(input: &[u8]) -> (Vec<VisibleByte>, Vec<Ansi
     let mut idx = 0usize;
 
     while idx < input.len() {
-        if let Some(width) = valid_utf8_char_width_at(input, idx) {
-            for (offset, byte) in input[idx..idx + width].iter().copied().enumerate() {
-                visible.push(VisibleByte {
-                    byte,
-                    raw: idx + offset,
-                });
-            }
-            idx += width;
-        } else if input[idx] == 0x1b || is_c1_control(input[idx]) {
+        // Same classification order as `tokenize_ansi`: a control (including the
+        // UTF-8 C1 form `C2 xx`) wins over the UTF-8 character it also encodes.
+        if input[idx] == 0x1b || c1_control_at(input, idx).is_some() {
             let c1 = input[idx] != 0x1b;
             let end = if c1 {
                 c1_sequence_end(input, idx)
@@ -1744,11 +1738,18 @@ fn visible_byte_map_and_ansi_ranges(input: &[u8]) -> (Vec<VisibleByte>, Vec<Ansi
             ansi_ranges.push(AnsiRange {
                 start: idx,
                 end,
-                is_sgr: (input[idx..end].starts_with(b"\x1b[")
-                    || input[idx..end].starts_with(b"\x9b"))
+                is_sgr: is_csi_sequence(&input[idx..end])
                     && input.get(end.saturating_sub(1)) == Some(&b'm'),
             });
             idx = end;
+        } else if let Some(width) = valid_utf8_char_width_at(input, idx) {
+            for (offset, byte) in input[idx..idx + width].iter().copied().enumerate() {
+                visible.push(VisibleByte {
+                    byte,
+                    raw: idx + offset,
+                });
+            }
+            idx += width;
         } else {
             visible.push(VisibleByte {
                 byte: input[idx],
@@ -2479,13 +2480,11 @@ fn contains_alternate_screen_enable_tokens(tokens: &[Token]) -> bool {
 }
 
 fn alternate_screen_command(bytes: &[u8]) -> Option<bool> {
-    let body_start = if bytes.starts_with(b"\x1b[?") {
-        3
-    } else if bytes.starts_with(b"\x9b?") {
-        2
-    } else {
+    let introducer = csi_introducer_len(bytes)?;
+    if bytes.get(introducer) != Some(&b'?') {
         return None;
-    };
+    }
+    let body_start = introducer + 1;
     let final_byte = *bytes.last()?;
     let enable = match final_byte {
         b'h' => true,
@@ -2508,7 +2507,9 @@ fn contains_cursor_positioning_sequence_tokens(tokens: &[Token]) -> bool {
 
 fn contains_bracketed_paste_disable_tokens(tokens: &[Token]) -> bool {
     tokens.iter().any(|token| match token {
-        Token::Ansi(bytes) => matches!(bytes.as_slice(), b"\x1b[?2004l" | b"\x9b?2004l"),
+        Token::Ansi(bytes) => {
+            csi_introducer_len(bytes).is_some_and(|introducer| &bytes[introducer..] == b"?2004l")
+        }
         Token::Text(_) => false,
     })
 }
@@ -2542,8 +2543,21 @@ fn is_interactive_layout_boundary_sequence(bytes: &[u8]) -> bool {
         )
 }
 
+/// Length of the CSI introducer at the start of `bytes`: `ESC [`, the raw C1
+/// `9B`, or its UTF-8 encoding `C2 9B` (the tokenizer accepts both C1 forms,
+/// so every classifier must too). `None` when `bytes` is not a CSI sequence.
+fn csi_introducer_len(bytes: &[u8]) -> Option<usize> {
+    if bytes.starts_with(b"\x1b[") || bytes.starts_with(b"\xc2\x9b") {
+        Some(2)
+    } else if bytes.starts_with(b"\x9b") {
+        Some(1)
+    } else {
+        None
+    }
+}
+
 fn is_csi_sequence(bytes: &[u8]) -> bool {
-    bytes.starts_with(b"\x1b[") || bytes.starts_with(b"\x9b")
+    csi_introducer_len(bytes).is_some()
 }
 
 fn visible_bytes(tokens: &[Token]) -> Vec<u8> {
@@ -2739,11 +2753,7 @@ struct NativeSgrState {
 
 impl NativeSgrState {
     fn apply_sequence(&mut self, bytes: &[u8]) {
-        let body_start = if bytes.starts_with(b"\x1b[") {
-            2
-        } else if bytes.starts_with(b"\x9b") {
-            1
-        } else {
+        let Some(body_start) = csi_introducer_len(bytes) else {
             return;
         };
         if !bytes.ends_with(b"m") {
@@ -4529,7 +4539,11 @@ rules:
         let highlighter =
             Highlighter::from_config(PrismConfig::default()).expect("empty config compiles");
 
-        for source_sgr in [b"\x1b[31m".as_slice(), b"\x9b31m".as_slice()] {
+        for source_sgr in [
+            b"\x1b[31m".as_slice(),
+            b"\x9b31m".as_slice(),
+            b"\xc2\x9b31m".as_slice(),
+        ] {
             let mut streaming = StreamingHighlighter::new_interactive(highlighter.clone());
             assert_eq!(streaming.push(b"FGT01 # "), b"FGT01 # ");
 
@@ -5350,6 +5364,44 @@ rules:
     fn raw_c1_csi_updates_terminal_state_checks() {
         assert_eq!(super::alternate_screen_command(b"\x9b?1049h"), Some(true));
         assert!(super::is_cursor_positioning_sequence(b"\x9b2H"));
+    }
+
+    // The tokenizer accepts the UTF-8 encoding of C1 CSI (`C2 9B`) as a
+    // control, so every classifier must treat it exactly like `9B` and `ESC [`.
+    #[test]
+    fn utf8_c1_csi_matches_raw_c1_csi_in_every_classifier() {
+        assert_eq!(
+            super::alternate_screen_command(b"\xc2\x9b?1049h"),
+            Some(true)
+        );
+        assert_eq!(
+            super::alternate_screen_command(b"\xc2\x9b?1049l"),
+            Some(false)
+        );
+        assert!(super::is_csi_sequence(b"\xc2\x9b2H"));
+        assert!(super::is_cursor_positioning_sequence(b"\xc2\x9b2H"));
+        assert!(super::is_interactive_layout_boundary_sequence(
+            b"\xc2\x9b2J"
+        ));
+        assert!(super::contains_bracketed_paste_disable_tokens(&[
+            super::Token::Ansi(b"\xc2\x9b?2004l".to_vec())
+        ]));
+
+        let mut state = NativeSgrState::default();
+        state.apply_sequence(b"\xc2\x9b31m");
+        assert_eq!(state.ansi_start().as_deref(), Some("\x1b[31m"));
+        state.apply_sequence(b"\xc2\x9b0m");
+        assert_eq!(state.ansi_start(), None);
+
+        // The visible-byte map must agree with the tokenizer: the control is
+        // not visible text, and it is an SGR range.
+        let (visible, ranges) = super::visible_byte_map_and_ansi_ranges(b"a\xc2\x9b31mb");
+        assert_eq!(
+            visible.iter().map(|byte| byte.byte).collect::<Vec<_>>(),
+            b"ab"
+        );
+        assert_eq!(ranges.len(), 1);
+        assert!(ranges[0].is_sgr);
     }
 
     #[test]

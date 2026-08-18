@@ -27,6 +27,12 @@ All notable changes to PrismTTY are documented here.
   administrator.` right after `closed` could pop the remote profile mid-session;
   the marker is now evaluated once its line is complete, and a genuine close
   marker split across reads still pops when its line ends.
+- Treat the UTF-8 encoding of the C1 CSI introducer (`C2 9B`) like the raw
+  `9B` and `ESC [` forms everywhere, not only in the tokenizer: alternate
+  screen enter/leave, cursor and layout sequences, bracketed-paste disable,
+  program SGR tracking, and prompt-echo SGR neutralization now all recognize
+  it, so a program using that form no longer stays highlighted inside a
+  full-screen view or loses its foreground after a highlighted token.
 
 ## 1.2.1 - 2026-07-11
 
