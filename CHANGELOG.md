@@ -70,6 +70,9 @@ All notable changes to PrismTTY are documented here.
 - Require a `SAFETY:` comment on every `unsafe` block
   (`clippy::undocumented_unsafe_blocks`, enforced by the CI clippy gate) and
   document the existing libc PTY, termios, signal, and wait calls.
+- Bound the PCRE2 install step in CI and release packaging to 10 minutes and
+  give apt fetch timeouts and retries, so a stalled Ubuntu mirror fails the
+  job in minutes instead of holding it for hours.
 
 ## 1.2.1 - 2026-07-11
 

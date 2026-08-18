@@ -43,9 +43,13 @@ jobs:
           toolchain: 1.85.0
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Install PCRE2
+        # A hung apt mirror once held this step for hours; bound it and make
+        # apt give up on a stalled fetch instead of waiting forever.
+        timeout-minutes: 10
         run: |
-          sudo apt-get update
-          sudo apt-get install -y libpcre2-dev pkg-config
+          apt_get() { sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 "$@"; }
+          apt_get update
+          apt_get install -y --no-install-recommends libpcre2-dev pkg-config
       - run: cargo test --locked
 
   test:
@@ -65,12 +69,16 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Install PCRE2
+        # A hung apt mirror once held this step for hours; bound it and make
+        # apt give up on a stalled fetch instead of waiting forever.
+        timeout-minutes: 10
         run: |
           if [[ "${{ runner.os }}" == "macOS" ]]; then
             brew install pcre2 pkg-config
           else
-            sudo apt-get update
-            sudo apt-get install -y libpcre2-dev pkg-config
+            apt_get() { sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 "$@"; }
+            apt_get update
+            apt_get install -y --no-install-recommends libpcre2-dev pkg-config
           fi
       - run: cargo fmt --check
       - run: cargo clippy --locked --all-targets --all-features -- -D warnings
