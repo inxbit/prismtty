@@ -6,7 +6,7 @@ use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::process::ExitCode;
 use std::sync::{
     Arc, Mutex,
-    atomic::{AtomicI32, Ordering},
+    atomic::{AtomicI32, AtomicUsize, Ordering},
     mpsc::{self, SyncSender},
 };
 use std::thread;
@@ -119,8 +119,71 @@ const RAW_SIGNAL_STOP_BYTE: u8 = 0;
 const RESIZE_STOP_BYTE: u8 = b'q';
 const RESIZE_WAKE_BYTE: u8 = b'r';
 
-static RAW_MODE_SIGNAL_WRITE_FD: AtomicI32 = AtomicI32::new(-1);
-static RESIZE_SIGNAL_WRITE_FD: AtomicI32 = AtomicI32::new(-1);
+static RAW_MODE_SIGNAL_PIPE: SignalPipeSlot = SignalPipeSlot::new();
+static RESIZE_SIGNAL_PIPE: SignalPipeSlot = SignalPipeSlot::new();
+
+/// How long `SignalPipeSlot::disarm` waits for an in-flight signal handler to
+/// finish its write before giving up and leaking the descriptor instead of
+/// closing it out from under the handler.
+const SIGNAL_PIPE_DISARM_LIMIT: Duration = Duration::from_secs(1);
+
+/// The write end of a self-pipe shared with an async signal handler.
+///
+/// The handler runs `notify`: it announces itself in `in_flight`, loads the
+/// descriptor, writes one byte, and leaves. `disarm` publishes `-1` and then
+/// waits for `in_flight` to drain before the caller closes the descriptor, so a
+/// handler that loaded the descriptor just before it was withdrawn can never
+/// write into a descriptor number that has since been reused. Everything the
+/// handler touches is an atomic or `write(2)`, all async-signal-safe.
+struct SignalPipeSlot {
+    write_fd: AtomicI32,
+    in_flight: AtomicUsize,
+}
+
+impl SignalPipeSlot {
+    const fn new() -> Self {
+        Self {
+            write_fd: AtomicI32::new(-1),
+            in_flight: AtomicUsize::new(0),
+        }
+    }
+
+    fn arm(&self, write_fd: RawFd) {
+        self.write_fd.store(write_fd, Ordering::SeqCst);
+    }
+
+    /// Async-signal-safe: called from signal handlers.
+    fn notify(&self, byte: u8) {
+        self.in_flight.fetch_add(1, Ordering::SeqCst);
+        let write_fd = self.write_fd.load(Ordering::SeqCst);
+        if write_fd >= 0 {
+            write_signal_byte(write_fd, byte);
+        }
+        self.in_flight.fetch_sub(1, Ordering::SeqCst);
+    }
+
+    /// Withdraws the descriptor from handlers and returns once no handler can
+    /// still be writing to it, so the caller may close it. Returns `false` if a
+    /// handler stayed in flight past the limit; the caller must then leak the
+    /// descriptor rather than close it. A stalled handler's eventual write on
+    /// the leaked end (whose reader has gone) fails with EPIPE, which is
+    /// harmless because the Rust runtime ignores SIGPIPE.
+    fn disarm(&self) -> bool {
+        self.disarm_within(SIGNAL_PIPE_DISARM_LIMIT)
+    }
+
+    fn disarm_within(&self, limit: Duration) -> bool {
+        self.write_fd.store(-1, Ordering::SeqCst);
+        let deadline = Instant::now() + limit;
+        while self.in_flight.load(Ordering::SeqCst) != 0 {
+            if Instant::now() >= deadline {
+                return false;
+            }
+            thread::yield_now();
+        }
+        true
+    }
+}
 static FORWARD_CHILD_PID: AtomicI32 = AtomicI32::new(0);
 static FORWARD_CHILD_LOCK: Mutex<()> = Mutex::new(());
 
@@ -999,10 +1062,7 @@ impl Drop for RawModeGuard {
 }
 
 extern "C" fn restore_raw_mode_for_signal(signal: libc::c_int) {
-    let write_fd = RAW_MODE_SIGNAL_WRITE_FD.load(Ordering::SeqCst);
-    if write_fd >= 0 {
-        write_signal_byte(write_fd, signal as u8);
-    }
+    RAW_MODE_SIGNAL_PIPE.notify(signal as u8);
 }
 
 fn terminate_raw_mode_from_signal_state(state: &Mutex<RawModeLifecycle>) -> io::Result<()> {
@@ -1102,16 +1162,17 @@ impl SessionSignalWatcher {
             close_fd(write_fd);
             return Err(error);
         }
-        RAW_MODE_SIGNAL_WRITE_FD.store(write_fd, Ordering::SeqCst);
+        RAW_MODE_SIGNAL_PIPE.arm(write_fd);
         let mut previous_signal_handlers = Vec::new();
         for signal in TERMINATING_SIGNALS.into_iter().chain(JOB_CONTROL_SIGNALS) {
             match install_signal_handler(signal, restore_raw_mode_for_signal, libc::SA_RESTART) {
                 Ok(previous) => previous_signal_handlers.push((signal, previous)),
                 Err(error) => {
                     restore_signal_handlers(&previous_signal_handlers);
-                    RAW_MODE_SIGNAL_WRITE_FD.store(-1, Ordering::SeqCst);
                     close_fd(read_fd);
-                    close_fd(write_fd);
+                    if RAW_MODE_SIGNAL_PIPE.disarm() {
+                        close_fd(write_fd);
+                    }
                     return Err(error);
                 }
             }
@@ -1134,10 +1195,14 @@ impl SessionSignalWatcher {
         }
         restore_signal_handlers(&self.previous_signal_handlers);
         self.previous_signal_handlers.clear();
-        RAW_MODE_SIGNAL_WRITE_FD.store(-1, Ordering::SeqCst);
+        // Handlers are restored, so no new one starts; wait out any that is
+        // mid-write before the descriptor is closed (or leak it if one stalls).
+        let closable = RAW_MODE_SIGNAL_PIPE.disarm();
         if self.write_fd >= 0 {
             write_signal_byte(self.write_fd, RAW_SIGNAL_STOP_BYTE);
-            close_fd(self.write_fd);
+            if closable {
+                close_fd(self.write_fd);
+            }
             self.write_fd = -1;
         }
         if let Some(thread) = self.thread.take() {
@@ -1280,7 +1345,7 @@ impl PtyResizeWatcher {
             close_fd(write_fd);
             return Err(error);
         }
-        RESIZE_SIGNAL_WRITE_FD.store(write_fd, Ordering::SeqCst);
+        RESIZE_SIGNAL_PIPE.arm(write_fd);
         let previous_signal_handler = match install_signal_handler(
             libc::SIGWINCH,
             notify_resize_for_signal,
@@ -1288,9 +1353,10 @@ impl PtyResizeWatcher {
         ) {
             Ok(previous) => previous,
             Err(error) => {
-                RESIZE_SIGNAL_WRITE_FD.store(-1, Ordering::SeqCst);
                 close_fd(read_fd);
-                close_fd(write_fd);
+                if RESIZE_SIGNAL_PIPE.disarm() {
+                    close_fd(write_fd);
+                }
                 return Err(error);
             }
         };
@@ -1306,10 +1372,14 @@ impl PtyResizeWatcher {
 
     fn stop(&mut self) {
         restore_signal_handler(libc::SIGWINCH, &self.previous_signal_handler);
-        RESIZE_SIGNAL_WRITE_FD.store(-1, Ordering::SeqCst);
+        // Handler restored, so no new one starts; wait out any that is
+        // mid-write before the descriptor is closed (or leak it if one stalls).
+        let closable = RESIZE_SIGNAL_PIPE.disarm();
         if self.write_fd >= 0 {
             write_signal_byte(self.write_fd, RESIZE_STOP_BYTE);
-            close_fd(self.write_fd);
+            if closable {
+                close_fd(self.write_fd);
+            }
             self.write_fd = -1;
         }
         if let Some(thread) = self.thread.take() {
@@ -1325,10 +1395,7 @@ impl Drop for PtyResizeWatcher {
 }
 
 extern "C" fn notify_resize_for_signal(_signal: libc::c_int) {
-    let write_fd = RESIZE_SIGNAL_WRITE_FD.load(Ordering::SeqCst);
-    if write_fd >= 0 {
-        write_signal_byte(write_fd, RESIZE_WAKE_BYTE);
-    }
+    RESIZE_SIGNAL_PIPE.notify(RESIZE_WAKE_BYTE);
 }
 
 fn resize_pty_on_signals(master: Box<dyn portable_pty::MasterPty + Send>, read_fd: RawFd) {
@@ -1456,12 +1523,15 @@ fn restore_signal_handler(signal: libc::c_int, previous: &libc::sigaction) {
 #[cfg(test)]
 mod tests {
     use std::io::Cursor;
+    use std::os::fd::RawFd;
     use std::sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
         mpsc,
     };
+    use std::time::{Duration, Instant};
 
+    use nix::libc;
     use nix::sys::termios::{InputFlags, LocalFlags, OutputFlags};
 
     #[test]
@@ -1939,6 +2009,88 @@ mod tests {
                 .kind(),
             std::io::ErrorKind::BrokenPipe
         );
+    }
+
+    // The self-pipe protocol between a signal handler and the watcher's stop:
+    // once the slot is disarmed a handler must never write, and the descriptor
+    // must not be closed while a handler that already loaded it is still
+    // writing (its number could be reused by then).
+    fn signal_pipe_for_test() -> (RawFd, RawFd) {
+        let (read_fd, write_fd) = super::pipe_fds().expect("pipe");
+        super::set_fd_nonblocking(read_fd).expect("nonblocking read end");
+        super::set_fd_nonblocking(write_fd).expect("nonblocking write end");
+        (read_fd, write_fd)
+    }
+
+    fn drain_signal_pipe(read_fd: RawFd) -> Vec<u8> {
+        let mut buffer = [0_u8; 16];
+        // SAFETY: `buffer` is valid for writes of its length and `read_fd` is our pipe end.
+        let read = unsafe { libc::read(read_fd, buffer.as_mut_ptr().cast(), buffer.len()) };
+        if read <= 0 {
+            Vec::new()
+        } else {
+            buffer[..read as usize].to_vec()
+        }
+    }
+
+    #[test]
+    fn signal_pipe_slot_notify_writes_only_while_armed() {
+        let slot = super::SignalPipeSlot::new();
+        let (read_fd, write_fd) = signal_pipe_for_test();
+
+        slot.notify(b'x');
+        assert!(drain_signal_pipe(read_fd).is_empty(), "unarmed slot wrote");
+
+        slot.arm(write_fd);
+        slot.notify(b'y');
+        assert_eq!(drain_signal_pipe(read_fd), b"y");
+
+        assert!(slot.disarm(), "no handler in flight, so closable");
+        slot.notify(b'z');
+        assert!(drain_signal_pipe(read_fd).is_empty(), "disarmed slot wrote");
+
+        super::close_fd(read_fd);
+        super::close_fd(write_fd);
+    }
+
+    #[test]
+    fn signal_pipe_slot_disarm_waits_for_an_in_flight_handler() {
+        static SLOT: super::SignalPipeSlot = super::SignalPipeSlot::new();
+        let (read_fd, write_fd) = signal_pipe_for_test();
+        SLOT.arm(write_fd);
+
+        // A handler that has announced itself but not finished writing yet.
+        SLOT.in_flight.fetch_add(1, Ordering::SeqCst);
+        let disarm = std::thread::spawn(|| SLOT.disarm());
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(
+            !disarm.is_finished(),
+            "disarm returned while a handler was still in flight"
+        );
+
+        SLOT.in_flight.fetch_sub(1, Ordering::SeqCst);
+        assert!(
+            disarm.join().expect("disarm thread"),
+            "descriptor is closable once the handler has left"
+        );
+
+        super::close_fd(read_fd);
+        super::close_fd(write_fd);
+    }
+
+    #[test]
+    fn signal_pipe_slot_disarm_gives_up_on_a_stalled_handler() {
+        let slot = super::SignalPipeSlot::new();
+        slot.arm(3);
+        slot.in_flight.fetch_add(1, Ordering::SeqCst);
+
+        let started = Instant::now();
+        assert!(
+            !slot.disarm_within(Duration::from_millis(50)),
+            "a stalled handler must make the descriptor non-closable"
+        );
+        assert!(started.elapsed() >= Duration::from_millis(50));
+        assert_eq!(slot.write_fd.load(Ordering::SeqCst), -1);
     }
 
     #[test]
