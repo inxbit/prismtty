@@ -110,7 +110,9 @@ jobs:
         run: bash scripts/privacy-scan.sh
 
       - name: Install cargo-audit
-        run: cargo install cargo-audit --version 0.22.1 --locked
+        uses: taiki-e/install-action@5b4d68e2e660441203ab128a23676f1e4faf1532 # v2.86.3
+        with:
+          tool: cargo-audit@0.22.1
       - name: cargo audit
         run: cargo audit --deny warnings
       - name: cargo deny

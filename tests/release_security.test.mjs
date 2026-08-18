@@ -171,13 +171,17 @@ test('CI verifies the minimum supported Rust version used for releases', () => {
   );
 });
 
-test('cargo audit stays pinned to a release-MSRV-compatible version', () => {
+test('cargo audit stays pinned to an exact prebuilt version', () => {
   const ci = read('.github/workflows/ci.yml');
   const release = read('.github/workflows/release.yml');
-  const install = /cargo install cargo-audit --version 0\.22\.1 --locked/g;
+  // Prebuilt binary via a SHA-pinned installer: no compile on the release
+  // toolchain, and an upstream cargo-audit release cannot change what runs.
+  const installer = /uses: taiki-e\/install-action@[0-9a-f]{40} # v\d+\.\d+\.\d+\n\s+with:\n\s+tool: cargo-audit@0\.22\.1\n/g;
 
-  assert.equal((ci.match(install) ?? []).length, 1);
-  assert.equal((release.match(install) ?? []).length, 1);
+  assert.equal((ci.match(installer) ?? []).length, 1);
+  assert.equal((release.match(installer) ?? []).length, 1);
+  assert.doesNotMatch(ci, /cargo install cargo-audit/);
+  assert.doesNotMatch(release, /cargo install cargo-audit/);
   assert.match(ci, /cargo audit --deny warnings/);
   assert.match(release, /cargo audit --deny warnings/);
   assert.doesNotMatch(ci, /rustsec\/audit-check/);

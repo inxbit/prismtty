@@ -59,6 +59,15 @@ All notable changes to PrismTTY are documented here.
 - Build release binaries with fat LTO and a single codegen unit: `prismtty`
   shrinks from 2.28 MB to 1.76 MB with no change in highlighting speed.
 
+### Release and QA
+
+- Install the pinned `cargo-audit` 0.22.1 as a prebuilt binary through a
+  SHA-pinned `taiki-e/install-action` in CI and release validation instead of
+  compiling it on every run (the supply-chain job was the longest CI job),
+  cache Cargo dependencies in the test jobs, and run push CI only on `main`
+  so a pull request from a branch in this repository is checked once, not
+  twice.
+
 ## 1.2.1 - 2026-07-11
 
 ### Release and QA
