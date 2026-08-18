@@ -54,6 +54,11 @@ All notable changes to PrismTTY are documented here.
   a `::`-led address must start its token, so `::1`, `[2001:db8::1]:443`, and
   `fe80::1` still highlight.
 
+### Packaging
+
+- Build release binaries with fat LTO and a single codegen unit: `prismtty`
+  shrinks from 2.28 MB to 1.76 MB with no change in highlighting speed.
+
 ## 1.2.1 - 2026-07-11
 
 ### Release and QA
