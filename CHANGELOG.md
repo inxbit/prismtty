@@ -2,6 +2,18 @@
 
 All notable changes to PrismTTY are documented here.
 
+## Unreleased
+
+### Performance
+
+- Reuse PCRE2 match data while applying rules. Each rule ran every line
+  through `captures_iter`, which allocates a match-data block and a JIT stack
+  per match attempt; whole-match rules now use the regex's pooled match data
+  and capture-styled rules reuse one capture block per line. Piped highlighting
+  of a synthetic 20k-line router dump with four profiles drops from 0.57s to
+  0.14s, and a capture-styled rule that can match empty drops from 4.3s to
+  0.16s. Output is unchanged.
+
 ## 1.2.1 - 2026-07-11
 
 ### Release and QA

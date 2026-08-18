@@ -2251,30 +2251,62 @@ fn match_rule(
     let mut ranges = Vec::new();
     let mut match_count = 0;
     let mut match_error = None;
-    for captures_result in rule.regex.captures_iter(visible) {
-        let captures = match captures_result {
-            Ok(captures) => captures,
-            Err(error) => {
-                match_error = Some(error.to_string());
-                break;
-            }
-        };
-        match_count += 1;
-
-        match &rule.style {
-            RuleStyle::Whole(style) => {
-                if let Some(matched) = captures.get(0) {
-                    ranges.push((matched.start(), matched.end(), style.clone()));
+    // pcre2's `captures_iter` allocates a fresh match-data block (and, with a
+    // JIT stack limit set, a fresh JIT stack) for every match attempt. Every
+    // rule runs on every line, so use the regex's pooled match data for
+    // whole-match rules and a single reusable capture block for capture rules.
+    match &rule.style {
+        RuleStyle::Whole(style) => {
+            for found in rule.regex.find_iter(visible) {
+                match found {
+                    Ok(matched) => {
+                        match_count += 1;
+                        ranges.push((matched.start(), matched.end(), style.clone()));
+                    }
+                    Err(error) => {
+                        match_error = Some(error.to_string());
+                        break;
+                    }
                 }
             }
-            RuleStyle::Captures(capture_styles) => {
+        }
+        RuleStyle::Captures(capture_styles) => {
+            let mut locations = rule.regex.capture_locations();
+            let mut last_end = 0;
+            let mut last_match = None;
+            while last_end <= visible.len() {
+                let matched = match rule
+                    .regex
+                    .captures_read_at(&mut locations, visible, last_end)
+                {
+                    Ok(Some(matched)) => matched,
+                    Ok(None) => break,
+                    Err(error) => {
+                        match_error = Some(error.to_string());
+                        break;
+                    }
+                };
+                // Same stepping as pcre2's own iterator: an empty match advances
+                // one byte so the search makes progress, and an empty match
+                // directly after the previous match is skipped.
+                if matched.start() == matched.end() {
+                    last_end = matched.end() + 1;
+                    if Some(matched.end()) == last_match {
+                        continue;
+                    }
+                } else {
+                    last_end = matched.end();
+                }
+                last_match = Some(matched.end());
+                match_count += 1;
+
                 for (group, style) in capture_styles {
-                    let matched = match group {
-                        CaptureRef::Index(index) => captures.get(*index),
-                        CaptureRef::Name(name) => captures.name(name),
+                    let index = match group {
+                        CaptureRef::Index(index) => Some(*index),
+                        CaptureRef::Name(name) => capture_group_index(&rule.regex, name),
                     };
-                    if let Some(matched) = matched {
-                        ranges.push((matched.start(), matched.end(), style.clone()));
+                    if let Some((start, end)) = index.and_then(|index| locations.get(index)) {
+                        ranges.push((start, end, style.clone()));
                     }
                 }
             }
@@ -2282,6 +2314,13 @@ fn match_rule(
     }
 
     (ranges, match_count, match_error)
+}
+
+fn capture_group_index(regex: &Regex, name: &str) -> Option<usize> {
+    regex
+        .capture_names()
+        .iter()
+        .position(|candidate| candidate.as_deref() == Some(name))
 }
 
 fn tokenize_ansi(input: &[u8]) -> Vec<Token> {
