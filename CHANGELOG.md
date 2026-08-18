@@ -37,6 +37,10 @@ All notable changes to PrismTTY are documented here.
   `---- trace truncated at N bytes ----` is written the trace is closed at the
   limit; shorter lines no longer keep appending below the marker and the
   marker no longer repeats.
+- Parse combined short options when learning the remote host from a typed
+  command (`ssh -4p 2222 router1`, `ssh -vp 2222 router1`), so the close
+  marker for that host still returns to the local profile instead of the
+  port number being taken as the target.
 
 ### Profiles
 

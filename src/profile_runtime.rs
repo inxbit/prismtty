@@ -731,6 +731,29 @@ fn is_literal_remote_target(word: &str) -> bool {
 }
 
 fn remote_option_takes_value(command: &str, option: &str) -> bool {
+    if remote_option_word_takes_value(command, option) {
+        return true;
+    }
+    // Combined getopt-style short flags (`-4p 2222`, `-vp 2222`): the first
+    // flag that takes a value consumes the rest of the word as an attached
+    // value (`-p2222`), so only a value-taking flag in the last position
+    // leaves its value to the next word.
+    let Some(flags) = option.strip_prefix('-') else {
+        return false;
+    };
+    if flags.starts_with('-') || flags.chars().count() < 2 {
+        return false;
+    }
+    let mut flags = flags.chars().peekable();
+    while let Some(flag) = flags.next() {
+        if remote_option_word_takes_value(command, &format!("-{flag}")) {
+            return flags.peek().is_none();
+        }
+    }
+    false
+}
+
+fn remote_option_word_takes_value(command: &str, option: &str) -> bool {
     match command {
         "ssh" => matches!(
             option,
@@ -1131,6 +1154,30 @@ mod tests {
                 .and_then(|attempt| attempt.target.as_deref()),
             Some("router-a")
         );
+    }
+
+    // getopt-style commands accept combined short flags (`-4p 2222`) and
+    // attached values (`-p2222`); the close target must still be the host.
+    #[test]
+    fn combined_short_options_do_not_shift_the_remote_target() {
+        for line in [
+            "ssh -4p 2222 router-a\r",
+            "ssh -vp 2222 router-a\r",
+            "ssh -p2222 router-a\r",
+            "ssh -4p2222 router-a\r",
+            "ssh -46 router-a\r",
+        ] {
+            let mut runtime = ProfileRuntime::new(names(&["generic", "linux-unix"]));
+            runtime.observe_input(line.as_bytes());
+            assert_eq!(
+                runtime
+                    .pending_remote
+                    .as_ref()
+                    .and_then(|attempt| attempt.target.as_deref()),
+                Some("router-a"),
+                "{line:?}"
+            );
+        }
     }
 
     #[test]
