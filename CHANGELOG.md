@@ -34,6 +34,13 @@ All notable changes to PrismTTY are documented here.
   it, so a program using that form no longer stays highlighted inside a
   full-screen view or loses its foreground after a highlighted token.
 
+### Profiles
+
+- The generic IPv6 rule no longer paints `::` scope-resolution operators in
+  compiler and stack-trace output (`MyClass::Add`, `Foo::dead`, `Ok::<u8, _>`);
+  a `::`-led address must start its token, so `::1`, `[2001:db8::1]:443`, and
+  `fe80::1` still highlight.
+
 ## 1.2.1 - 2026-07-11
 
 ### Release and QA
