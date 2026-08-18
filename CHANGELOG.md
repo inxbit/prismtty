@@ -2,7 +2,7 @@
 
 All notable changes to PrismTTY are documented here.
 
-## Unreleased
+## 1.2.2 - 2026-08-18
 
 ### Library API
 
