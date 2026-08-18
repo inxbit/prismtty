@@ -2,6 +2,14 @@
 
 All notable changes to PrismTTY are documented here.
 
+## Unreleased
+
+### Release and QA
+
+- Add a policy test requiring every GitHub Actions `uses:` in the workflows to
+  be pinned to a full commit SHA, so a future mutable-tag reference cannot
+  slip in unnoticed.
+
 ## 1.2.2 - 2026-08-18
 
 ### Library API
