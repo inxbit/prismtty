@@ -9,7 +9,11 @@ compile_error!(
      On Windows, run it under WSL."
 );
 
-/// Command-line entry point and CLI error type.
+/// Command-line entry point used by the `prismtty`, `ptty`, `ct`, and
+/// `gen-completions` binaries. It is `pub` only so those binaries can reach
+/// it: it is not part of the crate's supported library API, is hidden from
+/// the documentation, and may change in any release.
+#[doc(hidden)]
 pub mod cli;
 /// Configuration loading and profile YAML parsing.
 pub mod config;

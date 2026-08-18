@@ -2,6 +2,8 @@
 //!
 //! The public surface is intentionally small: `run` performs argument parsing,
 //! dispatches the requested CLI action, and returns the process exit code.
+//! This module exists for the crate's own binaries; it is `#[doc(hidden)]`
+//! and outside the library's semver contract.
 
 mod args;
 mod profile_selection;

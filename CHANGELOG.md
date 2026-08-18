@@ -4,6 +4,12 @@ All notable changes to PrismTTY are documented here.
 
 ## Unreleased
 
+### Library API
+
+- Mark the `cli` module `#[doc(hidden)]`. It is public only so the crate's own
+  binaries can call it; it is not part of the supported library API or its
+  semver contract.
+
 ### Performance
 
 - Reuse PCRE2 match data while applying rules. Each rule ran every line
@@ -46,6 +52,10 @@ All notable changes to PrismTTY are documented here.
   command (`ssh -4p 2222 router1`, `ssh -vp 2222 router1`), so the close
   marker for that host still returns to the local profile instead of the
   port number being taken as the target.
+- Close the signal self-pipes only after any in-flight signal handler has
+  finished writing to them. Previously a handler that had loaded the pipe
+  descriptor just as the session was tearing down could write its byte into a
+  descriptor number that had already been reused.
 
 ### Profiles
 
