@@ -7,7 +7,7 @@
 #![cfg(unix)]
 
 use std::fs::{File, OpenOptions};
-use std::io::Read;
+use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::process::Child;
 use std::sync::{
@@ -1158,4 +1158,62 @@ fn stream_error_kills_immune_descendant_after_group_leader_exits() {
         "signal-immune descendant survived after its group leader exited"
     );
     wrapped_guard.disarm();
+}
+
+/// Input that reaches the wrapper after the wrapped child has already exited
+/// (a paste ending in `exit`, or fast typing) fails the PTY master write with
+/// EIO because the slave side is gone. That is the session ending, not an
+/// input failure: the child's own exit code must be reported, not an I/O error.
+#[test]
+fn input_after_child_exit_preserves_wrapped_exit_code() {
+    let pair = native_pty_system()
+        .openpty(PtySize::default())
+        .expect("openpty");
+    let mut builder = CommandBuilder::new(env!("CARGO_BIN_EXE_ptty"));
+    builder.arg("sh");
+    builder.arg("-c");
+    // No output before `read`: the echoed line is the wrapper's first chunk,
+    // so it is still building the highlighter when the child exits, which is
+    // the widest window for late input to hit the closed slave.
+    builder.arg("read line; exit 3");
+    let child = pair
+        .slave
+        .spawn_command(builder)
+        .expect("spawn interactive ptty");
+    drop(pair.slave);
+    let mut writer = pair.master.take_writer().expect("take writer");
+    let mut ptty = PtySession::new(child, &*pair.master);
+    thread::sleep(Duration::from_millis(300));
+
+    writer.write_all(b"go\n").expect("write line");
+    writer.flush().expect("flush line");
+    // Keep typing while the child exits so some bytes reach the wrapper after
+    // the slave has closed. Writes to our master fail once ptty itself is gone.
+    let deadline = Instant::now() + Duration::from_millis(500);
+    while Instant::now() < deadline {
+        if writer
+            .write_all(b"y\n")
+            .and_then(|()| writer.flush())
+            .is_err()
+        {
+            break;
+        }
+        thread::sleep(Duration::from_micros(100));
+    }
+
+    let code = ptty.wait_for_exit(Duration::from_secs(5));
+    let output = ptty
+        .capture()
+        .wait_until(Duration::from_millis(200), |_| false);
+    assert_eq!(
+        code,
+        Some(3),
+        "wrapped exit code not preserved; wrapper output: {:?}",
+        String::from_utf8_lossy(&output)
+    );
+    assert!(
+        !contains_bytes(&output, b"I/O error"),
+        "wrapper reported an input I/O error after the child exited: {:?}",
+        String::from_utf8_lossy(&output)
+    );
 }

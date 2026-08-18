@@ -14,6 +14,15 @@ All notable changes to PrismTTY are documented here.
   0.14s, and a capture-styled rule that can match empty drops from 4.3s to
   0.16s. Output is unchanged.
 
+### Security and Reliability
+
+- Keep the wrapped command's exit code when input reaches PrismTTY after the
+  command has already exited (a paste ending in `exit`, or fast typing). The
+  PTY master write then fails with EIO because the slave side is gone; that is
+  the session ending, not an input failure, so PrismTTY no longer replaces the
+  child's status with exit code 1 and `prismtty: I/O error`. Regression from
+  1.2.0's input-worker failure reporting.
+
 ## 1.2.1 - 2026-07-11
 
 ### Release and QA

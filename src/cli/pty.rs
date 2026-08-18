@@ -643,8 +643,17 @@ fn forward_stdin_to_pty<R: Read, W: Write>(
         // thread and `write_all` may block, so this is a cross-thread pre-write
         // window; it is idle-gated and only ever surfaces the child's own output.
         record_recent_input(recent_input, input);
-        writer.write_all(input)?;
-        writer.flush()?;
+        if let Err(error) = writer.write_all(input).and_then(|()| writer.flush()) {
+            // EIO on the master means every slave descriptor is closed: the
+            // wrapped child has exited and the read loop is already at EOF.
+            // Input that arrived after that point (a paste ending in `exit`,
+            // fast typing) is not an input failure; the child's own exit
+            // status must be reported.
+            if error.raw_os_error() == Some(libc::EIO) {
+                return Ok(());
+            }
+            return Err(error);
+        }
 
         if local_echo {
             let echo = echo_state.push(input);
@@ -1549,7 +1558,7 @@ mod tests {
             .find("record_recent_input(recent_input, input)")
             .expect("recent input is recorded");
         let write_idx = function_source
-            .find("writer.write_all(input)?")
+            .find("writer.write_all(input)")
             .expect("input is written to child PTY");
 
         assert!(
@@ -1854,6 +1863,53 @@ mod tests {
                 .expect("main PTY loop receives the worker failure")
                 .kind(),
             std::io::ErrorKind::BrokenPipe
+        );
+    }
+
+    #[test]
+    fn master_write_eio_ends_forwarding_without_failure() {
+        // EIO on the PTY master means the slave side is gone: the wrapped child
+        // has exited (a paste ending in `exit`, or fast typing). That is the
+        // session ending, not an input failure, so the worker must return Ok
+        // and let the main loop report the child's own exit code.
+        struct ClosedSlaveWriter;
+        impl std::io::Write for ClosedSlaveWriter {
+            fn write(&mut self, _buffer: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::from_raw_os_error(libc::EIO))
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let mut input = Cursor::new(b"y\n".to_vec());
+        let mut output = ClosedSlaveWriter;
+        let recent_input = Mutex::new(Vec::new());
+        let state = Mutex::new(None);
+        let mut woke_session = false;
+        super::run_input_worker(
+            &state,
+            || {
+                super::forward_stdin_to_pty(
+                    &mut input,
+                    &mut output,
+                    false,
+                    super::IoTrace::open(None).expect("trace disabled"),
+                    None,
+                    &recent_input,
+                )
+            },
+            || woke_session = true,
+        );
+
+        assert!(
+            !woke_session,
+            "a closed slave must not be treated as an input worker failure"
+        );
+        assert!(
+            super::take_input_worker_failure(&state).is_none(),
+            "EIO on the PTY master must not surface as a session error"
         );
     }
 
