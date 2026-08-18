@@ -946,13 +946,23 @@ fn recent_chars(text: &str, limit: usize) -> &str {
     &text[start..]
 }
 
+/// The most recent terminated lines of `text`, at most `limit` bytes.
+///
+/// A trailing unterminated line is excluded: a read boundary can split
+/// `Connection to X closed by administrator.` right after `closed`, and that
+/// prefix must not count as a teardown marker before the line is complete.
+/// A leading line cut by the byte limit is excluded for the same reason.
 fn recent_complete_lines(text: &str, limit: usize) -> &str {
-    if text.len() <= limit {
-        return text;
+    let Some(last_newline) = text.rfind('\n') else {
+        return "";
+    };
+    let terminated = &text[..=last_newline];
+    if terminated.len() <= limit {
+        return terminated;
     }
-    let recent = recent_chars(text, limit);
-    let start = text.len() - recent.len();
-    if start == 0 || text.as_bytes()[start - 1] == b'\n' {
+    let recent = recent_chars(terminated, limit);
+    let start = terminated.len() - recent.len();
+    if start == 0 || terminated.as_bytes()[start - 1] == b'\n' {
         return recent;
     }
     recent
@@ -1139,6 +1149,36 @@ mod tests {
 
         assert_eq!(changed, Some(names(&["generic", "linux-unix"])));
         assert_eq!(runtime.active_profiles(), names(&["generic", "linux-unix"]));
+    }
+
+    // A read boundary can split a benign line right after a marker-shaped
+    // prefix; only terminated lines may count as teardown markers.
+    #[test]
+    fn partial_trailing_line_is_not_a_close_marker() {
+        let store = ProfileStore::builtin();
+        let mut runtime = ProfileRuntime::new(names(&["generic", "linux-unix"]));
+
+        runtime.observe_input(b"ssh router-a\r");
+        assert_eq!(
+            runtime.observe_output(b"--- JUNOS 22.4R3 Kernel 64-bit\n", &store),
+            Some(names(&["generic", "juniper"]))
+        );
+
+        assert_eq!(
+            runtime.observe_output(b"Connection to router-a closed", &store),
+            None
+        );
+        assert_eq!(
+            runtime.observe_output(b" by administrator.\r\n", &store),
+            None
+        );
+        assert_eq!(runtime.active_profiles(), names(&["generic", "juniper"]));
+
+        // The genuine marker still pops once its line is complete.
+        assert_eq!(
+            runtime.observe_output(b"Connection to router-a closed.\r\n", &store),
+            Some(names(&["generic", "linux-unix"]))
+        );
     }
 
     #[test]

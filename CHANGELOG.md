@@ -22,6 +22,11 @@ All notable changes to PrismTTY are documented here.
   the session ending, not an input failure, so PrismTTY no longer replaces the
   child's status with exit code 1 and `prismtty: I/O error`. Regression from
   1.2.0's input-worker failure reporting.
+- Only terminated output lines count as remote close markers. A read boundary
+  that split a benign line such as `Connection to router1 closed by
+  administrator.` right after `closed` could pop the remote profile mid-session;
+  the marker is now evaluated once its line is complete, and a genuine close
+  marker split across reads still pops when its line ends.
 
 ## 1.2.1 - 2026-07-11
 
