@@ -4,6 +4,12 @@ All notable changes to PrismTTY are documented here.
 
 ## Unreleased
 
+### Library API
+
+- Mark the `cli` module `#[doc(hidden)]`. It is public only so the crate's own
+  binaries can call it; it is not part of the supported library API or its
+  semver contract.
+
 ### Performance
 
 - Reuse PCRE2 match data while applying rules. Each rule ran every line
