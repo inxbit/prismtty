@@ -33,6 +33,10 @@ All notable changes to PrismTTY are documented here.
   program SGR tracking, and prompt-echo SGR neutralization now all recognize
   it, so a program using that form no longer stays highlighted inside a
   full-screen view or loses its foreground after a highlighted token.
+- Make the `--trace-io` size-limit marker terminal. Once
+  `---- trace truncated at N bytes ----` is written the trace is closed at the
+  limit; shorter lines no longer keep appending below the marker and the
+  marker no longer repeats.
 
 ### Profiles
 

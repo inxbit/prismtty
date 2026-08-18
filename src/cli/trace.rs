@@ -72,15 +72,14 @@ impl IoTrace {
         }
         let line_len = line.len() as u64;
         if previous.saturating_add(line_len) > inner.limit {
+            // The marker is terminal: whether or not it fits, the trace is
+            // closed at the limit so no shorter line lands below it.
             let marker = format!("---- trace truncated at {} bytes ----\n", inner.limit);
             let remaining = (inner.limit - previous) as usize;
-            if remaining >= marker.len() && file.write_all(marker.as_bytes()).is_ok() {
-                inner
-                    .written
-                    .store(previous + marker.len() as u64, Ordering::Relaxed);
-            } else {
-                inner.written.store(inner.limit, Ordering::Relaxed);
+            if remaining >= marker.len() {
+                let _ = file.write_all(marker.as_bytes());
             }
+            inner.written.store(inner.limit, Ordering::Relaxed);
             return;
         }
         if file.write_all(line.as_bytes()).is_err() {
@@ -164,6 +163,40 @@ mod tests {
 
         let size = std::fs::metadata(&path).expect("trace metadata").len();
         assert!(size <= 128, "trace should stay within its byte limit");
+    }
+
+    // The truncation marker must be the last thing in the file: once it is
+    // written, no shorter line may slip in below it and it must not repeat.
+    #[cfg(unix)]
+    #[test]
+    fn trace_truncation_marker_is_terminal() {
+        let dir = tempfile::tempdir().expect("tempdir creates");
+        let path = dir.path().join("trace.log");
+
+        // Three 37-byte lines (111), then a line too long to fit: the 39-byte
+        // marker lands at 150. An 18-byte line and another long line would
+        // then still fit in the bytes left before 210.
+        let trace = super::IoTrace::open_with_limit(Some(&path), 210).expect("trace opens");
+        for _ in 0..3 {
+            trace.log("OUT", b"payload");
+        }
+        trace.log("OUT", &[b'x'; 200]);
+        trace.log("IN", b"a");
+        trace.log("OUT", &[b'x'; 200]);
+        trace.log("IN", b"a");
+        drop(trace);
+
+        let contents = std::fs::read_to_string(&path).expect("trace reads");
+        let marker = "---- trace truncated at 210 bytes ----\n";
+        assert_eq!(
+            contents.matches(marker).count(),
+            1,
+            "marker must appear exactly once: {contents:?}"
+        );
+        assert!(
+            contents.ends_with(marker),
+            "marker must be the last line: {contents:?}"
+        );
     }
 
     #[cfg(unix)]
