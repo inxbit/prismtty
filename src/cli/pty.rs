@@ -156,7 +156,11 @@ fn exit_code_from_wait(status: nix::sys::wait::WaitStatus) -> u8 {
 
 fn wait_for_child_exit_without_reaping(pid: libc::pid_t) -> io::Result<()> {
     loop {
+        // SAFETY: siginfo_t is a plain C struct; all-zero bytes are a valid value that waitid
+        // overwrites.
         let mut info = unsafe { std::mem::zeroed::<libc::siginfo_t>() };
+        // SAFETY: `info` is a valid, exclusively borrowed siginfo_t for the call; WNOWAIT leaves
+        // the child reapable.
         let result = unsafe {
             libc::waitid(
                 libc::P_PID,
@@ -177,7 +181,11 @@ fn wait_for_child_exit_without_reaping(pid: libc::pid_t) -> io::Result<()> {
 
 fn child_exit_is_waitable(pid: libc::pid_t) -> io::Result<bool> {
     loop {
+        // SAFETY: siginfo_t is a plain C struct; all-zero bytes are a valid value that waitid
+        // overwrites.
         let mut info = unsafe { std::mem::zeroed::<libc::siginfo_t>() };
+        // SAFETY: `info` is a valid, exclusively borrowed siginfo_t for the call; WNOWAIT leaves
+        // the child reapable.
         let result = unsafe {
             libc::waitid(
                 libc::P_PID,
@@ -187,6 +195,8 @@ fn child_exit_is_waitable(pid: libc::pid_t) -> io::Result<bool> {
             )
         };
         if result == 0 {
+            // SAFETY: waitid returned 0, so `info` is populated (WNOHANG zeroes si_pid when nothing
+            // changed) and readable.
             return Ok(unsafe { info.si_pid() } != 0);
         }
         let error = io::Error::last_os_error();
@@ -237,6 +247,8 @@ fn terminate_and_reap_process_group(pid: libc::pid_t, initial_signal: libc::c_in
     use nix::errno::Errno;
     use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
 
+    // SAFETY: kill has no memory-safety preconditions; `pid` is the wrapped session leader, so
+    // `-pid` is its process group.
     unsafe {
         libc::kill(-pid, initial_signal);
     }
@@ -247,6 +259,8 @@ fn terminate_and_reap_process_group(pid: libc::pid_t, initial_signal: libc::c_in
             Ok(true) => {
                 // Keep the leader waitable until the final group signal so its
                 // process-group id cannot be reused while descendants remain.
+                // SAFETY: kill has no memory-safety preconditions; the leader is still unreaped, so
+                // its group id has not been reused.
                 unsafe {
                     libc::kill(-pid, libc::SIGKILL);
                 }
@@ -258,6 +272,8 @@ fn terminate_and_reap_process_group(pid: libc::pid_t, initial_signal: libc::c_in
         }
     }
 
+    // SAFETY: kill has no memory-safety preconditions; the group id and pid belong to the still-
+    // unreaped wrapped child.
     unsafe {
         libc::kill(-pid, libc::SIGKILL);
         libc::kill(pid, libc::SIGKILL);
@@ -301,6 +317,8 @@ fn forward_signal_to_child(signal: u8) {
     let _guard = forward_child_lock();
     let pid = FORWARD_CHILD_PID.load(Ordering::SeqCst);
     if pid > 0 {
+        // SAFETY: kill has no memory-safety preconditions; `pid` was read under
+        // `forward_child_lock`, which serializes it with reaping.
         unsafe {
             libc::kill(-pid, libc::c_int::from(signal));
         }
@@ -308,6 +326,8 @@ fn forward_signal_to_child(signal: u8) {
 }
 
 fn process_group_exists(pid: libc::pid_t) -> bool {
+    // SAFETY: kill with signal 0 has no memory-safety preconditions and only checks that the group
+    // exists.
     if unsafe { libc::kill(-pid, 0) } == 0 {
         return true;
     }
@@ -333,6 +353,8 @@ fn wake_main_loop_after_input_failure() {
     if pid <= 0 {
         return;
     }
+    // SAFETY: kill has no memory-safety preconditions; `pid` was read under `forward_child_lock`,
+    // which serializes it with reaping.
     unsafe {
         libc::kill(-pid, libc::SIGHUP);
     }
@@ -341,6 +363,8 @@ fn wake_main_loop_after_input_failure() {
         thread::sleep(Duration::from_millis(10));
     }
     if process_group_exists(pid) {
+        // SAFETY: kill has no memory-safety preconditions; `pid` was read under
+        // `forward_child_lock`, which serializes it with reaping.
         unsafe {
             libc::kill(-pid, libc::SIGKILL);
             libc::kill(pid, libc::SIGKILL);
@@ -800,14 +824,19 @@ struct SessionSignalMask {
 
 impl SessionSignalMask {
     fn block() -> io::Result<Self> {
+        // SAFETY: sigset_t is a plain C type; sigemptyset below initializes it before it is used.
         let mut blocked = unsafe { mem::zeroed::<libc::sigset_t>() };
+        // SAFETY: sigset_t is a plain C type; pthread_sigmask writes it before it is read.
         let mut previous = unsafe { mem::zeroed::<libc::sigset_t>() };
+        // SAFETY: `blocked` is a valid, exclusively borrowed sigset_t for both calls.
         unsafe {
             libc::sigemptyset(&mut blocked);
             for signal in TERMINATING_SIGNALS.into_iter().chain(JOB_CONTROL_SIGNALS) {
                 libc::sigaddset(&mut blocked, signal);
             }
         }
+        // SAFETY: both sets are valid for the call; the returned mask is kept in `previous` and
+        // reinstated by `restore`.
         let result = unsafe { libc::pthread_sigmask(libc::SIG_BLOCK, &blocked, &mut previous) };
         if result != 0 {
             return Err(io::Error::from_raw_os_error(result));
@@ -822,6 +851,8 @@ impl SessionSignalMask {
         if !self.active {
             return Ok(());
         }
+        // SAFETY: `self.previous` was written by pthread_sigmask in `block`; a null old-set pointer
+        // is permitted.
         let result = unsafe {
             libc::pthread_sigmask(libc::SIG_SETMASK, &self.previous, std::ptr::null_mut())
         };
@@ -932,6 +963,8 @@ impl RawModeGuard {
         let stdin_fd = stdin.as_fd().as_raw_fd();
         let original = terminal_attrs(stdin_fd)?;
         let mut raw = original;
+        // SAFETY: `raw` is a valid termios copied from tcgetattr; cfmakeraw only rewrites its
+        // fields.
         unsafe {
             libc::cfmakeraw(&mut raw);
         }
@@ -1002,6 +1035,8 @@ fn reapply_raw_mode_from_signal_state(state: &Mutex<RawModeLifecycle>) -> io::Re
 
 fn set_terminal_attrs_retrying_eintr(fd: RawFd, attrs: &libc::termios) -> io::Result<()> {
     loop {
+        // SAFETY: `attrs` is a valid termios and `fd` is a terminal descriptor the caller keeps
+        // open for the call.
         if unsafe { libc::tcsetattr(fd, libc::TCSANOW, attrs) } == 0 {
             return Ok(());
         }
@@ -1016,18 +1051,24 @@ fn set_terminal_attrs_retrying_eintr(fd: RawFd, attrs: &libc::termios) -> io::Re
 /// A background wrapper must be able to restore its terminal before stopping;
 /// otherwise `tcsetattr` recursively queues SIGTTOU and never reaches SIGSTOP.
 fn restore_terminal_attrs(fd: RawFd, attrs: &libc::termios) -> io::Result<()> {
+    // SAFETY: sigset_t is a plain C type; sigemptyset below initializes it before it is used.
     let mut blocked = unsafe { mem::zeroed::<libc::sigset_t>() };
+    // SAFETY: sigset_t is a plain C type; pthread_sigmask writes it before it is read.
     let mut previous = unsafe { mem::zeroed::<libc::sigset_t>() };
+    // SAFETY: `blocked` is a valid, exclusively borrowed sigset_t for both calls.
     unsafe {
         libc::sigemptyset(&mut blocked);
         libc::sigaddset(&mut blocked, libc::SIGTTOU);
     }
+    // SAFETY: both sets are valid for the call; the previous mask is reinstated below.
     let block_result = unsafe { libc::pthread_sigmask(libc::SIG_BLOCK, &blocked, &mut previous) };
     if block_result != 0 {
         return Err(io::Error::from_raw_os_error(block_result));
     }
     let result = set_terminal_attrs_retrying_eintr(fd, attrs);
     let restore_result =
+        // SAFETY: `previous` was written by the pthread_sigmask call above; a null old-set pointer
+        // is permitted.
         unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, &previous, std::ptr::null_mut()) };
     if result.is_ok() && restore_result != 0 {
         return Err(io::Error::from_raw_os_error(restore_result));
@@ -1036,7 +1077,9 @@ fn restore_terminal_attrs(fd: RawFd, attrs: &libc::termios) -> io::Result<()> {
 }
 
 fn terminal_attrs(fd: RawFd) -> io::Result<libc::termios> {
+    // SAFETY: termios is a plain C struct; tcgetattr fills it before it is read.
     let mut attrs = unsafe { mem::zeroed::<libc::termios>() };
+    // SAFETY: `attrs` is a valid, exclusively borrowed termios for the call.
     if unsafe { libc::tcgetattr(fd, &mut attrs) } == 0 {
         Ok(attrs)
     } else {
@@ -1159,6 +1202,8 @@ fn handle_session_signals(read_fd: RawFd, raw_mode_state: SharedRawModeState) {
                     eprintln!("prismtty: could not restore terminal before exit: {error}");
                 }
                 terminate_and_reap_forwarded_child(signal);
+                // SAFETY: _exit never returns and skips destructors by design: the terminal was
+                // restored and the child reaped above.
                 unsafe {
                     libc::_exit(128 + signal);
                 }
@@ -1168,6 +1213,8 @@ fn handle_session_signals(read_fd: RawFd, raw_mode_state: SharedRawModeState) {
                     || suspend_raw_mode_from_signal_state(&raw_mode_state),
                     || {
                         forward_signal_to_child(libc::SIGSTOP as u8);
+                        // SAFETY: raise has no memory-safety preconditions; SIGSTOP cannot be
+                        // caught and raw mode was restored just before.
                         unsafe {
                             // Target the calling thread so Linux delivers the
                             // stop before this worker can continue and reapply
@@ -1202,7 +1249,10 @@ fn fallback_pty_size(size: Option<PtySize>) -> PtySize {
 }
 
 fn pty_size_from_fd(fd: BorrowedFd<'_>) -> Option<PtySize> {
+    // SAFETY: winsize is a plain C struct; the ioctl fills it before it is read.
     let mut winsize: libc::winsize = unsafe { mem::zeroed() };
+    // SAFETY: TIOCGWINSZ takes a pointer to a winsize; `winsize` is valid and exclusively borrowed
+    // and `fd` is a live borrowed descriptor.
     let result = unsafe { libc::ioctl(fd.as_raw_fd(), libc::TIOCGWINSZ, &mut winsize) };
     if result != 0 || winsize.ws_row == 0 || winsize.ws_col == 0 {
         return None;
@@ -1298,6 +1348,7 @@ fn resize_pty_on_signals(master: Box<dyn portable_pty::MasterPty + Send>, read_f
 
 fn pipe_fds() -> io::Result<(RawFd, RawFd)> {
     let mut fds = [0; 2];
+    // SAFETY: `fds` is a valid array of two c_int that pipe fills on success.
     if unsafe { libc::pipe(fds.as_mut_ptr()) } == 0 {
         Ok((fds[0], fds[1]))
     } else {
@@ -1306,10 +1357,13 @@ fn pipe_fds() -> io::Result<(RawFd, RawFd)> {
 }
 
 fn set_fd_nonblocking(fd: RawFd) -> io::Result<()> {
+    // SAFETY: F_GETFL takes no pointer argument; an invalid `fd` reports EBADF instead of touching
+    // memory.
     let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
     if flags < 0 {
         return Err(io::Error::last_os_error());
     }
+    // SAFETY: F_SETFL takes an integer flags argument.
     if unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } == 0 {
         Ok(())
     } else {
@@ -1320,6 +1374,8 @@ fn set_fd_nonblocking(fd: RawFd) -> io::Result<()> {
 fn read_signal_bytes(read_fd: RawFd) -> Option<Vec<u8>> {
     let mut buffer = [0_u8; 64];
     loop {
+        // SAFETY: `buffer` is valid for writes of `buffer.len()` bytes for the call and `read_fd`
+        // is our own pipe end.
         let read = unsafe {
             libc::read(
                 read_fd,
@@ -1342,6 +1398,8 @@ fn read_signal_bytes(read_fd: RawFd) -> Option<Vec<u8>> {
 
 fn write_signal_byte(write_fd: RawFd, byte: u8) {
     let bytes = [byte];
+    // SAFETY: `bytes` is valid for reads of `bytes.len()`; write is async-signal-safe and
+    // `write_fd` is our nonblocking pipe end.
     unsafe {
         libc::write(write_fd, bytes.as_ptr().cast::<libc::c_void>(), bytes.len());
     }
@@ -1349,6 +1407,8 @@ fn write_signal_byte(write_fd: RawFd, byte: u8) {
 
 fn close_fd(fd: RawFd) {
     if fd >= 0 {
+        // SAFETY: `fd` is a descriptor this module opened and owns, and it is not used after this
+        // call.
         unsafe {
             libc::close(fd);
         }
@@ -1360,13 +1420,18 @@ fn install_signal_handler(
     handler: extern "C" fn(libc::c_int),
     flags: libc::c_int,
 ) -> io::Result<libc::sigaction> {
+    // SAFETY: sigaction is a plain C struct; the fields used are set below and the rest stay zero.
     let mut action = unsafe { mem::zeroed::<libc::sigaction>() };
+    // SAFETY: sigaction is a plain C struct; the sigaction call fills it before it is returned.
     let mut previous = unsafe { mem::zeroed::<libc::sigaction>() };
     action.sa_sigaction = handler as libc::sighandler_t;
     action.sa_flags = flags;
+    // SAFETY: `action.sa_mask` is a valid, exclusively borrowed sigset_t.
     unsafe {
         libc::sigemptyset(&mut action.sa_mask);
     }
+    // SAFETY: `handler` is an `extern "C" fn(c_int)` that lives for the whole process; `action` and
+    // `previous` are valid for the call.
     if unsafe { libc::sigaction(signal, &action, &mut previous) } == 0 {
         Ok(previous)
     } else {
@@ -1381,6 +1446,8 @@ fn restore_signal_handlers(handlers: &[(libc::c_int, libc::sigaction)]) {
 }
 
 fn restore_signal_handler(signal: libc::c_int, previous: &libc::sigaction) {
+    // SAFETY: `previous` was returned by sigaction in `install_signal_handler`; a null old-action
+    // pointer is permitted.
     unsafe {
         libc::sigaction(signal, previous, std::ptr::null_mut());
     }
@@ -1704,7 +1771,11 @@ mod tests {
         let activation = std::thread::spawn(move || {
             let terminal = super::RawModeState {
                 stdin_fd: -1,
+                // SAFETY: termios is a plain C struct; this state is never applied to a terminal
+                // (stdin_fd is -1).
                 original: unsafe { std::mem::zeroed() },
+                // SAFETY: termios is a plain C struct; this state is never applied to a terminal
+                // (stdin_fd is -1).
                 raw: unsafe { std::mem::zeroed() },
             };
             activation_ready_tx.send(()).unwrap();
@@ -1735,7 +1806,11 @@ mod tests {
     fn failed_terminal_restore_keeps_original_state_for_cleanup_retry() {
         let terminal = super::RawModeState {
             stdin_fd: -1,
+            // SAFETY: termios is a plain C struct; this state is never applied to a terminal
+            // (stdin_fd is -1).
             original: unsafe { std::mem::zeroed() },
+            // SAFETY: termios is a plain C struct; this state is never applied to a terminal
+            // (stdin_fd is -1).
             raw: unsafe { std::mem::zeroed() },
         };
         let mut lifecycle = super::RawModeLifecycle::Active(terminal);

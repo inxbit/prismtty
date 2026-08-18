@@ -104,6 +104,7 @@ fn open_trace_file(path: &Path) -> io::Result<File> {
             format!("trace path is not a regular file: {}", path.display()),
         ));
     }
+    // SAFETY: getuid has no preconditions and cannot fail.
     if metadata.uid() != unsafe { libc::getuid() } {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,

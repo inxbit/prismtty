@@ -108,6 +108,7 @@ fn runtime_dir() -> PathBuf {
 }
 
 fn current_uid() -> u32 {
+    // SAFETY: getuid has no preconditions and cannot fail.
     unsafe { libc::getuid() }
 }
 
@@ -227,6 +228,8 @@ fn process_is_alive(pid: u32) -> bool {
     if pid == 0 {
         return false;
     }
+    // SAFETY: kill with signal 0 has no memory-safety preconditions and only checks that the
+    // process exists.
     let result = unsafe { libc::kill(pid as libc::pid_t, 0) };
     let errno = (result != 0)
         .then(|| io::Error::last_os_error().raw_os_error())

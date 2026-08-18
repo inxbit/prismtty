@@ -54,6 +54,8 @@ impl PtyChildGuard {
         // forkpty children are session and process-group leaders. Kill both the
         // group and direct pid so cleanup remains reliable if that assumption
         // changes in portable-pty.
+        // SAFETY: kill has no memory-safety preconditions; the target is a process this test
+        // spawned.
         unsafe {
             libc::kill(-self.pid, libc::SIGKILL);
             libc::kill(self.pid, libc::SIGKILL);
@@ -87,12 +89,15 @@ struct CaptureTask {
 impl CaptureTask {
     fn start(master: &dyn portable_pty::MasterPty) -> Self {
         let master_fd = master.as_raw_fd().expect("PTY master fd");
+        // SAFETY: `master_fd` is the open PTY master; dup returns a fresh descriptor this test
+        // owns.
         let reader_fd = unsafe { libc::dup(master_fd) };
         assert!(
             reader_fd >= 0,
             "duplicate PTY master fd: {}",
             std::io::Error::last_os_error()
         );
+        // SAFETY: `reader_fd` is a freshly duplicated descriptor that nothing else owns or closes.
         let mut reader = unsafe { File::from_raw_fd(reader_fd) };
 
         let (sender, receiver) = mpsc::sync_channel(1);
@@ -119,6 +124,7 @@ impl CaptureTask {
                     events: libc::POLLIN | libc::POLLHUP | libc::POLLERR,
                     revents: 0,
                 };
+                // SAFETY: `poll_fd` is a valid, exclusively borrowed pollfd and the count matches.
                 let ready = unsafe {
                     libc::poll(
                         &mut poll_fd,
@@ -327,6 +333,7 @@ fn wait_for_condition(timeout: Duration, mut condition: impl FnMut() -> bool) ->
 }
 
 fn process_exists(pid: libc::pid_t) -> bool {
+    // SAFETY: kill with signal 0 has no memory-safety preconditions and only checks for existence.
     unsafe { libc::kill(pid, 0) == 0 }
 }
 

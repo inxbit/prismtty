@@ -44,6 +44,11 @@ portable-pty = "0.9"
 predicates = "3.1"
 tempfile = "3.14"
 
+[lints.clippy]
+# Every `unsafe` block carries a `// SAFETY:` comment stating the invariant it
+# relies on. Most of them wrap libc PTY, termios, signal, and wait calls.
+undocumented_unsafe_blocks = "warn"
+
 [profile.release]
 # Whole-program optimization: 23% smaller binaries at the cost of a longer
 # release build. Highlighting speed is bound by PCRE2, so no runtime change.

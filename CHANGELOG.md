@@ -67,6 +67,9 @@ All notable changes to PrismTTY are documented here.
   cache Cargo dependencies in the test jobs, and run push CI only on `main`
   so a pull request from a branch in this repository is checked once, not
   twice.
+- Require a `SAFETY:` comment on every `unsafe` block
+  (`clippy::undocumented_unsafe_blocks`, enforced by the CI clippy gate) and
+  document the existing libc PTY, termios, signal, and wait calls.
 
 ## 1.2.1 - 2026-07-11
 
