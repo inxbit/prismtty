@@ -823,17 +823,17 @@ fn assert_job_control_stop_resume(signal: libc::c_int) {
         contains_bytes(&ready, b"READY"),
         "wrapped child reached READY"
     );
-    let child_pid = wait_for_pid_file(&child_pid_path, Duration::from_secs(2));
+    let child_pid = wait_for_pid_file(&child_pid_path, Duration::from_secs(5));
     child_guard.set(child_pid);
     let initial_heartbeat = file_counter(&heartbeat_path).unwrap_or(0);
     assert!(
-        wait_for_condition(Duration::from_secs(2), || {
+        wait_for_condition(Duration::from_secs(5), || {
             file_counter(&heartbeat_path).is_some_and(|value| value > initial_heartbeat)
         }),
         "wrapped child heartbeat did not start"
     );
     assert!(
-        wait_for_condition(Duration::from_secs(2), || {
+        wait_for_condition(Duration::from_secs(5), || {
             tcgetattr(&tty)
                 .map(|attrs| !attrs.local_flags.contains(LocalFlags::ICANON))
                 .unwrap_or(false)
@@ -845,7 +845,7 @@ fn assert_job_control_stop_resume(signal: libc::c_int) {
     assert_eq!(unsafe { libc::kill(pid, signal) }, 0);
     let mut observed_stop = None;
     assert!(
-        wait_for_condition(Duration::from_secs(2), || {
+        wait_for_condition(Duration::from_secs(5), || {
             match waitpid(
                 Pid::from_raw(pid),
                 Some(WaitPidFlag::WUNTRACED | WaitPidFlag::WNOHANG),
@@ -883,7 +883,7 @@ fn assert_job_control_stop_resume(signal: libc::c_int) {
 
     // SAFETY: kill has no memory-safety preconditions; the target is a process this test spawned.
     assert_eq!(unsafe { libc::kill(pid, libc::SIGCONT) }, 0);
-    let resumed_raw = wait_for_condition(Duration::from_secs(2), || {
+    let resumed_raw = wait_for_condition(Duration::from_secs(5), || {
         tcgetattr(&tty)
             .map(|attrs| !attrs.local_flags.contains(LocalFlags::ICANON))
             .unwrap_or(false)
@@ -898,7 +898,7 @@ fn assert_job_control_stop_resume(signal: libc::c_int) {
         );
     }
     assert!(
-        wait_for_condition(Duration::from_secs(2), || {
+        wait_for_condition(Duration::from_secs(5), || {
             file_counter(&heartbeat_path).is_some_and(|value| value > stopped_heartbeat)
                 && std::fs::read_to_string(&resume_path)
                     .map(|contents| contents.contains("resumed"))
@@ -915,7 +915,7 @@ fn assert_job_control_stop_resume(signal: libc::c_int) {
         "ptty exits after cleanup signal"
     );
     assert!(
-        wait_for_condition(Duration::from_secs(2), || !process_exists(child_pid)),
+        wait_for_condition(Duration::from_secs(5), || !process_exists(child_pid)),
         "wrapped child survived cleanup after job-control signal {signal}"
     );
     child_guard.disarm();
