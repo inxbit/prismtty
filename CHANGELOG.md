@@ -13,6 +13,11 @@ All notable changes to PrismTTY are documented here.
   of a synthetic 20k-line router dump with four profiles drops from 0.57s to
   0.14s, and a capture-styled rule that can match empty drops from 4.3s to
   0.16s. Output is unchanged.
+- Check for a Unicode prompt marker before decoding when scanning a visible
+  line for prompt echo. The scan runs once per candidate prompt end, so long
+  lines without a prompt paid a full UTF-8 decode per byte; interactive
+  throughput on 8 KiB lines without newlines improves from 1.1 MiB/s to
+  4.4 MiB/s.
 
 ### Security and Reliability
 

@@ -1831,20 +1831,22 @@ fn looks_like_prompt_tail(line: &[u8]) -> bool {
 }
 
 fn looks_like_unicode_prompt_tail(trimmed: &[u8]) -> bool {
+    // Cheap marker check first: this runs for every candidate prompt end of a
+    // visible line, so the UTF-8 decode and control scan below must only run
+    // for the rare tail that actually ends in a Unicode prompt marker.
+    let Some(marker) = UNICODE_PROMPT_MARKERS
+        .iter()
+        .copied()
+        .find(|marker| trimmed.ends_with(marker.as_bytes()))
+    else {
+        return false;
+    };
     let Ok(text) = std::str::from_utf8(trimmed) else {
         return false;
     };
     if !text.chars().all(|ch| !ch.is_control()) {
         return false;
     }
-
-    let Some(marker) = UNICODE_PROMPT_MARKERS
-        .iter()
-        .copied()
-        .find(|marker| text.ends_with(marker))
-    else {
-        return false;
-    };
 
     let body = &text[..text.len() - marker.len()];
     body.is_empty()
