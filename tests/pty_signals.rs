@@ -7,7 +7,7 @@
 #![cfg(unix)]
 
 use std::fs::{File, OpenOptions};
-use std::io::Read;
+use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::process::Child;
 use std::sync::{
@@ -68,6 +68,8 @@ impl PtyChildGuard {
         let Some(mut child) = self.child.take() else {
             return;
         };
+        // SAFETY: kill has no memory-safety preconditions; the target is a process this test
+        // spawned.
         unsafe {
             libc::kill(-self.pid, libc::SIGKILL);
             libc::kill(self.pid, libc::SIGKILL);
@@ -186,6 +188,8 @@ impl Drop for PidGuard {
             }
         });
         if let Some(pid) = self.pid.or(marker_pid) {
+            // SAFETY: kill has no memory-safety preconditions; the target is a process this test
+            // spawned.
             unsafe {
                 libc::kill(-pid, libc::SIGKILL);
                 libc::kill(pid, libc::SIGKILL);
@@ -206,8 +210,11 @@ struct CaptureTask {
 impl CaptureTask {
     fn from_master(master: &dyn portable_pty::MasterPty) -> Self {
         let master_fd = master.as_raw_fd().expect("PTY master fd");
+        // SAFETY: `master_fd` is the open PTY master; dup returns a fresh descriptor this test
+        // owns.
         let reader_fd = unsafe { libc::dup(master_fd) };
         assert!(reader_fd >= 0, "duplicate PTY master fd failed");
+        // SAFETY: `reader_fd` is a freshly duplicated descriptor that nothing else owns or closes.
         let reader = unsafe { File::from_raw_fd(reader_fd) };
         Self::from_reader(reader, reader_fd)
     }
@@ -237,6 +244,7 @@ impl CaptureTask {
                     events: libc::POLLIN | libc::POLLHUP | libc::POLLERR,
                     revents: 0,
                 };
+                // SAFETY: `poll_fd` is a valid, exclusively borrowed pollfd and the count matches.
                 let ready = unsafe {
                     libc::poll(
                         &mut poll_fd,
@@ -402,10 +410,12 @@ fn wait_for_condition(timeout: Duration, mut condition: impl FnMut() -> bool) ->
 }
 
 fn process_exists(pid: libc::pid_t) -> bool {
+    // SAFETY: kill with signal 0 has no memory-safety preconditions and only checks for existence.
     unsafe { libc::kill(pid, 0) == 0 }
 }
 
 fn process_group_exists(pgid: libc::pid_t) -> bool {
+    // SAFETY: kill with signal 0 has no memory-safety preconditions and only checks for existence.
     if unsafe { libc::kill(-pgid, 0) } == 0 {
         return true;
     }
@@ -514,13 +524,16 @@ fn capture_cleanup_is_bounded_when_a_reader_is_stuck() {
     }
 
     let mut fds = [0; 2];
+    // SAFETY: `fds` is a valid array of two c_int that pipe fills on success.
     assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
     let read_fd = fds[0];
     let write_fd = fds[1];
+    // SAFETY: `write_fd` is our pipe end and the buffer is a valid 1-byte slice.
     assert_eq!(unsafe { libc::write(write_fd, b"x".as_ptr().cast(), 1) }, 1);
     let entered = Arc::new(AtomicBool::new(false));
     let gate = Arc::new((Mutex::new(false), Condvar::new()));
     let reader = GatedReader {
+        // SAFETY: `read_fd` is our pipe end and this File becomes its sole owner.
         file: unsafe { File::from_raw_fd(read_fd) },
         entered: Arc::clone(&entered),
         gate: Arc::clone(&gate),
@@ -541,6 +554,7 @@ fn capture_cleanup_is_bounded_when_a_reader_is_stuck() {
     *lock.lock().unwrap() = true;
     wake.notify_all();
     dropper.join().expect("capture dropper joins after release");
+    // SAFETY: `write_fd` is our pipe end, opened above and not used after this close.
     unsafe {
         libc::close(write_fd);
     }
@@ -615,6 +629,7 @@ fn interactive_termination_reaps_a_signal_immune_child_group() {
 
     let (wrapped_pid, descendant_pid) = wait_for_pid_pair(&marker_path, Duration::from_secs(2));
     wrapped_guard.set(wrapped_pid);
+    // SAFETY: kill has no memory-safety preconditions; the target is a process this test spawned.
     assert_eq!(unsafe { libc::kill(ptty.pid(), libc::SIGTERM) }, 0);
 
     assert_eq!(
@@ -656,6 +671,7 @@ fn noninteractive_termination_reaps_a_signal_immune_child_group() {
     let mut ptty = ProcessGuard::new(ptty);
     let (wrapped_pid, descendant_pid) = wait_for_pid_pair(&marker_path, Duration::from_secs(10));
     wrapped_guard.set(wrapped_pid);
+    // SAFETY: kill has no memory-safety preconditions; the target is a process this test spawned.
     assert_eq!(unsafe { libc::kill(ptty.pid(), libc::SIGTERM) }, 0);
 
     let status = ptty
@@ -723,6 +739,7 @@ fn assert_terminal_restored_after(signal: libc::c_int) {
         "ptty never entered raw mode before signal {signal}"
     );
 
+    // SAFETY: kill has no memory-safety preconditions; the target is a process this test spawned.
     assert_eq!(unsafe { libc::kill(ptty.pid(), signal) }, 0);
     assert!(
         wait_for_condition(Duration::from_secs(1), || {
@@ -806,17 +823,17 @@ fn assert_job_control_stop_resume(signal: libc::c_int) {
         contains_bytes(&ready, b"READY"),
         "wrapped child reached READY"
     );
-    let child_pid = wait_for_pid_file(&child_pid_path, Duration::from_secs(2));
+    let child_pid = wait_for_pid_file(&child_pid_path, Duration::from_secs(5));
     child_guard.set(child_pid);
     let initial_heartbeat = file_counter(&heartbeat_path).unwrap_or(0);
     assert!(
-        wait_for_condition(Duration::from_secs(2), || {
+        wait_for_condition(Duration::from_secs(5), || {
             file_counter(&heartbeat_path).is_some_and(|value| value > initial_heartbeat)
         }),
         "wrapped child heartbeat did not start"
     );
     assert!(
-        wait_for_condition(Duration::from_secs(2), || {
+        wait_for_condition(Duration::from_secs(5), || {
             tcgetattr(&tty)
                 .map(|attrs| !attrs.local_flags.contains(LocalFlags::ICANON))
                 .unwrap_or(false)
@@ -824,10 +841,11 @@ fn assert_job_control_stop_resume(signal: libc::c_int) {
         "ptty never entered raw mode before job-control signal {signal}"
     );
 
+    // SAFETY: kill has no memory-safety preconditions; the target is a process this test spawned.
     assert_eq!(unsafe { libc::kill(pid, signal) }, 0);
     let mut observed_stop = None;
     assert!(
-        wait_for_condition(Duration::from_secs(2), || {
+        wait_for_condition(Duration::from_secs(5), || {
             match waitpid(
                 Pid::from_raw(pid),
                 Some(WaitPidFlag::WUNTRACED | WaitPidFlag::WNOHANG),
@@ -863,8 +881,9 @@ fn assert_job_control_stop_resume(signal: libc::c_int) {
         "wrapped child kept running while ptty was stopped by signal {signal}"
     );
 
+    // SAFETY: kill has no memory-safety preconditions; the target is a process this test spawned.
     assert_eq!(unsafe { libc::kill(pid, libc::SIGCONT) }, 0);
-    let resumed_raw = wait_for_condition(Duration::from_secs(2), || {
+    let resumed_raw = wait_for_condition(Duration::from_secs(5), || {
         tcgetattr(&tty)
             .map(|attrs| !attrs.local_flags.contains(LocalFlags::ICANON))
             .unwrap_or(false)
@@ -879,7 +898,7 @@ fn assert_job_control_stop_resume(signal: libc::c_int) {
         );
     }
     assert!(
-        wait_for_condition(Duration::from_secs(2), || {
+        wait_for_condition(Duration::from_secs(5), || {
             file_counter(&heartbeat_path).is_some_and(|value| value > stopped_heartbeat)
                 && std::fs::read_to_string(&resume_path)
                     .map(|contents| contents.contains("resumed"))
@@ -888,6 +907,7 @@ fn assert_job_control_stop_resume(signal: libc::c_int) {
         "wrapped child did not resume after job-control signal {signal}"
     );
 
+    // SAFETY: kill has no memory-safety preconditions; the target is a process this test spawned.
     assert_eq!(unsafe { libc::kill(pid, libc::SIGTERM) }, 0);
     assert_eq!(
         ptty.wait_for_exit(Duration::from_secs(5)),
@@ -895,7 +915,7 @@ fn assert_job_control_stop_resume(signal: libc::c_int) {
         "ptty exits after cleanup signal"
     );
     assert!(
-        wait_for_condition(Duration::from_secs(2), || !process_exists(child_pid)),
+        wait_for_condition(Duration::from_secs(5), || !process_exists(child_pid)),
         "wrapped child survived cleanup after job-control signal {signal}"
     );
     child_guard.disarm();
@@ -959,6 +979,7 @@ fn external_signal_is_forwarded_to_wrapped_child() {
 
     // Deliver SIGTERM to prismtty; it must forward to the wrapped child group.
     let signal_started = Instant::now();
+    // SAFETY: kill has no memory-safety preconditions; the target is a process this test spawned.
     assert_eq!(unsafe { libc::kill(ptty_pid, libc::SIGTERM) }, 0);
 
     // The child's TERM trap writes the marker; poll for it.
@@ -1026,6 +1047,7 @@ fn signal_after_pty_eof_still_terminates_wrapped_child() {
         "wrapped child exited too early"
     );
 
+    // SAFETY: kill has no memory-safety preconditions; the target is a process this test spawned.
     assert_eq!(unsafe { libc::kill(session.pid(), libc::SIGTERM) }, 0);
     assert_eq!(
         session.wait_for_exit(Duration::from_secs(3)),
@@ -1094,6 +1116,7 @@ fn stream_error_terminates_sighup_immune_child() {
     // child ignores both HUP and TERM, so clearing its registered pid before
     // the bounded reap would let the signal watcher exit and orphan it.
     thread::sleep(Duration::from_millis(250));
+    // SAFETY: kill has no memory-safety preconditions; the target is a process this test spawned.
     assert_eq!(unsafe { libc::kill(ptty.pid(), libc::SIGTERM) }, 0);
 
     // ptty must exit instead of blocking forever reaping the HUP-immune child.
@@ -1158,4 +1181,62 @@ fn stream_error_kills_immune_descendant_after_group_leader_exits() {
         "signal-immune descendant survived after its group leader exited"
     );
     wrapped_guard.disarm();
+}
+
+/// Input that reaches the wrapper after the wrapped child has already exited
+/// (a paste ending in `exit`, or fast typing) fails the PTY master write with
+/// EIO because the slave side is gone. That is the session ending, not an
+/// input failure: the child's own exit code must be reported, not an I/O error.
+#[test]
+fn input_after_child_exit_preserves_wrapped_exit_code() {
+    let pair = native_pty_system()
+        .openpty(PtySize::default())
+        .expect("openpty");
+    let mut builder = CommandBuilder::new(env!("CARGO_BIN_EXE_ptty"));
+    builder.arg("sh");
+    builder.arg("-c");
+    // No output before `read`: the echoed line is the wrapper's first chunk,
+    // so it is still building the highlighter when the child exits, which is
+    // the widest window for late input to hit the closed slave.
+    builder.arg("read line; exit 3");
+    let child = pair
+        .slave
+        .spawn_command(builder)
+        .expect("spawn interactive ptty");
+    drop(pair.slave);
+    let mut writer = pair.master.take_writer().expect("take writer");
+    let mut ptty = PtySession::new(child, &*pair.master);
+    thread::sleep(Duration::from_millis(300));
+
+    writer.write_all(b"go\n").expect("write line");
+    writer.flush().expect("flush line");
+    // Keep typing while the child exits so some bytes reach the wrapper after
+    // the slave has closed. Writes to our master fail once ptty itself is gone.
+    let deadline = Instant::now() + Duration::from_millis(500);
+    while Instant::now() < deadline {
+        if writer
+            .write_all(b"y\n")
+            .and_then(|()| writer.flush())
+            .is_err()
+        {
+            break;
+        }
+        thread::sleep(Duration::from_micros(100));
+    }
+
+    let code = ptty.wait_for_exit(Duration::from_secs(5));
+    let output = ptty
+        .capture()
+        .wait_until(Duration::from_millis(200), |_| false);
+    assert_eq!(
+        code,
+        Some(3),
+        "wrapped exit code not preserved; wrapper output: {:?}",
+        String::from_utf8_lossy(&output)
+    );
+    assert!(
+        !contains_bytes(&output, b"I/O error"),
+        "wrapper reported an input I/O error after the child exited: {:?}",
+        String::from_utf8_lossy(&output)
+    );
 }

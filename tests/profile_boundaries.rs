@@ -133,6 +133,33 @@ fn address_prefix_lengths_enforce_protocol_boundaries() {
     }
 }
 
+// `::` also appears as a scope-resolution operator in compiler and stack-trace
+// output; only a `::` that starts a token may begin an IPv6 address.
+#[test]
+fn ipv6_rule_ignores_scope_resolution_operators() {
+    for valid in [
+        "2001:db8::1",
+        "::1",
+        "ping ::1",
+        "route 2001:db8::/32",
+        "fe80::1",
+        "[2001:db8::1]:443",
+        "2001:db8:0:0:0:0:0:1",
+    ] {
+        assert_colored("generic", valid, CYAN);
+    }
+    for invalid in [
+        "MyClass::Add(1)",
+        "Foo::dead",
+        "Ok::<u8, _>",
+        "Foo::",
+        "std::vector",
+        "crate::config",
+    ] {
+        assert_not_colored("generic", invalid, CYAN);
+    }
+}
+
 #[test]
 fn interface_subunits_require_at_least_one_digit() {
     assert_colored("cisco", "Gi1/0/1.0", BLUE);

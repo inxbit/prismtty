@@ -1898,6 +1898,8 @@ mod tests {
 
         // Pending data == not idle: wait, do not consume.
         assert_eq!(
+            // SAFETY: `slave_fd` is the open PTY slave from openpty and the buffer is a valid
+            // 1-byte slice.
             unsafe { nix::libc::write(slave_fd, b"x".as_ptr().cast(), 1) },
             1
         );
@@ -1943,6 +1945,8 @@ mod tests {
         // Strict idle: pending output means the prompt-echo tail is not flushed
         // (a continuation may still arrive), unlike the lenient echo-suffix path.
         assert_eq!(
+            // SAFETY: `slave_fd` is the open PTY slave from openpty and the buffer is a valid
+            // 1-byte slice.
             unsafe { nix::libc::write(slave_fd, b"x".as_ptr().cast(), 1) },
             1
         );

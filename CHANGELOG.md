@@ -2,6 +2,75 @@
 
 All notable changes to PrismTTY are documented here.
 
+## Unreleased
+
+### Performance
+
+- Reuse PCRE2 match data while applying rules. Each rule ran every line
+  through `captures_iter`, which allocates a match-data block and a JIT stack
+  per match attempt; whole-match rules now use the regex's pooled match data
+  and capture-styled rules reuse one capture block per line. Piped highlighting
+  of a synthetic 20k-line router dump with four profiles drops from 0.57s to
+  0.14s, and a capture-styled rule that can match empty drops from 4.3s to
+  0.16s. Output is unchanged.
+- Check for a Unicode prompt marker before decoding when scanning a visible
+  line for prompt echo. The scan runs once per candidate prompt end, so long
+  lines without a prompt paid a full UTF-8 decode per byte; interactive
+  throughput on 8 KiB lines without newlines improves from 1.1 MiB/s to
+  4.4 MiB/s.
+
+### Security and Reliability
+
+- Keep the wrapped command's exit code when input reaches PrismTTY after the
+  command has already exited (a paste ending in `exit`, or fast typing). The
+  PTY master write then fails with EIO because the slave side is gone; that is
+  the session ending, not an input failure, so PrismTTY no longer replaces the
+  child's status with exit code 1 and `prismtty: I/O error`. Regression from
+  1.2.0's input-worker failure reporting.
+- Only terminated output lines count as remote close markers. A read boundary
+  that split a benign line such as `Connection to router1 closed by
+  administrator.` right after `closed` could pop the remote profile mid-session;
+  the marker is now evaluated once its line is complete, and a genuine close
+  marker split across reads still pops when its line ends.
+- Treat the UTF-8 encoding of the C1 CSI introducer (`C2 9B`) like the raw
+  `9B` and `ESC [` forms everywhere, not only in the tokenizer: alternate
+  screen enter/leave, cursor and layout sequences, bracketed-paste disable,
+  program SGR tracking, and prompt-echo SGR neutralization now all recognize
+  it, so a program using that form no longer stays highlighted inside a
+  full-screen view or loses its foreground after a highlighted token.
+- Make the `--trace-io` size-limit marker terminal. Once
+  `---- trace truncated at N bytes ----` is written the trace is closed at the
+  limit; shorter lines no longer keep appending below the marker and the
+  marker no longer repeats.
+- Parse combined short options when learning the remote host from a typed
+  command (`ssh -4p 2222 router1`, `ssh -vp 2222 router1`), so the close
+  marker for that host still returns to the local profile instead of the
+  port number being taken as the target.
+
+### Profiles
+
+- The generic IPv6 rule no longer paints `::` scope-resolution operators in
+  compiler and stack-trace output (`MyClass::Add`, `Foo::dead`, `Ok::<u8, _>`);
+  a `::`-led address must start its token, so `::1`, `[2001:db8::1]:443`, and
+  `fe80::1` still highlight.
+
+### Packaging
+
+- Build release binaries with fat LTO and a single codegen unit: `prismtty`
+  shrinks from 2.28 MB to 1.76 MB with no change in highlighting speed.
+
+### Release and QA
+
+- Install the pinned `cargo-audit` 0.22.1 as a prebuilt binary through a
+  SHA-pinned `taiki-e/install-action` in CI and release validation instead of
+  compiling it on every run (the supply-chain job was the longest CI job),
+  cache Cargo dependencies in the test jobs, and run push CI only on `main`
+  so a pull request from a branch in this repository is checked once, not
+  twice.
+- Require a `SAFETY:` comment on every `unsafe` block
+  (`clippy::undocumented_unsafe_blocks`, enforced by the CI clippy gate) and
+  document the existing libc PTY, termios, signal, and wait calls.
+
 ## 1.2.1 - 2026-07-11
 
 ### Release and QA

@@ -731,6 +731,29 @@ fn is_literal_remote_target(word: &str) -> bool {
 }
 
 fn remote_option_takes_value(command: &str, option: &str) -> bool {
+    if remote_option_word_takes_value(command, option) {
+        return true;
+    }
+    // Combined getopt-style short flags (`-4p 2222`, `-vp 2222`): the first
+    // flag that takes a value consumes the rest of the word as an attached
+    // value (`-p2222`), so only a value-taking flag in the last position
+    // leaves its value to the next word.
+    let Some(flags) = option.strip_prefix('-') else {
+        return false;
+    };
+    if flags.starts_with('-') || flags.chars().count() < 2 {
+        return false;
+    }
+    let mut flags = flags.chars().peekable();
+    while let Some(flag) = flags.next() {
+        if remote_option_word_takes_value(command, &format!("-{flag}")) {
+            return flags.peek().is_none();
+        }
+    }
+    false
+}
+
+fn remote_option_word_takes_value(command: &str, option: &str) -> bool {
     match command {
         "ssh" => matches!(
             option,
@@ -946,13 +969,23 @@ fn recent_chars(text: &str, limit: usize) -> &str {
     &text[start..]
 }
 
+/// The most recent terminated lines of `text`, at most `limit` bytes.
+///
+/// A trailing unterminated line is excluded: a read boundary can split
+/// `Connection to X closed by administrator.` right after `closed`, and that
+/// prefix must not count as a teardown marker before the line is complete.
+/// A leading line cut by the byte limit is excluded for the same reason.
 fn recent_complete_lines(text: &str, limit: usize) -> &str {
-    if text.len() <= limit {
-        return text;
+    let Some(last_newline) = text.rfind('\n') else {
+        return "";
+    };
+    let terminated = &text[..=last_newline];
+    if terminated.len() <= limit {
+        return terminated;
     }
-    let recent = recent_chars(text, limit);
-    let start = text.len() - recent.len();
-    if start == 0 || text.as_bytes()[start - 1] == b'\n' {
+    let recent = recent_chars(terminated, limit);
+    let start = terminated.len() - recent.len();
+    if start == 0 || terminated.as_bytes()[start - 1] == b'\n' {
         return recent;
     }
     recent
@@ -1123,6 +1156,30 @@ mod tests {
         );
     }
 
+    // getopt-style commands accept combined short flags (`-4p 2222`) and
+    // attached values (`-p2222`); the close target must still be the host.
+    #[test]
+    fn combined_short_options_do_not_shift_the_remote_target() {
+        for line in [
+            "ssh -4p 2222 router-a\r",
+            "ssh -vp 2222 router-a\r",
+            "ssh -p2222 router-a\r",
+            "ssh -4p2222 router-a\r",
+            "ssh -46 router-a\r",
+        ] {
+            let mut runtime = ProfileRuntime::new(names(&["generic", "linux-unix"]));
+            runtime.observe_input(line.as_bytes());
+            assert_eq!(
+                runtime
+                    .pending_remote
+                    .as_ref()
+                    .and_then(|attempt| attempt.target.as_deref()),
+                Some("router-a"),
+                "{line:?}"
+            );
+        }
+    }
+
     #[test]
     fn split_close_marker_pops_remote_profile() {
         let store = ProfileStore::builtin();
@@ -1139,6 +1196,36 @@ mod tests {
 
         assert_eq!(changed, Some(names(&["generic", "linux-unix"])));
         assert_eq!(runtime.active_profiles(), names(&["generic", "linux-unix"]));
+    }
+
+    // A read boundary can split a benign line right after a marker-shaped
+    // prefix; only terminated lines may count as teardown markers.
+    #[test]
+    fn partial_trailing_line_is_not_a_close_marker() {
+        let store = ProfileStore::builtin();
+        let mut runtime = ProfileRuntime::new(names(&["generic", "linux-unix"]));
+
+        runtime.observe_input(b"ssh router-a\r");
+        assert_eq!(
+            runtime.observe_output(b"--- JUNOS 22.4R3 Kernel 64-bit\n", &store),
+            Some(names(&["generic", "juniper"]))
+        );
+
+        assert_eq!(
+            runtime.observe_output(b"Connection to router-a closed", &store),
+            None
+        );
+        assert_eq!(
+            runtime.observe_output(b" by administrator.\r\n", &store),
+            None
+        );
+        assert_eq!(runtime.active_profiles(), names(&["generic", "juniper"]));
+
+        // The genuine marker still pops once its line is complete.
+        assert_eq!(
+            runtime.observe_output(b"Connection to router-a closed.\r\n", &store),
+            Some(names(&["generic", "linux-unix"]))
+        );
     }
 
     #[test]

@@ -35,6 +35,33 @@ rules:
 }
 
 #[test]
+fn capture_rules_style_every_match_and_step_past_empty_matches() {
+    // Capture-styled rules must find every match on a line, and a pattern that
+    // can match empty must still advance (never loop, never double-style).
+    let yaml = r##"
+rules:
+  - description: every number
+    regex: (\d+)
+    color:
+      1: f#00ffff
+  - description: possibly empty
+    regex: (x*)
+    color:
+      1: underline
+"##;
+
+    let config = PrismConfig::from_chromaterm_yaml(yaml).expect("chromaterm config loads");
+    let highlighter = Highlighter::from_config(config).expect("rules compile");
+
+    let output = highlighter.highlight_str("1 22 333 axxb\n");
+
+    assert_eq!(
+        output,
+        "\x1b[38;2;0;255;255m1\x1b[0m \x1b[38;2;0;255;255m22\x1b[0m \x1b[38;2;0;255;255m333\x1b[0m a\x1b[4mxx\x1b[0mb\n"
+    );
+}
+
+#[test]
 fn ansi16_color_mode_keeps_core_prismtty_colors_distinct_with_short_sgr() {
     let interface = Style::parse("f#0099ff").expect("interface style parses");
     let ip = Style::parse("f#00ffff").expect("ip style parses");
