@@ -2,7 +2,7 @@
 
 All notable changes to PrismTTY are documented here.
 
-## Unreleased
+## 1.2.3 - 2026-08-19
 
 ### Security and Reliability
 
@@ -31,6 +31,9 @@ All notable changes to PrismTTY are documented here.
   now refuses a version Homebrew cannot derive from the URL: for a hyphenated
   pre-release such as `2.0.0-rc1`, Homebrew reads the `x86_64` in the file
   name and reports version `86.64`, which would outrank every later release.
+- Make the Ubuntu build dependency install survive a broken package mirror:
+  force IPv4, bound each fetch, retry, and fall back to the canonical Ubuntu
+  archive when the runner's regional mirror stops answering.
 
 ## 1.2.2 - 2026-08-18
 
