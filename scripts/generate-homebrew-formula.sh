@@ -36,31 +36,33 @@ linux_x86_64_sha="$(sha_for linux-x86_64)"
 
 mkdir -p "$(dirname "${output}")"
 
+# The release version is written literally into each URL so Homebrew derives
+# the formula version from it; an explicit `version` line would be flagged as
+# redundant by `brew audit --strict`.
 cat > "${output}" <<FORMULA
 class Prismtty < Formula
   desc "Fast terminal highlighter focused on network devices and Unix administration"
   homepage "${repo_url}"
-  version "${version}"
   license "MIT"
 
   depends_on "pcre2"
 
   on_macos do
     if Hardware::CPU.arm?
-      url "${repo_url}/releases/download/v#{version}/prismtty-#{version}-darwin-aarch64.tar.gz"
+      url "${repo_url}/releases/download/v${version}/prismtty-${version}-darwin-aarch64.tar.gz"
       sha256 "${darwin_aarch64_sha}"
     else
-      url "${repo_url}/releases/download/v#{version}/prismtty-#{version}-darwin-x86_64.tar.gz"
+      url "${repo_url}/releases/download/v${version}/prismtty-${version}-darwin-x86_64.tar.gz"
       sha256 "${darwin_x86_64_sha}"
     end
   end
 
   on_linux do
     if Hardware::CPU.intel?
-      url "${repo_url}/releases/download/v#{version}/prismtty-#{version}-linux-x86_64.tar.gz"
+      url "${repo_url}/releases/download/v${version}/prismtty-${version}-linux-x86_64.tar.gz"
       sha256 "${linux_x86_64_sha}"
     else
-      odie "Linux ARM release artifacts are not published for PrismTTY #{version}"
+      odie "Linux ARM release artifacts are not published for PrismTTY ${version}"
     end
   end
 

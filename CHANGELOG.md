@@ -18,6 +18,10 @@ All notable changes to PrismTTY are documented here.
 - Add a policy test requiring every GitHub Actions `uses:` in the workflows to
   be pinned to a full commit SHA, so a future mutable-tag reference cannot
   slip in unnoticed.
+- Write the release version literally into the generated Homebrew formula's
+  URLs and drop the explicit `version` line, so Homebrew derives the version
+  from the URL and `brew audit --strict` passes without the redundancy note;
+  CI and release validation check the URL form instead.
 
 ## 1.2.2 - 2026-08-18
 

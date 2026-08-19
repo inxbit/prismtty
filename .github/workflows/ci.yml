@@ -144,7 +144,11 @@ jobs:
             printf '%s  prismtty-%s-%s.tar.gz\n' "$checksum" "$version" "$target" > "$tmp/prismtty-${version}-${target}.tar.gz.sha256"
           done
           bash scripts/generate-homebrew-formula.sh "$tmp/prismtty.rb" "$tmp"
-          grep -F "version \"${version}\"" "$tmp/prismtty.rb"
+          grep -F "/releases/download/v${version}/prismtty-${version}-darwin-aarch64.tar.gz" "$tmp/prismtty.rb"
+          if grep -n -E '^\s*version "' "$tmp/prismtty.rb"; then
+            echo "Generated Homebrew formula must derive its version from the URLs."
+            exit 1
+          fi
           grep -F 'depends_on "pcre2"' "$tmp/prismtty.rb"
           grep -F "linux-x86_64" "$tmp/prismtty.rb"
           if grep -n -E "REPLACE_WITH|linux-aarch64" "$tmp/prismtty.rb"; then
