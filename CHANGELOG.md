@@ -6,6 +6,12 @@ All notable changes to PrismTTY are documented here.
 
 ### Security and Reliability
 
+- Keep highlighting the rest of a chunk when one rule exhausts its PCRE2 match
+  budget on a pathological span. The scan now resumes after the token that
+  failed, for at most four failures per rule per chunk, and the matches found
+  around it are applied before the rule is set aside for the rest of the
+  session. Previously a single such failure dropped every match that rule had
+  found on that chunk.
 - Accept a bare carriage return as a line terminator when inspecting remote
   close markers, so devices that end lines with `\r` only still return to
   the local profile when their session closes.
