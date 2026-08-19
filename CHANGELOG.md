@@ -4,6 +4,12 @@ All notable changes to PrismTTY are documented here.
 
 ## Unreleased
 
+### Security and Reliability
+
+- Accept a bare carriage return as a line terminator when inspecting remote
+  close markers, so devices that end lines with `\r` only still return to
+  the local profile when their session closes.
+
 ### Release and QA
 
 - Add a policy test requiring every GitHub Actions `uses:` in the workflows to

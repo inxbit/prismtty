@@ -814,7 +814,7 @@ fn observed_close_markers(text: &str) -> Vec<ObservedCloseMarker> {
     // mentions these words (e.g. a log line "... connection to X closed and
     // reopened") does not pop a still-live remote profile. The caller passes
     // lowercased text.
-    text.lines()
+    text.split(is_line_terminator)
         .filter_map(|line| {
             let line = line.trim();
             if line == "logout" {
@@ -969,6 +969,13 @@ fn recent_chars(text: &str, limit: usize) -> &str {
     &text[start..]
 }
 
+/// Line terminators for close-marker inspection. A bare carriage return
+/// counts too: some devices end every line with `\r` only, and their teardown
+/// lines must still be seen as complete.
+fn is_line_terminator(character: char) -> bool {
+    matches!(character, '\n' | '\r')
+}
+
 /// The most recent terminated lines of `text`, at most `limit` bytes.
 ///
 /// A trailing unterminated line is excluded: a read boundary can split
@@ -976,20 +983,20 @@ fn recent_chars(text: &str, limit: usize) -> &str {
 /// prefix must not count as a teardown marker before the line is complete.
 /// A leading line cut by the byte limit is excluded for the same reason.
 fn recent_complete_lines(text: &str, limit: usize) -> &str {
-    let Some(last_newline) = text.rfind('\n') else {
+    let Some(last_terminator) = text.rfind(is_line_terminator) else {
         return "";
     };
-    let terminated = &text[..=last_newline];
+    let terminated = &text[..=last_terminator];
     if terminated.len() <= limit {
         return terminated;
     }
     let recent = recent_chars(terminated, limit);
     let start = terminated.len() - recent.len();
-    if start == 0 || terminated.as_bytes()[start - 1] == b'\n' {
+    if start == 0 || matches!(terminated.as_bytes()[start - 1], b'\n' | b'\r') {
         return recent;
     }
     recent
-        .split_once('\n')
+        .split_once(is_line_terminator)
         .map_or("", |(_, complete_lines)| complete_lines)
 }
 
@@ -1224,6 +1231,35 @@ mod tests {
         // The genuine marker still pops once its line is complete.
         assert_eq!(
             runtime.observe_output(b"Connection to router-a closed.\r\n", &store),
+            Some(names(&["generic", "linux-unix"]))
+        );
+    }
+
+    // Some devices end lines with a bare carriage return; a CR-terminated
+    // marker is complete, and a CR-split benign line still is not.
+    #[test]
+    fn carriage_return_terminates_close_marker_lines() {
+        let store = ProfileStore::builtin();
+        let mut runtime = ProfileRuntime::new(names(&["generic", "linux-unix"]));
+
+        runtime.observe_input(b"ssh router-a\r");
+        assert_eq!(
+            runtime.observe_output(b"--- JUNOS 22.4R3 Kernel 64-bit\r", &store),
+            Some(names(&["generic", "juniper"]))
+        );
+
+        assert_eq!(
+            runtime.observe_output(b"Connection to router-a closed", &store),
+            None
+        );
+        assert_eq!(
+            runtime.observe_output(b" by administrator.\r", &store),
+            None
+        );
+        assert_eq!(runtime.active_profiles(), names(&["generic", "juniper"]));
+
+        assert_eq!(
+            runtime.observe_output(b"Connection to router-a closed.\r", &store),
             Some(names(&["generic", "linux-unix"]))
         );
     }
