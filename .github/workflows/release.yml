@@ -190,7 +190,11 @@ jobs:
         run: |
           set -euo pipefail
           formula="${RUNNER_TEMP}/release-artifacts/prismtty.rb"
-          grep -F "version \"${GITHUB_REF_NAME#v}\"" "$formula"
+          grep -F "/releases/download/v${GITHUB_REF_NAME#v}/prismtty-${GITHUB_REF_NAME#v}-darwin-aarch64.tar.gz" "$formula"
+          if grep -n -E '^\s*version "' "$formula"; then
+            echo "Generated Homebrew formula must derive its version from the URLs."
+            exit 1
+          fi
           grep -F 'depends_on "pcre2"' "$formula"
           grep -F "linux-x86_64" "$formula"
           if grep -n -E "REPLACE_WITH|linux-aarch64" "$formula"; then

@@ -11,6 +11,17 @@ if [[ -z "${version}" ]]; then
   exit 1
 fi
 
+# The formula carries no explicit `version`, so Homebrew derives it from the
+# download URLs. That only works for a plain MAJOR.MINOR.PATCH version: a
+# hyphenated pre-release such as 2.0.0-rc1 makes Homebrew read the `x86_64` in
+# the file name instead and report version 86.64, which would outrank every
+# later release. Refuse to generate such a formula.
+if [[ ! "${version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+  printf 'refusing to generate a formula for non MAJOR.MINOR.PATCH version: %s\n' "${version}" >&2
+  printf 'Homebrew derives the version from the download URL; add an explicit version line first.\n' >&2
+  exit 1
+fi
+
 sha_for() {
   local target_name="$1"
   local checksum_file="${dist_dir}/prismtty-${version}-${target_name}.tar.gz.sha256"
@@ -36,31 +47,33 @@ linux_x86_64_sha="$(sha_for linux-x86_64)"
 
 mkdir -p "$(dirname "${output}")"
 
+# The release version is written literally into each URL so Homebrew derives
+# the formula version from it; an explicit `version` line would be flagged as
+# redundant by `brew audit --strict`.
 cat > "${output}" <<FORMULA
 class Prismtty < Formula
   desc "Fast terminal highlighter focused on network devices and Unix administration"
   homepage "${repo_url}"
-  version "${version}"
   license "MIT"
 
   depends_on "pcre2"
 
   on_macos do
     if Hardware::CPU.arm?
-      url "${repo_url}/releases/download/v#{version}/prismtty-#{version}-darwin-aarch64.tar.gz"
+      url "${repo_url}/releases/download/v${version}/prismtty-${version}-darwin-aarch64.tar.gz"
       sha256 "${darwin_aarch64_sha}"
     else
-      url "${repo_url}/releases/download/v#{version}/prismtty-#{version}-darwin-x86_64.tar.gz"
+      url "${repo_url}/releases/download/v${version}/prismtty-${version}-darwin-x86_64.tar.gz"
       sha256 "${darwin_x86_64_sha}"
     end
   end
 
   on_linux do
     if Hardware::CPU.intel?
-      url "${repo_url}/releases/download/v#{version}/prismtty-#{version}-linux-x86_64.tar.gz"
+      url "${repo_url}/releases/download/v${version}/prismtty-${version}-linux-x86_64.tar.gz"
       sha256 "${linux_x86_64_sha}"
     else
-      odie "Linux ARM release artifacts are not published for PrismTTY #{version}"
+      odie "Linux ARM release artifacts are not published for PrismTTY ${version}"
     end
   end
 
