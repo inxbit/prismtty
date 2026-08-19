@@ -171,6 +171,24 @@ test('CI verifies the minimum supported Rust version used for releases', () => {
   );
 });
 
+test('every workflow action is pinned to a full commit SHA', () => {
+  // A mutable tag (`@v4`) can be repointed at attacker code that then runs
+  // with the job's token; a 40-hex SHA cannot. Local `./` actions are exempt.
+  const dir = '.github/workflows';
+  const unpinned = [];
+  for (const file of readdirSync(dir).filter((name) => /\.ya?ml$/.test(name))) {
+    const lines = read(`${dir}/${file}`).split('\n');
+    lines.forEach((line, index) => {
+      const match = line.match(/^\s*-?\s*uses:\s*(\S+)/);
+      if (!match || match[1].startsWith('./')) return;
+      if (!/^[^@\s]+@[0-9a-f]{40}$/.test(match[1])) {
+        unpinned.push(`${file}:${index + 1}: ${match[1]}`);
+      }
+    });
+  }
+  assert.deepEqual(unpinned, [], 'workflow actions must be pinned to a commit SHA');
+});
+
 test('cargo audit stays pinned to an exact prebuilt version', () => {
   const ci = read('.github/workflows/ci.yml');
   const release = read('.github/workflows/release.yml');
