@@ -62,6 +62,42 @@ rules:
 }
 
 #[test]
+fn a_rule_that_errors_on_one_span_still_highlights_the_rest_of_the_chunk() {
+    // A rule can exceed PCRE2's match limit at one starting position (bounded
+    // backtracking, not a hang) without the rest of the line being pathological.
+    // The interactive path disables such a rule for later chunks, but the
+    // matches it did find in this one must still be applied.
+    let yaml = r##"
+rules:
+  - description: backtracker
+    regex: '(a+)+z'
+    color: f#00ffff
+"##;
+
+    let config = PrismConfig::from_chromaterm_yaml(yaml).expect("chromaterm config loads");
+    let highlighter = Highlighter::from_config(config).expect("rule compiles");
+    let mut streaming = StreamingHighlighter::new(highlighter);
+
+    let mut line = "aaz ".to_string();
+    line.push_str(&"a".repeat(2000));
+    line.push_str(" aaz\n");
+
+    let mut output = streaming.push(line.as_bytes());
+    output.extend(streaming.finish());
+    let rendered = String::from_utf8(output).expect("valid utf8");
+
+    assert!(
+        rendered.contains("\x1b[38;2;0;255;255maaz\x1b[0m"),
+        "no match survived the rule error: {rendered:?}"
+    );
+    assert_eq!(
+        rendered.matches("\x1b[38;2;0;255;255maaz\x1b[0m").count(),
+        2,
+        "matches on both sides of the pathological span should highlight: {rendered:?}"
+    );
+}
+
+#[test]
 fn duplicate_capture_names_resolve_like_pcre2() {
     // PCRE2 allows duplicate group names with (?J); its name lookup returns the
     // last group carrying the name, so a style keyed on that name must follow

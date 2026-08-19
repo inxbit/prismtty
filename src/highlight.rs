@@ -22,6 +22,12 @@ const PCRE2_JIT_STACK_LIMIT_BYTES: usize = 32 * 1024;
 const PCRE2_MATCH_LIMIT: usize = 100_000;
 const PCRE2_DEPTH_LIMIT: usize = 1_000;
 const MAX_COMPILED_RULES: usize = 512;
+/// How many runtime match errors a rule may hit on one chunk before the scan
+/// gives up. Each error means PCRE2 spent its whole match budget at that
+/// starting position, so recovery has to stay bounded; a handful is enough to
+/// get past one pathological span without letting a crafted line multiply the
+/// budget by its length.
+const MAX_RULE_MATCH_ERRORS: usize = 4;
 const MAX_TOTAL_PATTERN_BYTES: usize = 256 * 1024;
 
 #[derive(Clone, Debug)]
@@ -2199,16 +2205,9 @@ impl Highlighter {
                     match_error.as_deref(),
                 );
             }
-            if let Some(message) = match_error {
-                if let Some(disabled) = disabled_rule_identities.as_deref_mut() {
-                    disabled.insert(rule.identity.clone());
-                    continue;
-                }
-                return Err(RuleMatchError {
-                    description: escape_untrusted(&rule.description),
-                    message: escape_untrusted(&message),
-                });
-            }
+            // A rule that hit a runtime error still reports the matches it
+            // found around the failing span, so apply them before deciding
+            // what the error means for the rest of the session.
             for (start, end, style) in matches {
                 if start >= end || end > styles.len() {
                     continue;
@@ -2230,6 +2229,19 @@ impl Highlighter {
                         protected[idx] = true;
                     }
                 }
+            }
+
+            // The matches found around a failing span are applied above; the
+            // error itself decides what happens to the rule from here on.
+            if let Some(message) = match_error {
+                if let Some(disabled) = disabled_rule_identities.as_deref_mut() {
+                    disabled.insert(rule.identity.clone());
+                    continue;
+                }
+                return Err(RuleMatchError {
+                    description: escape_untrusted(&rule.description),
+                    message: escape_untrusted(&message),
+                });
             }
         }
 
@@ -2263,70 +2275,88 @@ fn match_rule(
     let mut ranges = Vec::new();
     let mut match_count = 0;
     let mut match_error = None;
-    // pcre2's `captures_iter` allocates a fresh match-data block (and, with a
-    // JIT stack limit set, a fresh JIT stack) for every match attempt. Every
-    // rule runs on every line, so use the regex's pooled match data for
-    // whole-match rules and a single reusable capture block for capture rules.
-    match &rule.style {
-        CompiledStyle::Whole(style) => {
-            for found in rule.regex.find_iter(visible) {
-                match found {
-                    Ok(matched) => {
-                        match_count += 1;
-                        ranges.push((matched.start(), matched.end(), style.clone()));
-                    }
-                    Err(error) => {
-                        match_error = Some(error.to_string());
-                        break;
-                    }
-                }
-            }
-        }
-        CompiledStyle::Captures(capture_styles) => {
-            let mut locations = rule.regex.capture_locations();
-            let mut last_end = 0;
-            let mut last_match = None;
-            while last_end <= visible.len() {
-                let matched = match rule
-                    .regex
-                    .captures_read_at(&mut locations, visible, last_end)
-                {
-                    Ok(Some(matched)) => matched,
-                    Ok(None) => break,
-                    Err(error) => {
-                        match_error = Some(error.to_string());
-                        break;
-                    }
-                };
-                // Same stepping as pcre2's own iterator: an empty match advances
-                // one byte so the search makes progress, and an empty match
-                // directly after the previous match is skipped.
-                if matched.start() == matched.end() {
-                    last_end = matched.end() + 1;
-                    if Some(matched.end()) == last_match {
-                        continue;
-                    }
-                } else {
-                    last_end = matched.end();
-                }
-                last_match = Some(matched.end());
-                match_count += 1;
+    let mut errors = 0;
+    let mut locations = match &rule.style {
+        CompiledStyle::Whole(_) => None,
+        // pcre2's `captures_iter` allocates a fresh match-data block (and, with
+        // a JIT stack limit set, a fresh JIT stack) for every match attempt.
+        // Every rule runs on every line, so reuse one capture block per call;
+        // whole-match rules use the regex's own pooled match data below.
+        CompiledStyle::Captures(_) => Some(rule.regex.capture_locations()),
+    };
+    let mut last_end = 0;
+    let mut last_match = None;
 
+    while last_end <= visible.len() {
+        let found = match &mut locations {
+            Some(locations) => rule
+                .regex
+                .captures_read_at(locations, visible, last_end)
+                .map(|matched| matched.map(|matched| (matched.start(), matched.end()))),
+            None => rule
+                .regex
+                .find_at(visible, last_end)
+                .map(|matched| matched.map(|matched| (matched.start(), matched.end()))),
+        };
+
+        let (start, end) = match found {
+            Ok(Some(matched)) => matched,
+            Ok(None) => break,
+            Err(error) => {
+                // The rule exhausted its match budget at this starting
+                // position. Keep the first error for reporting, then resume
+                // after the token that blew up, so one pathological word does
+                // not hide every later match on the line. Stepping a single
+                // byte would just re-enter the same word for each of its
+                // bytes, and resuming is bounded by MAX_RULE_MATCH_ERRORS.
+                if match_error.is_none() {
+                    match_error = Some(error.to_string());
+                }
+                errors += 1;
+                if errors > MAX_RULE_MATCH_ERRORS {
+                    break;
+                }
+                match visible[last_end..]
+                    .iter()
+                    .position(|byte| byte.is_ascii_whitespace())
+                {
+                    Some(offset) => last_end += offset + 1,
+                    None => break,
+                }
+                continue;
+            }
+        };
+
+        // Same stepping as pcre2's own iterator: an empty match advances one
+        // byte so the search makes progress, and an empty match directly after
+        // the previous match is skipped.
+        if start == end {
+            last_end = end + 1;
+            if Some(end) == last_match {
+                continue;
+            }
+        } else {
+            last_end = end;
+        }
+        last_match = Some(end);
+        match_count += 1;
+
+        match (&rule.style, &locations) {
+            (CompiledStyle::Whole(style), _) => ranges.push((start, end, style.clone())),
+            (CompiledStyle::Captures(capture_styles), Some(locations)) => {
                 for (index, style) in capture_styles {
                     if let Some((start, end)) = locations.get(*index) {
                         ranges.push((start, end, style.clone()));
                     }
                 }
             }
+            (CompiledStyle::Captures(_), None) => unreachable!("capture rules keep locations"),
         }
     }
 
     (ranges, match_count, match_error)
 }
 
-/// Group index for a capture name. With `(?J)` a name can label several
-/// groups; PCRE2's name lookup (and pcre2's `Captures::name`) returns the last
-/// one, so follow that.
 fn capture_group_index(regex: &Regex, name: &str) -> Option<usize> {
     regex
         .capture_names()
