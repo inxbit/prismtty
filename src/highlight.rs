@@ -686,8 +686,16 @@ struct CompiledRule {
     identity: RuleIdentity,
     description: String,
     regex: Regex,
-    style: RuleStyle,
+    style: CompiledStyle,
     exclusive: bool,
+}
+
+/// A rule's style with capture references resolved to group indices at
+/// compile time, so matching does not look names up per match.
+#[derive(Clone, Debug)]
+enum CompiledStyle {
+    Whole(Style),
+    Captures(Vec<(usize, Style)>),
 }
 
 #[derive(Clone, Debug)]
@@ -2107,12 +2115,12 @@ fn compile_rule(
             description: escape_untrusted(&description),
             source,
         })?;
-    validate_capture_references(&description, &rule.style, &regex)?;
+    let style = resolve_capture_references(&description, rule.style, &regex)?;
     Ok(CompiledRule {
         identity,
         description,
         regex,
-        style: rule.style,
+        style,
         exclusive: rule.exclusive,
     })
 }
@@ -2130,36 +2138,37 @@ fn configuration_validation_error(message: String) -> HighlightError {
     }
 }
 
-fn validate_capture_references(
+/// Resolves every styled capture reference to a group index, rejecting
+/// references to groups the pattern does not define.
+fn resolve_capture_references(
     description: &str,
-    style: &RuleStyle,
+    style: RuleStyle,
     regex: &Regex,
-) -> Result<(), HighlightError> {
-    let RuleStyle::Captures(capture_styles) = style else {
-        return Ok(());
+) -> Result<CompiledStyle, HighlightError> {
+    let capture_styles = match style {
+        RuleStyle::Whole(style) => return Ok(CompiledStyle::Whole(style)),
+        RuleStyle::Captures(capture_styles) => capture_styles,
     };
-    for capture in capture_styles.keys() {
-        let exists = match capture {
-            CaptureRef::Index(index) => *index < regex.captures_len(),
-            CaptureRef::Name(name) => regex
-                .capture_names()
-                .iter()
-                .flatten()
-                .any(|candidate| candidate == name),
+    let mut resolved = Vec::with_capacity(capture_styles.len());
+    for (capture, style) in capture_styles {
+        let index = match &capture {
+            CaptureRef::Index(index) => (*index < regex.captures_len()).then_some(*index),
+            CaptureRef::Name(name) => capture_group_index(regex, name),
         };
-        if !exists {
+        let Some(index) = index else {
             let capture = match capture {
                 CaptureRef::Index(index) => index.to_string(),
-                CaptureRef::Name(name) => name.clone(),
+                CaptureRef::Name(name) => name,
             };
             return Err(configuration_validation_error(format!(
                 "{} references capture '{}' that does not exist",
                 escape_untrusted(description),
                 escape_untrusted(&capture)
             )));
-        }
+        };
+        resolved.push((index, style));
     }
-    Ok(())
+    Ok(CompiledStyle::Captures(resolved))
 }
 
 impl Highlighter {
@@ -2259,7 +2268,7 @@ fn match_rule(
     // rule runs on every line, so use the regex's pooled match data for
     // whole-match rules and a single reusable capture block for capture rules.
     match &rule.style {
-        RuleStyle::Whole(style) => {
+        CompiledStyle::Whole(style) => {
             for found in rule.regex.find_iter(visible) {
                 match found {
                     Ok(matched) => {
@@ -2273,7 +2282,7 @@ fn match_rule(
                 }
             }
         }
-        RuleStyle::Captures(capture_styles) => {
+        CompiledStyle::Captures(capture_styles) => {
             let mut locations = rule.regex.capture_locations();
             let mut last_end = 0;
             let mut last_match = None;
@@ -2303,12 +2312,8 @@ fn match_rule(
                 last_match = Some(matched.end());
                 match_count += 1;
 
-                for (group, style) in capture_styles {
-                    let index = match group {
-                        CaptureRef::Index(index) => Some(*index),
-                        CaptureRef::Name(name) => capture_group_index(&rule.regex, name),
-                    };
-                    if let Some((start, end)) = index.and_then(|index| locations.get(index)) {
+                for (index, style) in capture_styles {
+                    if let Some((start, end)) = locations.get(*index) {
                         ranges.push((start, end, style.clone()));
                     }
                 }
@@ -2319,11 +2324,14 @@ fn match_rule(
     (ranges, match_count, match_error)
 }
 
+/// Group index for a capture name. With `(?J)` a name can label several
+/// groups; PCRE2's name lookup (and pcre2's `Captures::name`) returns the last
+/// one, so follow that.
 fn capture_group_index(regex: &Regex, name: &str) -> Option<usize> {
     regex
         .capture_names()
         .iter()
-        .position(|candidate| candidate.as_deref() == Some(name))
+        .rposition(|candidate| candidate.as_deref() == Some(name))
 }
 
 fn tokenize_ansi(input: &[u8]) -> Vec<Token> {

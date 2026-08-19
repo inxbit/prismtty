@@ -62,6 +62,27 @@ rules:
 }
 
 #[test]
+fn duplicate_capture_names_resolve_like_pcre2() {
+    // PCRE2 allows duplicate group names with (?J); its name lookup returns the
+    // last group carrying the name, so a style keyed on that name must follow
+    // the same resolution.
+    let yaml = r##"
+rules:
+  - description: either branch
+    regex: "(?J)(?P<word>alpha)|(?P<word>beta)"
+    color:
+      word: f#00ffff
+"##;
+
+    let config = PrismConfig::from_chromaterm_yaml(yaml).expect("chromaterm config loads");
+    let highlighter = Highlighter::from_config(config).expect("rules compile");
+
+    let output = highlighter.highlight_str("beta\n");
+
+    assert_eq!(output, "\x1b[38;2;0;255;255mbeta\x1b[0m\n");
+}
+
+#[test]
 fn ansi16_color_mode_keeps_core_prismtty_colors_distinct_with_short_sgr() {
     let interface = Style::parse("f#0099ff").expect("interface style parses");
     let ip = Style::parse("f#00ffff").expect("ip style parses");
