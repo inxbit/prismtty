@@ -9,6 +9,9 @@ All notable changes to PrismTTY are documented here.
 - Accept a bare carriage return as a line terminator when inspecting remote
   close markers, so devices that end lines with `\r` only still return to
   the local profile when their session closes.
+- Resolve styled capture references to group indices when a rule compiles,
+  and resolve a duplicate `(?J)` group name to the last group carrying it, as
+  PCRE2 does (1.2.2 picked the first).
 
 ### Release and QA
 
