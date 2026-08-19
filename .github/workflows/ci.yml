@@ -43,13 +43,26 @@ jobs:
           toolchain: 1.85.0
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Install PCRE2
-        # A hung apt mirror once held this step for hours; bound it and make
-        # apt give up on a stalled fetch instead of waiting forever.
+        # Ubuntu runners regularly stall reaching the Azure package mirror over
+        # IPv6, which held this step for hours before it was bounded. Force
+        # IPv4, bound every fetch, and retry the whole step a few times so a
+        # stalled mirror costs a minute instead of the job.
         timeout-minutes: 10
         run: |
-          apt_get() { sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 "$@"; }
-          apt_get update
-          apt_get install -y --no-install-recommends libpcre2-dev pkg-config
+          apt_get() {
+            sudo apt-get -o Acquire::ForceIPv4=true -o Acquire::Retries=3 \
+              -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 "$@"
+          }
+          for attempt in 1 2 3; do
+            if timeout 120 bash -c "$(declare -f apt_get); apt_get update" \
+              && timeout 120 bash -c "$(declare -f apt_get); apt_get install -y --no-install-recommends libpcre2-dev pkg-config"; then
+              exit 0
+            fi
+            echo "apt attempt ${attempt} failed; retrying"
+            sleep 5
+          done
+          echo "apt could not install the PCRE2 build dependency"
+          exit 1
       - run: cargo test --locked
 
   test:
@@ -69,17 +82,30 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Install PCRE2
-        # A hung apt mirror once held this step for hours; bound it and make
-        # apt give up on a stalled fetch instead of waiting forever.
+        # Ubuntu runners regularly stall reaching the Azure package mirror over
+        # IPv6, which held this step for hours before it was bounded. Force
+        # IPv4, bound every fetch, and retry the whole step a few times so a
+        # stalled mirror costs a minute instead of the job.
         timeout-minutes: 10
         run: |
           if [[ "${{ runner.os }}" == "macOS" ]]; then
             brew install pcre2 pkg-config
-          else
-            apt_get() { sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 "$@"; }
-            apt_get update
-            apt_get install -y --no-install-recommends libpcre2-dev pkg-config
+            exit 0
           fi
+          apt_get() {
+            sudo apt-get -o Acquire::ForceIPv4=true -o Acquire::Retries=3 \
+              -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 "$@"
+          }
+          for attempt in 1 2 3; do
+            if timeout 120 bash -c "$(declare -f apt_get); apt_get update" \
+              && timeout 120 bash -c "$(declare -f apt_get); apt_get install -y --no-install-recommends libpcre2-dev pkg-config"; then
+              exit 0
+            fi
+            echo "apt attempt ${attempt} failed; retrying"
+            sleep 5
+          done
+          echo "apt could not install the PCRE2 build dependency"
+          exit 1
       - run: cargo fmt --check
       - run: cargo clippy --locked --all-targets --all-features -- -D warnings
       - run: cargo test --locked
