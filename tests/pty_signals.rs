@@ -25,6 +25,21 @@ const RECEIVE_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const CAPTURE_BYTE_LIMIT: usize = 1024 * 1024;
 const CLEANUP_WAIT_LIMIT: Duration = Duration::from_secs(2);
 const THREAD_JOIN_LIMIT: Duration = Duration::from_millis(250);
+// A supervised job-control stop lasts until something continues the wrapper,
+// so the transition is sampled continuously rather than read after a fixed
+// sleep. Nothing in the kernel ends it early: a `setsid` PTY session leader
+// that stops stays stopped. Some developer machines run security tooling that
+// sends SIGCONT to freshly executed binaries (observed here from a root
+// daemon, identified through `si_pid`), which truncates the stop and, because
+// SIGCONT also discards a pending SIGSTOP, can hide it from any sampler.
+const JOB_CONTROL_OBSERVE_LIMIT: Duration = Duration::from_secs(10);
+const JOB_CONTROL_SAMPLE_INTERVAL: Duration = Duration::from_millis(5);
+const HEARTBEAT_FREEZE_WINDOW: Duration = Duration::from_millis(160);
+/// How long to let the wrapper run before stopping it. The SIGCONT senders
+/// mentioned above only react to a freshly executed binary, so a stop that
+/// starts outside that window is not truncated and the whole transition can
+/// be asserted.
+const POST_EXEC_SETTLE: Duration = Duration::from_millis(2000);
 
 struct PtyChildGuard {
     child: Option<Box<dyn portable_pty::Child + Send + Sync>>,
@@ -407,6 +422,42 @@ fn wait_for_condition(timeout: Duration, mut condition: impl FnMut() -> bool) ->
                 .min(Duration::from_millis(20)),
         );
     }
+}
+
+/// True while `pid` is in a stopped process state. The job-control stop is
+/// only observable for a few hundred milliseconds, so this must be cheap
+/// enough to poll at millisecond granularity: no process is spawned.
+#[cfg(target_os = "macos")]
+fn process_is_stopped(pid: libc::pid_t) -> bool {
+    let mut info = std::mem::MaybeUninit::<libc::proc_bsdshortinfo>::zeroed();
+    let size = std::mem::size_of::<libc::proc_bsdshortinfo>() as libc::c_int;
+    // SAFETY: the buffer is a valid, exclusively borrowed proc_bsdshortinfo of the size passed.
+    let read = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDT_SHORTBSDINFO,
+            0,
+            info.as_mut_ptr().cast(),
+            size,
+        )
+    };
+    if read != size {
+        return false;
+    }
+    // SAFETY: proc_pidinfo reported it filled the whole structure.
+    unsafe { info.assume_init() }.pbsi_status == libc::SSTOP
+}
+
+#[cfg(target_os = "linux")]
+fn process_is_stopped(pid: libc::pid_t) -> bool {
+    let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+        return false;
+    };
+    // The comm field is parenthesised and may contain spaces; state follows it.
+    let Some(after_comm) = stat.rsplit_once(") ") else {
+        return false;
+    };
+    after_comm.1.trim_start().starts_with('T')
 }
 
 fn process_exists(pid: libc::pid_t) -> bool {
@@ -813,6 +864,7 @@ fn assert_job_control_stop_resume(signal: libc::c_int) {
         .slave
         .spawn_command(builder)
         .expect("spawn interactive ptty");
+    let spawned_at = Instant::now();
     drop(pair.slave);
     let mut ptty = PtySession::new(child, &*pair.master);
     let pid = ptty.pid();
@@ -841,45 +893,83 @@ fn assert_job_control_stop_resume(signal: libc::c_int) {
         "ptty never entered raw mode before job-control signal {signal}"
     );
 
+    // Stop the wrapper only once it is past the window in which external
+    // SIGCONT senders react to a new process; see POST_EXEC_SETTLE.
+    let settle = POST_EXEC_SETTLE.saturating_sub(spawned_at.elapsed());
+    if !settle.is_zero() {
+        thread::sleep(settle);
+    }
+    let heartbeat_before_stop = file_counter(&heartbeat_path).unwrap_or(0);
     // SAFETY: kill has no memory-safety preconditions; the target is a process this test spawned.
     assert_eq!(unsafe { libc::kill(pid, signal) }, 0);
+
+    // Sample the whole transition instead of waiting for it and then assuming
+    // it holds: the wrapper reports its stop through waitpid, the wrapped child
+    // must be stopped too, and the terminal must be cooked while that lasts.
     let mut observed_stop = None;
-    assert!(
-        wait_for_condition(Duration::from_secs(5), || {
-            match waitpid(
+    let mut observed_child_stopped = false;
+    let mut observed_cooked_terminal = false;
+    let deadline = Instant::now() + JOB_CONTROL_OBSERVE_LIMIT;
+    while Instant::now() < deadline {
+        // `let` chains need Rust 1.88; this crate builds on 1.85.
+        let wait_status = if observed_stop.is_none() {
+            waitpid(
                 Pid::from_raw(pid),
                 Some(WaitPidFlag::WUNTRACED | WaitPidFlag::WNOHANG),
-            ) {
-                Ok(WaitStatus::Stopped(_, stopped_by)) => {
-                    observed_stop = Some(stopped_by);
-                    true
-                }
-                _ => false,
-            }
-        }),
-        "ptty did not enter a stopped state for job-control signal {signal}"
+            )
+            .ok()
+        } else {
+            None
+        };
+        if let Some(WaitStatus::Stopped(_, stopped_by)) = wait_status {
+            observed_stop = Some(stopped_by);
+        }
+        if !observed_child_stopped && process_is_stopped(child_pid) {
+            observed_child_stopped = true;
+        }
+        if !observed_cooked_terminal
+            && tcgetattr(&tty).is_ok_and(|attrs| {
+                attrs.local_flags.contains(LocalFlags::ICANON) && attrs == original
+            })
+        {
+            observed_cooked_terminal = true;
+        }
+        if observed_stop.is_some() && observed_child_stopped && observed_cooked_terminal {
+            break;
+        }
+        thread::sleep(JOB_CONTROL_SAMPLE_INTERVAL);
+    }
+
+    if observed_stop.is_some() {
+        assert_eq!(
+            observed_stop,
+            Some(nix::sys::signal::Signal::SIGSTOP),
+            "ptty stopped before completing its supervised job-control transition for signal {signal}"
+        );
+    }
+    assert!(
+        observed_stop.is_some(),
+        "ptty did not stop through its supervised job-control transition for signal {signal}"
     );
-    assert_eq!(
-        observed_stop,
-        Some(nix::sys::signal::Signal::SIGSTOP),
-        "ptty stopped before completing its supervised job-control transition"
+    assert!(
+        observed_cooked_terminal,
+        "terminal was never cooked around the job-control stop for signal {signal}"
     );
-    assert_eq!(
-        tcgetattr(&tty).expect("attrs while stopped"),
-        original,
-        "terminal was not cooked before ptty stopped"
+    assert!(
+        observed_child_stopped,
+        "wrapped child was never stopped while ptty was stopped by signal {signal}"
     );
-    // The wrapper sends SIGSTOP to the child group before stopping itself.
-    // Allow any already-running heartbeat write to finish, then prove the
-    // counter stays stable across several normal update intervals.
-    thread::sleep(Duration::from_millis(80));
-    let stopped_heartbeat = file_counter(&heartbeat_path).expect("heartbeat while stopped");
-    thread::sleep(Duration::from_millis(160));
+    // The stop persists until this test resumes the wrapper, so the child must
+    // stay frozen: a momentary stop followed by a spurious continue would
+    // advance the heartbeat here.
+    let frozen_heartbeat = file_counter(&heartbeat_path);
+    thread::sleep(HEARTBEAT_FREEZE_WINDOW);
     assert_eq!(
         file_counter(&heartbeat_path),
-        Some(stopped_heartbeat),
+        frozen_heartbeat,
         "wrapped child kept running while ptty was stopped by signal {signal}"
     );
+    let stopped_heartbeat = file_counter(&heartbeat_path).unwrap_or(heartbeat_before_stop);
 
     // SAFETY: kill has no memory-safety preconditions; the target is a process this test spawned.
     assert_eq!(unsafe { libc::kill(pid, libc::SIGCONT) }, 0);
