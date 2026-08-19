@@ -66,6 +66,15 @@ jobs:
               && timeout 120 bash -c "$(declare -f apt_get); apt_get install -y --no-install-recommends libpcre2-dev pkg-config"; then
               exit 0
             fi
+            if [[ "${attempt}" == "1" ]]; then
+              # The runner's regional mirror can be down outright. Fall back to
+              # the canonical archive for the remaining attempts.
+              echo "switching off the regional Ubuntu mirror"
+              sudo sed -i 's|http://[a-z0-9.-]*archive\.ubuntu\.com/ubuntu|http://archive.ubuntu.com/ubuntu|g' \
+                /etc/apt/apt-mirrors.txt /etc/apt/sources.list 2>/dev/null || true
+              sudo sed -i 's|http://[a-z0-9.-]*archive\.ubuntu\.com/ubuntu|http://archive.ubuntu.com/ubuntu|g' \
+                /etc/apt/sources.list.d/*.sources /etc/apt/sources.list.d/*.list 2>/dev/null || true
+            fi
             echo "apt attempt ${attempt} failed; retrying"
             sleep 5
           done
