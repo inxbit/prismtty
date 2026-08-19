@@ -171,6 +171,41 @@ test('CI verifies the minimum supported Rust version used for releases', () => {
   );
 });
 
+test('formula generation rejects a version Homebrew cannot derive from the URL', () => {
+  // The formula carries no explicit `version`, so Homebrew reads it from the
+  // download URL. A hyphenated pre-release makes it read the `x86_64` in the
+  // file name instead and report 86.64, which outranks every later release.
+  const directory = mkdtempSync(`${tmpdir()}/prismtty-formula-`);
+  try {
+    const generate = (version) => {
+      for (const target of ['darwin-aarch64', 'darwin-x86_64', 'linux-x86_64']) {
+        writeFileSync(
+          `${directory}/prismtty-${version}-${target}.tar.gz.sha256`,
+          `${'a'.repeat(64)}  prismtty-${version}-${target}.tar.gz\n`,
+        );
+      }
+      return spawnSync('bash', ['scripts/generate-homebrew-formula.sh', `${directory}/prismtty.rb`, directory], {
+        encoding: 'utf8',
+        env: { ...process.env, PRISMTTY_VERSION: version },
+      });
+    };
+
+    for (const rejected of ['2.0.0-rc1', '2.0.0-beta.1', '1.2', '1.2.3rc4']) {
+      const result = generate(rejected);
+      assert.notEqual(result.status, 0, `generator accepted version ${rejected}`);
+      assert.match(result.stderr, /refusing to generate a formula/);
+    }
+
+    const accepted = generate('1.2.3');
+    assert.equal(accepted.status, 0, accepted.stderr);
+    const formula = read(`${directory}/prismtty.rb`);
+    assert.match(formula, /url "[^"]*\/v1\.2\.3\/prismtty-1\.2\.3-darwin-aarch64\.tar\.gz"/);
+    assert.doesNotMatch(formula, /^\s*version "/m);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test('every workflow action is pinned to a full commit SHA', () => {
   // A mutable tag (`@v4`) can be repointed at attacker code that then runs
   // with the job's token; a 40-hex SHA cannot. Local `./` actions are exempt.

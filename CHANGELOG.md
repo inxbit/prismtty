@@ -21,7 +21,10 @@ All notable changes to PrismTTY are documented here.
 - Write the release version literally into the generated Homebrew formula's
   URLs and drop the explicit `version` line, so Homebrew derives the version
   from the URL and `brew audit --strict` passes without the redundancy note;
-  CI and release validation check the URL form instead.
+  CI and release validation check the URL form instead. Formula generation
+  now refuses a version Homebrew cannot derive from the URL: for a hyphenated
+  pre-release such as `2.0.0-rc1`, Homebrew reads the `x86_64` in the file
+  name and reports version `86.64`, which would outrank every later release.
 
 ## 1.2.2 - 2026-08-18
 

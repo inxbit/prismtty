@@ -11,6 +11,17 @@ if [[ -z "${version}" ]]; then
   exit 1
 fi
 
+# The formula carries no explicit `version`, so Homebrew derives it from the
+# download URLs. That only works for a plain MAJOR.MINOR.PATCH version: a
+# hyphenated pre-release such as 2.0.0-rc1 makes Homebrew read the `x86_64` in
+# the file name instead and report version 86.64, which would outrank every
+# later release. Refuse to generate such a formula.
+if [[ ! "${version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+  printf 'refusing to generate a formula for non MAJOR.MINOR.PATCH version: %s\n' "${version}" >&2
+  printf 'Homebrew derives the version from the download URL; add an explicit version line first.\n' >&2
+  exit 1
+fi
+
 sha_for() {
   local target_name="$1"
   local checksum_file="${dist_dir}/prismtty-${version}-${target_name}.tar.gz.sha256"
