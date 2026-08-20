@@ -2,6 +2,18 @@
 
 All notable changes to PrismTTY are documented here.
 
+## Unreleased
+
+### Fixed
+
+- Draw the whole line when a shell recalls a command from history. Pressing the
+  up or down arrow makes the remote line editor backspace over the input line
+  and rewrite it; when the recalled command ended mid-token (no delimiter after
+  a trailing `=`, for example) everything after that point stayed invisible
+  until the next keypress. A tail stranded on a line whose accumulated output
+  carries a backspace is now surfaced once the session goes idle, like a prompt
+  redraw already was, including when the redraw arrives across several reads.
+
 ## 1.2.3 - 2026-08-19
 
 ### Security and Reliability
