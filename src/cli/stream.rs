@@ -122,6 +122,7 @@ pub(super) fn highlight_stream<R: Read, W: Write>(
         input.pty_fd,
         session.buffered_echo(),
         session.buffered_prompt_echo(),
+        session.buffered_line_edit_redraw(),
         input.recent_input.as_deref(),
     ) {
         trace.log("FLUSH", reason.as_bytes());
@@ -213,6 +214,7 @@ pub(super) fn highlight_stream<R: Read, W: Write>(
             input.pty_fd,
             session.buffered_echo(),
             session.buffered_prompt_echo(),
+            session.buffered_line_edit_redraw(),
             input.recent_input.as_deref(),
         ) {
             trace.log("FLUSH", reason.as_bytes());
@@ -544,6 +546,15 @@ impl<'a> HighlightSession<'a> {
         self.streaming.buffered_echo_completes_prompt_line()
     }
 
+    /// Whether the buffered tail is stranded on a line that was rewritten in
+    /// place (a shell redrawing the command line after a history recall or an
+    /// in-place edit), the other redraw the read loop surfaces on idle without a
+    /// recent-input byte match. See
+    /// `StreamingHighlighter::buffered_echo_completes_line_edit_redraw`.
+    fn buffered_line_edit_redraw(&self) -> bool {
+        self.streaming.buffered_echo_completes_line_edit_redraw()
+    }
+
     fn finish<W: Write>(&mut self, writer: &mut W, trace: &IoTrace) -> Result<(), CliError> {
         write_rendered(writer, trace, self.streaming.finish())?;
         Ok(())
@@ -737,8 +748,8 @@ fn prepare_chunk(
 /// across reads still highlights as one unit. For interactive echo that
 /// buffering must not strand the last token: a keystroke or pasted line echoes
 /// back and then the child goes idle, so the token would otherwise stay hidden
-/// until the next byte. Two independent triggers surface it; the flush only ever
-/// emits the child's own buffered output bytes, never `recent_input`:
+/// until the next byte. Three independent triggers surface it; the flush only
+/// ever emits the child's own buffered output bytes, never `recent_input`:
 ///
 /// 1. Echo-suffix: the buffered token is a byte-for-byte suffix of recently
 ///    forwarded input ([`consume_echo_suffix`], after ignoring a trailing
@@ -751,8 +762,19 @@ fn prepare_chunk(
 ///    match. Gated on a strict clean idle ([`input_source_idle_strict`]; a poll
 ///    error is NOT idle here, since a continuation may still arrive) and does
 ///    NOT touch `recent_input`, so typed-ahead input is preserved.
+/// 3. Line-edit redraw: the buffered token is stranded on a visible line that
+///    has been rewritten in place with a backspace
+///    (`buffered_line_edit_redraw`), the shape a shell emits when the user
+///    recalls history with an arrow key (a readline-style editor; one that
+///    redraws with cursor movement instead does not). The keystroke never matches the
+///    recalled text, so trigger 1 cannot fire, and the redraw carries no prompt,
+///    so trigger 2 cannot either. The signal is read from the accumulated line
+///    rather than one chunk, so a redraw split across reads still qualifies
+///    when the backspace-carrying read reaches the line tracker.
+///    Same strict-idle gate and same hands-off treatment of `recent_input` as
+///    trigger 2.
 ///
-/// Screen safety does not rely on either heuristic: the session only ever emits
+/// Screen safety does not rely on any of these heuristics: the session only emits
 /// the child's own output bytes, never `recent_input`, so a non-echoed secret is
 /// never drawn (it produces no buffered token).
 fn should_flush_input_echo(
@@ -760,6 +782,7 @@ fn should_flush_input_echo(
     pty_fd: Option<RawFd>,
     buffered_echo: &[u8],
     buffered_prompt_echo: bool,
+    buffered_line_edit_redraw: bool,
     recent_input: Option<&Mutex<Vec<u8>>>,
 ) -> Option<&'static str> {
     if !interactive || buffered_echo.is_empty() {
@@ -777,6 +800,9 @@ fn should_flush_input_echo(
     }
     if buffered_prompt_echo && input_source_idle_strict(pty_fd) {
         return Some("prompt-echo");
+    }
+    if buffered_line_edit_redraw && input_source_idle_strict(pty_fd) {
+        return Some("line-edit-redraw");
     }
     None
 }
@@ -1858,12 +1884,14 @@ mod tests {
     fn should_flush_input_echo_requires_interactive_buffered_and_recent_input() {
         // Not interactive: the interactive guard short-circuits, so a
         // non-interactive stream never flushes.
-        assert!(super::should_flush_input_echo(false, None, b"tok", false, None).is_none());
+        assert!(super::should_flush_input_echo(false, None, b"tok", false, false, None).is_none());
         // Interactive but nothing buffered: never flushes.
         let recent = Mutex::new(b"tok".to_vec());
-        assert!(super::should_flush_input_echo(true, None, b"", false, Some(&recent)).is_none());
+        assert!(
+            super::should_flush_input_echo(true, None, b"", false, false, Some(&recent)).is_none()
+        );
         // Interactive with buffered echo but no recent_input source: never flushes.
-        assert!(super::should_flush_input_echo(true, None, b"tok", false, None).is_none());
+        assert!(super::should_flush_input_echo(true, None, b"tok", false, false, None).is_none());
     }
 
     #[test]
@@ -1880,7 +1908,14 @@ mod tests {
         // discriminator, which is what lets raw-mode/ssh echo (ECHO off) surface.
         let recent = Mutex::new(b"router# show ".to_vec());
         assert_eq!(
-            super::should_flush_input_echo(true, Some(master_fd), b"show ", false, Some(&recent),),
+            super::should_flush_input_echo(
+                true,
+                Some(master_fd),
+                b"show ",
+                false,
+                false,
+                Some(&recent),
+            ),
             Some("echo-suffix"),
         );
         assert!(
@@ -1891,8 +1926,15 @@ mod tests {
         // Token is not recent input (program output): do not flush, leave it.
         let recent = Mutex::new(b"x".to_vec());
         assert!(
-            super::should_flush_input_echo(true, Some(master_fd), b"Vlan11", false, Some(&recent),)
-                .is_none()
+            super::should_flush_input_echo(
+                true,
+                Some(master_fd),
+                b"Vlan11",
+                false,
+                false,
+                Some(&recent),
+            )
+            .is_none()
         );
         assert_eq!(recent.lock().unwrap().as_slice(), b"x");
 
@@ -1905,8 +1947,15 @@ mod tests {
         );
         let recent = Mutex::new(b"show ".to_vec());
         assert!(
-            super::should_flush_input_echo(true, Some(master_fd), b"show ", false, Some(&recent),)
-                .is_none()
+            super::should_flush_input_echo(
+                true,
+                Some(master_fd),
+                b"show ",
+                false,
+                false,
+                Some(&recent),
+            )
+            .is_none()
         );
         assert_eq!(recent.lock().unwrap().as_slice(), b"show ");
     }
@@ -1926,7 +1975,14 @@ mod tests {
         // on strict idle and must NOT drop typed-ahead input.
         let recent = Mutex::new(b"sh lo\t".to_vec());
         assert_eq!(
-            super::should_flush_input_echo(true, Some(master_fd), b"log", true, Some(&recent),),
+            super::should_flush_input_echo(
+                true,
+                Some(master_fd),
+                b"log",
+                true,
+                false,
+                Some(&recent),
+            ),
             Some("prompt-echo"),
         );
         assert_eq!(
@@ -1938,8 +1994,15 @@ mod tests {
         // Without the prompt-echo flag and without a byte match, nothing flushes.
         let recent = Mutex::new(b"sh lo\t".to_vec());
         assert!(
-            super::should_flush_input_echo(true, Some(master_fd), b"zzz", false, Some(&recent),)
-                .is_none()
+            super::should_flush_input_echo(
+                true,
+                Some(master_fd),
+                b"zzz",
+                false,
+                false,
+                Some(&recent),
+            )
+            .is_none()
         );
 
         // Strict idle: pending output means the prompt-echo tail is not flushed
@@ -1952,8 +2015,15 @@ mod tests {
         );
         let recent = Mutex::new(b"sh lo\t".to_vec());
         assert!(
-            super::should_flush_input_echo(true, Some(master_fd), b"log", true, Some(&recent),)
-                .is_none()
+            super::should_flush_input_echo(
+                true,
+                Some(master_fd),
+                b"log",
+                true,
+                false,
+                Some(&recent),
+            )
+            .is_none()
         );
     }
 
@@ -1987,6 +2057,7 @@ mod tests {
                 Some(master_fd),
                 streaming.buffered_echo(),
                 streaming.buffered_echo_completes_prompt_line(),
+                streaming.buffered_echo_completes_line_edit_redraw(),
                 Some(&recent),
             ),
             Some("prompt-echo"),
@@ -1998,6 +2069,95 @@ mod tests {
         assert_eq!(
             crate::highlight::strip_ansi(&streaming.flush_buffered_echo()),
             b"log"
+        );
+    }
+
+    // The strict-idle conjunct on the line-edit arm is load-bearing: with output
+    // already queued the redraw's continuation may still be arriving, and
+    // flushing mid-burst would tear a span. Pin it, so deleting the poll cannot
+    // pass CI.
+    #[test]
+    fn should_flush_input_echo_holds_the_line_edit_tail_while_output_is_pending() {
+        use nix::pty::openpty;
+        use std::os::fd::AsRawFd;
+
+        let pty = openpty(None, None).expect("openpty");
+        let master_fd = pty.master.as_raw_fd();
+        let slave_fd = pty.slave.as_raw_fd();
+
+        // Idle master: the line-edit tail flushes.
+        let recent = Mutex::new(b"\x1b[A".to_vec());
+        assert_eq!(
+            super::should_flush_input_echo(
+                true,
+                Some(master_fd),
+                b"operator",
+                false,
+                true,
+                Some(&recent),
+            ),
+            Some("line-edit-redraw"),
+        );
+
+        // Same state, but the child has more to say: hold the tail.
+        // SAFETY: `slave_fd` is the open PTY slave from openpty and the buffer is
+        // a valid 1-byte slice.
+        assert_eq!(unsafe { libc::write(slave_fd, b"x".as_ptr().cast(), 1) }, 1);
+        assert!(
+            super::should_flush_input_echo(
+                true,
+                Some(master_fd),
+                b"operator",
+                false,
+                true,
+                Some(&recent),
+            )
+            .is_none(),
+            "a pending continuation must keep the line-edit tail buffered"
+        );
+        // The arrow key is never consumed by this path, idle or busy.
+        assert_eq!(recent.lock().unwrap().as_slice(), b"\x1b[A");
+    }
+
+    // End-to-end read-loop decision for the history-recall shape: the shell
+    // backspaces over the input line and rewrites it ending mid-token, the arrow
+    // key that triggered it is nothing like the recalled text, and only the
+    // line-edit provenance can surface the tail on idle.
+    #[test]
+    fn read_loop_surfaces_history_recall_tail_on_idle() {
+        use nix::pty::openpty;
+        use std::os::fd::AsRawFd;
+
+        let pty = openpty(None, None).expect("openpty");
+        let master_fd = pty.master.as_raw_fd();
+
+        let highlighter =
+            crate::highlight::Highlighter::from_config(crate::config::PrismConfig::default())
+                .expect("empty config compiles");
+        let mut streaming = crate::highlight::StreamingHighlighter::new_interactive(highlighter);
+        let _ = streaming.push_str("user@host:~$ deploy\r\n");
+        let _ = streaming
+            .push_str("\x08\x08\x08\x08\x08\x08vault login -method=userpass username=operator");
+
+        // The arrow key, not the recalled text: the byte match cannot fire.
+        let recent = Mutex::new(b"\x1b[A".to_vec());
+        assert_eq!(
+            super::should_flush_input_echo(
+                true,
+                Some(master_fd),
+                streaming.buffered_echo(),
+                streaming.buffered_echo_completes_prompt_line(),
+                streaming.buffered_echo_completes_line_edit_redraw(),
+                Some(&recent),
+            ),
+            Some("line-edit-redraw"),
+            "idle line-edit redraw tail must be flushed by the read-loop gate"
+        );
+        // Like the prompt-echo path, it must not consume typed-ahead input.
+        assert_eq!(recent.lock().unwrap().as_slice(), b"\x1b[A");
+        assert_eq!(
+            crate::highlight::strip_ansi(&streaming.flush_buffered_echo()),
+            b"operator"
         );
     }
 
@@ -2083,5 +2243,77 @@ mod tests {
         );
         // The prompt-echo path must not consume typed-ahead input.
         assert_eq!(recent.lock().unwrap().as_slice(), b"sh lo\t");
+    }
+
+    // End-to-end wiring for the line-edit trigger: the read loop must pass
+    // `session.buffered_line_edit_redraw()` into the gate and flush mid-stream,
+    // so a history recall that ends mid-token is drawn without waiting for the
+    // next keystroke.
+    #[test]
+    fn highlight_stream_wires_line_edit_redraw_flush_end_to_end() {
+        use nix::pty::openpty;
+        use std::collections::VecDeque;
+        use std::io::Read;
+        use std::os::fd::AsRawFd;
+
+        struct ChunkedReader(VecDeque<Vec<u8>>);
+        impl Read for ChunkedReader {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                match self.0.pop_front() {
+                    Some(c) => {
+                        let n = c.len().min(buf.len());
+                        buf[..n].copy_from_slice(&c[..n]);
+                        Ok(n)
+                    }
+                    None => Ok(0),
+                }
+            }
+        }
+
+        let pty = openpty(None, None).expect("openpty");
+        let master_fd = pty.master.as_raw_fd();
+
+        let reader = ChunkedReader(VecDeque::from(vec![
+            b"user@host:~$ deploy\r\n".to_vec(),
+            b"\x08\x08\x08\x08\x08\x08vault login -method=userpass username=operator".to_vec(),
+        ]));
+        let mut writer: Vec<u8> = Vec::new();
+        let options = crate::cli::args::Options {
+            profiles: vec!["generic".to_string()],
+            no_auto_detect: true,
+            no_dynamic_profile: true,
+            ..Default::default()
+        };
+        let recent = std::sync::Arc::new(Mutex::new(b"\x1b[A".to_vec()));
+        let input = super::InputSource {
+            interactive: true,
+            pty_fd: Some(master_fd),
+            recent_input: Some(recent.clone()),
+        };
+        let trace_file = tempfile::NamedTempFile::new().expect("trace temp file");
+        let trace_path = trace_file.path().to_path_buf();
+        let trace = super::IoTrace::open(Some(trace_path.as_path())).expect("trace opens");
+
+        super::highlight_stream(reader, &mut writer, &options, input, None, trace, None)
+            .expect("highlight_stream succeeds");
+
+        let trace_text = std::fs::read_to_string(&trace_path).expect("read trace");
+        let saw_line_edit_flush = trace_text.lines().any(|line| {
+            let mut fields = line.split_whitespace();
+            let _ts = fields.next();
+            if fields.next() != Some("FLUSH") {
+                return false;
+            }
+            let bytes: Vec<u8> = fields
+                .filter_map(|h| u8::from_str_radix(h, 16).ok())
+                .collect();
+            bytes == b"line-edit-redraw"
+        });
+        assert!(
+            saw_line_edit_flush,
+            "no FLUSH line-edit-redraw marker; trace:\n{trace_text}"
+        );
+        // The arrow key stays in recent_input: this path never consumes it.
+        assert_eq!(recent.lock().unwrap().as_slice(), b"\x1b[A");
     }
 }

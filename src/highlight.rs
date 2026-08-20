@@ -133,6 +133,13 @@ pub struct StreamingHighlighter {
     /// without a recent-input byte match; program output buffered by the normal
     /// streaming split leaves this `false`.
     pending_from_prompt_echo_remainder: bool,
+    /// True when `pending` holds a trailing token split off the ordinary
+    /// interactive split (set at the last branch in `push_combined_chunk`). This
+    /// is the provenance half of the line-edit flush trigger; its only job is to
+    /// keep that trigger disjoint from the prompt-echo one, which buffers its
+    /// tail at a different split site. The shape half lives in the visible line,
+    /// not here, so the signal survives a redraw delivered across several reads.
+    pending_from_interactive_split: bool,
     alternate_screen: bool,
     passthrough_single_byte_chunks: bool,
     prompt_echo_passthrough: bool,
@@ -979,6 +986,7 @@ impl StreamingHighlighter {
             pending: Vec::new(),
             oversized_string_controls: OversizedStringControlFilter::default(),
             pending_from_prompt_echo_remainder: false,
+            pending_from_interactive_split: false,
             alternate_screen: false,
             passthrough_single_byte_chunks: false,
             prompt_echo_passthrough: false,
@@ -999,6 +1007,7 @@ impl StreamingHighlighter {
             pending: Vec::new(),
             oversized_string_controls: OversizedStringControlFilter::default(),
             pending_from_prompt_echo_remainder: false,
+            pending_from_interactive_split: false,
             alternate_screen: false,
             passthrough_single_byte_chunks: true,
             prompt_echo_passthrough: false,
@@ -1019,6 +1028,7 @@ impl StreamingHighlighter {
             pending: Vec::new(),
             oversized_string_controls: OversizedStringControlFilter::default(),
             pending_from_prompt_echo_remainder: false,
+            pending_from_interactive_split: false,
             alternate_screen: false,
             passthrough_single_byte_chunks: false,
             prompt_echo_passthrough: false,
@@ -1039,6 +1049,7 @@ impl StreamingHighlighter {
             pending: Vec::new(),
             oversized_string_controls: OversizedStringControlFilter::default(),
             pending_from_prompt_echo_remainder: false,
+            pending_from_interactive_split: false,
             alternate_screen: false,
             passthrough_single_byte_chunks: true,
             prompt_echo_passthrough: false,
@@ -1153,6 +1164,7 @@ impl StreamingHighlighter {
         // earlier chunk (e.g. after a partial `flush_buffered_echo` drain or an
         // emit-all passthrough that leaves `pending` untouched) from surviving.
         self.pending_from_prompt_echo_remainder = false;
+        self.pending_from_interactive_split = false;
         combined.neutralize_oversized_incomplete_escape();
         let alternate_screen_chunk =
             self.alternate_screen || contains_alternate_screen_enable_tokens(&combined.tokens);
@@ -1220,6 +1232,7 @@ impl StreamingHighlighter {
             let split_at = interactive_split_at_chunk(&remainder, false, self.alternate_screen);
             let processed = split_prepared_pending(&mut remainder, split_at, &mut self.pending);
             self.pending_from_prompt_echo_remainder = !self.pending.is_empty();
+            self.pending_from_interactive_split = false;
 
             output.extend(self.highlight_output_chunk(&processed));
             self.observe_interactive_visible_chunk(&processed);
@@ -1244,6 +1257,7 @@ impl StreamingHighlighter {
             let split_at = interactive_split_at_chunk(&remainder, false, self.alternate_screen);
             let processed = split_prepared_pending(&mut remainder, split_at, &mut self.pending);
             self.pending_from_prompt_echo_remainder = !self.pending.is_empty();
+            self.pending_from_interactive_split = false;
 
             output.extend(self.highlight_output_chunk(&processed));
             self.observe_interactive_visible_chunk(&processed);
@@ -1262,9 +1276,19 @@ impl StreamingHighlighter {
         };
         let processed = split_prepared_pending(&mut combined, split_at, &mut self.pending);
         self.pending_from_prompt_echo_remainder = false;
+        self.pending_from_interactive_split = !self.pending.is_empty();
 
         let mut output = self.highlight_output_chunk(&processed);
-        self.observe_interactive_visible_chunk(&processed);
+        // Load-bearing: a chunk that switches screens belongs to no primary-screen
+        // line. Clearing at the enable/disable token alone is not enough, because a
+        // final alt-screen frame coalesced with the disable in one read would be
+        // observed after that clear and re-arm the rewrite signal. Uses the
+        // chunk-entry value; `self.alternate_screen` is already false here for a
+        // disable chunk. Cost: bytes sharing a read with a screen switch go
+        // unobserved, which at most skips a flush.
+        if !alternate_screen_chunk {
+            self.observe_interactive_visible_chunk(&processed);
+        }
         self.reset_interactive_overlay_after_prompt_tail(&mut output);
         output
     }
@@ -1357,6 +1381,38 @@ impl StreamingHighlighter {
             && contains_prompt_echo_in_visible_line(&self.visible_line_tail)
     }
 
+    /// True only when [`Self::buffered_echo`] holds a token stranded on a visible
+    /// line that has been rewritten in place: something backspaced over the line
+    /// and typed new text on top of it. A shell emits exactly that when the user
+    /// recalls history or edits the command line, so the stranded tail is the
+    /// user's own recalled command, echoed back. The keystroke behind it is an
+    /// arrow key, so the read loop's byte match against recent input can never
+    /// confirm it; this shape is the only signal that it is echo.
+    ///
+    /// The shape is read from the accumulated visible line, not from the chunk
+    /// that stranded the tail, so a redraw delivered across several reads still
+    /// qualifies, provided the read carrying the backspaces reached the line
+    /// tracker: a repaint chunk that qualifies for prompt-echo preservation
+    /// (cursor-positioning token, no printable bytes) is not observed, and
+    /// backspaces inside it are lost to this signal.
+    ///
+    /// The tracker clears the line at every `\r`/`\n` it observes, and at every
+    /// alternate-screen switch. A `\r`/`\n` inside a preserved prompt-echo
+    /// repaint chunk is not observed, so the signal can survive into the next
+    /// line there and arm one early flush of the accepted cosmetic class.
+    ///
+    /// Ordinary program output does not qualify *unless it too rewrites its line
+    /// with a backspace* (an in-place counter, an overstrike), or inherits a
+    /// stale backspace through the unobserved window above: for those, the tail
+    /// is flushed early, which can split one highlight span into two. That is
+    /// the ADR's accepted cosmetic limitation, never text loss.
+    pub(crate) fn buffered_echo_completes_line_edit_redraw(&self) -> bool {
+        !self.buffered_echo().is_empty()
+            && self.pending_from_interactive_split
+            && !self.alternate_screen
+            && visible_line_was_rewritten_in_place(&self.visible_line_tail)
+    }
+
     fn highlight_output_chunk(&mut self, input: &AnsiChunk) -> Vec<u8> {
         if self.passthrough_single_byte_chunks {
             self.highlight_interactive_output_chunk(input)
@@ -1417,6 +1473,10 @@ impl StreamingHighlighter {
                     self.native_sgr.apply_sequence(bytes);
                     self.alternate_screen = true;
                     self.prompt_echo_passthrough = false;
+                    // Entering the alternate screen is a line discontinuity: the
+                    // tracked line describes the primary screen and must not
+                    // carry into (or back out of) the app's own drawing.
+                    self.visible_line_tail.clear();
                     output.extend_from_slice(bytes);
                 }
                 Token::Ansi(bytes) if is_alternate_screen_disable(bytes) => {
@@ -1424,6 +1484,7 @@ impl StreamingHighlighter {
                     self.reset_interactive_overlay(&mut output);
                     self.native_sgr.apply_sequence(bytes);
                     self.alternate_screen = false;
+                    self.visible_line_tail.clear();
                     output.extend_from_slice(bytes);
                 }
                 Token::Ansi(bytes)
@@ -2032,6 +2093,24 @@ fn contains_prompt_echo_before_lf_visible(visible: &[u8]) -> bool {
         .map(|idx| idx + 1)
         .unwrap_or(0);
     contains_prompt_echo_in_visible_line(&sub[start..])
+}
+
+/// Reports whether the current visible line has been rewritten in place: it
+/// carries a backspace, so something moved back over text already on the line
+/// and wrote over it. Shells and readline rewrite the command line exactly that
+/// way on history recall (up/down arrow) and in-place edits; editors that
+/// redraw with cursor-movement controls instead of backspaces (zle beyond short
+/// distances) do not produce this shape.
+///
+/// Read from the accumulated visible line rather than from one chunk, so a
+/// redraw split across reads still counts. A `\r`/`\n` seen by the line tracker
+/// resets it (see the qualifier's doc for the repaint chunks the tracker does
+/// not observe). Deliberately does not treat a bare `\r`
+/// rewrite as a line edit: that is the shape a progress bar emits on every
+/// update. A line longer than the retained tail can age its backspace out,
+/// which only costs the flush (the pre-fix behaviour), never correctness.
+fn visible_line_was_rewritten_in_place(line: &[u8]) -> bool {
+    line.contains(&0x08)
 }
 
 fn contains_prompt_echo_in_visible_line(line: &[u8]) -> bool {
@@ -4553,6 +4632,283 @@ rules:
         // The idle flush surfaces exactly the tail.
         assert_eq!(super::strip_ansi(&streaming.flush_buffered_echo()), b"log");
         assert!(streaming.finish().is_empty());
+    }
+
+    // Regression: a shell recalling history with an arrow key rewrites the input
+    // line by backspacing over it. The rewritten line ends mid-token (no
+    // delimiter after `=`), so the tail stays buffered, and the arrow key never
+    // matches it byte for byte, so only the line-edit provenance can surface it.
+    #[test]
+    fn interactive_buffered_history_recall_tail_is_flagged_as_line_edit_redraw() {
+        let highlighter =
+            Highlighter::from_config(PrismConfig::default()).expect("empty config compiles");
+        let mut streaming = StreamingHighlighter::new_interactive(highlighter);
+
+        let _ = streaming.push_str("user@host:~$ deploy\r\n");
+        let redraw = "\x08\x08\x08\x08\x08\x08vault login -method=userpass username=operator";
+        let out = streaming.push_str(redraw);
+        let visible = super::strip_ansi(out.as_bytes());
+
+        // The trailing token is withheld (the reported bug): the recalled line is
+        // drawn only up to the `=`.
+        assert!(
+            visible.ends_with(b"username="),
+            "tail should be withheld: {out:?}"
+        );
+        assert_eq!(streaming.buffered_echo(), b"operator");
+
+        // The buffered tail provably came from a line-editor redraw.
+        assert!(streaming.buffered_echo_completes_line_edit_redraw());
+        assert!(
+            !streaming.buffered_echo_completes_prompt_line(),
+            "the redraw carries no prompt, so the prompt-echo trigger stays out of it"
+        );
+
+        // The idle flush surfaces exactly the tail.
+        assert_eq!(
+            super::strip_ansi(&streaming.flush_buffered_echo()),
+            b"operator"
+        );
+        assert!(streaming.finish().is_empty());
+    }
+
+    // Provenance guard: only a backspace-led rewrite of the current line counts.
+    #[test]
+    fn program_output_does_not_qualify_for_line_edit_redraw_flush() {
+        // Bulk output split mid-token: no leading backspace, so not a line edit.
+        let highlighter =
+            Highlighter::from_config(PrismConfig::default()).expect("empty config compiles");
+        let mut streaming = StreamingHighlighter::new_interactive(highlighter);
+        let _ = streaming.push(b"interface Vlan11");
+        assert_eq!(streaming.buffered_echo(), b"Vlan11");
+        assert!(
+            !streaming.buffered_echo_completes_line_edit_redraw(),
+            "bulk program output must not qualify as a line-edit redraw tail"
+        );
+
+        // A bare-CR rewrite is what a progress bar emits on every update; it must
+        // not arm the flush.
+        let highlighter =
+            Highlighter::from_config(PrismConfig::default()).expect("empty config compiles");
+        let mut streaming = StreamingHighlighter::new_interactive(highlighter);
+        let _ = streaming.push(b"\rdownloading 42 of 96 blocks eta=0012");
+        assert!(!streaming.buffered_echo().is_empty());
+        assert!(
+            !streaming.buffered_echo_completes_line_edit_redraw(),
+            "a carriage-return rewrite is not a line edit"
+        );
+
+        // A backspace-led chunk that then starts a new line has moved on to
+        // program output; the stranded tail is no longer the edited line.
+        let highlighter =
+            Highlighter::from_config(PrismConfig::default()).expect("empty config compiles");
+        let mut streaming = StreamingHighlighter::new_interactive(highlighter);
+        let _ = streaming.push(b"\x08\x08done\r\nnext chunk=value");
+        assert!(!streaming.buffered_echo().is_empty());
+        assert!(
+            !streaming.buffered_echo_completes_line_edit_redraw(),
+            "a chunk containing a line feed is not an in-place line edit"
+        );
+    }
+
+    // The signal is per-LINE, not per-chunk: it must survive the reads that
+    // follow on the same line (that is what makes a split redraw work) and must
+    // be gone once the line ends.
+    #[test]
+    fn line_edit_redraw_signal_is_scoped_to_the_rewritten_line() {
+        let highlighter =
+            Highlighter::from_config(PrismConfig::default()).expect("empty config compiles");
+        let mut streaming = StreamingHighlighter::new_interactive(highlighter);
+
+        let _ = streaming.push(b"\x08\x08\x08show version=1");
+        assert!(streaming.buffered_echo_completes_line_edit_redraw());
+
+        // Same line, next read: still the rewritten line, still eligible.
+        let _ = streaming.push(b".2 target=host");
+        assert_eq!(streaming.buffered_echo(), b"host");
+        assert!(
+            streaming.buffered_echo_completes_line_edit_redraw(),
+            "the rewritten line continues across reads"
+        );
+
+        // The line ends: the signal must not carry into what follows.
+        let _ = streaming.push(b"\r\ninterface Vlan11");
+        assert_eq!(streaming.buffered_echo(), b"Vlan11");
+        assert!(
+            !streaming.buffered_echo_completes_line_edit_redraw(),
+            "a new line is not a rewritten line"
+        );
+    }
+
+    // The reported redraw delivered in two reads. Only the first carries the
+    // backspaces; the second strands the tail. A per-chunk test of the stranding
+    // read cannot see the edit, so the signal has to come from the line.
+    #[test]
+    fn split_history_recall_redraw_still_qualifies_for_the_line_edit_flush() {
+        for boundary in [6usize, 12, 26, 44] {
+            let redraw: &[u8] =
+                b"\x08\x08\x08\x08\x08\x08vault login -method=userpass username=operator";
+            let highlighter =
+                Highlighter::from_config(PrismConfig::default()).expect("empty config compiles");
+            let mut streaming = StreamingHighlighter::new_interactive(highlighter);
+            let _ = streaming.push_str("user@host:~$ deploy\r\n");
+            let _ = streaming.push(&redraw[..boundary]);
+            let _ = streaming.push(&redraw[boundary..]);
+
+            assert_eq!(
+                streaming.buffered_echo(),
+                b"operator",
+                "boundary {boundary}: the tail is stranded as reported"
+            );
+            assert!(
+                streaming.buffered_echo_completes_line_edit_redraw(),
+                "boundary {boundary}: a split redraw must still qualify for the flush"
+            );
+            assert_eq!(
+                super::strip_ansi(&streaming.flush_buffered_echo()),
+                b"operator",
+                "boundary {boundary}: the flush surfaces exactly the tail"
+            );
+        }
+    }
+
+    // The redraw arriving while an earlier echo token is still buffered: the
+    // combined chunk no longer starts with the backspaces, but the line does
+    // carry them.
+    #[test]
+    fn history_recall_after_a_pending_echo_token_still_qualifies() {
+        let highlighter =
+            Highlighter::from_config(PrismConfig::default()).expect("empty config compiles");
+        let mut streaming = StreamingHighlighter::new_interactive(highlighter);
+
+        // Echo the detector does not recognize as a prompt is held back; it is
+        // still buffered when the recall redraw arrives.
+        let _ = streaming.push(b"lt");
+        assert_eq!(streaming.buffered_echo(), b"lt");
+        let _ = streaming.push(b"\x08\x08vault login -method=userpass username=operator");
+
+        assert_eq!(streaming.buffered_echo(), b"operator");
+        assert!(
+            streaming.buffered_echo_completes_line_edit_redraw(),
+            "a pending token in front of the backspaces must not hide the line edit"
+        );
+    }
+
+    // Alternate-screen apps draw with backspaces (xterm's cub1 is ^H). Those
+    // bytes belong to the app's own screen, not to any line of the shell, and
+    // must not arm the rewrite signal for the output that follows the exit.
+    #[test]
+    fn alt_screen_backspace_does_not_arm_after_exit_separate_reads() {
+        let highlighter =
+            Highlighter::from_config(PrismConfig::default()).expect("empty config compiles");
+        let mut streaming = StreamingHighlighter::new_interactive(highlighter);
+
+        let _ = streaming.push(b"\x1b[?1049h");
+        let _ = streaming.push(b"x\x08y");
+        let _ = streaming.push(b"\x1b[?1049l");
+        let _ = streaming.push(b"interface Vlan11");
+
+        assert_eq!(streaming.buffered_echo(), b"Vlan11");
+        assert!(
+            !streaming.buffered_echo_completes_line_edit_redraw(),
+            "alternate-screen bytes must not arm the trigger on a primary-screen line"
+        );
+    }
+
+    // The same, with the app's last frame and the screen switch in one read:
+    // clearing the tracked line at the switch token alone would be observed away
+    // again by the rest of the chunk.
+    #[test]
+    fn alt_screen_backspace_does_not_arm_after_coalesced_exit_read() {
+        let highlighter =
+            Highlighter::from_config(PrismConfig::default()).expect("empty config compiles");
+        let mut streaming = StreamingHighlighter::new_interactive(highlighter);
+
+        let _ = streaming.push(b"\x1b[?1049h");
+        let _ = streaming.push(b"x\x08y\x1b[?1049l");
+        let _ = streaming.push(b"interface Vlan11");
+
+        assert_eq!(streaming.buffered_echo(), b"Vlan11");
+        assert!(
+            !streaming.buffered_echo_completes_line_edit_redraw(),
+            "a screen switch coalesced with the frame must still break the line"
+        );
+    }
+
+    // A genuine line edit made before the app started must not come back when it
+    // exits: the alternate screen is a line discontinuity in both directions.
+    #[test]
+    fn pre_alt_screen_backspace_does_not_survive_the_round_trip() {
+        let highlighter =
+            Highlighter::from_config(PrismConfig::default()).expect("empty config compiles");
+        let mut streaming = StreamingHighlighter::new_interactive(highlighter);
+
+        let _ = streaming.push(b"vault lo\x08gin ");
+        let _ = streaming.push(b"\x1b[?1049h");
+        let _ = streaming.push(b"\x1b[?1049l");
+        let _ = streaming.push(b"interface Vlan11");
+
+        assert_eq!(streaming.buffered_echo(), b"Vlan11");
+        assert!(
+            !streaming.buffered_echo_completes_line_edit_redraw(),
+            "a pre-app line edit must not arm the trigger after the app exits"
+        );
+    }
+
+    // White-box guards on the two conjuncts no byte stream can currently reach.
+    // They are defense in depth, so they need a regression signal of their own.
+    #[test]
+    fn qualifier_is_false_while_the_alternate_screen_is_active() {
+        let highlighter =
+            Highlighter::from_config(PrismConfig::default()).expect("empty config compiles");
+        let mut streaming = StreamingHighlighter::new_interactive(highlighter);
+
+        let _ = streaming.push(b"\x08\x08show ver");
+        assert!(streaming.buffered_echo_completes_line_edit_redraw());
+
+        streaming.alternate_screen = true;
+        assert!(
+            !streaming.buffered_echo_completes_line_edit_redraw(),
+            "a stranded tail must never flush while an app owns the screen"
+        );
+    }
+
+    #[test]
+    fn prompt_echo_provenance_does_not_qualify_for_line_edit_redraw() {
+        let highlighter =
+            Highlighter::from_config(PrismConfig::default()).expect("empty config compiles");
+        let mut streaming = StreamingHighlighter::new_interactive(highlighter);
+
+        let _ = streaming.push(b"\x08\x08show ver");
+        assert!(streaming.buffered_echo_completes_line_edit_redraw());
+
+        // A tail buffered at the prompt-echo split site belongs to trigger 2.
+        streaming.pending_from_interactive_split = false;
+        streaming.pending_from_prompt_echo_remainder = true;
+        assert!(
+            !streaming.buffered_echo_completes_line_edit_redraw(),
+            "triggers 2 and 3 must stay disjoint"
+        );
+    }
+
+    // The `\r` half of the scope is covered by
+    // `line_edit_redraw_signal_is_scoped_to_the_rewritten_line`; pin the bare
+    // `\n` half too, so dropping either reset fails a test.
+    #[test]
+    fn bare_lf_clears_the_rewritten_line_signal() {
+        let highlighter =
+            Highlighter::from_config(PrismConfig::default()).expect("empty config compiles");
+        let mut streaming = StreamingHighlighter::new_interactive(highlighter);
+
+        let _ = streaming.push(b"\x08\x08\x08show version=1");
+        assert!(streaming.buffered_echo_completes_line_edit_redraw());
+
+        let _ = streaming.push(b"\ninterface Vlan11");
+        assert_eq!(streaming.buffered_echo(), b"Vlan11");
+        assert!(
+            !streaming.buffered_echo_completes_line_edit_redraw(),
+            "a bare line feed ends the rewritten line"
+        );
     }
 
     #[test]

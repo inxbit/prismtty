@@ -796,3 +796,134 @@ fn raw_mode_typed_chars_are_visible_without_extra_input() {
         "raw-mode typed token never surfaced without a delimiter; saw: {visible:?}"
     );
 }
+
+/// History recall: a shell rewrites the current input line by backspacing over
+/// it, and the recalled command ends mid-token (`username=operator` has no
+/// delimiter after the `=`). The keystroke that triggered the redraw is an arrow
+/// key, so the recent-input byte match can never confirm the tail is echo — only
+/// the line-edit provenance can surface it. Reported live: everything after the
+/// `=` stayed invisible until the next keypress.
+///
+/// The child holds the line open on a file gate so the tail cannot surface via
+/// `finish()` at EOF, which would make the assertion a tautology.
+#[test]
+fn history_recall_redraw_tail_is_visible_without_extra_input() {
+    let gate_dir = tempfile::tempdir().expect("gate tempdir");
+    let continue_path = gate_dir.path().join("continue");
+    let pair = native_pty_system()
+        .openpty(PtySize {
+            rows: 24,
+            cols: 200,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("openpty");
+
+    let mut builder = CommandBuilder::new(env!("CARGO_BIN_EXE_ptty"));
+    builder.env("PRISMTTY_TEST_CONTINUE", &continue_path);
+    builder.arg("sh");
+    builder.arg("-c");
+    // Raw + ECHO off is the ssh shape: the remote line editor's redraw arrives as
+    // ordinary program output, and the arrow key itself is never echoed back.
+    builder.arg(
+        "stty raw -echo 2>/dev/null; printf 'READY\\n'; head -c 3 >/dev/null; \
+         printf '\\b\\b\\b\\b\\b\\bvault login -method=userpass username=operator'; \
+         while [ ! -f \"$PRISMTTY_TEST_CONTINUE\" ]; do sleep 0.05; done; printf '\\n'",
+    );
+
+    let child = pair
+        .slave
+        .spawn_command(builder)
+        .expect("spawn ptty raw shell");
+    drop(pair.slave);
+
+    let mut writer = pair.master.take_writer().expect("take writer");
+    let session = PtySession::new(child, &*pair.master);
+    let ready = session.capture().wait_until(Duration::from_secs(5), |out| {
+        visible_output(out).contains("READY")
+    });
+    assert!(
+        visible_output(&ready).contains("READY"),
+        "raw-mode child was not ready before the recall; saw: {:?}",
+        visible_output(&ready)
+    );
+
+    writer.write_all(b"\x1b[A").expect("write up arrow");
+    writer.flush().expect("flush up arrow");
+
+    let target = "username=operator";
+    let output = session.capture().wait_until(Duration::from_secs(5), |out| {
+        visible_output(out).contains(target)
+    });
+    let visible = visible_output(&output);
+    std::fs::write(&continue_path, b"continue").expect("release the line-edit gate");
+
+    assert!(
+        visible.contains(target),
+        "recalled history line lost its tail until the next keypress; saw: {visible:?}"
+    );
+}
+
+/// The same recall, delivered in two reads. Over ssh the transport splits a
+/// remote line editor's redraw routinely: the read that strands the tail no
+/// longer carries the backspaces, so a per-chunk test of it sees nothing. Only
+/// the accumulated line still shows the rewrite. Without that, the reported
+/// symptom comes straight back.
+#[test]
+fn split_history_recall_redraw_tail_is_visible_without_extra_input() {
+    let gate_dir = tempfile::tempdir().expect("gate tempdir");
+    let continue_path = gate_dir.path().join("continue");
+    let pair = native_pty_system()
+        .openpty(PtySize {
+            rows: 24,
+            cols: 200,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("openpty");
+
+    let mut builder = CommandBuilder::new(env!("CARGO_BIN_EXE_ptty"));
+    builder.env("PRISMTTY_TEST_CONTINUE", &continue_path);
+    builder.arg("sh");
+    builder.arg("-c");
+    // Two writes with a gap: the backspaces and the head of the line land in one
+    // read, the stranded tail in another.
+    builder.arg(
+        "stty raw -echo 2>/dev/null; printf 'READY\\n'; head -c 3 >/dev/null; \
+         printf '\\b\\b\\b\\b\\b\\bvault login'; sleep 0.4; \
+         printf ' -method=userpass username=operator'; \
+         while [ ! -f \"$PRISMTTY_TEST_CONTINUE\" ]; do sleep 0.05; done; printf '\\n'",
+    );
+
+    let child = pair
+        .slave
+        .spawn_command(builder)
+        .expect("spawn ptty raw shell");
+    drop(pair.slave);
+
+    let mut writer = pair.master.take_writer().expect("take writer");
+    let session = PtySession::new(child, &*pair.master);
+    let ready = session.capture().wait_until(Duration::from_secs(5), |out| {
+        visible_output(out).contains("READY")
+    });
+    assert!(
+        visible_output(&ready).contains("READY"),
+        "raw-mode child was not ready before the recall; saw: {:?}",
+        visible_output(&ready)
+    );
+
+    writer.write_all(b"\x1b[A").expect("write up arrow");
+    writer.flush().expect("flush up arrow");
+
+    let target = "username=operator";
+    let output = session.capture().wait_until(Duration::from_secs(5), |out| {
+        visible_output(out).contains(target)
+    });
+    let visible = visible_output(&output);
+    std::fs::write(&continue_path, b"continue").expect("release the line-edit gate");
+
+    assert!(
+        visible.contains(target),
+        "split recall lost its tail until the next keypress; saw: {visible:?}"
+    );
+}
