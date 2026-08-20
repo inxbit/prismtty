@@ -31,3 +31,22 @@ The shape is deliberately read from **the line, not the chunk**. A first attempt
 - **Screen-safety is unchanged**, for the same reason as trigger 2: only the child's own buffered output bytes are ever emitted, never `recent_input`, so a non-echoed secret still produces no token to draw.
 - **Alternate screen is excluded.** Alt-screen chunks are never observed by the line tracker, and entering or leaving the alternate screen clears the tracked line, so an app's own backspaces (xterm's `cub1` is `^H`) cannot arm the trigger afterwards. Bytes coalesced into the same read as the screen switch are unobserved, which at most costs the flush, never correctness.
 - Guards: two live PTY regression tests (single-read and split delivery, both failing without the change with exactly the reported screen state), the read-loop gate and `highlight_stream` wiring tests, a negative test pinning the strict-idle conjunct (deleting it left the whole suite green before), and shape negatives for bulk output, `\r` rewrites and line-crossing chunks, a pending-token-prefix positive, a provenance negative keeping triggers 2 and 3 disjoint, alternate-screen round-trip negatives, and white-box guards on the alternate-screen conjunct and the bare-`\n` reset.
+
+## Amendment 2: the rewritten-line signal (2026-08-20)
+
+The first amendment shipped in 1.2.4 with three named gaps, two of which cost the user visible text rather than colour (the third armed one spurious early flush of the accepted cosmetic class), and all of which share one cause: the shape was read out of `visible_line_tail`, a byte buffer maintained for a different purpose.
+
+- A line editor that redraws with cursor movement instead of backspaces (zsh's `zle` once the edit is more than a few columns back) never put a backspace on the line, so a split-delivered redraw stranded its tail with no trigger.
+- A chunk that qualifies for prompt-echo preservation is skipped by the line tracker, so backspaces inside it were lost to the signal, and a `\r`/`\n` inside it did not end the line.
+- The retained tail is capped at 512 bytes, so a long enough rewritten line aged its own backspace out.
+
+The shape is now a sticky per-line flag, `line_rewritten_in_place`, maintained by `observe_line_rewrite_controls` ahead of the rest of `observe_interactive_visible_chunk`, including its prompt-echo shortcut. It is set by a literal backspace and by CSI CUB (`D`), DCH (`P`), ECH (`X`) and ICH (`@`); it is cleared by the `\r`/`\n` that ends the line and by either alternate-screen switch. Nothing else about the trigger changed: same provenance conjunct, same strict clean-idle gate, `recent_input` still untouched, and `visible_line_tail` keeps its existing semantics so trigger 2 is unaffected.
+
+The controls are read in a single in-order walk of the chunk's tokens, because order decides the answer: a cursor-back after a `\r` leaves the line rewritten, the same two controls the other way round do not.
+
+### Consequences
+
+- **Column-one repaints remain excluded, on purpose.** A bare `\r`, `ESC [ G` and a lone `ESC [ K` return to column one and repaint, which is byte-for-byte what a progress bar emits on every update. A line editor that redraws only that way still strands its tail. Widen only against a trace that shows a real failure, and only with a way to tell the two apart.
+- **The accepted early-flush limitation now covers CSI rewrites too**, with one asymmetry worth stating: `is_cursor_positioning_sequence` matches CUB but not DCH, ECH or ICH, so only a CUB-carrying chunk is sure to take the full-length interactive split and strand nothing itself. A chunk carrying a backspace, DCH, ECH or ICH can strand its own trailing token and qualify with no following read. The consequence is identical either way: one highlight span drawn as two, never text loss.
+- **Alternate screen is unchanged**: the flag clears at both switches, and a chunk that switches screens is still not observed at all.
+- Guards: a live PTY test for the cursor-movement redraw split across reads (red without this change, with the reported screen state), a control matrix asserting that `D`/`P`/`X`/`@` mark a rewrite while `\r`, `ESC [ G`, `ESC [ K`, `ESC [ 2K` and `ESC [ J` do not, an ordering pair for the in-order walk, both directions of the prompt-echo repaint window, and a rewritten line longer than the retained tail. Each new conditional was mutation-checked: dropping CUB, moving the maintenance past the prompt-echo shortcut, and dropping the alternate-screen clear each fail a named test.

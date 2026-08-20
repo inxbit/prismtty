@@ -2,6 +2,22 @@
 
 All notable changes to PrismTTY are documented here.
 
+## Unreleased
+
+### Fixed
+
+- Recognise a command line rewritten with cursor-movement controls, not just
+  with backspaces, so a history recall still draws its whole line under a line
+  editor that redraws that way (zsh's `zle` once the edit is more than a few
+  columns back). Column-one repaints stay excluded: a bare carriage return,
+  `ESC [ G` or a lone `ESC [ K` is what a progress bar emits on every update.
+- Track the rewritten line as a flag rather than by searching the retained line
+  tail. A rewrite is no longer lost when its controls arrive inside a prompt
+  repaint the line tracker skips, or when the line runs past the 512-byte tail
+  the highlighter retains; and a line ending inside such a repaint now clears
+  the signal instead of letting it arm one spurious early flush on the next
+  line.
+
 ## 1.2.4 - 2026-08-20
 
 ### Fixed

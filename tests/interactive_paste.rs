@@ -927,3 +927,64 @@ fn split_history_recall_redraw_tail_is_visible_without_extra_input() {
         "split recall lost its tail until the next keypress; saw: {visible:?}"
     );
 }
+
+/// A line editor that redraws with cursor movement rather than backspaces
+/// (zsh's zle once the edit is more than a few columns back) strands the tail
+/// the same way. The read that moves the cursor and the read that strands the
+/// tail arrive separately, so only a per-line signal connects them.
+#[test]
+fn csi_history_recall_redraw_tail_is_visible_without_extra_input() {
+    let gate_dir = tempfile::tempdir().expect("gate tempdir");
+    let continue_path = gate_dir.path().join("continue");
+    let pair = native_pty_system()
+        .openpty(PtySize {
+            rows: 24,
+            cols: 200,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("openpty");
+
+    let mut builder = CommandBuilder::new(env!("CARGO_BIN_EXE_ptty"));
+    builder.env("PRISMTTY_TEST_CONTINUE", &continue_path);
+    builder.arg("sh");
+    builder.arg("-c");
+    builder.arg(
+        "stty raw -echo 2>/dev/null; printf 'READY\\n'; head -c 3 >/dev/null; \
+         printf '\\033[6D\\033[K'; sleep 0.4; \
+         printf 'vault login -method=userpass username=operator'; \
+         while [ ! -f \"$PRISMTTY_TEST_CONTINUE\" ]; do sleep 0.05; done; printf '\\n'",
+    );
+
+    let child = pair
+        .slave
+        .spawn_command(builder)
+        .expect("spawn ptty raw shell");
+    drop(pair.slave);
+
+    let mut writer = pair.master.take_writer().expect("take writer");
+    let session = PtySession::new(child, &*pair.master);
+    let ready = session.capture().wait_until(Duration::from_secs(5), |out| {
+        visible_output(out).contains("READY")
+    });
+    assert!(
+        visible_output(&ready).contains("READY"),
+        "raw-mode child was not ready before the recall; saw: {:?}",
+        visible_output(&ready)
+    );
+
+    writer.write_all(b"\x1b[A").expect("write up arrow");
+    writer.flush().expect("flush up arrow");
+
+    let target = "username=operator";
+    let output = session.capture().wait_until(Duration::from_secs(5), |out| {
+        visible_output(out).contains(target)
+    });
+    let visible = visible_output(&output);
+    std::fs::write(&continue_path, b"continue").expect("release the line-edit gate");
+
+    assert!(
+        visible.contains(target),
+        "cursor-movement recall lost its tail until the next keypress; saw: {visible:?}"
+    );
+}
