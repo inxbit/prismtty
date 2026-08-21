@@ -763,16 +763,15 @@ fn prepare_chunk(
 ///    error is NOT idle here, since a continuation may still arrive) and does
 ///    NOT touch `recent_input`, so typed-ahead input is preserved.
 /// 3. Line-edit redraw: the buffered token is stranded on a visible line that
-///    has been rewritten in place with a backspace
-///    (`buffered_line_edit_redraw`), the shape a shell emits when the user
-///    recalls history with an arrow key (a readline-style editor; one that
-///    redraws with cursor movement instead does not). The keystroke never matches the
-///    recalled text, so trigger 1 cannot fire, and the redraw carries no prompt,
-///    so trigger 2 cannot either. The signal is read from the accumulated line
-///    rather than one chunk, so a redraw split across reads still qualifies
-///    when the backspace-carrying read reaches the line tracker.
-///    Same strict-idle gate and same hands-off treatment of `recent_input` as
-///    trigger 2.
+///    has been rewritten in place, with a backspace or a CSI cursor-back or
+///    in-line delete (`buffered_line_edit_redraw`), the shape a readline-style
+///    editor emits when the user recalls history with an arrow key. The
+///    keystroke never matches the recalled text, so trigger 1 cannot fire, and
+///    the redraw carries no prompt, so trigger 2 cannot either. The signal is a
+///    flag on the line rather than a property of one chunk, so a redraw split
+///    across reads still qualifies. Column-one repaints are excluded: that is
+///    what a progress bar emits. Same strict-idle gate and same hands-off
+///    treatment of `recent_input` as trigger 2.
 ///
 /// Screen safety does not rely on any of these heuristics: the session only emits
 /// the child's own output bytes, never `recent_input`, so a non-echoed secret is

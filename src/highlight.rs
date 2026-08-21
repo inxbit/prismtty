@@ -140,6 +140,16 @@ pub struct StreamingHighlighter {
     /// tail at a different split site. The shape half lives in the visible line,
     /// not here, so the signal survives a redraw delivered across several reads.
     pending_from_interactive_split: bool,
+    /// True when the current visible line has been rewritten in place: a
+    /// backspace or a CSI cursor-back / in-line delete moved back over text
+    /// already on the line so new text could be written over it. Sticky for the
+    /// life of the line: set by `observe_interactive_visible_chunk` wherever it
+    /// sees such a control, cleared by the `\r`/`\n` that ends the line and by
+    /// either alternate-screen switch. This is the shape half of the line-edit
+    /// flush trigger. It is deliberately NOT derived from `visible_line_tail`,
+    /// which is capped and can age the control out of a long rewritten line,
+    /// and NOT reset per chunk, since a redraw spans several reads.
+    line_rewritten_in_place: bool,
     alternate_screen: bool,
     passthrough_single_byte_chunks: bool,
     prompt_echo_passthrough: bool,
@@ -987,6 +997,7 @@ impl StreamingHighlighter {
             oversized_string_controls: OversizedStringControlFilter::default(),
             pending_from_prompt_echo_remainder: false,
             pending_from_interactive_split: false,
+            line_rewritten_in_place: false,
             alternate_screen: false,
             passthrough_single_byte_chunks: false,
             prompt_echo_passthrough: false,
@@ -1008,6 +1019,7 @@ impl StreamingHighlighter {
             oversized_string_controls: OversizedStringControlFilter::default(),
             pending_from_prompt_echo_remainder: false,
             pending_from_interactive_split: false,
+            line_rewritten_in_place: false,
             alternate_screen: false,
             passthrough_single_byte_chunks: true,
             prompt_echo_passthrough: false,
@@ -1029,6 +1041,7 @@ impl StreamingHighlighter {
             oversized_string_controls: OversizedStringControlFilter::default(),
             pending_from_prompt_echo_remainder: false,
             pending_from_interactive_split: false,
+            line_rewritten_in_place: false,
             alternate_screen: false,
             passthrough_single_byte_chunks: false,
             prompt_echo_passthrough: false,
@@ -1050,6 +1063,7 @@ impl StreamingHighlighter {
             oversized_string_controls: OversizedStringControlFilter::default(),
             pending_from_prompt_echo_remainder: false,
             pending_from_interactive_split: false,
+            line_rewritten_in_place: false,
             alternate_screen: false,
             passthrough_single_byte_chunks: true,
             prompt_echo_passthrough: false,
@@ -1382,35 +1396,43 @@ impl StreamingHighlighter {
     }
 
     /// True only when [`Self::buffered_echo`] holds a token stranded on a visible
-    /// line that has been rewritten in place: something backspaced over the line
-    /// and typed new text on top of it. A shell emits exactly that when the user
-    /// recalls history or edits the command line, so the stranded tail is the
-    /// user's own recalled command, echoed back. The keystroke behind it is an
-    /// arrow key, so the read loop's byte match against recent input can never
-    /// confirm it; this shape is the only signal that it is echo.
+    /// line that has been rewritten in place: something moved back over text
+    /// already on the line and wrote over it, with a backspace or with a CSI
+    /// cursor-back or in-line delete. A readline-style editor emits exactly that
+    /// when the user recalls history or edits the command line, so the stranded
+    /// tail is the user's own recalled command, echoed back. The keystroke
+    /// behind it is an arrow key, so the read loop's byte match against recent
+    /// input can never confirm it; this shape is the only signal that it is
+    /// echo.
     ///
-    /// The shape is read from the accumulated visible line, not from the chunk
-    /// that stranded the tail, so a redraw delivered across several reads still
-    /// qualifies, provided the read carrying the backspaces reached the line
-    /// tracker: a repaint chunk that qualifies for prompt-echo preservation
-    /// (cursor-positioning token, no printable bytes) is not observed, and
-    /// backspaces inside it are lost to this signal.
+    /// The shape is a flag on the line, not a search of the chunk that stranded
+    /// the tail nor of the retained line tail. That matters three ways: a redraw
+    /// delivered across several reads qualifies as long as one of them carried
+    /// the control, a prompt-echo repaint chunk still reports the controls
+    /// inside it even though the rest of the line tracker skips it, and a
+    /// rewritten line longer than the retained tail does not age its control
+    /// out. The flag clears at the `\r`/`\n` that ends the line and at either
+    /// alternate-screen switch, so it cannot outlive the tracked line it
+    /// describes.
     ///
-    /// The tracker clears the line at every `\r`/`\n` it observes, and at every
-    /// alternate-screen switch. A `\r`/`\n` inside a preserved prompt-echo
-    /// repaint chunk is not observed, so the signal can survive into the next
-    /// line there and arm one early flush of the accepted cosmetic class.
+    /// Column-one repaints (a bare `\r`, `ESC [ G`, a lone `ESC [ K`) are
+    /// deliberately not line edits: that is byte-for-byte what a progress bar
+    /// emits on every update, and treating it as one would flush during
+    /// continuous output.
     ///
     /// Ordinary program output does not qualify *unless it too rewrites its line
-    /// with a backspace* (an in-place counter, an overstrike), or inherits a
-    /// stale backspace through the unobserved window above: for those, the tail
-    /// is flushed early, which can split one highlight span into two. That is
-    /// the ADR's accepted cosmetic limitation, never text loss.
+    /// in place* (an in-place counter that backs up, an overstrike): for those,
+    /// the tail is flushed early, which can split one highlight span into two.
+    /// That is the ADR's accepted cosmetic limitation, never text loss. Of these
+    /// controls only CUB is also a cursor-positioning sequence, so only a
+    /// CUB-carrying chunk is sure to pass through whole; one carrying a
+    /// backspace, DCH, ECH or ICH can strand its own trailing token and qualify
+    /// in the same read. Either way the cost is one span drawn as two.
     pub(crate) fn buffered_echo_completes_line_edit_redraw(&self) -> bool {
         !self.buffered_echo().is_empty()
             && self.pending_from_interactive_split
             && !self.alternate_screen
-            && visible_line_was_rewritten_in_place(&self.visible_line_tail)
+            && self.line_rewritten_in_place
     }
 
     fn highlight_output_chunk(&mut self, input: &AnsiChunk) -> Vec<u8> {
@@ -1477,6 +1499,7 @@ impl StreamingHighlighter {
                     // tracked line describes the primary screen and must not
                     // carry into (or back out of) the app's own drawing.
                     self.visible_line_tail.clear();
+                    self.line_rewritten_in_place = false;
                     output.extend_from_slice(bytes);
                 }
                 Token::Ansi(bytes) if is_alternate_screen_disable(bytes) => {
@@ -1485,6 +1508,7 @@ impl StreamingHighlighter {
                     self.native_sgr.apply_sequence(bytes);
                     self.alternate_screen = false;
                     self.visible_line_tail.clear();
+                    self.line_rewritten_in_place = false;
                     output.extend_from_slice(bytes);
                 }
                 Token::Ansi(bytes)
@@ -1571,10 +1595,44 @@ impl StreamingHighlighter {
         }
     }
 
+    /// Tracks whether the current line has been rewritten in place, for the
+    /// line-edit flush trigger. Runs before the rest of
+    /// [`Self::observe_interactive_visible_chunk`], including its prompt-echo
+    /// preservation shortcut: that shortcut exists to keep `visible_line_tail`
+    /// intact across a repaint, but a repaint chunk can carry the very
+    /// backspaces that mark the edit, and the `\r`/`\n` that ends the line.
+    /// Both have to be seen.
+    ///
+    /// Walks the chunk's tokens in stream order, because order decides the
+    /// outcome: a cursor-back after a `\r` leaves the line rewritten, the same
+    /// two controls the other way round do not.
+    fn observe_line_rewrite_controls(&mut self, input: &AnsiChunk) {
+        for token in &input.tokens {
+            match token {
+                Token::Ansi(bytes) => {
+                    if is_in_place_line_edit_sequence(bytes) {
+                        self.line_rewritten_in_place = true;
+                    }
+                }
+                Token::Text(text) => {
+                    for byte in text.iter() {
+                        match *byte {
+                            0x08 => self.line_rewritten_in_place = true,
+                            b'\r' | b'\n' => self.line_rewritten_in_place = false,
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     fn observe_interactive_visible_chunk(&mut self, input: &AnsiChunk) {
         if !self.passthrough_single_byte_chunks {
             return;
         }
+
+        self.observe_line_rewrite_controls(input);
 
         if contains_bracketed_paste_disable_tokens(&input.tokens) {
             self.prompt_echo_passthrough = false;
@@ -2095,22 +2153,17 @@ fn contains_prompt_echo_before_lf_visible(visible: &[u8]) -> bool {
     contains_prompt_echo_in_visible_line(&sub[start..])
 }
 
-/// Reports whether the current visible line has been rewritten in place: it
-/// carries a backspace, so something moved back over text already on the line
-/// and wrote over it. Shells and readline rewrite the command line exactly that
-/// way on history recall (up/down arrow) and in-place edits; editors that
-/// redraw with cursor-movement controls instead of backspaces (zle beyond short
-/// distances) do not produce this shape.
+/// Reports whether an escape sequence moves back over, or deletes within, text
+/// already on the current line: CSI CUB (`D`), DCH (`P`), ECH (`X`) and ICH
+/// (`@`). Together with a literal backspace these are the controls a
+/// readline-style line editor uses to rewrite a command line in place, and they
+/// are what distinguishes that from a full-line repaint.
 ///
-/// Read from the accumulated visible line rather than from one chunk, so a
-/// redraw split across reads still counts. A `\r`/`\n` seen by the line tracker
-/// resets it (see the qualifier's doc for the repaint chunks the tracker does
-/// not observe). Deliberately does not treat a bare `\r`
-/// rewrite as a line edit: that is the shape a progress bar emits on every
-/// update. A line longer than the retained tail can age its backspace out,
-/// which only costs the flush (the pre-fix behaviour), never correctness.
-fn visible_line_was_rewritten_in_place(line: &[u8]) -> bool {
-    line.contains(&0x08)
+/// A bare `\r`, `ESC [ G` and a lone `ESC [ K` are deliberately excluded: those
+/// return to column one and repaint, which is byte-for-byte what a progress bar
+/// emits on every update.
+fn is_in_place_line_edit_sequence(bytes: &[u8]) -> bool {
+    is_csi_sequence(bytes) && matches!(bytes.last(), Some(b'D' | b'P' | b'X' | b'@'))
 }
 
 fn contains_prompt_echo_in_visible_line(line: &[u8]) -> bool {
@@ -4908,6 +4961,151 @@ rules:
         assert!(
             !streaming.buffered_echo_completes_line_edit_redraw(),
             "a bare line feed ends the rewritten line"
+        );
+    }
+
+    // A line editor that redraws with cursor movement instead of backspaces
+    // (zsh's zle past a few columns) strands its tail the same way. The moving
+    // read and the stranding read arrive separately, so only a per-line signal
+    // can connect them.
+    #[test]
+    fn csi_cursor_back_redraw_split_across_reads_qualifies() {
+        let highlighter =
+            Highlighter::from_config(PrismConfig::default()).expect("empty config compiles");
+        let mut streaming = StreamingHighlighter::new_interactive(highlighter);
+
+        let _ = streaming.push_str("user@host:~$ deploy\r\n");
+        let _ = streaming.push(b"\x1b[6D\x1b[K");
+        let _ = streaming.push(b"vault login -method=userpass username=operator");
+
+        assert_eq!(streaming.buffered_echo(), b"operator");
+        assert!(
+            streaming.buffered_echo_completes_line_edit_redraw(),
+            "a cursor-movement rewrite is a line edit too"
+        );
+    }
+
+    // Every in-place edit control the trigger recognizes, and the repaint
+    // controls it must keep ignoring.
+    #[test]
+    fn only_in_place_edit_controls_mark_the_line_as_rewritten() {
+        for control in [&b"\x1b[3D"[..], b"\x1b[2P", b"\x1b[4X", b"\x1b[1@"] {
+            let highlighter =
+                Highlighter::from_config(PrismConfig::default()).expect("empty config compiles");
+            let mut streaming = StreamingHighlighter::new_interactive(highlighter);
+            let _ = streaming.push(control);
+            let _ = streaming.push(b"vault login username=operator");
+            assert!(
+                streaming.buffered_echo_completes_line_edit_redraw(),
+                "{:?} rewrites the line in place",
+                String::from_utf8_lossy(control)
+            );
+        }
+
+        // Column-one repaints: byte-identical to a progress bar's update.
+        for control in [&b"\x1b[G"[..], b"\x1b[K", b"\x1b[2K", b"\x1b[J", b"\r"] {
+            let highlighter =
+                Highlighter::from_config(PrismConfig::default()).expect("empty config compiles");
+            let mut streaming = StreamingHighlighter::new_interactive(highlighter);
+            let _ = streaming.push(control);
+            let _ = streaming.push(b"downloading 42 of 96 blocks eta=0012");
+            assert!(
+                !streaming.buffered_echo().is_empty(),
+                "{:?} should still strand a tail",
+                String::from_utf8_lossy(control)
+            );
+            assert!(
+                !streaming.buffered_echo_completes_line_edit_redraw(),
+                "{:?} repaints the line, it does not edit it",
+                String::from_utf8_lossy(control)
+            );
+        }
+    }
+
+    // Order decides the outcome, so the controls must be read in stream order
+    // rather than scanned in two passes.
+    #[test]
+    fn line_rewrite_controls_are_read_in_stream_order() {
+        let highlighter =
+            Highlighter::from_config(PrismConfig::default()).expect("empty config compiles");
+        let mut streaming = StreamingHighlighter::new_interactive(highlighter);
+        // Repaint, then edit what was repainted: the line is rewritten. The
+        // stranding read has to be a separate one, since a chunk carrying a
+        // cursor sequence passes through whole and strands nothing itself.
+        let _ = streaming.push(b"\r\x1b[4D");
+        let _ = streaming.push(b"vault username=operator");
+        assert!(
+            streaming.buffered_echo_completes_line_edit_redraw(),
+            "a cursor-back after a repaint still rewrites the line"
+        );
+
+        let highlighter =
+            Highlighter::from_config(PrismConfig::default()).expect("empty config compiles");
+        let mut streaming = StreamingHighlighter::new_interactive(highlighter);
+        // Edit, then start the line over: the edit is gone.
+        let _ = streaming.push(b"\x1b[4D\r");
+        let _ = streaming.push(b"downloading eta=0012");
+        assert!(
+            !streaming.buffered_echo_completes_line_edit_redraw(),
+            "a repaint after a cursor-back ends the rewritten line"
+        );
+    }
+
+    // A prompt-echo repaint chunk is skipped by the visible-line tracker so a
+    // redraw does not lose the prompt. The rewrite signal must still see the
+    // controls inside it, in both directions.
+    #[test]
+    fn prompt_echo_repaint_window_still_reports_line_rewrites() {
+        // Backspaces delivered inside a preserved repaint chunk must arm.
+        let highlighter =
+            Highlighter::from_config(PrismConfig::default()).expect("empty config compiles");
+        let mut streaming = StreamingHighlighter::new_interactive(highlighter);
+        let _ = streaming.push(b"\x1b[2Dvault relogin");
+        let _ = streaming.push(b"\x1b[C\x08\x08\x08");
+        let _ = streaming.push(b"\x1b[?2004l");
+        let _ = streaming.push(b" username=operator");
+        assert_eq!(streaming.buffered_echo(), b"operator");
+        assert!(
+            streaming.buffered_echo_completes_line_edit_redraw(),
+            "backspaces inside a preserved repaint chunk still rewrite the line"
+        );
+
+        // A line break delivered inside one must clear.
+        let highlighter =
+            Highlighter::from_config(PrismConfig::default()).expect("empty config compiles");
+        let mut streaming = StreamingHighlighter::new_interactive(highlighter);
+        let _ = streaming.push(b"\x08\x08\x08vault login ");
+        let _ = streaming.push(b"\x1b[42Gfoo ");
+        let _ = streaming.push(b"\x1b[H\r\n");
+        let _ = streaming.push(b"\x1b[?2004l");
+        let _ = streaming.push(b"interface Vlan11");
+        assert_eq!(streaming.buffered_echo(), b"Vlan11");
+        assert!(
+            !streaming.buffered_echo_completes_line_edit_redraw(),
+            "a line break inside a preserved repaint chunk still ends the line"
+        );
+    }
+
+    // The signal is a flag, not a search of the retained line tail, so a rewrite
+    // survives a command longer than the tail cap.
+    #[test]
+    fn line_rewrite_signal_survives_a_line_longer_than_the_retained_tail() {
+        let highlighter =
+            Highlighter::from_config(PrismConfig::default()).expect("empty config compiles");
+        let mut streaming = StreamingHighlighter::new_interactive(highlighter);
+
+        let mut redraw = b"\x08\x08\x08vault login".to_vec();
+        for index in 0..80 {
+            redraw.extend_from_slice(format!(" --option-{index}=value-{index}").as_bytes());
+        }
+        redraw.extend_from_slice(b" username=operator");
+        assert!(redraw.len() > 1024, "the fixture must outrun the tail cap");
+
+        let _ = streaming.push(&redraw);
+        assert_eq!(streaming.buffered_echo(), b"operator");
+        assert!(
+            streaming.buffered_echo_completes_line_edit_redraw(),
+            "a rewritten line longer than the retained tail still qualifies"
         );
     }
 
