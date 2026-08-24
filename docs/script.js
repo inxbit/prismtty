@@ -165,9 +165,22 @@
       return;
     }
 
+    // Idle the typing loop while the tab is hidden or the hero is scrolled away.
+    let onScreen = true;
+    if ('IntersectionObserver' in window) {
+      onScreen = false;
+      new IntersectionObserver((entries) => {
+        onScreen = entries[0].isIntersecting;
+      }).observe(body);
+    }
+    const gate = async () => {
+      while (document.hidden || !onScreen) await sleep(300);
+    };
+
     while (true) {
       body.innerHTML = '';
       for (const line of HERO) {
+        await gate();
         const el = document.createElement('span');
         el.className = 'tline';
         body.appendChild(el);
@@ -217,6 +230,7 @@
     const tabs = [...root.querySelectorAll('.profile-tab')];
     const body = root.querySelector('[data-profile-body]');
     const title = root.querySelector('[data-profile-title]');
+    const badge = root.querySelector('[data-profile-badge]');
 
     const show = (key) => {
       const data = PROFILES[key];
@@ -224,6 +238,7 @@
       const paint = () => {
         body.innerHTML = render(data.lines, lineHTML);
         title.textContent = data.title;
+        if (badge) badge.textContent = key;
         body.classList.remove('is-swapping');
       };
       if (reduceMotion) { paint(); return; }
@@ -231,14 +246,36 @@
       setTimeout(paint, 150);
     };
 
-    tabs.forEach((tab) => {
-      tab.addEventListener('click', () => {
-        tabs.forEach((t) => t.setAttribute('aria-selected', String(t === tab)));
-        show(tab.dataset.profile);
+    const select = (tab) => {
+      tabs.forEach((t) => {
+        t.setAttribute('aria-selected', String(t === tab));
+        t.tabIndex = t === tab ? 0 : -1;
+      });
+      show(tab.dataset.profile);
+    };
+
+    tabs.forEach((tab, i) => {
+      tab.addEventListener('click', () => select(tab));
+      tab.addEventListener('keydown', (e) => {
+        const to = {
+          ArrowRight: i + 1,
+          ArrowDown: i + 1,
+          ArrowLeft: i - 1,
+          ArrowUp: i - 1,
+          Home: 0,
+          End: tabs.length - 1,
+        }[e.key];
+        if (to === undefined) return;
+        e.preventDefault();
+        const next = tabs[(to + tabs.length) % tabs.length];
+        next.focus();
+        select(next);
       });
     });
 
-    show(tabs.find((t) => t.getAttribute('aria-selected') === 'true')?.dataset.profile || 'cisco');
+    const initial =
+      tabs.find((t) => t.getAttribute('aria-selected') === 'true') || tabs[0];
+    if (initial) select(initial);
   }
 
   /* ---- copy buttons ---- */
@@ -259,41 +296,6 @@
         }, 1600);
       });
     });
-  }
-
-  /* ---- cursor spotlight on panels ---- */
-  function initSpotlight() {
-    if (reduceMotion || window.matchMedia('(hover: none)').matches) return;
-    const panels = document.querySelectorAll(
-      '.feature-card, .install-card, .workflow-step, .scope-panel'
-    );
-    panels.forEach((el) => {
-      el.classList.add('spot');
-      el.addEventListener('pointermove', (e) => {
-        const r = el.getBoundingClientRect();
-        el.style.setProperty('--mx', `${e.clientX - r.left}px`);
-        el.style.setProperty('--my', `${e.clientY - r.top}px`);
-      });
-    });
-  }
-
-  /* ---- scroll reveal ---- */
-  function initReveal() {
-    const targets = document.querySelectorAll('.section, .command-band');
-    if (reduceMotion || !('IntersectionObserver' in window)) return;
-    targets.forEach((el) => el.classList.add('reveal'));
-    const io = new IntersectionObserver(
-      (entries, obs) => {
-        entries.forEach((e) => {
-          if (e.isIntersecting) {
-            e.target.classList.add('is-in');
-            obs.unobserve(e.target);
-          }
-        });
-      },
-      { rootMargin: '0px 0px -12% 0px', threshold: 0.08 }
-    );
-    targets.forEach((el) => io.observe(el));
   }
 
   /* ---- active nav state ---- */
@@ -322,8 +324,6 @@
   initCompare();
   initProfiles();
   initCopy();
-  initSpotlight();
-  initReveal();
   initNav();
   runHero();
 })();
