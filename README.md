@@ -19,8 +19,6 @@ network-focused built-in profiles.
 
 Website: [prismtty.com](https://prismtty.com/).
 
-Current version: `1.2.5`.
-
 ## Quick Demo
 
 ![Animated PrismTTY terminal demo](.github/assets/prismtty-terminal-demo.svg?v=20260531)
@@ -62,6 +60,11 @@ or store operational data.
 
 ## Install
 
+PrismTTY builds and is tested on macOS and Linux. Every install method
+provides the same three commands: `prismtty`, plus the `ptty` and `ct`
+aliases. All three run the same binary; `ct` matches ChromaTerm's command
+name so existing ChromaTerm habits and scripts keep working.
+
 ### Homebrew
 
 Install the latest release from the PrismTTY Homebrew tap:
@@ -96,10 +99,14 @@ For `cargo install` on Debian/Ubuntu, install:
 sudo apt-get install libpcre2-dev pkg-config
 ```
 
+Cargo installs the binaries only. Shell completions for zsh, bash, and fish
+live in [`completions/`](completions/); copy the file for your shell into its
+completions directory.
+
 ### GitHub Release
 
 Prebuilt release archives and checksums are available on the
-[v1.2.5 release page](https://github.com/inxbit/prismtty/releases/tag/v1.2.5).
+[latest release page](https://github.com/inxbit/prismtty/releases/latest).
 
 Each release archive contains the binaries, license/readme files, example
 profiles, shell completions, and a `.tar.gz.sha256` checksum.
@@ -282,15 +289,17 @@ private `negative_signals` that block only startup prompt matcher detection; wea
 `detection` hints, strong banner signals, and runtime prompt transitions are not
 blocked by those exclusions.
 
-Interactive dynamic mode keeps built-in vendor selection conservative: after a
+Interactive dynamic mode keeps built-in vendor selection conservative. After a
 specific profile such as `generic, cisco` or `generic, juniper` is selected,
-normal command output cannot add another vendor profile. Strong login banners can
-still switch profiles, and typed nested remote commands can switch after the next
-strong banner or repeated prompt. Fortinet is intentionally more permissive only
-from a local-shell baseline: a single `hostname #` Fortinet prompt can promote to
-`generic, fortinet`, which supports local shell wrappers such as `fw` that do not
-show a FortiOS banner or an explicit `ssh` command. Other prompt-only vendor
-switches still require repeated evidence or a typed remote-jump command.
+normal command output cannot add another vendor profile. Strong login banners
+can still switch profiles, and typed nested remote commands can switch after
+the next strong banner or repeated prompt.
+
+Fortinet is intentionally more permissive from a local-shell baseline only. A
+single `hostname #` Fortinet prompt can promote to `generic, fortinet`, which
+supports local shell wrappers such as `fw` that show neither a FortiOS banner
+nor an explicit `ssh` command. Other prompt-only vendor switches still require
+repeated evidence or a typed remote-jump command.
 
 When PrismTTY is launched as an iTerm profile command, it strips iTerm's native
 shell-integration variables from the child shell to avoid nested integration
@@ -319,27 +328,13 @@ Testing feedback is especially useful for the built-in profile coverage:
 - Linux and Unix administration output
 - Custom profile files for other vendors, appliances, and terminal workflows
 
-## Development Notes
+[Open an issue](https://github.com/inxbit/prismtty/issues) with the platform,
+the command, and a scrubbed snippet of the output.
 
-The CLI entry point is intentionally split into focused internal modules:
+## Contributing
 
-- `src/cli.rs` keeps `run()`, action dispatch, and CLI error handling.
-- `src/cli/args.rs` owns the clap-backed parser and parser contract tests.
-- `src/cli/profile_selection.rs` loads profile stores, user config, color mode,
-  and profile reporting.
-- `src/cli/pty.rs` owns PTY command execution, raw mode, stdin forwarding, local
-  echo, the iTerm environment guard, and resize polling.
-- `src/cli/stream.rs` owns streaming highlight orchestration, dynamic profile
-  observation, reload handling, benchmarks, and `HighlightSession`.
-- `src/cli/runtime.rs` owns runtime registration and reload markers.
-- `src/cli/trace.rs` owns `--trace-io` formatting.
-
-Keep these modules internal to the CLI tree. Parser contract tests intentionally
-preserve current behavior, including `--pcre` as a no-op compatibility flag, so
-future parser migrations can be checked without changing user-facing semantics.
-The data-driven profile refactor did not keep a temporary old/new detector
-compatibility module; instead, the current safety net is the runtime transition
-tests plus byte-for-byte Cisco and Juniper streaming snapshots.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup, the CLI module
+layout, fixture and privacy policy, and the pull request checklist.
 
 ## Benchmark
 
