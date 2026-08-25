@@ -2,73 +2,103 @@
   <title id="title">PrismTTY social preview</title>
   <desc id="desc">PrismTTY terminal output highlighting preview for network and Unix operations.</desc>
   <defs>
-    <linearGradient id="bg" x1="0" x2="1" y1="0" y2="1">
-      <stop offset="0" stop-color="#111827"/>
-      <stop offset="0.56" stop-color="#020617"/>
-      <stop offset="1" stop-color="#07111f"/>
+    <linearGradient id="bg" x1="0" x2="0" y1="0" y2="1">
+      <stop offset="0" stop-color="#040b18"/>
+      <stop offset="0.7" stop-color="#020617"/>
     </linearGradient>
-    <linearGradient id="beam" x1="0" x2="1" y1="0" y2="0">
+    <radialGradient id="glow" cx="0.85" cy="-0.1" r="0.8">
+      <stop offset="0" stop-color="#22d3ee" stop-opacity="0.09"/>
+      <stop offset="0.6" stop-color="#22d3ee" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="prism-line" x1="0" x2="1" y1="0" y2="0">
       <stop offset="0" stop-color="#22d3ee"/>
-      <stop offset="0.5" stop-color="#a3e635"/>
-      <stop offset="1" stop-color="#f472b6"/>
+      <stop offset="0.32" stop-color="#a3e635"/>
+      <stop offset="0.56" stop-color="#fbbf24"/>
+      <stop offset="0.78" stop-color="#f472b6"/>
+      <stop offset="1" stop-color="#a78bfa"/>
+    </linearGradient>
+    <linearGradient id="lk-cyan" x1="0" x2="1" y1="0" y2="0">
+      <stop offset="0" stop-color="#22d3ee" stop-opacity="0.9"/>
+      <stop offset="1" stop-color="#22d3ee" stop-opacity="0"/>
+    </linearGradient>
+    <linearGradient id="lk-green" x1="0" x2="1" y1="0" y2="0">
+      <stop offset="0" stop-color="#a3e635" stop-opacity="0.85"/>
+      <stop offset="1" stop-color="#a3e635" stop-opacity="0"/>
+    </linearGradient>
+    <linearGradient id="lk-pink" x1="0" x2="1" y1="0" y2="0">
+      <stop offset="0" stop-color="#f472b6" stop-opacity="0.78"/>
+      <stop offset="1" stop-color="#f472b6" stop-opacity="0"/>
+    </linearGradient>
+    <linearGradient id="lk-prism" x1="70" x2="250" y1="45" y2="215" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#f8fafc"/>
+      <stop offset="0.45" stop-color="#67e8f9"/>
+      <stop offset="1" stop-color="#a78bfa"/>
+    </linearGradient>
+    <linearGradient id="lk-term" x1="0" x2="1" y1="0" y2="1">
+      <stop offset="0" stop-color="#1f2937"/>
+      <stop offset="1" stop-color="#020617"/>
+    </linearGradient>
+    <linearGradient id="term-bg" x1="0" x2="0" y1="0" y2="1">
+      <stop offset="0" stop-color="#061021"/>
+      <stop offset="1" stop-color="#03091a"/>
     </linearGradient>
     <style>
-      .sans { font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif; }
-      .mono { font-family: SFMono-Regular, Consolas, Liberation Mono, Menlo, monospace; }
-      .title { fill: #f8fafc; font-size: 84px; font-weight: 900; letter-spacing: 0; }
-      .lede { fill: #cbd5e1; font-size: 32px; font-weight: 700; letter-spacing: 0; }
-      .small { fill: #94a3b8; font-size: 22px; font-weight: 700; letter-spacing: 0; }
-      .term { fill: #0f172a; stroke: #334155; stroke-width: 2; }
-      .bar { fill: #111827; }
+      .mono { font-family: 'JetBrains Mono', SFMono-Regular, Consolas, 'Liberation Mono', Menlo, monospace; }
+      .title { fill: #f4f7fb; font-size: 62px; font-weight: 700; letter-spacing: -1.8px; }
+      .facts { fill: #67768f; font-size: 19px; }
+      .facts-strong { fill: #f4f7fb; font-weight: 600; }
+      .bar-title { fill: #9fb0c8; font-size: 16px; }
+      .badge { fill: #67768f; font-size: 14px; }
       .cyan { fill: #22d3ee; }
-      .green { fill: #a3e635; }
-      .yellow { fill: #facc15; }
-      .red { fill: #fb7185; }
-      .purple { fill: #c084fc; }
-      .fg { fill: #e5e7eb; }
-      .muted { fill: #64748b; }
+      .green { fill: #a3e635; font-weight: 600; }
+      .up { fill: #4ade80; font-weight: 600; }
+      .amber { fill: #fbbf24; }
+      .pink { fill: #f472b6; font-weight: 600; }
+      .purple { fill: #a78bfa; font-weight: 600; }
+      .fg { fill: #eef2f7; }
     </style>
   </defs>
 
   <rect width="1200" height="630" fill="url(#bg)"/>
-  <path d="M610 70h660v78H610z" fill="#22d3ee" opacity="0.10" transform="skewX(-16)"/>
-  <path d="M520 192h760v64H520z" fill="#a3e635" opacity="0.12" transform="skewX(-16)"/>
-  <path d="M650 306h640v58H650z" fill="#f472b6" opacity="0.10" transform="skewX(-16)"/>
+  <rect width="1200" height="630" fill="url(#glow)"/>
 
-  <g class="sans">
-    <text x="70" y="138" class="title">PrismTTY</text>
-    <text x="74" y="192" class="lede">Readable SSH, network-device, and Unix output.</text>
-    <text x="74" y="234" class="small">Live terminal highlighting for operators.</text>
+  <!-- brand lockup -->
+  <g transform="translate(72 52) scale(0.232)">
+    <g transform="translate(-80 -44)">
+      <path d="M254 89 L435 50 L435 82 L254 112 Z" fill="url(#lk-cyan)"/>
+      <path d="M258 123 L450 117 L450 147 L258 146 Z" fill="url(#lk-green)"/>
+      <path d="M254 158 L435 206 L435 176 L254 136 Z" fill="url(#lk-pink)"/>
+      <path d="M88 202 L166 54 L252 202 Z" fill="none" stroke="url(#lk-prism)" stroke-width="14" stroke-linejoin="round"/>
+      <path d="M166 54 L166 202" stroke="#67e8f9" stroke-width="6" stroke-linecap="round" opacity="0.9"/>
+      <path d="M88 202 L166 132 L252 202" fill="none" stroke="#c084fc" stroke-width="6" stroke-linecap="round" stroke-linejoin="round" opacity="0.85"/>
+      <rect x="104" y="111" width="116" height="72" rx="10" fill="url(#lk-term)" stroke="#334155" stroke-width="3"/>
+      <circle cx="122" cy="128" r="4" fill="#ef4444"/>
+      <circle cx="136" cy="128" r="4" fill="#f59e0b"/>
+      <circle cx="150" cy="128" r="4" fill="#22c55e"/>
+      <path d="M127 153 L144 141 L127 129" fill="none" stroke="#22d3ee" stroke-width="7" stroke-linecap="round" stroke-linejoin="round"/>
+      <path d="M157 160 H196" stroke="#a3e635" stroke-width="7" stroke-linecap="round"/>
+    </g>
+  </g>
+  <text x="174" y="86" class="mono" font-size="27" font-weight="700" fill="#f4f7fb">Prism<tspan fill="#22d3ee">TTY</tspan></text>
+
+  <!-- headline -->
+  <g class="mono">
+    <text x="72" y="188" class="title">Readable output,</text>
+    <text x="72" y="252" class="title">live in your terminal.</text>
+    <text x="72" y="311" class="facts"><tspan class="facts-strong">9</tspan> built-in profiles <tspan fill="#2c3e5e">·</tspan> <tspan class="facts-strong">v1.2.5</tspan> <tspan fill="#2c3e5e">·</tspan> <tspan class="facts-strong">PCRE2</tspan> engine <tspan fill="#2c3e5e">·</tspan> <tspan class="facts-strong">MIT</tspan> licensed</text>
   </g>
 
-  <g transform="translate(70 285)">
-    <rect width="1060" height="270" rx="20" class="term"/>
-    <rect width="1060" height="52" rx="20" class="bar"/>
-    <rect y="34" width="1060" height="18" class="bar"/>
-    <circle cx="30" cy="26" r="8" fill="#ef4444"/>
-    <circle cx="58" cy="26" r="8" fill="#f59e0b"/>
-    <circle cx="86" cy="26" r="8" fill="#22c55e"/>
-    <text x="122" y="35" class="mono small">ptty ssh edge-sw1.example.net</text>
-    <rect y="52" width="1060" height="4" fill="url(#beam)"/>
-
-    <text x="32" y="98" class="mono green" font-size="24">edge-sw1#</text>
-    <text x="166" y="98" class="mono fg" font-size="24">show ip interface brief</text>
-    <text x="32" y="140" class="mono muted" font-size="19">Interface</text>
-    <text x="260" y="140" class="mono muted" font-size="19">IP-Address</text>
-    <text x="500" y="140" class="mono muted" font-size="19">Status</text>
-    <text x="680" y="140" class="mono muted" font-size="19">Protocol</text>
-    <text x="32" y="180" class="mono yellow" font-size="22">Gi1/0/1</text>
-    <text x="260" y="180" class="mono cyan" font-size="22">192.0.2.10</text>
-    <text x="500" y="180" class="mono green" font-size="22">up</text>
-    <text x="680" y="180" class="mono green" font-size="22">up</text>
-    <text x="32" y="220" class="mono yellow" font-size="22">Gi1/0/2</text>
-    <text x="260" y="220" class="mono cyan" font-size="22">198.51.100.42</text>
-    <text x="500" y="220" class="mono red" font-size="22">down</text>
-    <text x="680" y="220" class="mono red" font-size="22">down</text>
-    <text x="32" y="258" class="mono purple" font-size="22">%LINK-3-UPDOWN:</text>
-    <text x="250" y="258" class="mono fg" font-size="22">Interface </text>
-    <text x="378" y="258" class="mono yellow" font-size="22">Gi1/0/2</text>
-    <text x="492" y="258" class="mono fg" font-size="22"> changed state to </text>
-    <text x="736" y="258" class="mono red" font-size="22">down</text>
+  <!-- terminal -->
+  <g transform="translate(72 388)">
+    <rect width="1056" height="260" rx="16" fill="url(#term-bg)" stroke="#1b2942" stroke-width="1"/>
+    <text x="24" y="32" class="mono bar-title">ptty ssh edge-sw1.example.net</text>
+    <text x="1032" y="32" class="mono badge" text-anchor="end">profile: <tspan class="cyan">cisco</tspan></text>
+    <rect y="50" width="1056" height="2" fill="url(#prism-line)" opacity="0.5"/>
+    <g class="mono" font-size="20">
+      <text x="26" y="92"><tspan class="green">edge-sw1#</tspan><tspan class="fg">show ip interface brief</tspan></text>
+      <text x="26" y="126"><tspan class="amber">GigabitEthernet1/0/1</tspan><tspan class="fg">   </tspan><tspan class="cyan">192.0.2.10</tspan><tspan class="fg">      </tspan><tspan class="up">up</tspan><tspan class="fg">        </tspan><tspan class="up">up</tspan></text>
+      <text x="26" y="160"><tspan class="amber">GigabitEthernet1/0/2</tspan><tspan class="fg">   </tspan><tspan class="cyan">198.51.100.42</tspan><tspan class="fg">   </tspan><tspan class="pink">down</tspan><tspan class="fg">      </tspan><tspan class="pink">down</tspan></text>
+      <text x="26" y="194"><tspan class="purple">%LINK-3-UPDOWN</tspan><tspan class="fg">: Interface </tspan><tspan class="amber">Gi1/0/2</tspan><tspan class="fg">, changed state to </tspan><tspan class="pink">down</tspan></text>
+    </g>
   </g>
 </svg>
