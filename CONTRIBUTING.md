@@ -21,6 +21,28 @@ cargo run --locked --features completion-generation --bin gen-completions
 git diff --exit-code completions/
 ```
 
+## CLI Module Layout
+
+The CLI entry point is intentionally split into focused internal modules:
+
+- `src/cli.rs` keeps `run()`, action dispatch, and CLI error handling.
+- `src/cli/args.rs` owns the clap-backed parser and parser contract tests.
+- `src/cli/profile_selection.rs` loads profile stores, user config, color mode,
+  and profile reporting.
+- `src/cli/pty.rs` owns PTY command execution, raw mode, stdin forwarding, local
+  echo, the iTerm environment guard, and resize polling.
+- `src/cli/stream.rs` owns streaming highlight orchestration, dynamic profile
+  observation, reload handling, benchmarks, and `HighlightSession`.
+- `src/cli/runtime.rs` owns runtime registration and reload markers.
+- `src/cli/trace.rs` owns `--trace-io` formatting.
+
+Keep these modules internal to the CLI tree. Parser contract tests intentionally
+preserve current behavior, including `--pcre` as a no-op compatibility flag, so
+future parser migrations can be checked without changing user-facing semantics.
+The data-driven profile refactor did not keep a temporary old/new detector
+compatibility module; instead, the current safety net is the runtime transition
+tests plus byte-for-byte Cisco and Juniper streaming snapshots.
+
 ## Fixtures and Test Data
 
 Use synthetic fixtures only. Do not commit real terminal captures, private
