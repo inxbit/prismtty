@@ -169,13 +169,13 @@
 
         <div class="profiles-demo" data-profiles>
           <div class="profile-tabs" role="tablist" aria-label="Built-in profiles">
-            <button class="profile-tab" role="tab" data-profile="cisco" aria-selected="true">cisco</button>
-            <button class="profile-tab" role="tab" data-profile="juniper" aria-selected="false">juniper</button>
-            <button class="profile-tab" role="tab" data-profile="fortinet" aria-selected="false">fortinet</button>
-            <button class="profile-tab" role="tab" data-profile="arista" aria-selected="false">arista</button>
-            <button class="profile-tab" role="tab" data-profile="linux-unix" aria-selected="false">linux-unix</button>
+            <button class="profile-tab" role="tab" id="tab-cisco" aria-controls="profile-panel" data-profile="cisco" aria-selected="true">cisco</button>
+            <button class="profile-tab" role="tab" id="tab-juniper" aria-controls="profile-panel" data-profile="juniper" aria-selected="false">juniper</button>
+            <button class="profile-tab" role="tab" id="tab-fortinet" aria-controls="profile-panel" data-profile="fortinet" aria-selected="false">fortinet</button>
+            <button class="profile-tab" role="tab" id="tab-arista" aria-controls="profile-panel" data-profile="arista" aria-selected="false">arista</button>
+            <button class="profile-tab" role="tab" id="tab-linux-unix" aria-controls="profile-panel" data-profile="linux-unix" aria-selected="false">linux-unix</button>
           </div>
-          <div class="terminal profile-terminal">
+          <div class="terminal profile-terminal" id="profile-panel" role="tabpanel" aria-labelledby="tab-cisco" tabindex="0">
             <div class="terminal-bar">
               <span class="terminal-title" data-profile-title></span>
               <span class="terminal-badge">profile: <span class="badge-key" data-profile-badge>cisco</span></span>

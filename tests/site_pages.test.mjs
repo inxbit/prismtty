@@ -80,6 +80,51 @@ test('GitHub Pages site has the expected static contract', () => {
   assert.doesNotMatch(cratesReadme, /show-tech\.txt \| prismtty/);
 });
 
+test('site text tokens clear WCAG AA contrast on every surface', () => {
+  const css = read('docs/styles.css');
+  const token = (name) => css.match(new RegExp(`--${name}: (#[0-9a-f]{6});`))[1];
+  const luminance = (hex) => {
+    const channel = (i) => {
+      const v = parseInt(hex.slice(i, i + 2), 16) / 255;
+      return v <= 0.03928 ? v / 12.92 : ((v + 0.055) / 1.055) ** 2.4;
+    };
+    return 0.2126 * channel(1) + 0.7152 * channel(3) + 0.0722 * channel(5);
+  };
+  const ratio = (a, b) => {
+    const [hi, lo] = [luminance(a), luminance(b)].sort((x, y) => y - x);
+    return (hi + 0.05) / (lo + 0.05);
+  };
+  const surfaces = ['bg', 'bg-2', 'panel', 'panel-2'].map(token);
+  // Small text (11-13px labels, footer, comments) needs 4.5:1 on every surface.
+  for (const ink of ['text', 'muted', 'subtle'].map(token)) {
+    for (const surface of surfaces) {
+      assert.ok(
+        ratio(ink, surface) >= 4.5,
+        `${ink} on ${surface} is ${ratio(ink, surface).toFixed(2)}:1`,
+      );
+    }
+  }
+  // The dimmed raw pane only ever sits on the compare box background.
+  const compareRaw = css.match(/\.compare-raw \{ color: (#[0-9a-f]{6}); \}/)[1];
+  const compareBg = css.match(/\.compare \{[^}]*background: (#[0-9a-f]{6});/)[1];
+  assert.ok(
+    ratio(compareRaw, compareBg) >= 4.5,
+    `compare-raw ${compareRaw} on ${compareBg} is ${ratio(compareRaw, compareBg).toFixed(2)}:1`,
+  );
+});
+
+test('profile tabs are wired to their panel', () => {
+  const html = read('docs/index.html');
+  const tabs = html.match(/<button class="profile-tab"[^>]*>/g);
+  assert.equal(tabs.length, 5);
+  for (const tab of tabs) {
+    assert.match(tab, /\bid="tab-[a-z-]+"/);
+    assert.match(tab, /aria-controls="profile-panel"/);
+  }
+  assert.match(html, /id="profile-panel" role="tabpanel" aria-labelledby="tab-cisco" tabindex="0"/);
+  assert.match(read('docs/script.js'), /panel\.setAttribute\('aria-labelledby', tab\.id\)/);
+});
+
 test('site pages ship a strict CSP and self-hosted fonts', () => {
   assert.equal(existsSync('docs/assets/fonts/jetbrains-mono-latin.woff2'), true);
   assert.equal(existsSync('docs/assets/fonts/space-grotesk-latin.woff2'), true);
