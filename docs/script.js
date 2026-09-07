@@ -231,6 +231,7 @@
     const body = root.querySelector('[data-profile-body]');
     const title = root.querySelector('[data-profile-title]');
     const badge = root.querySelector('[data-profile-badge]');
+    const panel = root.querySelector('[role="tabpanel"]');
 
     const show = (key) => {
       const data = PROFILES[key];
@@ -251,6 +252,7 @@
         t.setAttribute('aria-selected', String(t === tab));
         t.tabIndex = t === tab ? 0 : -1;
       });
+      if (panel && tab.id) panel.setAttribute('aria-labelledby', tab.id);
       show(tab.dataset.profile);
     };
 
@@ -285,7 +287,7 @@
       btn.addEventListener('click', async () => {
         try {
           await navigator.clipboard.writeText(btn.dataset.copy);
-          btn.textContent = 'Copied ✓';
+          btn.textContent = 'Copied';
         } catch {
           btn.textContent = 'Select all';
         }
