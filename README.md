@@ -21,15 +21,21 @@ Website: [prismtty.com](https://prismtty.com/).
 
 ## Quick Demo
 
-![Animated PrismTTY terminal demo](.github/assets/prismtty-terminal-demo.svg?v=20261008)
+<p align="center">
+  <img src=".github/assets/prismtty-terminal-demo.svg?v=20261008" alt="Animated PrismTTY terminal demo">
+</p>
 
 ## Preview
 
 Real PrismTTY output over synthetic fixtures (invented hosts, documentation-range addresses):
 
-![Highlighted PrismTTY terminal output](.github/assets/prismtty-terminal-preview.svg?v=20261008)
+<p align="center">
+  <img src=".github/assets/prismtty-terminal-preview.svg?v=20261008" alt="Highlighted PrismTTY terminal output">
+</p>
 
-![Dynamic PrismTTY profile switching](.github/assets/prismtty-profile-switching.svg?v=20261008)
+<p align="center">
+  <img src=".github/assets/prismtty-profile-switching.svg?v=20261008" alt="Dynamic PrismTTY profile switching">
+</p>
 
 ## What This Is / What This Is Not
 
