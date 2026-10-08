@@ -1335,7 +1335,14 @@ a {
   }
 }
 
-@media (max-width: 400px) {
+/* Phones keep the name and three links; README stays in the footer. */
+@media (max-width: 460px) {
+  .nav-links a[href$="#readme"] {
+    display: none;
+  }
+}
+
+@media (max-width: 370px) {
   .brand-name {
     display: none;
   }
@@ -1346,8 +1353,4 @@ a {
   }
 }
 
-@media (max-width: 360px) {
-  .nav-links a[href$="#readme"] {
-    display: none;
-  }
-}
+
