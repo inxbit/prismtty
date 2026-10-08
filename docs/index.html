@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta
       http-equiv="Content-Security-Policy"
-      content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; base-uri 'none'; form-action 'none'"
+      content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; media-src 'self'; font-src 'self'; base-uri 'none'; form-action 'none'"
     >
     <title>PrismTTY - Terminal Output Highlighting</title>
     <meta
@@ -21,12 +21,12 @@
     <meta name="twitter:card" content="summary_large_image">
     <meta name="twitter:image" content="https://prismtty.com/assets/prismtty-social-card.png">
     <link rel="canonical" href="https://prismtty.com/">
-    <meta name="theme-color" content="#020617">
+    <meta name="theme-color" content="#0a0b0d">
     <link rel="icon" href="assets/prismtty-mark.svg" type="image/svg+xml">
-    <link rel="preload" href="assets/fonts/jetbrains-mono-latin.woff2" as="font" type="font/woff2" crossorigin>
-    <link rel="preload" href="assets/fonts/space-grotesk-latin.woff2" as="font" type="font/woff2" crossorigin>
-    <link rel="stylesheet" href="styles.css">
-    <script src="script.js" defer></script>
+    <link rel="preload" href="assets/fonts/vend-sans-latin-var.woff2" as="font" type="font/woff2" crossorigin>
+    <link rel="preload" href="assets/fonts/oxygen-mono-latin.woff2" as="font" type="font/woff2" crossorigin>
+    <link rel="stylesheet" href="site.css">
+    <script src="site.js" defer></script>
     <script type="application/ld+json">
     {
       "@context": "https://schema.org",
@@ -47,231 +47,360 @@
     </script>
   </head>
   <body>
-    <a class="skip-link" href="#top">Skip to content</a>
-
-    <header class="site-header" data-site-header>
-      <a class="brand" href="#top" aria-label="PrismTTY home">
-        <img class="brand-logo" src="assets/prismtty-lockup.svg" alt="" width="68" height="30">
-        <span class="brand-name">Prism<span class="tty">TTY</span></span>
+    <a class="skip" href="#main">Skip to content</a>
+    <header class="nav">
+      <a class="brand" href="#main" aria-label="PrismTTY home">
+        <img class="brand-mark" src="assets/prismtty-mark.svg" alt="" width="60" height="60">
+        <span class="brand-name">PrismTTY</span>
       </a>
-      <nav class="site-nav" aria-label="Primary navigation">
-        <a href="#preview">Demo</a>
-        <a href="#compare">Compare</a>
+      <nav class="nav-links" aria-label="Primary">
         <a href="#profiles">Profiles</a>
         <a href="#install">Install</a>
-        <a class="nav-external" href="https://github.com/inxbit/prismtty">GitHub<svg class="ext" width="9" height="9" viewBox="0 0 10 10" fill="none" aria-hidden="true"><path d="M2 8 L8 2 M3.5 2 H8 V6.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg></a>
+        <a href="https://github.com/inxbit/prismtty#readme">README</a>
+        <a href="https://github.com/inxbit/prismtty">GitHub</a>
       </nav>
     </header>
 
-    <main id="top" tabindex="-1">
+    <main id="main">
       <section class="hero" aria-labelledby="hero-title">
-        <div class="hero-copy">
-          <p class="eyebrow">// network &amp; unix terminal highlighting</p>
-          <h1 id="hero-title">Readable output,<br>live in your terminal.</h1>
-          <p class="specimen" aria-hidden="true"><span class="hl-sev">%LINK-3-UPDOWN</span>: Interface <span class="hl-iface">Gi1/0/2</span>, changed state to <span class="hl-down">down</span></p>
-          <p class="hero-lede">
-            PrismTTY wraps shells, SSH sessions, pipes, and logs with fast PCRE2
-            highlighting tuned for network devices and Unix administration. It never
-            logs in and never stores output. It colors what already flows through
-            your terminal.
+        <div class="hero-frame">
+          <picture class="hero-light-wrap">
+            <source srcset="assets/hero-light.webp" type="image/webp">
+            <img class="hero-light" src="assets/hero-light.png" alt="" width="1536" height="738" decoding="async">
+          </picture>
+
+          <h1 id="hero-title" class="headline">Readable output,<br>live in your terminal.</h1>
+          <p class="lede">PrismTTY colors the output already flowing through your shell, SSH sessions, pipes and logs.</p>
+
+          <div class="actions">
+            <div class="install-chip">
+              <code class="install-cmd"><span class="install-prompt" aria-hidden="true">$</span> brew install inxbit/tap/prismtty</code>
+              <button class="copy" type="button" data-copy="brew install inxbit/tap/prismtty" aria-label="Copy the Homebrew install command">
+                <svg class="ic-copy" width="22" height="22" viewBox="0 0 24 24" fill="none" aria-hidden="true"><rect x="8.5" y="8.5" width="11" height="11" rx="2.2" stroke="currentColor" stroke-width="1.7"/><path d="M15.5 8.5V6.7a2.2 2.2 0 0 0-2.2-2.2H6.7a2.2 2.2 0 0 0-2.2 2.2v6.6a2.2 2.2 0 0 0 2.2 2.2h1.8" stroke="currentColor" stroke-width="1.7"/></svg><svg class="ic-check" width="22" height="22" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M5 12.5l4.5 4.5L19 7.5" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"/></svg>
+              </button>
+              <span class="sr-only" role="status" aria-live="polite"></span>
+            </div>
+            <a class="button-ghost" href="https://github.com/inxbit/prismtty">
+              <img class="gh-mark" src="assets/github-mark.svg" alt="" width="22" height="22">
+              View on GitHub
+            </a>
+          </div>
+
+          <figure class="seam">
+            <pre class="out out-raw" role="group" aria-label="Raw output, before PrismTTY"><!-- raw:hero --><span class="ln">edge-sw1#show interfaces description</span>
+<span class="ln">Gi1/0/1  up  up  Uplink to core-rtr</span>
+<span class="ln">Gi1/0/2  down  down  Spare access port</span>
+<span class="ln">Po10  up  up  Bundle to dist-a</span>
+<span class="ln">edge-sw1#show ip route ospf</span>
+<span class="ln">O  192.0.2.0/24 [110/20] via 198.51.100.1, Vlan1191</span><!-- /raw:hero --></pre>
+            <div class="seam-media">
+              <picture>
+                <source srcset="assets/prism-seam.webp" type="image/webp">
+                <img class="seam-prism" src="assets/prism-seam.png" alt="" width="1536" height="910" fetchpriority="high" decoding="async">
+              </picture>
+              <video class="seam-video" muted playsinline preload="none" aria-hidden="true" hidden></video>
+            </div>
+            <div class="seam-light" aria-hidden="true">
+              <span class="beam"></span>
+              <canvas class="dust"></canvas>
+            </div>
+            <pre class="out out-hl" role="group" aria-label="The same output through PrismTTY"><!-- output:hero --><span class="ln"><span class="c-ffffff">edge-sw1#</span>show interfaces description</span>
+<span class="ln"><span class="c-0099ff">Gi1/0/1</span>  <span class="c-00ff00">up</span>  <span class="c-00ff00">up</span>  Uplink to core-rtr</span>
+<span class="ln"><span class="c-0099ff">Gi1/0/2</span>  <span class="c-ff0000 b">down</span>  <span class="c-ff0000 b">down</span>  Spare access port</span>
+<span class="ln"><span class="c-0099ff">Po10</span>  <span class="c-00ff00">up</span>  <span class="c-00ff00">up</span>  Bundle to dist-a</span>
+<span class="ln"><span class="c-ffffff">edge-sw1#</span>show ip route ospf</span>
+<span class="ln">O  <span class="c-00ffff">192.0.2.0/24</span> [110/20] via <span class="c-00ffff">198.51.100.1</span>, <span class="c-0099ff">Vlan1191</span></span><!-- /output:hero --></pre>
+            <figcaption class="caption">Real PrismTTY output, cisco profile.</figcaption>
+          </figure>
+
+          <hr class="rule">
+
+          <ul class="facts" role="list">
+            <li class="fact">
+              <svg class="fact-icon" width="44" height="44" viewBox="0 0 44 44" fill="none" aria-hidden="true"><circle cx="22" cy="9" r="5" stroke="currentColor" stroke-width="2"/><circle cx="9" cy="34" r="5" stroke="currentColor" stroke-width="2"/><circle cx="35" cy="34" r="5" stroke="currentColor" stroke-width="2"/><path d="M19.4 13.3 11.6 29.7M24.6 13.3l7.8 16.4" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+              <h3 class="fact-title">Follows every hop</h3>
+              <p class="fact-body">One wrapped shell switches profiles as you ssh from device to device, and back again on exit.</p>
+            </li>
+            <li class="fact">
+              <svg class="fact-icon" width="44" height="44" viewBox="0 0 44 44" fill="none" aria-hidden="true"><path d="M11 5h15l9 9v23a2 2 0 0 1-2 2H11a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2Z" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/><path d="M26 5v9h9M15 22h14M15 28h14" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+              <h3 class="fact-title">Nine built-in profiles</h3>
+              <p class="fact-body">Cisco, Juniper, Fortinet, Palo Alto, Arista, Aruba CX, Versa and Linux, on a generic base.</p>
+            </li>
+            <li class="fact">
+              <svg class="fact-icon" width="44" height="44" viewBox="0 0 44 44" fill="none" aria-hidden="true"><rect x="9" y="19" width="26" height="20" rx="3" stroke="currentColor" stroke-width="2"/><path d="M15 19v-5a7 7 0 0 1 14 0v5" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+              <h3 class="fact-title">Nothing stored by default</h3>
+              <p class="fact-body">No network code and no telemetry. Output is never written unless you ask for a trace.</p>
+            </li>
+          </ul>
+        </div>
+      </section>
+
+      <section class="section hop" id="hop" aria-labelledby="hop-title">
+        <div class="wrap">
+          <header class="section-head">
+            <h2 id="hop-title">One shell follows every hop.</h2>
+            <p class="section-lede">Start one wrapped shell with <code>ptty /bin/zsh</code> and keep your usual ssh, telnet and console habits. When a login banner or prompt matches after you jump, PrismTTY switches to that vendor's profile. When the connection closes, it switches back.</p>
+          </header>
+
+          <figure class="term hop-term">
+            <div class="term-bar">
+              <span class="term-title">ptty /bin/zsh</span>
+              <span class="term-badge">generic + top of stack</span>
+            </div>
+            <ol class="hop-steps" role="list">
+              <li class="hop-step">
+                <p class="hop-stack"><span class="on">linux-unix</span></p>
+                <pre class="out-block"><!-- output:hop1 --><span class="ln"><span class="c-ffffff">ops@workstation:~$</span> ssh admin@edge-sw1.example.net</span><!-- /output:hop1 --></pre>
+              </li>
+              <li class="hop-step">
+                <p class="hop-stack"><span>linux-unix</span> <span class="hop-op" aria-hidden="true">+</span><span class="sr-only">push</span> <span class="on">cisco</span></p>
+                <pre class="out-block"><!-- output:hop2 --><span class="ln"><span class="c-ffffff">edge-sw1#</span>show ip interface brief</span>
+<span class="ln">Interface              IP-Address      <span class="c-00ff00">OK</span>? Method Status                Protocol</span>
+<span class="ln"><span class="c-0099ff">GigabitEthernet1/0/1</span>   <span class="c-00ffff">192.0.2.1</span>       YES manual <span class="c-00ff00">up</span>                    <span class="c-00ff00">up</span></span>
+<span class="ln"><span class="c-0099ff">GigabitEthernet1/0/2</span>   unassigned      YES unset  administratively <span class="c-ff0000 b">down</span> <span class="c-ff0000 b">down</span></span>
+<span class="ln"><span class="c-0099ff">Vlan1191</span>               <span class="c-00ffff">198.51.100.1</span>    YES manual <span class="c-00ff00">up</span>                    <span class="c-00ff00">up</span></span>
+<span class="ln"><span class="c-ffffff">edge-sw1#</span>ssh -l admin core-rtr.example.net</span><!-- /output:hop2 --></pre>
+              </li>
+              <li class="hop-step">
+                <p class="hop-stack"><span>linux-unix</span> <span>cisco</span> <span class="hop-op" aria-hidden="true">+</span><span class="sr-only">push</span> <span class="on">juniper</span></p>
+                <pre class="out-block"><!-- output:hop3 --><span class="ln"><span class="c-00bfff">admin@core-rtr&gt;</span> show interfaces terse ge-0/0/*</span>
+<span class="ln">Interface               Admin Link Proto    Local</span>
+<span class="ln"><span class="c-0099ff">ge-0/0/0</span>                <span class="c-00ff00">up</span>    <span class="c-00ff00">up</span></span>
+<span class="ln"><span class="c-0099ff">ge-0/0/0.0</span>              <span class="c-00ff00">up</span>    <span class="c-00ff00">up</span>   inet     <span class="c-00ffff">192.0.2.2/30</span></span>
+<span class="ln"><span class="c-0099ff">ge-0/0/1</span>                <span class="c-00ff00">up</span>    <span class="c-ff0000 b">down</span></span>
+<span class="ln"><span class="c-00bfff">admin@core-rtr&gt;</span> exit</span><!-- /output:hop3 --></pre>
+              </li>
+              <li class="hop-step">
+                <p class="hop-stack"><span>linux-unix</span> <span class="on">cisco</span> <span class="hop-op" aria-hidden="true">&minus;</span><span class="sr-only">pop</span> <s>juniper</s></p>
+                <pre class="out-block"><!-- output:hop4 --><span class="ln">Connection to core-rtr.example.net closed.</span>
+<span class="ln"><span class="c-ffffff">edge-sw1#</span></span><!-- /output:hop4 --></pre>
+              </li>
+            </ol>
+            <figcaption class="term-note">Each block is real PrismTTY output for the profile marked on its left. The labels show the stack a wrapped shell keeps: a profile is pushed after <code>ssh</code>, <code>telnet</code>, <code>screen</code> or a serial console when the banner or prompt matches, and popped when the connection closes.</figcaption>
+          </figure>
+        </div>
+      </section>
+
+      <section class="section profiles" id="profiles" aria-labelledby="profiles-title">
+        <div class="wrap">
+          <header class="section-head">
+            <h2 id="profiles-title">Nine built-in profiles, written clean-room.</h2>
+            <p class="section-lede">Each profile knows how its platform writes prompts, interfaces, addresses, protocol state, counters and syslog severity. The generic profile underneath covers IPv4, IPv6, MAC addresses and common state words everywhere.</p>
+          </header>
+
+          <div class="profiles-demo" data-tabs>
+            <div class="tabs" role="tablist" aria-label="Built-in profiles">
+              <button class="tab" role="tab" id="tab-cisco" aria-controls="panel-cisco" aria-selected="true" type="button">cisco</button>
+              <button class="tab" role="tab" id="tab-juniper" aria-controls="panel-juniper" aria-selected="false" tabindex="-1" type="button">juniper</button>
+              <button class="tab" role="tab" id="tab-fortinet" aria-controls="panel-fortinet" aria-selected="false" tabindex="-1" type="button">fortinet</button>
+              <button class="tab" role="tab" id="tab-palo-alto" aria-controls="panel-palo-alto" aria-selected="false" tabindex="-1" type="button">palo-alto</button>
+              <button class="tab" role="tab" id="tab-arista" aria-controls="panel-arista" aria-selected="false" tabindex="-1" type="button">arista</button>
+              <button class="tab" role="tab" id="tab-arubacx" aria-controls="panel-arubacx" aria-selected="false" tabindex="-1" type="button">arubacx</button>
+              <button class="tab" role="tab" id="tab-versa" aria-controls="panel-versa" aria-selected="false" tabindex="-1" type="button">versa</button>
+              <button class="tab" role="tab" id="tab-linux-unix" aria-controls="panel-linux-unix" aria-selected="false" tabindex="-1" type="button">linux-unix</button>
+            </div>
+            <div class="term profiles-term">
+              <div class="term-bar">
+                <span class="term-title">ptty /bin/zsh</span>
+                <span class="term-badge">generic + <span data-profile-name>cisco</span></span>
+              </div>
+              <div class="tab-panels">
+                <pre class="out-block tab-panel" role="tabpanel" id="panel-cisco" aria-labelledby="tab-cisco" tabindex="0"><!-- output:tab-cisco --><span class="ln"><span class="c-ffffff">LAB-IOS-01#</span>show version</span>
+<span class="ln">Cisco IOS XE Software, Version 17.09.04</span>
+<span class="ln"><span class="c-ffffff">LAB-IOS-01#</span>show interfaces description</span>
+<span class="ln">Interface              Status         Protocol Description</span>
+<span class="ln"><span class="c-0099ff">Gi1/0/1</span>                <span class="c-00ff00">up</span>             <span class="c-00ff00">up</span>       Uplink to LAB-CORE</span>
+<span class="ln"><span class="c-0099ff">Gi1/0/2</span>                <span class="c-ff0000 b">down</span>           <span class="c-ff0000 b">down</span>     Spare access port</span>
+<span class="ln"><span class="c-0099ff">Po10</span>                   <span class="c-00ff00">up</span>             <span class="c-00ff00">up</span>       Bundle to DIST-A</span>
+<span class="ln"><span class="c-0099ff">Vlan1191</span>               <span class="c-00ff00">up</span>             <span class="c-00ff00">up</span>       Synthetic users VLAN</span>
+<span class="ln"><span class="c-ffffff">LAB-IOS-01#</span>show ip route</span>
+<span class="ln">O        <span class="c-00ffff">192.0.2.0/24</span> [110/20] via <span class="c-00ffff">198.51.100.1</span>, 00:00:14, <span class="c-0099ff">Vlan1191</span></span>
+<span class="ln">B        <span class="c-00ffff">203.0.113.0/24</span> [20/0] via <span class="c-00ffff">198.51.100.2</span>, 00:01:02</span><!-- /output:tab-cisco --></pre>
+                <pre class="out-block tab-panel" role="tabpanel" id="panel-juniper" aria-labelledby="tab-juniper" tabindex="0"><!-- output:tab-juniper --><span class="ln"><span class="c-00bfff">lab@mx-lab-01&gt;</span> show version</span>
+<span class="ln">Junos: 22.4R3.8</span>
+<span class="ln"><span class="c-00bfff">lab@mx-lab-01&gt;</span> show interfaces descriptions</span>
+<span class="ln">Interface       Admin Link Description</span>
+<span class="ln"><span class="c-0099ff">ge-0/0/0</span>        <span class="c-00ff00">up</span>    <span class="c-00ff00">up</span>   Transit to lab core</span>
+<span class="ln"><span class="c-0099ff">xe-7/0/2</span>        <span class="c-ff0000 b">down</span>  <span class="c-ff0000 b">down</span> Spare optic</span>
+<span class="ln"><span class="c-0099ff">reth1.808</span>       <span class="c-00ff00">up</span>    <span class="c-00ff00">up</span>   Synthetic trust segment</span>
+<span class="ln"><span class="c-0099ff">st0.9</span>           <span class="c-00ff00">up</span>    <span class="c-00ff00">up</span>   Synthetic VPN tunnel</span>
+<span class="ln"><span class="c-00bfff">lab@mx-lab-01&gt;</span> show route protocol ospf</span>
+<span class="ln"><span class="c-00ffff">192.0.2.0/24</span>    *[OSPF/10] 00:01:20, metric 20</span>
+<span class="ln">                 &gt; to <span class="c-00ffff">198.51.100.1</span> via <span class="c-0099ff">ge-0/0/0.0</span></span><!-- /output:tab-juniper --></pre>
+                <pre class="out-block tab-panel" role="tabpanel" id="panel-fortinet" aria-labelledby="tab-fortinet" tabindex="0"><!-- output:tab-fortinet --><span class="ln"><span class="c-ffffff">FGT-LAB-01 #</span> get system status</span>
+<span class="ln">Version: FortiGate-VM64 v7.4.3,build2573</span>
+<span class="ln">Hostname: FGT-LAB-01</span>
+<span class="ln"><span class="c-ffffff">FGT-LAB-01 #</span> get system interface</span>
+<span class="ln">== [ <span class="c-0099ff">port1</span> ]</span>
+<span class="ln">name: <span class="c-0099ff">port1</span>   mode: static   ip: <span class="c-00ffff">192.0.2.10</span> <span class="c-00ffff">255.255.255.0</span>   status: <span class="c-00ff00">up</span></span>
+<span class="ln">== [ <span class="c-0099ff">port2</span> ]</span>
+<span class="ln">name: <span class="c-0099ff">port2</span>   mode: dhcp     ip: <span class="c-00ffff">0.0.0.0</span> <span class="c-00ffff">0.0.0.0</span>            status: <span class="c-ff0000 b">down</span></span>
+<span class="ln"><span class="c-ffffff">FGT-LAB-01 #</span> get router info routing-table all</span>
+<span class="ln">S*      <span class="c-00ffff">0.0.0.0/0</span> [10/0] via <span class="c-00ffff">192.0.2.1</span>, <span class="c-0099ff">port1</span></span>
+<span class="ln">O       <span class="c-00ffff">198.51.100.0/24</span> [110/20] via <span class="c-00ffff">192.0.2.2</span>, <span class="c-0099ff">port1</span></span><!-- /output:tab-fortinet --></pre>
+                <pre class="out-block tab-panel" role="tabpanel" id="panel-palo-alto" aria-labelledby="tab-palo-alto" tabindex="0"><!-- output:tab-palo-alto --><span class="ln"><span class="c-00bfff">admin@pa-lab-01&gt;</span> show system info</span>
+<span class="ln">hostname: pa-lab-01</span>
+<span class="ln">model: PA-VM</span>
+<span class="ln">sw-version: 11.1.0</span>
+<span class="ln"><span class="c-00bfff">admin@pa-lab-01&gt;</span> show interface all</span>
+<span class="ln">name                id    <span class="c-ff00ff">vsys</span> zone             <span class="c-00ff00">forwarding</span>               tag    address</span>
+<span class="ln"><span class="c-0099ff">ethernet1/1</span>         16    1    untrust          vr:default               0      <span class="c-00ffff">192.0.2.10/24</span></span>
+<span class="ln"><span class="c-0099ff">ethernet1/2.1191</span>    17    1    trust            vr:default               1191   <span class="c-00ffff">198.51.100.10/24</span></span>
+<span class="ln"><span class="c-0099ff">tunnel.10</span>           20    1    vpn              vr:default               0      <span class="c-00ffff">203.0.113.10/32</span></span>
+<span class="ln"><span class="c-00bfff">admin@pa-lab-01&gt;</span> show routing route</span>
+<span class="ln">S <span class="c-00ffff">0.0.0.0/0</span> [10/0] via <span class="c-00ffff">192.0.2.1</span>, <span class="c-0099ff">ethernet1/1</span></span><!-- /output:tab-palo-alto --></pre>
+                <pre class="out-block tab-panel" role="tabpanel" id="panel-arista" aria-labelledby="tab-arista" tabindex="0"><!-- output:tab-arista --><span class="ln"><span class="c-ffffff">ceos-lab-01#</span>show version</span>
+<span class="ln">Arista cEOSLab</span>
+<span class="ln">Software image version: 4.36.0F</span>
+<span class="ln"><span class="c-ffffff">ceos-lab-01#</span>show interfaces description</span>
+<span class="ln">Interface       Status  Protocol Description</span>
+<span class="ln"><span class="c-0099ff">Ethernet1</span>       <span class="c-00ff00">up</span>      <span class="c-00ff00">up</span>       Spine uplink</span>
+<span class="ln"><span class="c-0099ff">Et2</span>             <span class="c-ff0000 b">down</span>    <span class="c-ff0000 b">down</span>     Spare lab link</span>
+<span class="ln"><span class="c-0099ff">Port-Channel10</span>  <span class="c-00ff00">up</span>      <span class="c-00ff00">up</span>       <span class="c-ff00ff">MLAG</span> <span class="c-ff00ff">peer-link</span></span>
+<span class="ln"><span class="c-0099ff">Vlan1191</span>        <span class="c-00ff00">up</span>      <span class="c-00ff00">up</span>       Synthetic client vlan</span>
+<span class="ln"><span class="c-ffffff">ceos-lab-01#</span>show ip route</span>
+<span class="ln">O        <span class="c-00ffff">192.0.2.0/24</span> [110/20] via <span class="c-00ffff">198.51.100.1</span>, <span class="c-0099ff">Ethernet1</span></span><!-- /output:tab-arista --></pre>
+                <pre class="out-block tab-panel" role="tabpanel" id="panel-arubacx" aria-labelledby="tab-arubacx" tabindex="0"><!-- output:tab-arubacx --><span class="ln"><span class="c-ffffff">LAB-ARUBA-01#</span> show version</span>
+<span class="ln"><span class="c-ff00ff">ArubaOS-CX</span> 10.13.1000</span>
+<span class="ln"><span class="c-ffffff">LAB-ARUBA-01#</span> show interface brief</span>
+<span class="ln">Interface  Status  Protocol  Description</span>
+<span class="ln"><span class="c-0099ff">1/1/1</span>      <span class="c-00ff00">up</span>      <span class="c-00ff00">up</span>        Core uplink</span>
+<span class="ln"><span class="c-0099ff">1/1/2</span>      <span class="c-ff0000 b">down</span>    <span class="c-ff0000 b">down</span>      Spare copper</span>
+<span class="ln"><span class="c-0099ff">lag10</span>      <span class="c-00ff00">up</span>      <span class="c-00ff00">up</span>        Access aggregate</span>
+<span class="ln"><span class="c-0099ff">vlan1191</span>   <span class="c-00ff00">up</span>      <span class="c-00ff00">up</span>        Synthetic wireless vlan</span>
+<span class="ln"><span class="c-ffffff">LAB-ARUBA-01#</span> show events</span>
+<span class="ln">2026-05-07T12:00:00.000000+00:00 LAB-ARUBA-01 <span class="c-ff00ff">hpe-restd</span>[2529]: Event|7708|<span class="c-65d7fd">LOG_INFO</span>|AMM|1/1|Certificate example <span class="c-00ff00">accepted</span></span><!-- /output:tab-arubacx --></pre>
+                <pre class="out-block tab-panel" role="tabpanel" id="panel-versa" aria-labelledby="tab-versa" tabindex="0"><!-- output:tab-versa --><span class="ln"><span class="c-00bfff">admin@versa-lab-01&gt;</span> show system details</span>
+<span class="ln">Appliance Name: versa-lab-01</span>
+<span class="ln">Software Version: 22.1.4</span>
+<span class="ln"><span class="c-00bfff">admin@versa-lab-01&gt;</span> show interfaces brief</span>
+<span class="ln">NAME        TYPE      ADMIN  OPER  VRF       IP</span>
+<span class="ln"><span class="c-0099ff">vni-0/0</span>     ethernet  <span class="c-00ff00">up</span>     <span class="c-00ff00">up</span>    global    <span class="c-00ffff">192.0.2.20/24</span></span>
+<span class="ln"><span class="c-0099ff">tvi-0/332</span>   tunnel    <span class="c-00ff00">up</span>     <span class="c-00ff00">up</span>    TenantA   <span class="c-00ffff">198.51.100.20/30</span></span>
+<span class="ln"><span class="c-0099ff">ptvi-1</span>      tunnel    <span class="c-ff0000 b">down</span>   <span class="c-ff0000 b">down</span>  TenantA   -</span>
+<span class="ln"><span class="c-00bfff">admin@versa-lab-01&gt;</span> show route table</span>
+<span class="ln">TenantA  <span class="c-00ffff">203.0.113.0/24</span>  via <span class="c-00ffff">198.51.100.21</span>  <span class="c-0099ff">tvi-0/332</span></span><!-- /output:tab-versa --></pre>
+                <pre class="out-block tab-panel" role="tabpanel" id="panel-linux-unix" aria-labelledby="tab-linux-unix" tabindex="0"><!-- output:tab-linux-unix --><span class="ln"><span class="c-ff0000 b">root</span><span class="c-ffffff">@linux-lab:~#</span> hostnamectl</span>
+<span class="ln">Operating System: Ubuntu 24.04.4 LTS</span>
+<span class="ln">Kernel: Linux 6.8.0-110-generic</span>
+<span class="ln"><span class="c-ff0000 b">root</span><span class="c-ffffff">@linux-lab:~#</span> ip -br addr</span>
+<span class="ln">lo               UNKNOWN        <span class="c-00ffff">127.0.0.1/8</span> <span class="c-00ffff">::1/128</span></span>
+<span class="ln">ens18            <span class="c-00ff00">UP</span>             <span class="c-00ffff">192.0.2.50/24</span></span>
+<span class="ln"><span class="c-ff0000 b">root</span><span class="c-ffffff">@linux-lab:~#</span> ss -tulpen</span>
+<span class="ln">tcp   LISTEN 0 4096 <span class="c-00ffff">0.0.0.0</span><span class="c-00ffc0">:22</span>    <span class="c-00ffff">0.0.0.0</span>:* users:(("sshd",pid=101,fd=3))</span>
+<span class="ln">udp   UNCONN 0 0    <span class="c-00ffff">127.0.0.53</span><span class="c-00ffc0">:53</span> <span class="c-00ffff">0.0.0.0</span>:* users:(("systemd-resolve",pid=88,fd=13))</span>
+<span class="ln"><span class="c-ff0000 b">root</span><span class="c-ffffff">@linux-lab:~#</span> systemctl --<span class="c-ff0000 b">failed</span></span>
+<span class="ln">UNIT              LOAD   <span class="c-00ff00">ACTIVE</span> SUB    DESCRIPTION</span><!-- /output:tab-linux-unix --></pre>
+              </div>
+            </div>
+            <p class="term-note">Real PrismTTY output over the synthetic fixtures in the repository: invented hosts, documentation-range addresses. Colors are each profile's defaults; every rule can be changed in your own config.</p>
+          </div>
+        </div>
+      </section>
+
+      <section class="section install" id="install" aria-labelledby="install-title">
+        <div class="wrap install-wrap">
+          <header class="section-head">
+            <h2 id="install-title">Up and highlighting in one line.</h2>
+            <p class="section-lede">macOS and Linux. Homebrew installs <code>prismtty</code>, <code>ptty</code> and <code>ct</code>, shell completions and the PCRE2 dependency. Cargo needs Rust 1.85 or newer, PCRE2 and pkg-config.</p>
+          </header>
+          <div class="install-rows">
+            <div class="install-row">
+              <span class="install-label">Homebrew</span>
+              <code class="install-line"><span class="install-prompt" aria-hidden="true">$</span> brew install inxbit/tap/prismtty</code>
+              <button class="copy" type="button" data-copy="brew install inxbit/tap/prismtty" aria-label="Copy the Homebrew install command"><svg class="ic-copy" width="22" height="22" viewBox="0 0 24 24" fill="none" aria-hidden="true"><rect x="8.5" y="8.5" width="11" height="11" rx="2.2" stroke="currentColor" stroke-width="1.7"/><path d="M15.5 8.5V6.7a2.2 2.2 0 0 0-2.2-2.2H6.7a2.2 2.2 0 0 0-2.2 2.2v6.6a2.2 2.2 0 0 0 2.2 2.2h1.8" stroke="currentColor" stroke-width="1.7"/></svg><svg class="ic-check" width="22" height="22" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M5 12.5l4.5 4.5L19 7.5" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
+              <span class="sr-only" role="status" aria-live="polite"></span>
+            </div>
+            <div class="install-row">
+              <span class="install-label">Cargo</span>
+              <code class="install-line"><span class="install-prompt" aria-hidden="true">$</span> cargo install prismtty</code>
+              <button class="copy" type="button" data-copy="cargo install prismtty" aria-label="Copy the Cargo install command"><svg class="ic-copy" width="22" height="22" viewBox="0 0 24 24" fill="none" aria-hidden="true"><rect x="8.5" y="8.5" width="11" height="11" rx="2.2" stroke="currentColor" stroke-width="1.7"/><path d="M15.5 8.5V6.7a2.2 2.2 0 0 0-2.2-2.2H6.7a2.2 2.2 0 0 0-2.2 2.2v6.6a2.2 2.2 0 0 0 2.2 2.2h1.8" stroke="currentColor" stroke-width="1.7"/></svg><svg class="ic-check" width="22" height="22" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M5 12.5l4.5 4.5L19 7.5" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
+              <span class="sr-only" role="status" aria-live="polite"></span>
+            </div>
+            <div class="install-row">
+              <span class="install-label">Run</span>
+              <code class="install-line"><span class="install-prompt" aria-hidden="true">$</span> ptty /bin/zsh</code>
+              <button class="copy" type="button" data-copy="ptty /bin/zsh" aria-label="Copy the command that starts a wrapped shell"><svg class="ic-copy" width="22" height="22" viewBox="0 0 24 24" fill="none" aria-hidden="true"><rect x="8.5" y="8.5" width="11" height="11" rx="2.2" stroke="currentColor" stroke-width="1.7"/><path d="M15.5 8.5V6.7a2.2 2.2 0 0 0-2.2-2.2H6.7a2.2 2.2 0 0 0-2.2 2.2v6.6a2.2 2.2 0 0 0 2.2 2.2h1.8" stroke="currentColor" stroke-width="1.7"/></svg><svg class="ic-check" width="22" height="22" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M5 12.5l4.5 4.5L19 7.5" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
+              <span class="sr-only" role="status" aria-live="polite"></span>
+            </div>
+          </div>
+          <p class="install-links">
+            <a href="https://crates.io/crates/prismtty">crates.io</a>
+            <a href="https://github.com/inxbit/prismtty/releases">GitHub releases</a>
+            <a href="https://github.com/inxbit/homebrew-tap">Homebrew tap</a>
+            <a href="https://docs.rs/prismtty">Library docs</a>
           </p>
-          <div class="hero-actions">
-            <a class="button primary" href="#install">Install PrismTTY</a>
-            <a class="button ghost" href="https://github.com/inxbit/prismtty">View source<svg class="ext" width="10" height="10" viewBox="0 0 10 10" fill="none" aria-hidden="true"><path d="M2 8 L8 2 M3.5 2 H8 V6.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg></a>
-          </div>
-          <p class="hero-facts" aria-label="Project highlights"><strong>9</strong> built-in profiles<span class="sep">·</span><strong>v1.2.5</strong><span class="sep">·</span><strong>PCRE2</strong> engine<span class="sep">·</span><strong>MIT</strong> licensed</p>
-        </div>
-
-        <figure class="terminal hero-terminal" id="preview">
-          <div class="terminal-bar">
-            <span class="terminal-title" data-terminal-title>ptty ssh edge-sw1.example.net</span>
-            <span class="terminal-badge">profile: <span class="badge-key">cisco</span></span>
-          </div>
-          <div class="terminal-body" data-terminal aria-hidden="true"></div>
-          <figcaption class="sr-only">
-            A live terminal session: PrismTTY wraps an SSH connection to a switch and
-            highlights interfaces in amber, IP addresses in cyan, link state in green and
-            pink, and syslog severity in violet.
-          </figcaption>
-        </figure>
-      </section>
-
-      <section class="section compare-section" id="compare" aria-labelledby="compare-title">
-        <div class="section-heading compact">
-          <p class="section-label">// compare</p>
-          <h2 id="compare-title">Nothing changes but where your eyes land.</h2>
-          <p class="section-sub">
-            Left of the seam is the raw dump. Right of it is the same bytes through
-            PrismTTY: interfaces, addresses, state, and severity each carry their
-            own color.
-          </p>
-        </div>
-
-        <div class="compare" data-compare>
-          <pre class="compare-pane compare-raw" data-compare-raw aria-hidden="true"></pre>
-          <pre class="compare-pane compare-hl" data-compare-hl aria-hidden="true"></pre>
-          <div class="compare-divider" data-compare-divider aria-hidden="true">
-            <span class="compare-knob"><svg width="16" height="12" viewBox="0 0 16 12" fill="none" aria-hidden="true"><path d="M5 1 L1 6 L5 11 M11 1 L15 6 L11 11" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
-          </div>
-          <label class="sr-only" for="compare-range">Reveal PrismTTY highlighting</label>
-          <input
-            class="compare-range"
-            id="compare-range"
-            type="range"
-            min="0"
-            max="100"
-            value="46"
-            data-compare-range
-          >
-          <span class="compare-tag compare-tag-left" aria-hidden="true">raw</span>
-          <span class="compare-tag compare-tag-right" aria-hidden="true">prismtty</span>
         </div>
       </section>
 
-      <section class="section features-section" id="features" aria-labelledby="features-title">
-        <h2 id="features-title" class="section-label">// what it does</h2>
-        <div class="feature-list">
-          <article class="feature-row">
-            <h3>Network-aware profiles</h3>
-            <p>
-              Clean-room rules for prompts, interfaces, addresses, protocol state,
-              counters, syslog severity, and common vendor terms, tuned per platform
-              rather than one generic rule set.
-            </p>
-          </article>
-          <article class="feature-row">
-            <h3>Interactive shell wrapping</h3>
-            <p>
-              Start one wrapped shell with <code>ptty /bin/zsh</code>, then keep your
-              normal SSH, telnet, and console habits. Highlighting follows whatever
-              the session becomes.
-            </p>
-          </article>
-          <article class="feature-row">
-            <h3>ChromaTerm-compatible rules</h3>
-            <p>
-              Loads existing ChromaTerm YAML alongside native profiles, validates
-              profile files, and reloads long-running sessions after config changes.
-            </p>
-          </article>
-        </div>
-      </section>
-
-      <section class="section profiles-section" id="profiles" aria-labelledby="profiles-title">
-        <div class="section-heading compact">
-          <p class="section-label">// dynamic profile switching</p>
-          <h2 id="profiles-title">One wrapped shell follows the device context.</h2>
-          <p class="section-sub">
-            PrismTTY watches login banners, prompts, and remote-jump commands, then
-            re-colors the same kinds of output the way each vendor writes them.
-          </p>
-        </div>
-
-        <div class="profiles-demo" data-profiles>
-          <div class="profile-tabs" role="tablist" aria-label="Built-in profiles">
-            <button class="profile-tab" role="tab" id="tab-cisco" aria-controls="profile-panel" data-profile="cisco" aria-selected="true">cisco</button>
-            <button class="profile-tab" role="tab" id="tab-juniper" aria-controls="profile-panel" data-profile="juniper" aria-selected="false">juniper</button>
-            <button class="profile-tab" role="tab" id="tab-fortinet" aria-controls="profile-panel" data-profile="fortinet" aria-selected="false">fortinet</button>
-            <button class="profile-tab" role="tab" id="tab-arista" aria-controls="profile-panel" data-profile="arista" aria-selected="false">arista</button>
-            <button class="profile-tab" role="tab" id="tab-linux-unix" aria-controls="profile-panel" data-profile="linux-unix" aria-selected="false">linux-unix</button>
-          </div>
-          <div class="terminal profile-terminal" id="profile-panel" role="tabpanel" aria-labelledby="tab-cisco" tabindex="0">
-            <div class="terminal-bar">
-              <span class="terminal-title" data-profile-title></span>
-              <span class="terminal-badge">profile: <span class="badge-key" data-profile-badge>cisco</span></span>
+      <section class="section scope" id="scope" aria-labelledby="scope-title">
+        <div class="wrap">
+          <header class="section-head">
+            <h2 id="scope-title">Live terminal highlighting, not device management.</h2>
+          </header>
+          <div class="scope-cols">
+            <div class="scope-col">
+              <h3>What it colors</h3>
+              <ul class="scope-list" role="list">
+                <li>Prompts</li>
+                <li>Interfaces</li>
+                <li>Addresses: IPv4, IPv6, MAC</li>
+                <li>Protocol and operational state</li>
+                <li>Syslog severity</li>
+                <li>Counters and vendor terms</li>
+              </ul>
+              <p>In output that already reaches your terminal. Existing ChromaTerm configs load as they are, and <code>ct</code> keeps the old command name working.</p>
             </div>
-            <div class="terminal-body" data-profile-body aria-live="polite"></div>
-          </div>
-        </div>
-
-        <p class="inline-list" aria-label="All built-in profiles">generic<span class="sep">·</span>linux-unix<span class="sep">·</span>cisco<span class="sep">·</span>juniper<span class="sep">·</span>fortinet<span class="sep">·</span>palo-alto<span class="sep">·</span>arista<span class="sep">·</span>arubacx<span class="sep">·</span>versa</p>
-      </section>
-
-      <section class="section install-section" id="install" aria-labelledby="install-title">
-        <div class="section-heading compact">
-          <p class="section-label">// install</p>
-          <h2 id="install-title">Up and highlighting in one line.</h2>
-        </div>
-        <div class="install-block">
-          <div class="install-row">
-            <div class="install-cmd">
-              <span class="cmd-comment"># homebrew: installs prismtty, ptty, ct, profiles, completions</span>
-              <span class="cmd-line"><span class="prompt">$</span> <code>brew install inxbit/tap/prismtty</code></span>
+            <div class="scope-col">
+              <h3>What it never does</h3>
+              <ul class="scope-list" role="list">
+                <li>Log in to devices</li>
+                <li>Collect inventory</li>
+                <li>Push configuration</li>
+                <li>Store operational data</li>
+                <li>Open a network connection</li>
+              </ul>
+              <p>Not an NMS, a configuration tool, a source of truth, a SIEM, a log platform or an inventory system. The binary has no network code.</p>
             </div>
-            <button class="copy-button" type="button" data-copy="brew install inxbit/tap/prismtty">Copy</button>
-          </div>
-          <div class="install-row">
-            <div class="install-cmd">
-              <span class="cmd-comment"># cargo, from crates.io</span>
-              <span class="cmd-line"><span class="prompt">$</span> <code>cargo install prismtty</code></span>
-            </div>
-            <button class="copy-button" type="button" data-copy="cargo install prismtty">Copy</button>
-          </div>
-          <div class="install-row">
-            <div class="install-cmd">
-              <span class="cmd-comment"># start a wrapped shell</span>
-              <span class="cmd-line"><span class="prompt">$</span> <code>ptty /bin/zsh</code></span>
-            </div>
-            <button class="copy-button" type="button" data-copy="ptty /bin/zsh">Copy</button>
-          </div>
-        </div>
-        <div class="install-links">
-          <a href="https://crates.io/crates/prismtty">crates.io package<svg class="ext" width="9" height="9" viewBox="0 0 10 10" fill="none" aria-hidden="true"><path d="M2 8 L8 2 M3.5 2 H8 V6.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg></a>
-          <a href="https://github.com/inxbit/prismtty/releases">GitHub releases<svg class="ext" width="9" height="9" viewBox="0 0 10 10" fill="none" aria-hidden="true"><path d="M2 8 L8 2 M3.5 2 H8 V6.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg></a>
-          <a href="https://github.com/inxbit/homebrew-tap">Homebrew tap<svg class="ext" width="9" height="9" viewBox="0 0 10 10" fill="none" aria-hidden="true"><path d="M2 8 L8 2 M3.5 2 H8 V6.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg></a>
-        </div>
-      </section>
-
-      <section class="section scope-section" id="scope" aria-labelledby="scope-title">
-        <div class="section-heading compact">
-          <p class="section-label">// scope</p>
-          <h2 id="scope-title">Live terminal highlighting, not device management.</h2>
-        </div>
-        <div class="scope-grid">
-          <div class="scope-col">
-            <h3><span class="scope-tick scope-tick-yes" aria-hidden="true">+</span> What it is</h3>
-            <p>
-              A live terminal-output highlighter for shells, SSH sessions, pipes,
-              and logs. It adds color to prompts, interfaces, addresses, protocol
-              state, counters, severity, and common vendor terms.
-            </p>
-          </div>
-          <div class="scope-col">
-            <h3><span class="scope-tick scope-tick-no" aria-hidden="true">&minus;</span> What it is not</h3>
-            <p>
-              Not an NMS, a configuration tool, a source of truth, a SIEM, a log
-              platform, or an inventory system. It never logs in to devices,
-              collects inventory, pushes configuration, or stores operational data.
-            </p>
           </div>
         </div>
       </section>
 
-      <section class="section feedback-section" id="feedback" aria-labelledby="feedback-title">
-        <div class="section-heading compact">
-          <p class="section-label">// feedback wanted</p>
+      <section class="section feedback" id="feedback" aria-labelledby="feedback-title">
+        <div class="wrap feedback-wrap">
           <h2 id="feedback-title">Profile coverage improves with real-world testing.</h2>
-          <p class="section-sub">
-            Reports from real sessions help most, especially across the built-in
-            profiles and custom profile files for other vendors and appliances.
-          </p>
+          <p class="section-lede">Feedback wanted from real sessions, especially on these platforms and on custom profiles for other vendors and appliances. Strip hostnames and addresses before you paste.</p>
+          <ul class="vendors" role="list" aria-label="Platforms wanted for testing">
+            <li>Cisco IOS, IOS XE, IOS XR, NX-OS, ASA</li>
+            <li>Juniper Junos</li>
+            <li>Fortinet FortiOS</li>
+            <li>Palo Alto PAN-OS</li>
+            <li>Arista EOS</li>
+            <li>Aruba CX</li>
+            <li>Versa</li>
+            <li>Linux and Unix</li>
+          </ul>
+          <a class="button-ghost issue-link" href="https://github.com/inxbit/prismtty/issues">Open an issue on GitHub</a>
         </div>
-        <p class="inline-list" aria-label="Profiles and vendors wanted for testing">Cisco IOS / IOS XE / IOS XR / NX-OS / ASA<span class="sep">·</span>Juniper Junos<span class="sep">·</span>Fortinet FortiGate / FortiOS<span class="sep">·</span>Palo Alto PAN-OS<span class="sep">·</span>Arista EOS<span class="sep">·</span>Aruba CX<span class="sep">·</span>Versa<span class="sep">·</span>Linux / Unix</p>
-        <a class="issue-link" href="https://github.com/inxbit/prismtty/issues">Open an issue on GitHub<svg class="ext" width="9" height="9" viewBox="0 0 10 10" fill="none" aria-hidden="true"><path d="M2 8 L8 2 M3.5 2 H8 V6.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg></a>
       </section>
     </main>
 
-    <footer class="site-footer">
-      <div class="footer-brand">
-        <img class="brand-logo" src="assets/prismtty-lockup.svg" alt="" width="54" height="24">
-        <span>Prism<span class="tty">TTY</span></span>
+    <footer class="footer">
+      <div class="wrap footer-wrap">
+        <a class="brand footer-brand" href="#main" aria-label="PrismTTY home">
+          <img class="brand-mark" src="assets/prismtty-mark.svg" alt="" width="36" height="36">
+          <span class="brand-name">PrismTTY</span>
+        </a>
+        <p class="footer-facts">v<!-- version -->1.2.5<!-- /version --> &middot; MIT licensed &middot; clean&#8209;room profiles &middot; no telemetry</p>
+        <nav class="footer-links" aria-label="Project">
+          <a href="https://github.com/inxbit/prismtty">GitHub</a>
+          <a href="https://github.com/inxbit/prismtty#readme">README</a>
+          <a href="https://github.com/inxbit/prismtty/releases">Releases</a>
+          <a href="https://crates.io/crates/prismtty">crates.io</a>
+          <a href="https://github.com/inxbit/prismtty/blob/main/SECURITY.md">Security</a>
+        </nav>
       </div>
-      <p class="footer-note">MIT licensed · clean-room profiles · no telemetry.</p>
-      <nav class="footer-links" aria-label="Footer">
-        <a href="https://github.com/inxbit/prismtty/blob/main/README.md">Docs</a>
-        <a href="https://github.com/inxbit/prismtty">GitHub</a>
-        <a href="https://crates.io/crates/prismtty">crates.io</a>
-      </nav>
     </footer>
+
   </body>
 </html>

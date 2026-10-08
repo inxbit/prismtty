@@ -1,0 +1,11 @@
+[38;2;255;255;255mLAB-IOS-01#[0mshow version
+Cisco IOS XE Software, Version 17.09.04
+[38;2;255;255;255mLAB-IOS-01#[0mshow interfaces description
+Interface              Status         Protocol Description
+[38;2;0;153;255mGi1/0/1[0m                [38;2;0;255;0mup[0m             [38;2;0;255;0mup[0m       Uplink to LAB-CORE
+[38;2;0;153;255mGi1/0/2[0m                [1;38;2;255;0;0mdown[0m           [1;38;2;255;0;0mdown[0m     Spare access port
+[38;2;0;153;255mPo10[0m                   [38;2;0;255;0mup[0m             [38;2;0;255;0mup[0m       Bundle to DIST-A
+[38;2;0;153;255mVlan1191[0m               [38;2;0;255;0mup[0m             [38;2;0;255;0mup[0m       Synthetic users VLAN
+[38;2;255;255;255mLAB-IOS-01#[0mshow ip route
+O        [38;2;0;255;255m192.0.2.0/24[0m [110/20] via [38;2;0;255;255m198.51.100.1[0m, 00:00:14, [38;2;0;153;255mVlan1191[0m
+B        [38;2;0;255;255m203.0.113.0/24[0m [20/0] via [38;2;0;255;255m198.51.100.2[0m, 00:01:02

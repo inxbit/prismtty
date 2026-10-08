@@ -1,0 +1,11 @@
+ceos-lab-01#show version
+Arista cEOSLab
+Software image version: 4.36.0F
+ceos-lab-01#show interfaces description
+Interface       Status  Protocol Description
+Ethernet1       up      up       Spine uplink
+Et2             down    down     Spare lab link
+Port-Channel10  up      up       MLAG peer-link
+Vlan1191        up      up       Synthetic client vlan
+ceos-lab-01#show ip route
+O        192.0.2.0/24 [110/20] via 198.51.100.1, Ethernet1

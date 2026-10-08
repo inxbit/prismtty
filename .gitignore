@@ -16,3 +16,9 @@
 # Plan-review artifacts (transient, never commit)
 /PLAN.md
 /PLAN-REVIEW-LOG.md
+
+# Impeccable working state: build gates and review captures hold absolute
+# local paths; the mocks, surface brief and design sidecar are committed.
+/.impeccable/build/
+/.impeccable/review/
+/.impeccable/config.*.json

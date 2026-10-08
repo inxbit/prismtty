@@ -1,0 +1,11 @@
+[38;2;0;191;255madmin@pa-lab-01>[0m show system info
+hostname: pa-lab-01
+model: PA-VM
+sw-version: 11.1.0
+[38;2;0;191;255madmin@pa-lab-01>[0m show interface all
+name                id    [38;2;255;0;255mvsys[0m zone             [38;2;0;255;0mforwarding[0m               tag    address
+[38;2;0;153;255methernet1/1[0m         16    1    untrust          vr:default               0      [38;2;0;255;255m192.0.2.10/24[0m
+[38;2;0;153;255methernet1/2.1191[0m    17    1    trust            vr:default               1191   [38;2;0;255;255m198.51.100.10/24[0m
+[38;2;0;153;255mtunnel.10[0m           20    1    vpn              vr:default               0      [38;2;0;255;255m203.0.113.10/32[0m
+[38;2;0;191;255madmin@pa-lab-01>[0m show routing route
+S [38;2;0;255;255m0.0.0.0/0[0m [10/0] via [38;2;0;255;255m192.0.2.1[0m, [38;2;0;153;255methernet1/1[0m

@@ -1,0 +1,1 @@
+ops@workstation:~$ ssh admin@edge-sw1.example.net

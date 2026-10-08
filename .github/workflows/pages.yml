@@ -6,11 +6,17 @@ on:
       - main
     paths:
       - "docs/**"
+      - "fixtures/site/**"
+      - "scripts/site-output.mjs"
+      - "scripts/site-version.mjs"
       - "tests/site_pages.test.mjs"
       - ".github/workflows/pages.yml"
   pull_request:
     paths:
       - "docs/**"
+      - "fixtures/site/**"
+      - "scripts/site-output.mjs"
+      - "scripts/site-version.mjs"
       - "tests/site_pages.test.mjs"
       - ".github/workflows/pages.yml"
   workflow_dispatch:

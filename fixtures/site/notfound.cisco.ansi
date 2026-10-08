@@ -1,0 +1,5 @@
+[38;2;255;255;255medge-sw1#[0mshow page /does-not-exist
+              ^
+% [1;38;2;255;0;0mInvalid[0m input detected at '^' marker.
+
+[38;2;255;255;255medge-sw1#[0m

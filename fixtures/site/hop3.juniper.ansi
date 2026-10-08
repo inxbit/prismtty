@@ -1,0 +1,6 @@
+[38;2;0;191;255madmin@core-rtr>[0m show interfaces terse ge-0/0/*
+Interface               Admin Link Proto    Local
+[38;2;0;153;255mge-0/0/0[0m                [38;2;0;255;0mup[0m    [38;2;0;255;0mup[0m
+[38;2;0;153;255mge-0/0/0.0[0m              [38;2;0;255;0mup[0m    [38;2;0;255;0mup[0m   inet     [38;2;0;255;255m192.0.2.2/30[0m
+[38;2;0;153;255mge-0/0/1[0m                [38;2;0;255;0mup[0m    [1;38;2;255;0;0mdown[0m
+[38;2;0;191;255madmin@core-rtr>[0m exit

@@ -1,0 +1,6 @@
+edge-sw1#show ip interface brief
+Interface              IP-Address      OK? Method Status                Protocol
+GigabitEthernet1/0/1   192.0.2.1       YES manual up                    up
+GigabitEthernet1/0/2   unassigned      YES unset  administratively down down
+Vlan1191               198.51.100.1    YES manual up                    up
+edge-sw1#ssh -l admin core-rtr.example.net

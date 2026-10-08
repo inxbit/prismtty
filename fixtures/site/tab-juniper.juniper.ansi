@@ -1,0 +1,11 @@
+[38;2;0;191;255mlab@mx-lab-01>[0m show version
+Junos: 22.4R3.8
+[38;2;0;191;255mlab@mx-lab-01>[0m show interfaces descriptions
+Interface       Admin Link Description
+[38;2;0;153;255mge-0/0/0[0m        [38;2;0;255;0mup[0m    [38;2;0;255;0mup[0m   Transit to lab core
+[38;2;0;153;255mxe-7/0/2[0m        [1;38;2;255;0;0mdown[0m  [1;38;2;255;0;0mdown[0m Spare optic
+[38;2;0;153;255mreth1.808[0m       [38;2;0;255;0mup[0m    [38;2;0;255;0mup[0m   Synthetic trust segment
+[38;2;0;153;255mst0.9[0m           [38;2;0;255;0mup[0m    [38;2;0;255;0mup[0m   Synthetic VPN tunnel
+[38;2;0;191;255mlab@mx-lab-01>[0m show route protocol ospf
+[38;2;0;255;255m192.0.2.0/24[0m    *[OSPF/10] 00:01:20, metric 20
+                 > to [38;2;0;255;255m198.51.100.1[0m via [38;2;0;153;255mge-0/0/0.0[0m

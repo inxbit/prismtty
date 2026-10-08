@@ -1,0 +1,11 @@
+[38;2;255;255;255mceos-lab-01#[0mshow version
+Arista cEOSLab
+Software image version: 4.36.0F
+[38;2;255;255;255mceos-lab-01#[0mshow interfaces description
+Interface       Status  Protocol Description
+[38;2;0;153;255mEthernet1[0m       [38;2;0;255;0mup[0m      [38;2;0;255;0mup[0m       Spine uplink
+[38;2;0;153;255mEt2[0m             [1;38;2;255;0;0mdown[0m    [1;38;2;255;0;0mdown[0m     Spare lab link
+[38;2;0;153;255mPort-Channel10[0m  [38;2;0;255;0mup[0m      [38;2;0;255;0mup[0m       [38;2;255;0;255mMLAG[0m [38;2;255;0;255mpeer-link[0m
+[38;2;0;153;255mVlan1191[0m        [38;2;0;255;0mup[0m      [38;2;0;255;0mup[0m       Synthetic client vlan
+[38;2;255;255;255mceos-lab-01#[0mshow ip route
+O        [38;2;0;255;255m192.0.2.0/24[0m [110/20] via [38;2;0;255;255m198.51.100.1[0m, [38;2;0;153;255mEthernet1[0m

@@ -1,0 +1,5 @@
+edge-sw1#show page /does-not-exist
+              ^
+% Invalid input detected at '^' marker.
+
+edge-sw1#

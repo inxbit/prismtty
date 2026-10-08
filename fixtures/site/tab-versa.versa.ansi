@@ -1,0 +1,10 @@
+[38;2;0;191;255madmin@versa-lab-01>[0m show system details
+Appliance Name: versa-lab-01
+Software Version: 22.1.4
+[38;2;0;191;255madmin@versa-lab-01>[0m show interfaces brief
+NAME        TYPE      ADMIN  OPER  VRF       IP
+[38;2;0;153;255mvni-0/0[0m     ethernet  [38;2;0;255;0mup[0m     [38;2;0;255;0mup[0m    global    [38;2;0;255;255m192.0.2.20/24[0m
+[38;2;0;153;255mtvi-0/332[0m   tunnel    [38;2;0;255;0mup[0m     [38;2;0;255;0mup[0m    TenantA   [38;2;0;255;255m198.51.100.20/30[0m
+[38;2;0;153;255mptvi-1[0m      tunnel    [1;38;2;255;0;0mdown[0m   [1;38;2;255;0;0mdown[0m  TenantA   -
+[38;2;0;191;255madmin@versa-lab-01>[0m show route table
+TenantA  [38;2;0;255;255m203.0.113.0/24[0m  via [38;2;0;255;255m198.51.100.21[0m  [38;2;0;153;255mtvi-0/332[0m

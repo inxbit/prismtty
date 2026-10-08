@@ -1,0 +1,1353 @@
+/* prismtty.com. Lengths in the desktop hero are comp pixels times --u, the
+   width of one comp pixel (the approved comp is 1672 px wide), so the first
+   viewport keeps its measured proportions from 1100 px up. */
+
+@font-face {
+  font-family: "Vend Sans";
+  src: url("assets/fonts/vend-sans-latin-var.woff2") format("woff2");
+  font-weight: 300 700;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: "Oxygen Mono";
+  src: url("assets/fonts/oxygen-mono-latin.woff2") format("woff2");
+  font-weight: 400;
+  font-display: swap;
+}
+
+:root {
+  --ground: #0a0b0d;
+  --text: #f2f3f5;
+  --text-2: #c4c7ce;
+  --muted: #8b9099;
+  --dim: #7b8087;
+  --hairline: #23252a;
+  --chip: #0e1014;
+  --chip-line: #2a2d35;
+  --ghost-line: #3a414c;
+  --sans: "Vend Sans", ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  --mono: "Oxygen Mono", ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  --u: calc(min(100vw, 1672px) / 1672);
+  color-scheme: dark;
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  background: var(--ground);
+  color: var(--text);
+  font-family: var(--sans);
+  -webkit-font-smoothing: antialiased;
+}
+
+img,
+svg {
+  display: block;
+  max-width: 100%;
+}
+
+figure,
+pre,
+h1,
+h2,
+p,
+ul {
+  margin: 0;
+}
+
+ul {
+  padding: 0;
+  list-style: none;
+}
+
+a {
+  color: inherit;
+  text-decoration: none;
+}
+
+*::selection {
+  background: #0099ff55;
+  color: var(--text);
+}
+
+:focus-visible {
+  outline: 2px solid #00ffff;
+  outline-offset: 3px;
+  border-radius: 4px;
+}
+
+.skip {
+  position: absolute;
+  left: 16px;
+  top: -100px;
+  z-index: 10;
+  padding: 10px 14px;
+  background: var(--text);
+  color: var(--ground);
+  border-radius: 6px;
+}
+
+.skip:focus {
+  top: 16px;
+}
+
+/* Navigation sits over the top of the hero frame. */
+.nav {
+  position: absolute;
+  inset: 0 0 auto;
+  z-index: 3;
+  max-width: 1672px;
+  height: calc(80 * var(--u));
+  margin: 0 auto;
+}
+
+.brand {
+  position: absolute;
+  left: calc(66 * var(--u));
+  top: calc(9 * var(--u));
+  display: flex;
+  align-items: center;
+  gap: calc(12 * var(--u));
+}
+
+.brand-mark {
+  width: calc(60 * var(--u));
+  height: calc(60 * var(--u));
+}
+
+.brand-name {
+  font-size: calc(27 * var(--u));
+  font-weight: 650;
+  letter-spacing: -0.01em;
+}
+
+.nav-links {
+  position: absolute;
+  right: calc(70 * var(--u));
+  top: calc(26 * var(--u));
+  display: flex;
+  gap: calc(44 * var(--u));
+  font-size: max(15px, calc(19 * var(--u)));
+  line-height: calc(34 * var(--u));
+  color: #c3ccd9;
+}
+
+.nav-links a:hover {
+  color: var(--text);
+}
+
+/* The measured first viewport. */
+.hero-frame {
+  position: relative;
+  width: 100%;
+  max-width: 1672px;
+  height: calc(941 * var(--u));
+  margin: 0 auto;
+  overflow: hidden;
+}
+
+.hero-light {
+  position: absolute;
+  left: calc(748 * var(--u));
+  top: calc(68 * var(--u));
+  width: calc(832 * var(--u));
+  height: calc(400 * var(--u));
+  object-fit: cover;
+  -webkit-mask-image: radial-gradient(closest-side, #000 55%, transparent);
+  mask-image: radial-gradient(closest-side, #000 55%, transparent);
+}
+
+.headline {
+  position: absolute;
+  left: calc(68 * var(--u));
+  top: calc(128 * var(--u));
+  font-size: calc(75 * var(--u));
+  font-weight: 700;
+  line-height: calc(76 * var(--u));
+  letter-spacing: -0.017em;
+  color: #f6f6f7;
+}
+
+.lede {
+  position: absolute;
+  left: calc(70 * var(--u));
+  top: calc(288 * var(--u));
+  font-size: max(17px, calc(23 * var(--u)));
+  font-weight: 300;
+  line-height: calc(34 * var(--u));
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+.actions {
+  position: absolute;
+  z-index: 2;
+  left: calc(74 * var(--u));
+  top: calc(347 * var(--u));
+  display: flex;
+  gap: calc(20 * var(--u));
+}
+
+.install-chip,
+.button-ghost {
+  height: max(44px, calc(56 * var(--u)));
+  border-radius: calc(8 * var(--u));
+}
+
+.install-chip {
+  display: flex;
+  align-items: center;
+  width: calc(474 * var(--u));
+  padding-left: calc(16 * var(--u));
+  background: var(--chip);
+  border: 1px solid var(--chip-line);
+}
+
+.install-cmd {
+  flex: 1;
+  font-family: var(--mono);
+  font-size: max(15px, calc(18 * var(--u)));
+  letter-spacing: -0.03em;
+  color: #a9adb5;
+  white-space: nowrap;
+}
+
+.install-prompt {
+  color: var(--dim);
+}
+
+.copy {
+  display: grid;
+  place-items: center;
+  width: max(44px, calc(56 * var(--u)));
+  height: 100%;
+  padding: 0;
+  border: 0;
+  border-left: 1px solid var(--chip-line);
+  background: none;
+  color: var(--muted);
+  cursor: pointer;
+}
+
+.copy svg {
+  width: calc(22 * var(--u));
+  height: calc(22 * var(--u));
+}
+
+.copy:hover {
+  color: var(--text);
+}
+
+.copy .ic-check,
+.copy[data-copied] .ic-copy {
+  display: none;
+}
+
+.copy[data-copied] .ic-check {
+  display: block;
+  color: var(--text);
+}
+
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+.button-ghost {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: calc(12 * var(--u));
+  width: calc(211 * var(--u));
+  border: 1px solid var(--ghost-line);
+  font-size: max(14px, calc(18 * var(--u)));
+  color: #dde3e9;
+}
+
+.button-ghost .gh-mark {
+  width: calc(22 * var(--u));
+  height: calc(22 * var(--u));
+}
+
+.button-ghost:hover {
+  border-color: #59616d;
+  color: var(--text);
+}
+
+/* The seam: raw output, the prism, the same output through PrismTTY. */
+.seam {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+}
+
+.seam .out,
+.seam .caption {
+  pointer-events: auto;
+}
+
+.seam-media {
+  position: absolute;
+  left: calc(500 * var(--u));
+  top: calc(376 * var(--u));
+  width: calc(560 * var(--u));
+  height: calc(332 * var(--u));
+}
+
+.seam-prism {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  -webkit-mask-image: linear-gradient(90deg, transparent, #000 14%, #000 86%, transparent),
+    linear-gradient(180deg, transparent, #000 10%, #000 80%, transparent);
+  -webkit-mask-composite: source-in;
+  mask-image: linear-gradient(90deg, transparent, #000 14%, #000 86%, transparent),
+    linear-gradient(180deg, transparent, #000 10%, #000 80%, transparent);
+  mask-composite: intersect;
+}
+
+.out {
+  position: absolute;
+  top: calc(484 * var(--u));
+  z-index: 1;
+  font-family: var(--mono);
+  font-size: max(14.5px, calc(19 * var(--u)));
+  line-height: max(22px, calc(29 * var(--u)));
+  white-space: pre;
+}
+
+.out-raw {
+  left: calc(30 * var(--u));
+  color: #979aa2;
+}
+
+.out-hl {
+  left: calc(1063 * var(--u));
+  color: var(--text-2);
+}
+
+.out .b {
+  font-weight: 700;
+}
+
+/* output-colors:start */
+.c-0099ff { color: #0099ff; }
+.c-00bfff { color: #00bfff; }
+.c-00ff00 { color: #00ff00; }
+.c-00ffc0 { color: #00ffc0; }
+.c-00ffff { color: #00ffff; }
+.c-65d7fd { color: #65d7fd; }
+.c-ff0000 { color: #ff0000; }
+.c-ff00ff { color: #ff00ff; }
+.c-ffffff { color: #ffffff; }
+/* output-colors:end */
+
+.caption {
+  position: absolute;
+  left: 50%;
+  top: calc(710 * var(--u));
+  transform: translateX(-50%);
+  font-size: max(14px, calc(17 * var(--u)));
+  line-height: max(20px, calc(28 * var(--u)));
+  color: var(--dim);
+  white-space: nowrap;
+}
+
+.rule {
+  position: absolute;
+  left: calc(70 * var(--u));
+  top: calc(762 * var(--u));
+  width: calc(1532 * var(--u));
+  height: 1px;
+  margin: 0;
+  border: 0;
+  background: var(--hairline);
+}
+
+.facts {
+  position: absolute;
+  left: calc(66 * var(--u));
+  top: calc(792 * var(--u));
+  display: grid;
+  grid-template-columns: calc(482 * var(--u)) calc(532 * var(--u)) 1fr;
+  width: calc(1536 * var(--u));
+}
+
+.fact {
+  display: grid;
+  grid-template-columns: calc(68 * var(--u)) 1fr;
+  grid-template-rows: auto 1fr;
+  column-gap: 0;
+  height: calc(126 * var(--u));
+  padding-top: calc(11 * var(--u));
+}
+
+.fact + .fact {
+  padding-left: calc(58 * var(--u));
+  border-left: 1px solid var(--hairline);
+}
+
+.fact-icon {
+  grid-row: 1 / span 2;
+  width: calc(44 * var(--u));
+  height: calc(44 * var(--u));
+  color: #a3a7b7;
+}
+
+.fact-title {
+  margin: 0;
+  font-size: max(17px, calc(22 * var(--u)));
+  font-weight: 500;
+  line-height: calc(34 * var(--u));
+}
+
+.fact-body {
+  max-width: calc(380 * var(--u));
+  margin-top: calc(4 * var(--u));
+  font-size: max(15px, calc(18 * var(--u)));
+  font-weight: 400;
+  line-height: calc(27 * var(--u));
+  color: #8a8d94;
+}
+
+/* Prism media. The still plate is the default (no JS, reduced motion).
+   With motion, the footage plays once until the spectrum is wide, eases to
+   a stop on that frame, and the light layer takes over: a steady flow along
+   the beam and dust that only shows where it crosses the light. */
+.hero-light-wrap {
+  display: contents;
+}
+
+.prism-playing .seam-prism {
+  visibility: hidden;
+}
+
+.seam-video {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  -webkit-mask-image: linear-gradient(90deg, transparent, #000 14%, #000 86%, transparent),
+    linear-gradient(180deg, transparent, #000 10%, #000 80%, transparent);
+  -webkit-mask-composite: source-in;
+  mask-image: linear-gradient(90deg, transparent, #000 14%, #000 86%, transparent),
+    linear-gradient(180deg, transparent, #000 10%, #000 80%, transparent);
+  mask-composite: intersect;
+}
+
+.seam-light {
+  opacity: 0;
+  transition: opacity 1.6s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.prism-live .seam-light {
+  opacity: 1;
+}
+
+.beam {
+  position: absolute;
+  left: calc(500 * var(--u));
+  top: calc(504 * var(--u));
+  width: calc(246 * var(--u));
+  height: calc(12 * var(--u));
+  background: repeating-linear-gradient(
+    90deg,
+    transparent 0,
+    transparent calc(34 * var(--u)),
+    rgb(255 255 255 / 0.5) calc(62 * var(--u)),
+    transparent calc(90 * var(--u))
+  );
+  background-size: calc(90 * var(--u)) 100%;
+  -webkit-mask-image: linear-gradient(180deg, transparent, #000 42%, #000 58%, transparent),
+    linear-gradient(90deg, transparent, #000 22%, #000 88%, transparent);
+  -webkit-mask-composite: source-in;
+  mask-image: linear-gradient(180deg, transparent, #000 42%, #000 58%, transparent),
+    linear-gradient(90deg, transparent, #000 22%, #000 88%, transparent);
+  mask-composite: intersect;
+  mix-blend-mode: screen;
+}
+
+.dust {
+  position: absolute;
+  left: calc(470 * var(--u));
+  top: calc(420 * var(--u));
+  width: calc(620 * var(--u));
+  height: calc(220 * var(--u));
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .hero-light,
+  .section::before {
+    animation: drift 26s ease-in-out infinite alternate;
+  }
+
+  .section:nth-of-type(even)::before {
+    animation-duration: 34s;
+    animation-direction: alternate-reverse;
+  }
+
+  .beam {
+    animation: flow 1.5s linear infinite;
+  }
+
+  /* The signature moment: each raw line passes into the prism and leaves
+     in PrismTTY's colors, once, on load. */
+  .out-raw .ln {
+    animation: pass 0.9s cubic-bezier(0.16, 1, 0.3, 1) both;
+  }
+
+  .out-hl .ln {
+    display: inline-block;
+    animation: arrive 0.9s cubic-bezier(0.16, 1, 0.3, 1) both;
+  }
+
+  .out .ln:nth-child(1) { --d: 0.5s; }
+  .out .ln:nth-child(2) { --d: 0.68s; }
+  .out .ln:nth-child(3) { --d: 0.86s; }
+  .out .ln:nth-child(4) { --d: 1.04s; }
+  .out .ln:nth-child(5) { --d: 1.22s; }
+
+  .out-raw .ln {
+    animation-delay: var(--d);
+  }
+
+  .out-hl .ln {
+    animation-delay: calc(var(--d) + 0.32s);
+  }
+}
+
+@keyframes drift {
+  from { transform: translate3d(0, 0, 0) scale(1); }
+  to { transform: translate3d(calc(-24 * var(--u)), calc(10 * var(--u)), 0) scale(1.05); }
+}
+
+@keyframes flow {
+  from { background-position: 0 0; }
+  to { background-position: calc(90 * var(--u)) 0; }
+}
+
+@keyframes pass {
+  0% { color: #979aa2; }
+  35% { color: #e6e8ec; }
+  100% { color: #979aa2; }
+}
+
+@keyframes arrive {
+  from { clip-path: inset(0 100% 0 0); opacity: 0.2; }
+  to { clip-path: inset(0 0 0 0); opacity: 1; }
+}
+
+/* Sections below the hero share the hero's grid: 70 comp px margins on a
+   1672 px frame, frozen to a 20 px gutter on phones. */
+.wrap {
+  width: min(calc(1532 * var(--u)), calc(100% - 40px));
+  margin: 0 auto;
+}
+
+.section {
+  position: relative;
+  padding-block: max(56px, calc(100 * var(--u)));
+  border-top: 1px solid var(--hairline);
+}
+
+.section-head {
+  max-width: max(320px, calc(980 * var(--u)));
+  margin-bottom: max(28px, calc(44 * var(--u)));
+}
+
+.section h2,
+.feedback-wrap h2 {
+  font-size: max(30px, calc(54 * var(--u)));
+  font-weight: 700;
+  line-height: 1.08;
+  letter-spacing: -0.025em;
+  text-wrap: balance;
+}
+
+.section-lede {
+  max-width: 62ch;
+  margin-top: max(14px, calc(20 * var(--u)));
+  font-size: max(17px, calc(21 * var(--u)));
+  font-weight: 300;
+  line-height: 1.55;
+  color: var(--muted);
+}
+
+.section-lede code,
+.scope-col code,
+.term-note code {
+  font-family: var(--mono);
+  font-size: 0.9em;
+  color: var(--text-2);
+}
+
+/* Terminal windows that hold real output. */
+.term {
+  overflow: hidden;
+  background: #0c0e11;
+  border: 1px solid var(--hairline);
+  border-radius: max(10px, calc(14 * var(--u)));
+}
+
+.term-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  min-height: max(40px, calc(48 * var(--u)));
+  padding: 0 max(16px, calc(24 * var(--u)));
+  border-bottom: 1px solid var(--hairline);
+  font-family: var(--mono);
+  font-size: max(12px, calc(15 * var(--u)));
+  color: var(--muted);
+}
+
+.term-badge {
+  padding: 3px 10px;
+  border: 1px solid #2f333b;
+  border-radius: 999px;
+  color: var(--text-2);
+  white-space: nowrap;
+}
+
+.out-block {
+  overflow-x: auto;
+  padding: max(16px, calc(26 * var(--u))) max(16px, calc(28 * var(--u)));
+  font-family: var(--mono);
+  font-size: max(13px, calc(17 * var(--u)));
+  line-height: 1.65;
+  color: var(--text-2);
+  white-space: pre;
+  scrollbar-width: thin;
+  scrollbar-color: #2f333b transparent;
+}
+
+.out-block::-webkit-scrollbar,
+.install-line::-webkit-scrollbar,
+.out::-webkit-scrollbar {
+  height: 6px;
+}
+
+.out-block::-webkit-scrollbar-thumb,
+.install-line::-webkit-scrollbar-thumb,
+.out::-webkit-scrollbar-thumb {
+  background: #2f333b;
+  border-radius: 3px;
+}
+
+.out-block .b {
+  font-weight: 700;
+}
+
+.term-note {
+  max-width: 76ch;
+  margin-top: max(14px, calc(20 * var(--u)));
+  font-size: max(14px, calc(16 * var(--u)));
+  line-height: 1.6;
+  color: var(--dim);
+}
+
+.hop-term .term-note {
+  margin: 0;
+  padding: max(16px, calc(22 * var(--u))) max(16px, calc(28 * var(--u)));
+}
+
+/* One shell follows every hop: the stack on the left, real output right. */
+.hop-steps {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.hop-step {
+  display: grid;
+  grid-template-columns: calc(360 * var(--u)) 1fr;
+  align-items: start;
+}
+
+.hop-steps {
+  border-bottom: 1px solid var(--hairline);
+}
+
+.hop-step + .hop-step {
+  border-top: 1px solid #191c21;
+}
+
+.hop-stack {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 8px;
+  padding: max(16px, calc(26 * var(--u))) 0 0 max(16px, calc(28 * var(--u)));
+  font-family: var(--mono);
+  font-size: max(13px, calc(14 * var(--u)));
+  color: #8a9099;
+}
+
+.hop-stack span:not(.hop-op) {
+  padding: 2px 8px;
+  border: 1px solid #23262c;
+  border-radius: 8px;
+}
+
+.hop-stack .on {
+  border-color: #3a414c;
+  color: var(--text);
+}
+
+.hop-op {
+  color: var(--muted);
+}
+
+.hop-stack s {
+  color: var(--dim);
+}
+
+.hop .out-block {
+  padding-left: 0;
+}
+
+/* Off-focus crystals drift behind each section, set in its empty side so
+   they never sit under running text. */
+.section {
+  overflow: hidden;
+}
+
+.section::before {
+  content: "";
+  position: absolute;
+  z-index: 0;
+  aspect-ratio: 3 / 2;
+  background: var(--crystal) center / cover no-repeat;
+  opacity: var(--crystal-opacity, 0.6);
+  mix-blend-mode: screen;
+  -webkit-mask-image: radial-gradient(closest-side, #000 50%, transparent);
+  mask-image: radial-gradient(closest-side, #000 50%, transparent);
+  pointer-events: none;
+}
+
+.section > .wrap {
+  position: relative;
+  z-index: 1;
+}
+
+.hop::before {
+  --crystal: url("assets/crystals-right.webp");
+  top: 3%;
+  right: -8%;
+  width: 52%;
+}
+
+.profiles::before {
+  --crystal: url("assets/crystals-scatter.webp");
+  top: 3%;
+  right: -6%;
+  width: 50%;
+}
+
+.install::before {
+  --crystal: url("assets/crystals-left.webp");
+  --crystal-opacity: 0.5;
+  top: 6%;
+  right: -14%;
+  width: 46%;
+}
+
+/* Scope stays quiet: a still beat between install and feedback. */
+.scope::before {
+  content: none;
+}
+
+.feedback::before {
+  --crystal: url("assets/crystals-right.webp");
+  --crystal-opacity: 0.5;
+  top: 8%;
+  right: -10%;
+  width: 40%;
+}
+
+.tabs {
+  display: flex;
+  gap: 8px;
+  margin-bottom: max(16px, calc(20 * var(--u)));
+  overflow-x: auto;
+  padding: 2px;
+}
+
+.tab {
+  flex: none;
+  min-height: 44px;
+  padding: 0 max(14px, calc(18 * var(--u)));
+  border: 1px solid #23262c;
+  border-radius: 999px;
+  background: transparent;
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: max(13px, calc(15 * var(--u)));
+  cursor: pointer;
+}
+
+.tab:hover {
+  color: var(--text);
+}
+
+.tab:focus-visible,
+.tab-panel:focus-visible {
+  outline-offset: -3px;
+}
+
+.tab[aria-selected="true"] {
+  border-color: #3a414c;
+  background: #15181d;
+  color: var(--text);
+}
+
+.tab-panel {
+  min-height: calc(11 * 1.65em + 2 * max(16px, calc(26 * var(--u))));
+}
+
+.tab-panel[hidden] {
+  display: none;
+}
+
+/* Install. */
+.install-rows {
+  display: grid;
+  gap: 12px;
+  max-width: max(320px, calc(980 * var(--u)));
+}
+
+.install-row {
+  display: grid;
+  grid-template-columns: max(84px, calc(130 * var(--u))) 1fr auto;
+  align-items: center;
+  min-height: max(52px, calc(60 * var(--u)));
+  padding-left: max(16px, calc(22 * var(--u)));
+  background: var(--chip);
+  border: 1px solid var(--chip-line);
+  border-radius: max(8px, calc(10 * var(--u)));
+}
+
+.install-label {
+  font-size: max(14px, calc(16 * var(--u)));
+  color: var(--dim);
+}
+
+.install-line {
+  overflow-x: auto;
+  scrollbar-width: thin;
+  scrollbar-color: #2f333b transparent;
+  font-family: var(--mono);
+  font-size: max(14px, calc(18 * var(--u)));
+  color: var(--text-2);
+  white-space: nowrap;
+}
+
+.install-row .copy {
+  width: max(52px, calc(60 * var(--u)));
+  height: max(52px, calc(60 * var(--u)));
+}
+
+.install-links {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0 28px;
+  margin-top: max(10px, calc(16 * var(--u)));
+  font-size: max(15px, calc(17 * var(--u)));
+}
+
+.install-links a,
+.footer-links a {
+  display: inline-block;
+  padding-block: 11px;
+  color: var(--text-2);
+  text-decoration: underline;
+  text-decoration-color: #3a414c;
+  text-underline-offset: 4px;
+}
+
+.install-links a:hover,
+.footer-links a:hover {
+  color: var(--text);
+  text-decoration-color: var(--text-2);
+}
+
+/* Scope. */
+.scope-cols {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+}
+
+.scope-col {
+  padding-right: max(24px, calc(64 * var(--u)));
+}
+
+.scope-col + .scope-col {
+  padding-left: max(24px, calc(64 * var(--u)));
+  border-left: 1px solid var(--hairline);
+}
+
+.scope-col h3 {
+  margin: 0 0 12px;
+  font-size: max(18px, calc(22 * var(--u)));
+  font-weight: 500;
+}
+
+.scope-list {
+  margin: 0 0 18px;
+}
+
+.scope-list li {
+  padding: 10px 0;
+  border-bottom: 1px solid var(--hairline);
+  font-family: var(--mono);
+  font-size: max(14px, calc(16 * var(--u)));
+  color: var(--text-2);
+}
+
+.scope-col p {
+  max-width: 58ch;
+  font-size: max(16px, calc(19 * var(--u)));
+  line-height: 1.6;
+  color: var(--muted);
+}
+
+/* Feedback. */
+.vendors {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+  gap: 0 32px;
+  max-width: max(320px, calc(1200 * var(--u)));
+  margin: max(24px, calc(32 * var(--u))) 0;
+}
+
+.vendors li {
+  padding: 10px 0;
+  border-bottom: 1px solid var(--hairline);
+  font-family: var(--mono);
+  font-size: max(14px, calc(16 * var(--u)));
+  color: var(--text-2);
+}
+
+.issue-link {
+  display: inline-flex;
+  width: auto;
+  border-color: var(--text);
+  background: var(--text);
+  color: var(--ground);
+  font-weight: 500;
+  height: max(48px, calc(56 * var(--u)));
+  padding: 0 max(18px, calc(24 * var(--u)));
+  border-radius: max(8px, calc(8 * var(--u)));
+}
+
+.issue-link:hover {
+  border-color: #ffffff;
+  background: #ffffff;
+  color: var(--ground);
+}
+
+/* A pane that scrolls sideways fades at its right edge until the reader
+   reaches the end; touch devices hide scrollbars, so this is the cue. */
+.scrolls:not(.at-end) {
+  -webkit-mask-image: linear-gradient(90deg, #000 calc(100% - 48px), transparent);
+  mask-image: linear-gradient(90deg, #000 calc(100% - 48px), transparent);
+}
+
+/* Small transitions on every control. */
+.tab,
+.copy,
+.button-ghost,
+.nav-links a,
+.install-links a,
+.footer-links a {
+  transition: color 0.15s ease, border-color 0.15s ease, background-color 0.15s ease;
+}
+
+.button-ghost:active,
+.tab:active {
+  background: #15181d;
+}
+
+/* Footer. */
+.footer {
+  padding-block: 40px;
+  border-top: 1px solid var(--hairline);
+}
+
+.footer-wrap {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 16px 32px;
+}
+
+.footer .brand {
+  position: static;
+}
+
+.footer .brand-mark {
+  width: 32px;
+  height: 32px;
+}
+
+.footer .brand-name {
+  font-size: 19px;
+}
+
+.footer-facts {
+  flex: 1;
+  font-size: 15px;
+  color: var(--dim);
+}
+
+.footer-links {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 24px;
+  font-size: 15px;
+}
+
+/* Below 1280 px the hero leaves its measured frame and flows. */
+@media (max-width: 1279px) {
+  :root {
+    --u: 0.765px;
+  }
+
+  .nav {
+    position: relative;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    height: auto;
+    padding: 14px 20px;
+  }
+
+  .brand,
+  .nav-links {
+    position: static;
+  }
+
+  .brand {
+    flex-shrink: 0;
+  }
+
+  .brand-mark {
+    width: 34px;
+    height: 34px;
+  }
+
+  .brand-name {
+    font-size: 20px;
+  }
+
+  .nav-links {
+    gap: 4px;
+    font-size: 15px;
+    line-height: 1;
+  }
+
+  .nav-links a {
+    padding: 15px 8px;
+  }
+
+  .hero-frame {
+    display: flex;
+    flex-direction: column;
+    height: auto;
+    padding: 28px 20px 56px;
+  }
+
+  .hero-light {
+    left: 15%;
+    top: 300px;
+    width: 95%;
+    height: 340px;
+    opacity: 0.5;
+  }
+
+  .headline {
+    position: relative;
+    left: auto;
+    top: auto;
+    font-size: clamp(38px, 9.4vw, 66px);
+    line-height: 1.04;
+  }
+
+  .lede {
+    position: relative;
+    left: auto;
+    top: auto;
+    max-width: 36ch;
+    margin-top: 18px;
+    font-size: 18px;
+    font-weight: 400;
+    line-height: 1.5;
+    white-space: normal;
+  }
+
+  .actions {
+    position: relative;
+    left: auto;
+    top: auto;
+    flex-wrap: wrap;
+    gap: 12px;
+    margin-top: 26px;
+  }
+
+  .install-chip {
+    width: min(100%, 474px);
+    height: 52px;
+    padding-left: 14px;
+    border-radius: 8px;
+  }
+
+  .install-cmd {
+    min-width: 0;
+    overflow-x: auto;
+    font-size: clamp(12px, 3.4vw, 15px);
+    scrollbar-width: none;
+  }
+
+  .copy {
+    width: 52px;
+  }
+
+  .copy svg,
+  .button-ghost .gh-mark {
+    width: 20px;
+    height: 20px;
+  }
+
+  .button-ghost {
+    width: auto;
+    height: 48px;
+    padding: 0 18px;
+    gap: 10px;
+    border-radius: 8px;
+    font-size: 16px;
+  }
+
+  .seam {
+    position: relative;
+    inset: auto;
+    display: flex;
+    flex-direction: column;
+    margin-top: 44px;
+  }
+
+  .seam-media {
+    position: relative;
+    left: auto;
+    top: auto;
+    align-self: center;
+    width: min(100%, 520px);
+    height: auto;
+    aspect-ratio: 560 / 332;
+    margin: 8px 0;
+  }
+
+  .out {
+    position: relative;
+    left: auto;
+    top: auto;
+    max-width: 100%;
+    overflow-x: auto;
+    font-size: clamp(12px, 3.1vw, 16px);
+    line-height: 1.6;
+    scrollbar-width: thin;
+    scrollbar-color: #2f333b transparent;
+  }
+
+  .seam-light {
+    display: none !important;
+  }
+
+  .caption {
+    position: relative;
+    left: auto;
+    top: auto;
+    margin-top: 12px;
+    transform: none;
+    font-size: 14px;
+    white-space: normal;
+  }
+
+  .rule {
+    position: relative;
+    left: auto;
+    top: auto;
+    width: 100%;
+    margin-top: 44px;
+  }
+
+  .facts {
+    position: relative;
+    left: auto;
+    top: auto;
+    grid-template-columns: 1fr;
+    gap: 22px;
+    width: 100%;
+    margin-top: 28px;
+  }
+
+  .fact {
+    grid-template-columns: 52px 1fr;
+    height: auto;
+    padding: 0;
+  }
+
+  .fact + .fact {
+    padding: 22px 0 0;
+    border-top: 1px solid var(--hairline);
+    border-left: 0;
+  }
+
+  .fact-icon {
+    width: 34px;
+    height: 34px;
+  }
+
+  .fact-title {
+    font-size: 18px;
+    line-height: 1.4;
+  }
+
+  .fact-body {
+    max-width: none;
+    font-size: 16px;
+    line-height: 1.5;
+  }
+
+  .section-lede {
+    font-weight: 400;
+  }
+
+  .hop-step {
+    grid-template-columns: 1fr;
+  }
+
+  .hop .out-block {
+    padding-left: 16px;
+  }
+
+  .scope-cols {
+    grid-template-columns: 1fr;
+    gap: 28px;
+  }
+
+  .scope-col,
+  .scope-col + .scope-col {
+    padding: 0;
+    border: 0;
+  }
+
+  .scope-col + .scope-col {
+    padding-top: 28px;
+    border-top: 1px solid var(--hairline);
+  }
+}
+
+@media (min-width: 700px) and (max-width: 1279px) {
+  .fact-body {
+    font-size: 15px;
+  }
+
+  .out {
+    font-size: 15px;
+  }
+
+  .caption {
+    font-size: 14px;
+  }
+
+  .facts {
+    grid-template-columns: repeat(3, 1fr);
+    gap: 0 28px;
+  }
+
+  .fact + .fact {
+    padding: 0 0 0 28px;
+    border-top: 0;
+    border-left: 1px solid var(--hairline);
+  }
+
+  .seam-media {
+    width: min(100%, 460px);
+  }
+}
+
+@media (max-width: 600px) {
+  .tabs {
+    flex-wrap: wrap;
+    overflow: visible;
+  }
+}
+
+@media (max-width: 520px) {
+  .install-row {
+    grid-template-columns: 1fr auto;
+  }
+
+  .install-label {
+    display: none;
+  }
+
+  /* 51 columns fit a 390 px phone at the 12 px floor. */
+  .out {
+    font-size: 12px;
+    letter-spacing: -0.03em;
+  }
+
+  .out-block {
+    font-size: 12.5px;
+  }
+
+  .install-line {
+    font-size: 13px;
+  }
+
+  .install-line .install-prompt {
+    display: none;
+  }
+
+  .install-row .copy {
+    width: 44px;
+    height: 44px;
+  }
+
+  .seam-media {
+    width: min(100%, 300px);
+  }
+}
+
+@media (max-width: 400px) {
+  .brand-name {
+    display: none;
+  }
+
+  .nav-links a {
+    padding: 15px 7px;
+    font-size: 14px;
+  }
+}
+
+@media (max-width: 360px) {
+  .nav-links a[href$="#readme"] {
+    display: none;
+  }
+}
