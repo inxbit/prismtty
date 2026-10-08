@@ -1,0 +1,10 @@
+[38;2;255;255;255mLAB-ARUBA-01#[0m show version
+[38;2;255;0;255mArubaOS-CX[0m 10.13.1000
+[38;2;255;255;255mLAB-ARUBA-01#[0m show interface brief
+Interface  Status  Protocol  Description
+[38;2;0;153;255m1/1/1[0m      [38;2;0;255;0mup[0m      [38;2;0;255;0mup[0m        Core uplink
+[38;2;0;153;255m1/1/2[0m      [1;38;2;255;0;0mdown[0m    [1;38;2;255;0;0mdown[0m      Spare copper
+[38;2;0;153;255mlag10[0m      [38;2;0;255;0mup[0m      [38;2;0;255;0mup[0m        Access aggregate
+[38;2;0;153;255mvlan1191[0m   [38;2;0;255;0mup[0m      [38;2;0;255;0mup[0m        Synthetic wireless vlan
+[38;2;255;255;255mLAB-ARUBA-01#[0m show events
+2026-05-07T12:00:00.000000+00:00 LAB-ARUBA-01 [38;2;255;0;255mhpe-restd[0m[2529]: Event|7708|[38;2;101;215;253mLOG_INFO[0m|AMM|1/1|Certificate example [38;2;0;255;0maccepted[0m

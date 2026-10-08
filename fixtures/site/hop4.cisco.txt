@@ -1,0 +1,2 @@
+Connection to core-rtr.example.net closed.
+edge-sw1#

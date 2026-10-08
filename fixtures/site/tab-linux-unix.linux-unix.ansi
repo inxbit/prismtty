@@ -1,0 +1,11 @@
+[1;38;2;255;0;0mroot[0m[38;2;255;255;255m@linux-lab:~#[0m hostnamectl
+Operating System: Ubuntu 24.04.4 LTS
+Kernel: Linux 6.8.0-110-generic
+[1;38;2;255;0;0mroot[0m[38;2;255;255;255m@linux-lab:~#[0m ip -br addr
+lo               UNKNOWN        [38;2;0;255;255m127.0.0.1/8[0m [38;2;0;255;255m::1/128[0m
+ens18            [38;2;0;255;0mUP[0m             [38;2;0;255;255m192.0.2.50/24[0m
+[1;38;2;255;0;0mroot[0m[38;2;255;255;255m@linux-lab:~#[0m ss -tulpen
+tcp   LISTEN 0 4096 [38;2;0;255;255m0.0.0.0[0m[38;2;0;255;192m:22[0m    [38;2;0;255;255m0.0.0.0[0m:* users:(("sshd",pid=101,fd=3))
+udp   UNCONN 0 0    [38;2;0;255;255m127.0.0.53[0m[38;2;0;255;192m:53[0m [38;2;0;255;255m0.0.0.0[0m:* users:(("systemd-resolve",pid=88,fd=13))
+[1;38;2;255;0;0mroot[0m[38;2;255;255;255m@linux-lab:~#[0m systemctl --[1;38;2;255;0;0mfailed[0m
+UNIT              LOAD   [38;2;0;255;0mACTIVE[0m SUB    DESCRIPTION

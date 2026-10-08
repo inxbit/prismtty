@@ -1,22 +1,13 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="80 38 180 180" role="img" aria-label="PrismTTY">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="1.5 1.25 61 61" role="img" aria-label="PrismTTY">
   <defs>
-    <linearGradient id="pm-prism" x1="70" x2="250" y1="45" y2="215" gradientUnits="userSpaceOnUse">
+    <linearGradient id="pc-mark" x1="2" y1="4.5" x2="62" y2="59" gradientUnits="userSpaceOnUse">
       <stop offset="0" stop-color="#f8fafc"/>
-      <stop offset="0.45" stop-color="#67e8f9"/>
+      <stop offset=".45" stop-color="#67e8f9"/>
       <stop offset="1" stop-color="#a78bfa"/>
     </linearGradient>
-    <linearGradient id="pm-term" x1="0" x2="1" y1="0" y2="1">
-      <stop offset="0" stop-color="#1f2937"/>
-      <stop offset="1" stop-color="#020617"/>
-    </linearGradient>
   </defs>
-  <path d="M88 202 L166 54 L252 202 Z" fill="none" stroke="url(#pm-prism)" stroke-width="14" stroke-linejoin="round"/>
-  <path d="M166 54 L166 202" stroke="#67e8f9" stroke-width="6" stroke-linecap="round" opacity="0.9"/>
-  <path d="M88 202 L166 132 L252 202" fill="none" stroke="#c084fc" stroke-width="6" stroke-linecap="round" stroke-linejoin="round" opacity="0.85"/>
-  <rect x="104" y="111" width="116" height="72" rx="10" fill="url(#pm-term)" stroke="#334155" stroke-width="3"/>
-  <circle cx="122" cy="128" r="4" fill="#ef4444"/>
-  <circle cx="136" cy="128" r="4" fill="#f59e0b"/>
-  <circle cx="150" cy="128" r="4" fill="#22c55e"/>
-  <path d="M127 153 L144 141 L127 129" fill="none" stroke="#22d3ee" stroke-width="7" stroke-linecap="round" stroke-linejoin="round"/>
-  <path d="M157 160 H196" stroke="#a3e635" stroke-width="7" stroke-linecap="round"/>
+  <path d="M32 8.5 58 55H6Z" fill="none" stroke="url(#pc-mark)" stroke-width="7" stroke-linejoin="round"/>
+  <rect x="18.5" y="30.75" width="27" height="17" rx="3" fill="#0a0b0d" stroke="#23252a" stroke-width="1.5"/>
+  <path d="M22.75 35 27.75 39 22.75 43" fill="none" stroke="#22d3ee" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M31.25 43.5H41.25" stroke="#a3e635" stroke-width="4" stroke-linecap="round"/>
 </svg>

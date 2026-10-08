@@ -1,0 +1,6 @@
+[38;2;255;255;255medge-sw1#[0mshow ip interface brief
+Interface              IP-Address      [38;2;0;255;0mOK[0m? Method Status                Protocol
+[38;2;0;153;255mGigabitEthernet1/0/1[0m   [38;2;0;255;255m192.0.2.1[0m       YES manual [38;2;0;255;0mup[0m                    [38;2;0;255;0mup[0m
+[38;2;0;153;255mGigabitEthernet1/0/2[0m   unassigned      YES unset  administratively [1;38;2;255;0;0mdown[0m [1;38;2;255;0;0mdown[0m
+[38;2;0;153;255mVlan1191[0m               [38;2;0;255;255m198.51.100.1[0m    YES manual [38;2;0;255;0mup[0m                    [38;2;0;255;0mup[0m
+[38;2;255;255;255medge-sw1#[0mssh -l admin core-rtr.example.net

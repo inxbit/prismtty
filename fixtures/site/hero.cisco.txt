@@ -1,0 +1,6 @@
+edge-sw1#show interfaces description
+Gi1/0/1  up  up  Uplink to core-rtr
+Gi1/0/2  down  down  Spare access port
+Po10  up  up  Bundle to dist-a
+edge-sw1#show ip route ospf
+O  192.0.2.0/24 [110/20] via 198.51.100.1, Vlan1191

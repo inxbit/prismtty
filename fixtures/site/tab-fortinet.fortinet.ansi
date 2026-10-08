@@ -1,0 +1,11 @@
+[38;2;255;255;255mFGT-LAB-01 #[0m get system status
+Version: FortiGate-VM64 v7.4.3,build2573
+Hostname: FGT-LAB-01
+[38;2;255;255;255mFGT-LAB-01 #[0m get system interface
+== [ [38;2;0;153;255mport1[0m ]
+name: [38;2;0;153;255mport1[0m   mode: static   ip: [38;2;0;255;255m192.0.2.10[0m [38;2;0;255;255m255.255.255.0[0m   status: [38;2;0;255;0mup[0m
+== [ [38;2;0;153;255mport2[0m ]
+name: [38;2;0;153;255mport2[0m   mode: dhcp     ip: [38;2;0;255;255m0.0.0.0[0m [38;2;0;255;255m0.0.0.0[0m            status: [1;38;2;255;0;0mdown[0m
+[38;2;255;255;255mFGT-LAB-01 #[0m get router info routing-table all
+S*      [38;2;0;255;255m0.0.0.0/0[0m [10/0] via [38;2;0;255;255m192.0.2.1[0m, [38;2;0;153;255mport1[0m
+O       [38;2;0;255;255m198.51.100.0/24[0m [110/20] via [38;2;0;255;255m192.0.2.2[0m, [38;2;0;153;255mport1[0m

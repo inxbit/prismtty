@@ -1,0 +1,10 @@
+LAB-ARUBA-01# show version
+ArubaOS-CX 10.13.1000
+LAB-ARUBA-01# show interface brief
+Interface  Status  Protocol  Description
+1/1/1      up      up        Core uplink
+1/1/2      down    down      Spare copper
+lag10      up      up        Access aggregate
+vlan1191   up      up        Synthetic wireless vlan
+LAB-ARUBA-01# show events
+2026-05-07T12:00:00.000000+00:00 LAB-ARUBA-01 hpe-restd[2529]: Event|7708|LOG_INFO|AMM|1/1|Certificate example accepted

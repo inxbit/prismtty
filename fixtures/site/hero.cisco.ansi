@@ -1,0 +1,6 @@
+[38;2;255;255;255medge-sw1#[0mshow interfaces description
+[38;2;0;153;255mGi1/0/1[0m  [38;2;0;255;0mup[0m  [38;2;0;255;0mup[0m  Uplink to core-rtr
+[38;2;0;153;255mGi1/0/2[0m  [1;38;2;255;0;0mdown[0m  [1;38;2;255;0;0mdown[0m  Spare access port
+[38;2;0;153;255mPo10[0m  [38;2;0;255;0mup[0m  [38;2;0;255;0mup[0m  Bundle to dist-a
+[38;2;255;255;255medge-sw1#[0mshow ip route ospf
+O  [38;2;0;255;255m192.0.2.0/24[0m [110/20] via [38;2;0;255;255m198.51.100.1[0m, [38;2;0;153;255mVlan1191[0m
