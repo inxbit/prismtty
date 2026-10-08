@@ -1,0 +1,567 @@
+{
+  "schemaVersion": 2,
+  "generatedAt": "2026-10-08T00:00:00Z",
+  "title": "Design System: PrismTTY",
+  "extensions": {
+    "colorMeta": {
+      "ground": {
+        "role": "neutral",
+        "displayName": "Bench Black",
+        "canonical": "#0a0b0d",
+        "tonalRamp": [
+          "#252628",
+          "#3f4041",
+          "#59595b",
+          "#727374",
+          "#8c8c8d",
+          "#b2b3b3",
+          "#d9d9d9",
+          "#f2f2f2"
+        ]
+      },
+      "text": {
+        "role": "neutral",
+        "displayName": "Paper White",
+        "canonical": "#f2f3f5",
+        "tonalRamp": [
+          "#262627",
+          "#404040",
+          "#59595a",
+          "#727374",
+          "#8c8c8d",
+          "#b2b3b4",
+          "#d8d9db",
+          "#f1f2f4"
+        ]
+      },
+      "text-2": {
+        "role": "neutral",
+        "displayName": "Output Gray",
+        "canonical": "#c4c7ce",
+        "tonalRamp": [
+          "#262628",
+          "#3f4042",
+          "#58595c",
+          "#717377",
+          "#8a8c91",
+          "#b0b3b9",
+          "#d7d9de",
+          "#f2f2f4"
+        ]
+      },
+      "muted": {
+        "role": "neutral",
+        "displayName": "Muted Steel",
+        "canonical": "#8b9099",
+        "tonalRamp": [
+          "#252629",
+          "#3e4044",
+          "#565a5f",
+          "#6f737a",
+          "#888d95",
+          "#afb3b9",
+          "#d7d9dc",
+          "#f2f2f3"
+        ]
+      },
+      "dim": {
+        "role": "neutral",
+        "displayName": "Dim Steel",
+        "canonical": "#7b8087",
+        "tonalRamp": [
+          "#252629",
+          "#3e4044",
+          "#565a5f",
+          "#6f737a",
+          "#888d93",
+          "#b0b3b7",
+          "#d7d9db",
+          "#f2f2f3"
+        ]
+      },
+      "hairline": {
+        "role": "neutral",
+        "displayName": "Hairline",
+        "canonical": "#23252a",
+        "tonalRamp": [
+          "#24262b",
+          "#3e4044",
+          "#58595d",
+          "#727376",
+          "#8b8c8f",
+          "#b2b3b4",
+          "#d8d9da",
+          "#f2f2f3"
+        ]
+      },
+      "chip": {
+        "role": "neutral",
+        "displayName": "Chip Black",
+        "canonical": "#0e1014",
+        "tonalRamp": [
+          "#25262a",
+          "#3e4043",
+          "#58595c",
+          "#727375",
+          "#8b8c8e",
+          "#b2b3b4",
+          "#d8d9d9",
+          "#f2f2f2"
+        ]
+      },
+      "chip-line": {
+        "role": "neutral",
+        "displayName": "Chip Line",
+        "canonical": "#2a2d35",
+        "tonalRamp": [
+          "#24262d",
+          "#3d4047",
+          "#575960",
+          "#717378",
+          "#8b8c91",
+          "#b1b3b5",
+          "#d8d9da",
+          "#f2f2f3"
+        ]
+      },
+      "ghost-line": {
+        "role": "neutral",
+        "displayName": "Ghost Line",
+        "canonical": "#3a414c",
+        "tonalRamp": [
+          "#22272d",
+          "#39404b",
+          "#545a63",
+          "#6e737b",
+          "#888d93",
+          "#b0b3b7",
+          "#d7d9db",
+          "#f2f2f3"
+        ]
+      },
+      "term-surface": {
+        "role": "neutral",
+        "displayName": "Terminal Surface",
+        "canonical": "#0c0e11",
+        "tonalRamp": [
+          "#252629",
+          "#3e4042",
+          "#58595b",
+          "#727375",
+          "#8b8c8e",
+          "#b2b3b4",
+          "#d8d9d9",
+          "#f2f2f2"
+        ]
+      },
+      "selected-surface": {
+        "role": "neutral",
+        "displayName": "Selected Surface",
+        "canonical": "#15181d",
+        "tonalRamp": [
+          "#24272b",
+          "#3d4044",
+          "#57595d",
+          "#717376",
+          "#8b8c8f",
+          "#b2b3b4",
+          "#d8d9da",
+          "#f2f2f3"
+        ]
+      },
+      "output-interface": {
+        "role": "primary",
+        "displayName": "Interface Blue",
+        "canonical": "#0099ff",
+        "tonalRamp": [
+          "#002e4c",
+          "#004c7f",
+          "#006bb2",
+          "#0089e5",
+          "#19a3ff",
+          "#66c2ff",
+          "#b2e0ff",
+          "#e5f5ff"
+        ],
+        "source": "generated .c-0099ff class (scripts/site-output.mjs); real output only"
+      },
+      "output-prompt-alt": {
+        "role": "primary",
+        "displayName": "Junos Prompt Sky",
+        "canonical": "#00bfff",
+        "tonalRamp": [
+          "#002f3f",
+          "#004f69",
+          "#006e93",
+          "#008dbd",
+          "#00ade7",
+          "#3cceff",
+          "#9de7ff",
+          "#def7ff"
+        ],
+        "source": "generated .c-00bfff class (scripts/site-output.mjs); real output only"
+      },
+      "output-up": {
+        "role": "primary",
+        "displayName": "State Up Green",
+        "canonical": "#00ff00",
+        "tonalRamp": [
+          "#003500",
+          "#005900",
+          "#007d00",
+          "#00a000",
+          "#00c400",
+          "#00fa00",
+          "#79ff79",
+          "#d2ffd2"
+        ],
+        "source": "generated .c-00ff00 class (scripts/site-output.mjs); real output only"
+      },
+      "output-port": {
+        "role": "primary",
+        "displayName": "Port Mint",
+        "canonical": "#00ffc0",
+        "tonalRamp": [
+          "#003225",
+          "#00533e",
+          "#007457",
+          "#009570",
+          "#00b689",
+          "#00e8af",
+          "#59ffd6",
+          "#c8fff1"
+        ],
+        "source": "generated .c-00ffc0 class (scripts/site-output.mjs); real output only"
+      },
+      "output-address": {
+        "role": "primary",
+        "displayName": "Address Cyan",
+        "canonical": "#00ffff",
+        "tonalRamp": [
+          "#003131",
+          "#005151",
+          "#007171",
+          "#009292",
+          "#00b2b2",
+          "#00e3e3",
+          "#4bffff",
+          "#c3ffff"
+        ],
+        "source": "generated .c-00ffff class (scripts/site-output.mjs); real output only"
+      },
+      "output-severity": {
+        "role": "primary",
+        "displayName": "Severity Ice",
+        "canonical": "#65d7fd",
+        "tonalRamp": [
+          "#142a32",
+          "#214753",
+          "#2f6375",
+          "#3c7f96",
+          "#499cb7",
+          "#5dc6e9",
+          "#9fe6fe",
+          "#dff7ff"
+        ],
+        "source": "generated .c-65d7fd class (scripts/site-output.mjs); real output only"
+      },
+      "output-down": {
+        "role": "primary",
+        "displayName": "State Down Red",
+        "canonical": "#ff0000",
+        "tonalRamp": [
+          "#b40000",
+          "#ff0c0c",
+          "#ff2c2c",
+          "#ff4d4d",
+          "#ff6d6d",
+          "#ff9e9e",
+          "#ffcece",
+          "#ffefef"
+        ],
+        "source": "generated .c-ff0000 class (scripts/site-output.mjs); real output only"
+      },
+      "output-accent": {
+        "role": "primary",
+        "displayName": "Vendor Magenta",
+        "canonical": "#ff00ff",
+        "tonalRamp": [
+          "#860086",
+          "#e000e0",
+          "#ff17ff",
+          "#ff3bff",
+          "#ff5fff",
+          "#ff94ff",
+          "#ffcaff",
+          "#ffedff"
+        ],
+        "source": "generated .c-ff00ff class (scripts/site-output.mjs); real output only"
+      },
+      "output-prompt": {
+        "role": "primary",
+        "displayName": "Prompt White",
+        "canonical": "#ffffff",
+        "tonalRamp": [
+          "#262626",
+          "#404040",
+          "#595959",
+          "#737373",
+          "#8c8c8c",
+          "#b3b3b3",
+          "#d9d9d9",
+          "#f2f2f2"
+        ],
+        "source": "generated .c-ffffff class (scripts/site-output.mjs); real output only"
+      }
+    },
+    "typographyMeta": {
+      "display": {
+        "displayName": "Display",
+        "purpose": "Two-line hero headline only; clamp(38px, 9.4vw, 66px) on 1.04 below 1280 px."
+      },
+      "headline": {
+        "displayName": "Headline",
+        "purpose": "Section headings and the 404 title; text-wrap: balance."
+      },
+      "title": {
+        "displayName": "Title",
+        "purpose": "Fact titles and scope column heads."
+      },
+      "lede": {
+        "displayName": "Lede",
+        "purpose": "Paragraph under each headline, Muted Steel, max 62ch; weight 400 below 1280 px."
+      },
+      "body": {
+        "displayName": "Body",
+        "purpose": "Fact bodies and scope prose."
+      },
+      "label": {
+        "displayName": "Label",
+        "purpose": "Captions, install labels, footer facts."
+      },
+      "mono-output": {
+        "displayName": "Mono Output",
+        "purpose": "Terminal panes of real output."
+      },
+      "mono-hero-output": {
+        "displayName": "Mono Hero Output",
+        "purpose": "Raw and highlighted output at the hero seam; 12px at -0.03em below 520 px."
+      },
+      "mono-command": {
+        "displayName": "Mono Command",
+        "purpose": "Install commands in chip and rows."
+      },
+      "mono-label": {
+        "displayName": "Mono Label",
+        "purpose": "Terminal title bars, tabs, hop stack, scope and vendor lists."
+      }
+    },
+    "shadows": [],
+    "motion": [
+      {
+        "name": "ease-out-expo",
+        "value": "cubic-bezier(0.16, 1, 0.3, 1)",
+        "purpose": "Light layer fade-in (1.6s) and the once-on-load line pass/arrive (0.9s)."
+      },
+      {
+        "name": "control",
+        "value": "0.15s ease",
+        "purpose": "Color, border and background transitions on every control."
+      },
+      {
+        "name": "line-stagger",
+        "value": "0.18s per line, highlighted twin +0.32s",
+        "purpose": "Raw line passes into the prism, highlighted line wipes in after it."
+      },
+      {
+        "name": "beam-flow",
+        "value": "1.5s linear infinite",
+        "purpose": "Steady white beam flow left to right in the light layer."
+      },
+      {
+        "name": "drift",
+        "value": "26s ease-in-out infinite alternate (34s alternate-reverse on even sections)",
+        "purpose": "Slow drift of the hero light plate and crystal plates."
+      },
+      {
+        "name": "prism-intro",
+        "value": "video once, per-frame playbackRate = sqrt(left / 1.4s), floor 0.0625",
+        "purpose": "Approved prism footage eases to a stop on the wide spectrum; still plate under reduced motion, save-data, error or 4s stall."
+      }
+    ],
+    "breakpoints": [
+      {
+        "name": "hero-flow",
+        "value": "1279px",
+        "note": "max-width; hero leaves the measured frame, --u frozen at 0.765px, light layer hidden"
+      },
+      {
+        "name": "facts-three-up",
+        "value": "700px",
+        "note": "min-width within the flow range"
+      },
+      {
+        "name": "tabs-wrap",
+        "value": "600px"
+      },
+      {
+        "name": "phone",
+        "value": "520px",
+        "note": "install labels hide, 12px terminal floor"
+      },
+      {
+        "name": "narrow",
+        "value": "400px",
+        "note": "wordmark hides"
+      },
+      {
+        "name": "tiny",
+        "value": "360px",
+        "note": "README link hides"
+      }
+    ],
+    "geometry": {
+      "compWidth": "1672px",
+      "unit": "calc(min(100vw, 1672px) / 1672)",
+      "heroHeight": "calc(941 * var(--u))"
+    }
+  },
+  "components": [
+    {
+      "name": "Install Chip",
+      "kind": "custom",
+      "refersTo": "install-chip",
+      "description": "Hero primary action: mono command with a divided copy button.",
+      "html": "<div class=\"ds-chip\"><code class=\"ds-chip-cmd\"><span class=\"ds-chip-prompt\">$</span> brew install inxbit/tap/prismtty</code><button class=\"ds-chip-copy\" type=\"button\" aria-label=\"Copy\"><svg width=\"20\" height=\"20\" viewBox=\"0 0 24 24\" fill=\"none\" aria-hidden=\"true\"><rect x=\"8.5\" y=\"8.5\" width=\"11\" height=\"11\" rx=\"2.2\" stroke=\"currentColor\" stroke-width=\"1.7\"/><path d=\"M15.5 8.5V6.7a2.2 2.2 0 0 0-2.2-2.2H6.7a2.2 2.2 0 0 0-2.2 2.2v6.6a2.2 2.2 0 0 0 2.2 2.2h1.8\" stroke=\"currentColor\" stroke-width=\"1.7\"/></svg></button></div>",
+      "css": ".ds-chip { display: flex; align-items: center; width: 474px; max-width: 100%; height: 56px; padding-left: 16px; background: #0e1014; border: 1px solid #2a2d35; border-radius: 8px; } .ds-chip-cmd { flex: 1; font-family: \"Oxygen Mono\", ui-monospace, Menlo, monospace; font-size: 17px; letter-spacing: -0.03em; color: #a9adb5; white-space: nowrap; overflow: hidden; } .ds-chip-prompt { color: #7b8087; } .ds-chip-copy { display: grid; place-items: center; width: 56px; height: 100%; padding: 0; border: 0; border-left: 1px solid #2a2d35; background: none; color: #8b9099; cursor: pointer; transition: color 0.15s ease; } .ds-chip-copy:hover { color: #f2f3f5; } .ds-chip-copy:focus-visible { outline: 2px solid #00ffff; outline-offset: 3px; border-radius: 4px; }"
+    },
+    {
+      "name": "Ghost Button",
+      "kind": "button",
+      "refersTo": "button-ghost",
+      "description": "Default button: 1px outline, quiet label.",
+      "html": "<a class=\"ds-btn-ghost\" href=\"#\">View on GitHub</a>",
+      "css": ".ds-btn-ghost { display: inline-flex; align-items: center; justify-content: center; height: 56px; padding: 0 28px; border: 1px solid #3a414c; border-radius: 8px; font-family: \"Vend Sans\", ui-sans-serif, system-ui, sans-serif; font-size: 18px; color: #dde3e9; text-decoration: none; background: transparent; transition: color 0.15s ease, border-color 0.15s ease, background-color 0.15s ease; } .ds-btn-ghost:hover { border-color: #59616d; color: #f2f3f5; } .ds-btn-ghost:active { background: #15181d; } .ds-btn-ghost:focus-visible { outline: 2px solid #00ffff; outline-offset: 3px; border-radius: 4px; }"
+    },
+    {
+      "name": "Solid Button",
+      "kind": "button",
+      "refersTo": "button-solid",
+      "description": "The one solid button per page (feedback CTA on home, way home on 404).",
+      "html": "<a class=\"ds-btn-solid\" href=\"#\">Open an issue on GitHub</a>",
+      "css": ".ds-btn-solid { display: inline-flex; align-items: center; height: 56px; padding: 0 24px; border: 1px solid #f2f3f5; border-radius: 8px; background: #f2f3f5; color: #0a0b0d; font-family: \"Vend Sans\", ui-sans-serif, system-ui, sans-serif; font-size: 18px; font-weight: 500; text-decoration: none; transition: background-color 0.15s ease, border-color 0.15s ease; } .ds-btn-solid:hover { background: #ffffff; border-color: #ffffff; } .ds-btn-solid:focus-visible { outline: 2px solid #00ffff; outline-offset: 3px; border-radius: 4px; }"
+    },
+    {
+      "name": "Profile Tabs",
+      "kind": "chip",
+      "refersTo": "tab",
+      "description": "Mono pill tablist that switches terminal panes.",
+      "html": "<div class=\"ds-tabs\" role=\"tablist\"><button class=\"ds-tab\" role=\"tab\" aria-selected=\"true\">cisco</button><button class=\"ds-tab\" role=\"tab\" aria-selected=\"false\">juniper</button><button class=\"ds-tab\" role=\"tab\" aria-selected=\"false\">fortinet</button></div>",
+      "css": ".ds-tabs { display: flex; gap: 8px; } .ds-tab { min-height: 44px; padding: 0 18px; border: 1px solid #23262c; border-radius: 999px; background: transparent; color: #8b9099; font-family: \"Oxygen Mono\", ui-monospace, Menlo, monospace; font-size: 15px; cursor: pointer; transition: color 0.15s ease, border-color 0.15s ease, background-color 0.15s ease; } .ds-tab:hover { color: #f2f3f5; } .ds-tab:active { background: #15181d; } .ds-tab[aria-selected=\"true\"] { border-color: #3a414c; background: #15181d; color: #f2f3f5; } .ds-tab:focus-visible { outline: 2px solid #00ffff; outline-offset: -3px; }"
+    },
+    {
+      "name": "Terminal Window",
+      "kind": "card",
+      "refersTo": "term",
+      "description": "Frame for real PrismTTY output: mono title bar, profile badge, scrolling pane.",
+      "html": "<figure class=\"ds-term\"><div class=\"ds-term-bar\"><span>ptty /bin/zsh</span><span class=\"ds-term-badge\">generic + cisco</span></div><pre class=\"ds-term-out\"><span class=\"ds-c-ffffff\">edge-sw1#</span>show interfaces description\n<span class=\"ds-c-0099ff\">Gi1/0/1</span>  <span class=\"ds-c-00ff00\">up</span>  <span class=\"ds-c-00ff00\">up</span>  Uplink to core-rtr\n<span class=\"ds-c-0099ff\">Gi1/0/2</span>  <b class=\"ds-c-ff0000\">down</b>  <b class=\"ds-c-ff0000\">down</b>  Spare access port</pre></figure>",
+      "css": ".ds-term { margin: 0; overflow: hidden; background: #0c0e11; border: 1px solid #23252a; border-radius: 14px; } .ds-term-bar { display: flex; align-items: center; justify-content: space-between; gap: 16px; min-height: 48px; padding: 0 24px; border-bottom: 1px solid #23252a; font-family: \"Oxygen Mono\", ui-monospace, Menlo, monospace; font-size: 15px; color: #8b9099; } .ds-term-badge { padding: 3px 10px; border: 1px solid #2f333b; border-radius: 999px; color: #c4c7ce; } .ds-term-out { margin: 0; padding: 26px 28px; font-family: \"Oxygen Mono\", ui-monospace, Menlo, monospace; font-size: 17px; line-height: 1.65; color: #c4c7ce; white-space: pre; overflow-x: auto; } .ds-c-ffffff { color: #ffffff; } .ds-c-0099ff { color: #0099ff; } .ds-c-00ff00 { color: #00ff00; } .ds-c-ff0000 { color: #ff0000; }",
+      "note": "Output colors mirror the generated .c-rrggbb classes; never hand-color output on the site."
+    },
+    {
+      "name": "Install Row",
+      "kind": "custom",
+      "refersTo": "install-row",
+      "description": "Section-scale install command with label and copy button.",
+      "html": "<div class=\"ds-row\"><span class=\"ds-row-label\">Cargo</span><code class=\"ds-row-line\"><span class=\"ds-row-prompt\">$</span> cargo install prismtty</code><button class=\"ds-row-copy\" type=\"button\" aria-label=\"Copy\"><svg width=\"20\" height=\"20\" viewBox=\"0 0 24 24\" fill=\"none\" aria-hidden=\"true\"><rect x=\"8.5\" y=\"8.5\" width=\"11\" height=\"11\" rx=\"2.2\" stroke=\"currentColor\" stroke-width=\"1.7\"/><path d=\"M15.5 8.5V6.7a2.2 2.2 0 0 0-2.2-2.2H6.7a2.2 2.2 0 0 0-2.2 2.2v6.6a2.2 2.2 0 0 0 2.2 2.2h1.8\" stroke=\"currentColor\" stroke-width=\"1.7\"/></svg></button></div>",
+      "css": ".ds-row { display: grid; grid-template-columns: 110px 1fr auto; align-items: center; min-height: 60px; padding-left: 22px; background: #0e1014; border: 1px solid #2a2d35; border-radius: 10px; } .ds-row-label { font-family: \"Vend Sans\", ui-sans-serif, system-ui, sans-serif; font-size: 16px; color: #7b8087; } .ds-row-line { font-family: \"Oxygen Mono\", ui-monospace, Menlo, monospace; font-size: 17px; color: #c4c7ce; white-space: nowrap; } .ds-row-prompt { color: #7b8087; } .ds-row-copy { display: grid; place-items: center; width: 60px; height: 60px; border: 0; border-left: 1px solid #2a2d35; background: none; color: #8b9099; cursor: pointer; transition: color 0.15s ease; } .ds-row-copy:hover { color: #f2f3f5; } .ds-row-copy:focus-visible { outline: 2px solid #00ffff; outline-offset: 3px; border-radius: 4px; }"
+    },
+    {
+      "name": "Hop Stack",
+      "kind": "chip",
+      "refersTo": "hop-stack",
+      "description": "Profile stack chips: active, inactive, popped.",
+      "html": "<p class=\"ds-hop\"><span class=\"ds-hop-chip\">linux-unix</span> <span class=\"ds-hop-chip ds-on\">cisco</span> <span class=\"ds-hop-op\">&minus;</span> <s class=\"ds-hop-pop\">juniper</s></p>",
+      "css": ".ds-hop { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 8px; margin: 0; font-family: \"Oxygen Mono\", ui-monospace, Menlo, monospace; font-size: 14px; color: #8a9099; } .ds-hop-chip { padding: 2px 8px; border: 1px solid #23262c; border-radius: 8px; } .ds-hop-chip.ds-on { border-color: #3a414c; color: #f2f3f5; } .ds-hop-op { color: #8b9099; } .ds-hop-pop { color: #7b8087; }"
+    },
+    {
+      "name": "Navigation",
+      "kind": "nav",
+      "refersTo": "nav",
+      "description": "Logo C mark plus wordmark, quiet text links.",
+      "html": "<header class=\"ds-nav\"><a class=\"ds-brand\" href=\"#\"><svg width=\"34\" height=\"34\" xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"1.5 1.25 61 61\" aria-hidden=\"true\"><defs><linearGradient id=\"pc-mark\" x1=\"2\" y1=\"4.5\" x2=\"62\" y2=\"59\" gradientUnits=\"userSpaceOnUse\"><stop offset=\"0\" stop-color=\"#f8fafc\"/><stop offset=\".45\" stop-color=\"#67e8f9\"/><stop offset=\"1\" stop-color=\"#a78bfa\"/></linearGradient></defs><path d=\"M32 8.5 58 55H6Z\" fill=\"none\" stroke=\"url(#pc-mark)\" stroke-width=\"7\" stroke-linejoin=\"round\"/><rect x=\"18.5\" y=\"30.75\" width=\"27\" height=\"17\" rx=\"3\" fill=\"#0a0b0d\" stroke=\"#23252a\" stroke-width=\"1.5\"/><path d=\"M22.75 35 27.75 39 22.75 43\" fill=\"none\" stroke=\"#22d3ee\" stroke-width=\"4\" stroke-linecap=\"round\" stroke-linejoin=\"round\"/><path d=\"M31.25 43.5H41.25\" stroke=\"#a3e635\" stroke-width=\"4\" stroke-linecap=\"round\"/></svg><span>PrismTTY</span></a><nav class=\"ds-nav-links\"><a href=\"#\">Profiles</a><a href=\"#\">Install</a><a href=\"#\">README</a><a href=\"#\">GitHub</a></nav></header>",
+      "css": ".ds-nav { display: flex; align-items: center; justify-content: space-between; padding: 14px 20px; background: #0a0b0d; } .ds-brand { display: flex; align-items: center; gap: 12px; color: #f2f3f5; text-decoration: none; font-family: \"Vend Sans\", ui-sans-serif, system-ui, sans-serif; font-size: 20px; font-weight: 650; letter-spacing: -0.01em; } .ds-nav-links { display: flex; gap: 4px; font-family: \"Vend Sans\", ui-sans-serif, system-ui, sans-serif; font-size: 15px; } .ds-nav-links a { padding: 15px 8px; color: #c3ccd9; text-decoration: none; transition: color 0.15s ease; } .ds-nav-links a:hover { color: #f2f3f5; } .ds-nav-links a:focus-visible, .ds-brand:focus-visible { outline: 2px solid #00ffff; outline-offset: 3px; border-radius: 4px; }"
+    }
+  ],
+  "narrative": {
+    "northStar": "The Prism at the Seam",
+    "overview": "The site is a dark optical bench with one instrument on it. A single Cisco session crosses the first viewport as raw gray text, passes through a glass prism and leaves in PrismTTY's real colors. Everything else on the page is set in near-black, off-white and a short ladder of grays, so that the only saturated light anywhere is the product's own output. The prism is the single optical object; the crystals elsewhere are the same glass, out of focus.\n\nThe world is terminal-native and restrained: one refined variable sans (Vend Sans) for display and UI, one clean mono (Oxygen Mono) for every command and every line of output. Surfaces are flat and separated by 1px hairlines, not shadows. Controls are quiet outlines and pills; there is exactly one solid button per page. Motion is a one-time demonstration (the footage plays once and stops on the wide spectrum, each raw line passes into the prism once) followed by a slow steady light, never a loop that asks for attention.\n\nThe desktop hero is a measured frame: every length is a comp pixel of the approved 1672 px comp times `--u`, with px floors for legibility. Below 1280 px the frame lets go and flows as a column.",
+    "keyCharacteristics": [
+      "Near-black ground, gray type ladder, hairline structure.",
+      "Saturated color only where PrismTTY itself produced it.",
+      "One optical object (the prism), one light layer, crystals in the empty side of each section.",
+      "Comp-pixel geometry on desktop, frozen unit and flow below 1280 px.",
+      "Every raster carries its provenance."
+    ],
+    "rules": [
+      {
+        "name": "The Real Output Rule",
+        "body": "No saturated color exists on the site unless PrismTTY produced it from a fixture. The only exceptions are the logo mark, which keeps its own fixed construction (a white-to-cyan-to-violet gradient prism stroke around a terminal with a cyan chevron and a lime cursor), and two UI borrowings from output: the keyboard focus ring (Address Cyan, 2px) and text selection (Interface Blue at 33% alpha). Add no others, and never reuse the mark's colors elsewhere.",
+        "section": "colors"
+      },
+      {
+        "name": "The Gray Ladder Rule",
+        "body": "UI text steps down Paper White, Output Gray, Muted Steel, Dim Steel. Every step holds 4.5:1 on its surface (enforced by the site test); a new gray must clear the same bar before it ships.",
+        "section": "colors"
+      },
+      {
+        "name": "The Two Faces Rule",
+        "body": "Vend Sans speaks, Oxygen Mono shows. Anything a user would type or a device would print is mono; nothing else is.",
+        "section": "typography"
+      },
+      {
+        "name": "The Terminal Floor Rule",
+        "body": "Terminal type never drops below 12px; on a 390 px phone the hero output sets 12px at -0.03em so 51 columns fit.",
+        "section": "typography"
+      },
+      {
+        "name": "The Comp Pixel Rule",
+        "body": "On desktop, new hero geometry is written as `calc(N * var(--u))` with N read off the comp, plus a px floor wherever text or a touch target could get too small. Never mix raw px into the measured frame.",
+        "section": "layout"
+      },
+      {
+        "name": "The Empty Side Rule",
+        "body": "Each section's crystal plate sits in the section's empty side and fades out before the section edge. Crystals never sit under running text, and the scope section carries none.",
+        "section": "layout"
+      },
+      {
+        "name": "The No Glow Rule",
+        "body": "No glow on UI: no shadows, no blurred halos, no gradient text, no gradient fills on surfaces. Gradients appear only as mask-image on plates and panes, as the beam fill in the light layer, and inside the logo mark.",
+        "section": "elevation"
+      },
+      {
+        "name": "The One Object Rule",
+        "body": "The prism is the only optical object in focus. Other glass on the page is out of focus and behind content.",
+        "section": "elevation"
+      }
+    ],
+    "dos": [
+      "**Do** take every saturated color from real PrismTTY output: add a fixture under `fixtures/site/`, regenerate with `scripts/site-output.mjs`, and let the tests guard it.",
+      "**Do** write desktop hero lengths as comp pixels times `--u`, with px floors on text and touch targets.",
+      "**Do** keep all styling in `site.css` (or a CSP-hashed `<style>` block on a standalone page); the CSP allows no style attributes.",
+      "**Do** give every new raster its provenance: an embedded prompt or a `.json` sidecar next to it.",
+      "**Do** place crystal plates in a section's empty side, screen-blended and masked to fade inside the section.",
+      "**Do** keep 44 px touch targets and a 12 px terminal-type floor on small screens, and a still path for every animation.",
+      "**Do** self-host fonts and media; the site loads nothing from a third-party host."
+    ],
+    "donts": [
+      "**Don't** introduce a saturated color that PrismTTY did not emit; the logo mark, the focus ring and selection are the only exceptions.",
+      "**Don't** add style attributes; the CSP blocks them.",
+      "**Don't** use gradient text, glow, box-shadows, neon or gradient blobs; the logo mark's own gradient stroke stays inside the mark.",
+      "**Don't** add eyebrows or kicker labels above headings.",
+      "**Don't** put a crystal plate under running text, or behind the scope section.",
+      "**Don't** add a second solid button to a page.",
+      "**Don't** imitate output with hand-colored spans; the JS imitation highlighter is retired."
+    ]
+  }
+}
