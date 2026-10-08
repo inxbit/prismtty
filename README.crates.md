@@ -5,7 +5,7 @@
 </p>
 
 <p align="center">
-  <a href="https://prismtty.com/"><img alt="website" src="https://img.shields.io/badge/website-prismtty-22d3ee?style=flat-square"></a>
+  <a href="https://prismtty.com/"><img alt="website" src="https://img.shields.io/badge/website-prismtty-0a0b0d?style=flat-square"></a>
   <a href="https://crates.io/crates/prismtty"><img alt="crates.io" src="https://img.shields.io/crates/v/prismtty?style=flat-square"></a>
   <a href="https://docs.rs/prismtty"><img alt="docs.rs" src="https://img.shields.io/docsrs/prismtty?style=flat-square"></a>
   <a href="https://github.com/inxbit/prismtty/actions/workflows/ci.yml"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/inxbit/prismtty/ci.yml?branch=main&style=flat-square"></a>
@@ -25,7 +25,7 @@ Website: [prismtty.com](https://prismtty.com/).
 
 ## Preview
 
-Synthetic terminal previews using documentation-only hostnames and addresses:
+Real PrismTTY output over synthetic fixtures (invented hosts, documentation-range addresses):
 
 ![Highlighted PrismTTY terminal output](https://prismtty.com/assets/prismtty-terminal-preview.svg)
 

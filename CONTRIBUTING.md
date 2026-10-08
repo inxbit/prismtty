@@ -61,6 +61,75 @@ and IPv6 unique-local, link-local, and publicly routable addresses. Prefer
 invented hostnames or documentation-range addresses whenever an exact address
 shape matters.
 
+## Website
+
+The prismtty.com site lives in `docs/` and is published by GitHub Pages
+(`.github/workflows/pages.yml`). There is no build step: the page is
+`docs/index.html`, `docs/site.css`, and `docs/site.js`, with fonts and images
+under `docs/assets/` and video under `docs/media/`. To preview it, serve the
+directory locally, for example `python3 -m http.server --directory docs`.
+
+The page sets a strict Content Security Policy in a `<meta>` tag. Scripts,
+styles, images, media, and fonts may only come from the site itself (plus
+`data:` images), so inline styles and executable inline scripts are blocked
+and no third-party host is allowed. This is why
+output colors are CSS classes rather than `style` attributes. Loosening the
+policy, or adding a source or host to it, is an owner decision: open an issue
+first instead of changing it in a pull request.
+
+The terminal output on the page is real PrismTTY output, not hand-colored
+markup. `scripts/site-output.mjs` pipes each
+`fixtures/site/<slug>.<profile>.txt` through the release binary with that
+profile forced, keeps the result as `<slug>.<profile>.ansi`, and rewrites the
+marked regions of `docs/index.html` and the color classes in `docs/site.css`.
+After changing a fixture or a profile, regenerate it:
+
+```sh
+cargo build --release
+node scripts/site-output.mjs
+```
+
+`tests/site_output.rs` fails when a snapshot no longer matches what the binary
+prints, and `tests/site_pages.test.mjs` fails when the page no longer matches
+the snapshots. Do not edit the generated markup by hand.
+
+The three README images (`prismtty-terminal-preview.svg`,
+`prismtty-profile-switching.svg`, `prismtty-terminal-demo.svg`) are drawn from
+the same snapshots. Run `node scripts/readme-svgs.mjs` after
+`node scripts/site-output.mjs`; it writes identical copies to `docs/assets/`
+and `.github/assets/`.
+
+Site fixtures are published on a public page and follow the fixture rules
+above: synthetic only, invented hostnames, and documentation-range addresses
+such as `192.0.2.0/24`, `198.51.100.0/24`, `203.0.113.0/24`, and
+`2001:db8::/32`.
+
+On release, after bumping the version in `Cargo.toml`, update the version the
+site shows (the JSON-LD `softwareVersion` and the footer):
+
+```sh
+node scripts/site-version.mjs
+```
+
+`tests/site_pages.test.mjs` fails while the page and `Cargo.toml` disagree;
+`node scripts/site-version.mjs --check` reports the same mismatch without
+writing anything.
+
+Generated images and video keep their provenance next to them. PNGs carry the
+prompt or capture notes in an embedded `impeccable:prompt` text chunk; other
+files use a `.json` sidecar named after the file (for example
+`prism-loop.mp4.json`) with a `prompt` field. Update it when you replace the
+asset.
+
+Browsers and caches keep CSS, JavaScript, and font files for a while, so a
+change made in place can take time to reach returning visitors. Renaming the
+file (as `styles.css` became `site.css`) busts those caches; update every
+reference, including the font `preload` links, when you do. Do not rename or
+remove `docs/assets/prismtty-logo.svg`, `prismtty-terminal-demo.svg`,
+`prismtty-terminal-preview.svg`, `prismtty-profile-switching.svg`, or
+`prismtty-social-card.png`: published crates.io READMEs and link previews load
+them from prismtty.com.
+
 ## Pull Request Checklist
 
 - Run `cargo fmt --check`.

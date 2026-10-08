@@ -1,59 +1,71 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="980" height="500" viewBox="0 0 980 500" role="img" aria-labelledby="title desc">
-  <title id="title">PrismTTY dynamic profile switching preview</title>
-  <desc id="desc">Synthetic terminal session showing PrismTTY switching from a Unix shell to Fortinet and Juniper device profiles.</desc>
-  <defs>
-    <linearGradient id="panel" x1="0" x2="1" y1="0" y2="1">
-      <stop offset="0" stop-color="#111827"/>
-      <stop offset="1" stop-color="#020617"/>
-    </linearGradient>
-    <style>
-      .mono { font-family: SFMono-Regular, Consolas, Liberation Mono, Menlo, monospace; font-size: 21px; }
-      .small { font-family: SFMono-Regular, Consolas, Liberation Mono, Menlo, monospace; font-size: 16px; }
-      .label { font-family: 'Berkeley Mono', 'JetBrains Mono', 'Cascadia Code', 'SF Mono', ui-monospace, Menlo, Consolas, monospace; font-size: 18px; font-weight: 700; }
-      .fg { fill: #e5e7eb; }
-      .muted { fill: #94a3b8; }
-      .dim { fill: #64748b; }
-      .cyan { fill: #22d3ee; }
-      .green { fill: #a3e635; }
-      .yellow { fill: #facc15; }
-      .pink { fill: #f472b6; }
-      .purple { fill: #c084fc; }
-      .blue { fill: #60a5fa; }
-    </style>
-  </defs>
-  <rect width="980" height="500" rx="24" fill="#020617"/>
-  <rect x="24" y="24" width="932" height="452" rx="18" fill="url(#panel)" stroke="#1e293b" stroke-width="2"/>
-  <text x="54" y="62" class="label fg">One wrapped shell, automatic profile context</text>
-
-  <rect x="54" y="88" width="190" height="48" rx="12" fill="#0f172a" stroke="#1e293b"/>
-  <text x="149" y="119" text-anchor="middle" class="small cyan">linux-unix</text>
-  <path d="M268 112 H348" stroke="#334155" stroke-width="3" stroke-linecap="round"/>
-  <path d="M338 102 L352 112 L338 122" fill="none" stroke="#334155" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
-
-  <rect x="374" y="88" width="190" height="48" rx="12" fill="#0f172a" stroke="#1e293b"/>
-  <text x="469" y="119" text-anchor="middle" class="small green">fortinet</text>
-  <path d="M588 112 H668" stroke="#334155" stroke-width="3" stroke-linecap="round"/>
-  <path d="M658 102 L672 112 L658 122" fill="none" stroke="#334155" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
-
-  <rect x="694" y="88" width="190" height="48" rx="12" fill="#0f172a" stroke="#1e293b"/>
-  <text x="789" y="119" text-anchor="middle" class="small purple">juniper</text>
-
-  <text x="54" y="178" class="mono green">devbox%</text>
-  <text x="150" y="178" class="mono fg">ptty /bin/zsh</text>
-  <text x="54" y="216" class="mono green">devbox%</text>
-  <text x="150" y="216" class="mono fg">ssh fw-edge.example.net</text>
-  <text x="54" y="254" class="small cyan">profile</text>
-  <text x="144" y="254" class="small dim">generic, linux-unix -&gt; </text>
-  <text x="420" y="254" class="small green">generic, fortinet</text>
-
-  <text x="54" y="300" class="mono yellow">fw-edge #</text>
-  <text x="174" y="300" class="mono fg">get system status</text>
-  <text x="54" y="338" class="small pink">Version:</text>
-  <text x="142" y="338" class="small fg"> FortiGate synthetic output</text>
-  <text x="54" y="384" class="mono yellow">fw-edge #</text>
-  <text x="174" y="384" class="mono fg">ssh core-rtr.example.net</text>
-  <text x="54" y="422" class="small cyan">profile</text>
-  <text x="144" y="422" class="small dim">fortinet -&gt; </text>
-  <text x="274" y="422" class="small purple">juniper</text>
-  <text x="54" y="462" class="mono purple">user@core-rtr&gt;</text>
+<svg xmlns="http://www.w3.org/2000/svg" width="1134" height="690" viewBox="0 0 1134 690" role="img" aria-labelledby="title desc">
+  <title id="title">PrismTTY switching profiles across ssh hops</title>
+  <desc id="desc">One wrapped shell across four hops of a synthetic session, each block real PrismTTY output for the profile marked on its left: linux-unix on the workstation, cisco pushed after ssh to edge-sw1, juniper pushed after ssh to core-rtr, and juniper popped when that connection closes.</desc>
+  <style>
+    text { white-space: pre; }
+  </style>
+  <g font-family="SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" fill="#c4c7ce">
+    <rect x="0.5" y="0.5" width="1133" height="689" rx="14" fill="#0c0e11" stroke="#23252a"/>
+    <path d="M1 48.5H1133" stroke="#23252a"/>
+    <text x="24" y="29" font-size="14" fill="#8b9099" xml:space="preserve">ptty /bin/zsh</text>
+    <rect x="918.4" y="11.5" width="191.6" height="25" rx="12.5" fill="none" stroke="#2f333b"/>
+    <text x="1014.2" y="28.5" font-size="13" fill="#c4c7ce" text-anchor="middle" xml:space="preserve">generic + top of stack</text>
+    <g font-size="14">
+      <rect x="32.5" y="73.5" width="99" height="23" rx="7.5" fill="none" stroke="#3a414c"/>
+      <text x="82" y="89.5" fill="#f2f3f5" text-anchor="middle" xml:space="preserve">linux-unix</text>
+    </g>
+    <g font-size="16">
+      <text x="334" y="89.48" xml:space="preserve"><tspan fill="#ffffff">ops@workstation:~$</tspan> ssh admin@edge-sw1.example.net</text>
+    </g>
+    <path d="M1 122.5H1133" stroke="#191c21"/>
+    <g font-size="14">
+      <rect x="32.5" y="147.5" width="99" height="23" rx="7.5" fill="none" stroke="#23262c"/>
+      <text x="82" y="163.5" fill="#8a9099" text-anchor="middle" xml:space="preserve">linux-unix</text>
+      <text x="144.2" y="163.5" fill="#8b9099" text-anchor="middle" xml:space="preserve">+</text>
+      <rect x="156.9" y="147.5" width="57" height="23" rx="7.5" fill="none" stroke="#3a414c"/>
+      <text x="185.4" y="163.5" fill="#f2f3f5" text-anchor="middle" xml:space="preserve">cisco</text>
+    </g>
+    <g font-size="16">
+      <text x="334" y="163.48" xml:space="preserve"><tspan fill="#ffffff">edge-sw1#</tspan>show ip interface brief</text>
+      <text x="334" y="189.48" xml:space="preserve">Interface              IP-Address      <tspan fill="#00ff00">OK</tspan>? Method Status                Protocol</text>
+      <text x="334" y="215.48" xml:space="preserve"><tspan fill="#0099ff">GigabitEthernet1/0/1</tspan>   <tspan fill="#00ffff">192.0.2.1</tspan>       YES manual <tspan fill="#00ff00">up</tspan>                    <tspan fill="#00ff00">up</tspan></text>
+      <text x="334" y="241.48" xml:space="preserve"><tspan fill="#0099ff">GigabitEthernet1/0/2</tspan>   unassigned      YES unset  administratively <tspan fill="#ff0000" font-weight="700">down</tspan> <tspan fill="#ff0000" font-weight="700">down</tspan></text>
+      <text x="334" y="267.48" xml:space="preserve"><tspan fill="#0099ff">Vlan1191</tspan>               <tspan fill="#00ffff">198.51.100.1</tspan>    YES manual <tspan fill="#00ff00">up</tspan>                    <tspan fill="#00ff00">up</tspan></text>
+      <text x="334" y="293.48" xml:space="preserve"><tspan fill="#ffffff">edge-sw1#</tspan>ssh -l admin core-rtr.example.net</text>
+    </g>
+    <path d="M1 326.5H1133" stroke="#191c21"/>
+    <g font-size="14">
+      <rect x="32.5" y="351.5" width="99" height="23" rx="7.5" fill="none" stroke="#23262c"/>
+      <text x="82" y="367.5" fill="#8a9099" text-anchor="middle" xml:space="preserve">linux-unix</text>
+      <rect x="140.5" y="351.5" width="57" height="23" rx="7.5" fill="none" stroke="#23262c"/>
+      <text x="169" y="367.5" fill="#8a9099" text-anchor="middle" xml:space="preserve">cisco</text>
+      <text x="210.2" y="367.5" fill="#8b9099" text-anchor="middle" xml:space="preserve">+</text>
+      <rect x="222.9" y="351.5" width="73.8" height="23" rx="7.5" fill="none" stroke="#3a414c"/>
+      <text x="259.8" y="367.5" fill="#f2f3f5" text-anchor="middle" xml:space="preserve">juniper</text>
+    </g>
+    <g font-size="16">
+      <text x="334" y="367.48" xml:space="preserve"><tspan fill="#00bfff">admin@core-rtr&gt;</tspan> show interfaces terse ge-0/0/*</text>
+      <text x="334" y="393.48" xml:space="preserve">Interface               Admin Link Proto    Local</text>
+      <text x="334" y="419.48" xml:space="preserve"><tspan fill="#0099ff">ge-0/0/0</tspan>                <tspan fill="#00ff00">up</tspan>    <tspan fill="#00ff00">up</tspan></text>
+      <text x="334" y="445.48" xml:space="preserve"><tspan fill="#0099ff">ge-0/0/0.0</tspan>              <tspan fill="#00ff00">up</tspan>    <tspan fill="#00ff00">up</tspan>   inet     <tspan fill="#00ffff">192.0.2.2/30</tspan></text>
+      <text x="334" y="471.48" xml:space="preserve"><tspan fill="#0099ff">ge-0/0/1</tspan>                <tspan fill="#00ff00">up</tspan>    <tspan fill="#ff0000" font-weight="700">down</tspan></text>
+      <text x="334" y="497.48" xml:space="preserve"><tspan fill="#00bfff">admin@core-rtr&gt;</tspan> exit</text>
+    </g>
+    <path d="M1 530.5H1133" stroke="#191c21"/>
+    <g font-size="14">
+      <rect x="32.5" y="555.5" width="99" height="23" rx="7.5" fill="none" stroke="#23262c"/>
+      <text x="82" y="571.5" fill="#8a9099" text-anchor="middle" xml:space="preserve">linux-unix</text>
+      <rect x="140.5" y="555.5" width="57" height="23" rx="7.5" fill="none" stroke="#3a414c"/>
+      <text x="169" y="571.5" fill="#f2f3f5" text-anchor="middle" xml:space="preserve">cisco</text>
+      <text x="210.2" y="571.5" fill="#8b9099" text-anchor="middle" xml:space="preserve">−</text>
+      <text x="251.8" y="571.5" fill="#7b8087" text-anchor="middle" xml:space="preserve">juniper</text>
+      <path d="M222.4 567.3H281.2" stroke="#7b8087"/>
+    </g>
+    <g font-size="16">
+      <text x="334" y="571.48" xml:space="preserve">Connection to core-rtr.example.net closed.</text>
+      <text x="334" y="597.48" xml:space="preserve"><tspan fill="#ffffff">edge-sw1#</tspan></text>
+    </g>
+    <path d="M1 630.5H1133" stroke="#23252a"/>
+    <text x="32" y="667" font-size="14" fill="#8b9099" xml:space="preserve">Real PrismTTY output for the profile marked on the left.</text>
+  </g>
 </svg>

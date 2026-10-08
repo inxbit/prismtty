@@ -1,11 +1,11 @@
 # PrismTTY
 
 <p align="center">
-  <img src=".github/assets/prismtty-logo.svg?v=20260531" alt="PrismTTY" width="760">
+  <img src=".github/assets/prismtty-logo.svg?v=20261008" alt="PrismTTY" width="760">
 </p>
 
 <p align="center">
-  <a href="https://prismtty.com/"><img alt="website" src="https://img.shields.io/badge/website-prismtty-22d3ee?style=flat-square"></a>
+  <a href="https://prismtty.com/"><img alt="website" src="https://img.shields.io/badge/website-prismtty-0a0b0d?style=flat-square"></a>
   <a href="https://crates.io/crates/prismtty"><img alt="crates.io" src="https://img.shields.io/crates/v/prismtty?style=flat-square"></a>
   <a href="https://docs.rs/prismtty"><img alt="docs.rs" src="https://img.shields.io/docsrs/prismtty?style=flat-square"></a>
   <a href="https://github.com/inxbit/prismtty/actions/workflows/ci.yml"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/inxbit/prismtty/ci.yml?branch=main&amp;style=flat-square"></a>
@@ -21,15 +21,15 @@ Website: [prismtty.com](https://prismtty.com/).
 
 ## Quick Demo
 
-![Animated PrismTTY terminal demo](.github/assets/prismtty-terminal-demo.svg?v=20260531)
+![Animated PrismTTY terminal demo](.github/assets/prismtty-terminal-demo.svg?v=20261008)
 
 ## Preview
 
-Synthetic terminal previews using documentation-only hostnames and addresses:
+Real PrismTTY output over synthetic fixtures (invented hosts, documentation-range addresses):
 
-![Highlighted PrismTTY terminal output](.github/assets/prismtty-terminal-preview.svg?v=20260513)
+![Highlighted PrismTTY terminal output](.github/assets/prismtty-terminal-preview.svg?v=20261008)
 
-![Dynamic PrismTTY profile switching](.github/assets/prismtty-profile-switching.svg?v=20260531)
+![Dynamic PrismTTY profile switching](.github/assets/prismtty-profile-switching.svg?v=20261008)
 
 ## What This Is / What This Is Not
 
