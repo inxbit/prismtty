@@ -7,6 +7,8 @@ use std::time::Instant;
 
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+#[cfg(unix)]
+use std::os::unix::io::AsRawFd;
 
 #[cfg(unix)]
 use nix::libc;
@@ -91,18 +93,30 @@ impl IoTrace {
 
 #[cfg(unix)]
 fn open_trace_file(path: &Path) -> io::Result<File> {
-    let file = OpenOptions::new()
+    let not_regular_file = || {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("trace path is not a regular file: {}", path.display()),
+        )
+    };
+    // O_NONBLOCK keeps a FIFO with no reader from blocking the open forever:
+    // it fails with ENXIO instead, and one with a reader is rejected below.
+    let file = match OpenOptions::new()
         .create(true)
         .append(true)
         .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(path)?;
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(error) if error.raw_os_error() == Some(libc::ENXIO) => {
+            return Err(not_regular_file());
+        }
+        Err(error) => return Err(error),
+    };
     let metadata = file.metadata()?;
     if !metadata.file_type().is_file() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("trace path is not a regular file: {}", path.display()),
-        ));
+        return Err(not_regular_file());
     }
     // SAFETY: getuid has no preconditions and cannot fail.
     if metadata.uid() != unsafe { libc::getuid() } {
@@ -123,6 +137,18 @@ fn open_trace_file(path: &Path) -> io::Result<File> {
                 path.display()
             ),
         ));
+    }
+    // Writes keep their usual blocking semantics; O_APPEND is preserved.
+    let fd = file.as_raw_fd();
+    // SAFETY: `fd` is the open descriptor owned by `file`; F_GETFL only reads
+    // its status flags.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: as above; F_SETFL only changes the descriptor's status flags.
+    if unsafe { libc::fcntl(fd, libc::F_SETFL, flags & !libc::O_NONBLOCK) } < 0 {
+        return Err(io::Error::last_os_error());
     }
     Ok(file)
 }
@@ -252,6 +278,39 @@ mod tests {
             std::fs::read_to_string(&target).expect("target reads"),
             "original\n"
         );
+    }
+
+    // Opening a FIFO for writing blocks until a reader appears, which would
+    // hang startup before the non-regular-file check could reject it.
+    #[cfg(unix)]
+    #[test]
+    fn trace_file_rejects_fifo_without_blocking() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let dir = tempfile::tempdir().expect("tempdir creates");
+        let path = dir.path().join("trace.fifo");
+        let c_path = CString::new(path.as_os_str().as_bytes()).expect("path has no NUL");
+        // SAFETY: `c_path` is a valid NUL-terminated path that outlives the call.
+        assert_eq!(unsafe { nix::libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+
+        let (tx, rx) = mpsc::channel();
+        let thread_path = path.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(
+                super::IoTrace::open(Some(&thread_path))
+                    .err()
+                    .map(|error| error.kind()),
+            );
+        });
+        let Ok(result) = rx.recv_timeout(Duration::from_secs(5)) else {
+            // Open the read end so the stuck writer returns and the test can exit.
+            let _ = std::fs::File::open(&path);
+            panic!("IoTrace::open blocked on a FIFO with no reader");
+        };
+        assert_eq!(result, Some(std::io::ErrorKind::InvalidInput));
     }
 
     #[cfg(unix)]
