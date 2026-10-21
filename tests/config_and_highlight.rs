@@ -1442,6 +1442,45 @@ fn interactive_streaming_highlighter_highlights_output_after_cr_only_command_ech
     );
 }
 
+// Text before %, #, > or $ looks like a prompt with a command after it, but a
+// line that already ended with LF is finished output, as its CRLF form is.
+#[test]
+fn interactive_streaming_highlights_complete_lf_lines_with_prompt_like_prefixes() {
+    let store = ProfileStore::builtin();
+    let input = "%LINK-3-UPDOWN: Interface Gi0/1, changed state to down\nGi0/1 is down, 50% load 192.0.2.1\n";
+    let render = |text: &str| {
+        let config = PrismConfig::from_profiles(&store, &["cisco"]).expect("cisco loads");
+        let highlighter = Highlighter::from_config(config).expect("rules compile");
+        let mut streaming = new_interactive_streaming(highlighter);
+        let mut output = streaming.push_str(text);
+        output.push_str(&String::from_utf8(streaming.finish()).expect("valid utf8"));
+        output
+    };
+
+    let lf_output = render(input);
+    assert_eq!(strip_ansi(lf_output.as_bytes()), input.as_bytes());
+    assert_eq!(
+        lf_output.replace('\n', "\r\n"),
+        render(&input.replace('\n', "\r\n")),
+        "LF and CRLF lines must render alike"
+    );
+    assert!(lf_output.contains("m%LINK-3-UPDOWN"), "{lf_output:?}");
+    assert!(lf_output.contains("m192.0.2.1"), "{lf_output:?}");
+}
+
+#[test]
+fn interactive_streaming_still_passes_typed_echo_after_lf_terminated_output() {
+    let store = ProfileStore::builtin();
+    let config = PrismConfig::from_profiles(&store, &["cisco"]).expect("cisco loads");
+    let highlighter = Highlighter::from_config(config).expect("rules compile");
+    let mut streaming = new_interactive_streaming(highlighter);
+
+    let _ = streaming.push_str("Gi0/1 is down\nRouter#");
+    assert_eq!(streaming.push_str("s"), "s");
+    assert_eq!(streaming.push_str("h"), "h");
+    assert_eq!(streaming.push_str(" ip"), " ip");
+}
+
 #[test]
 fn interactive_streaming_highlighter_highlights_output_after_pager_clear() {
     let store = ProfileStore::builtin();

@@ -2260,17 +2260,18 @@ fn prompt_echo_lf_prefix_len(bytes: &[u8], previous_visible_tail: &[u8]) -> Opti
 }
 
 fn contains_prompt_echo_before_lf_visible(visible: &[u8]) -> bool {
-    let line_end = visible
-        .iter()
-        .position(|byte| *byte == b'\n')
-        .unwrap_or(visible.len());
-    let sub = &visible[..line_end];
-    let start = sub
+    // A line this chunk already ended with LF is finished output, not a command
+    // line still being echoed. A CRLF line already has nothing after its CR to
+    // match below; a bare LF or LF-CR ending must not match either.
+    if visible.contains(&b'\n') {
+        return false;
+    }
+    let start = visible
         .iter()
         .rposition(|byte| *byte == b'\r')
         .map(|idx| idx + 1)
         .unwrap_or(0);
-    contains_prompt_echo_in_visible_line(&sub[start..])
+    contains_prompt_echo_in_visible_line(&visible[start..])
 }
 
 /// Reports whether an escape sequence moves back over, or deletes within, text
