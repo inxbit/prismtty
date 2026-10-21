@@ -218,6 +218,43 @@ fn wrapped_command_spawn_failures_use_shell_exit_codes() {
     }
 }
 
+// With no terminal on stdin nothing is forwarded to the wrapped command, so it
+// gets an immediate end of input, as with `cmd < /dev/null`, instead of
+// blocking forever on its PTY. Only VEOF is sent: no stray newline or `^D`.
+#[test]
+#[cfg(unix)]
+fn wrapped_command_gets_end_of_input_when_stdin_is_not_a_terminal() {
+    Command::cargo_bin("ptty")
+        .expect("ptty binary exists")
+        .args([
+            "sh",
+            "-c",
+            "if read line; then echo \"got:$line\"; else echo stdin-eof; fi",
+        ])
+        .write_stdin("")
+        .timeout(Duration::from_secs(10))
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("stdin-eof"));
+
+    let output = Command::cargo_bin("ptty")
+        .expect("ptty binary exists")
+        .arg("cat")
+        .write_stdin("")
+        .timeout(Duration::from_secs(10))
+        .output()
+        .expect("ptty runs");
+    assert!(
+        output.status.success(),
+        "cat never saw end of input: {output:?}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "",
+        "the end of input showed up in the output"
+    );
+}
+
 /// Drops CSI sequences so assertions see the text a terminal would show.
 fn strip_csi(output: &[u8]) -> String {
     let text = String::from_utf8_lossy(output);

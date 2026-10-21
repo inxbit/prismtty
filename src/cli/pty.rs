@@ -532,6 +532,8 @@ pub(super) fn run_command(options: Options, command: Vec<OsString>) -> Result<Ex
 
     if interactive {
         configure_child_pty(&*pair.master)?;
+    } else {
+        queue_end_of_input(&*pair.master)?;
     }
 
     let mut signal_mask = SessionSignalMask::block()?;
@@ -762,6 +764,27 @@ fn configure_child_pty(master: &dyn portable_pty::MasterPty) -> Result<(), CliEr
     normalize_child_pty_termios(&mut termios);
     tcsetattr(slave_tty.as_fd(), SetArg::TCSANOW, &termios)?;
     Ok(())
+}
+
+/// Queues an end of input on the child's PTY when there is no terminal to
+/// forward from, so a child that reads stdin sees EOF as it would with
+/// `cmd < /dev/null` instead of blocking forever. Only VEOF is sent, before
+/// the child exists: a newline would read as an extra empty line, and echo is
+/// off for the write because macOS echoes VEOF as `^D`.
+fn queue_end_of_input(master: &dyn portable_pty::MasterPty) -> io::Result<()> {
+    let mut pty = stdin_forward_writer(master)?;
+    let fd = pty.as_raw_fd();
+    let attrs = terminal_attrs(fd)?;
+    let eof = attrs.c_cc[libc::VEOF];
+    if eof == 0 {
+        return Ok(());
+    }
+    let mut quiet = attrs;
+    quiet.c_lflag &= !libc::ECHO;
+    set_terminal_attrs_retrying_eintr(fd, &quiet)?;
+    let written = pty.write_all(&[eof]);
+    set_terminal_attrs_retrying_eintr(fd, &attrs)?;
+    written
 }
 
 fn normalize_child_pty_termios(termios: &mut Termios) {
