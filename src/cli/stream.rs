@@ -1790,20 +1790,31 @@ mod tests {
     }
 
     /// Width of the UTF-8 character starting at `idx`, or of the rest of
-    /// `bytes` when the end cuts that character off. The test alphabet avoids
-    /// lead bytes with narrower continuation ranges (E0, ED, F0, F4).
+    /// `bytes` when the end cuts off a character that later bytes could still
+    /// complete. E0, ED, F0 and F4 take a narrower first continuation byte.
     fn utf8_text_width(bytes: &[u8], idx: usize) -> Option<usize> {
-        let width = match bytes[idx] {
-            0xc2..=0xdf => 2,
-            0xe0..=0xef => 3,
-            0xf0..=0xf4 => 4,
+        let (width, first_continuation) = match bytes[idx] {
+            0xc2..=0xdf => (2, 0x80..=0xbf),
+            0xe0 => (3, 0xa0..=0xbf),
+            0xed => (3, 0x80..=0x9f),
+            0xe1..=0xef => (3, 0x80..=0xbf),
+            0xf0 => (4, 0x90..=0xbf),
+            0xf4 => (4, 0x80..=0x8f),
+            0xf1..=0xf3 => (4, 0x80..=0xbf),
             _ => return None,
         };
         match bytes.get(idx..idx + width) {
             Some(character) => std::str::from_utf8(character).is_ok().then_some(width),
             None => bytes[idx + 1..]
                 .iter()
-                .all(|byte| (0x80..=0xbf).contains(byte))
+                .enumerate()
+                .all(|(position, byte)| {
+                    if position == 0 {
+                        first_continuation.contains(byte)
+                    } else {
+                        (0x80..=0xbf).contains(byte)
+                    }
+                })
                 .then_some(bytes.len() - idx),
         }
     }
@@ -2010,6 +2021,10 @@ mod tests {
             "\u{4e2d}".as_bytes(),
             "\u{275c}".as_bytes(),
             b"\xe2",
+            b"\xe2\x9d",
+            b"\xf0",
+            b"\xf0\x9f",
+            b"\x9f",
             b"\xff",
             b"\x1b[31m",
             b"\x1b[0m",
@@ -2100,6 +2115,83 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    // A UTF-8 prefix that a later byte of the read can never complete must
+    // not hide a C1 string introducer inside it: whatever splits the read,
+    // the CSI or ESC around it ends there and the introducer is stripped.
+    #[test]
+    fn sanitize_split_does_not_emit_c1_string_introducer_from_broken_utf8_prefix() {
+        let cases: &[&[u8]] = &[
+            b"\x9b\xf0\x9f\xc2\x9c",
+            b"\x9b\xf0\x9f\xc2Gpayload\x9c",
+            b"\x9b\xf0\x9f\xc2",
+            b"\x9b\xf0\x9d\xc2\xa052;c;aGk=\x07",
+            b"\x9b\xf0\x90\xc2q\x9c",
+            b"\x9b\xe2\x9f\xc2\x9c",
+            b"\x9b\xf0\x9f\x1b\\",
+            b"\x1b[\xf0\x9f\xc2\x9c",
+            b"\x1b[\xe2\x9d\xc2x\x07",
+            b"\x1b\xf0\x9f\x9c\xc2\x1b[\x9c",
+            b"\x1b\xf0\x9f\xa0\xc2G\x9c",
+        ];
+        for input in cases {
+            for pipeline in [ChunkPipeline::Sanitize, ChunkPipeline::Strip] {
+                let whole = run_chunk_pipeline(&[input], pipeline);
+                assert_eq!(
+                    walk_vt_parser(&whole, false).0,
+                    None,
+                    "{pipeline:?} {input:02x?}: {whole:02x?}"
+                );
+                for size in 1..input.len() {
+                    let chunks: Vec<&[u8]> = input.chunks(size).collect();
+                    let output = run_chunk_pipeline(&chunks, pipeline);
+                    assert_eq!(
+                        walk_vt_parser(&output, false).0,
+                        None,
+                        "{pipeline:?} opened a string control for {input:02x?} in {size}-byte reads: {output:02x?}"
+                    );
+                    assert_eq!(
+                        output, whole,
+                        "{pipeline:?} output of {input:02x?} depends on {size}-byte reads"
+                    );
+                }
+            }
+        }
+
+        // Two writes with a pause between them are enough.
+        let output = run_chunk_pipeline(
+            &[b"\x9b\xf0\x9f\xc2", b"hidden-payload\x9c"],
+            ChunkPipeline::Sanitize,
+        );
+        assert_eq!(walk_vt_parser(&output, false).0, None, "{output:02x?}");
+    }
+
+    // Each split of a sanitized read rescans the prefix before it, so a read
+    // of controls that each end in a character the next one cuts off must not
+    // be rescanned once per control.
+    #[test]
+    fn sanitize_split_stays_linear_for_runs_of_cut_off_characters() {
+        for group in [
+            b"\x1b\xf0\x9f\x9c".as_slice(),
+            b"\x1b[\xf0\x9f\x9c".as_slice(),
+            b"\x1b\xe2\x9d".as_slice(),
+            b"\x1b\xc2".as_slice(),
+        ] {
+            let read = group.repeat(8192 / group.len());
+            let mut state = super::ChunkFilterState::default();
+            let started = std::time::Instant::now();
+            for _ in 0..32 {
+                let prepared = super::prepare_chunk(&read, false, true, &mut state);
+                assert_eq!(walk_vt_parser(prepared.bytes(), false).0, None);
+            }
+            let elapsed = started.elapsed();
+
+            assert!(
+                elapsed < std::time::Duration::from_secs(2),
+                "32 reads of {group:02x?} runs took {elapsed:?}"
+            );
         }
     }
 

@@ -17,6 +17,12 @@ use thiserror::Error;
 const UNICODE_PROMPT_MARKERS: &[&str] = &["○", "●", "❯", "❮", "❱", "›", "»", "➜", "➤", "λ"];
 pub(crate) const MAX_INCOMPLETE_ESCAPE_BYTES: usize = 16 * 1024;
 const MAX_INCOMPLETE_NON_STRING_ESCAPE_BYTES: usize = 1024;
+/// How many times the sanitize split may scan the read. A clean split takes
+/// two scans, one to find it and one to check the prefix before it; each
+/// further scan steps back over one control that ends in a character the
+/// previous split cut off. Every scan reads the whole prefix, so the count is
+/// capped to keep a read linear.
+const MAX_SANITIZE_SPLIT_PASSES: usize = 8;
 const MAX_TENTATIVE_UTF8_SUFFIX_BYTES: usize = 2;
 const PCRE2_JIT_STACK_LIMIT_BYTES: usize = 32 * 1024;
 const PCRE2_MATCH_LIMIT: usize = 100_000;
@@ -3846,11 +3852,26 @@ fn escape_is_incomplete_at(bytes: &[u8], start: usize) -> bool {
 /// Raw and UTF-8 C1 strings are top-level controls like their ESC forms, so
 /// the top-level scan finds them; a C1 byte inside another string's payload
 /// is not a control and must not split that string.
+///
+/// The prefix before the split is sanitized on its own, and there a character
+/// the split cut off looks unfinished: a CSI or ESC that ends in it would be
+/// emitted whole, though the rest of the read shows its C1-valued bytes are
+/// controls. So split again until that prefix ends with nothing open.
 pub(crate) fn incomplete_sanitize_start(bytes: &[u8]) -> Option<usize> {
-    let escape = incomplete_top_level_escape_start(bytes).unwrap_or(bytes.len());
-    let utf8 = incomplete_utf8_start(bytes).unwrap_or(bytes.len());
-    let split = escape.min(utf8);
-    (split < bytes.len()).then_some(split)
+    let mut split = bytes.len();
+    for _ in 0..MAX_SANITIZE_SPLIT_PASSES {
+        let prefix = &bytes[..split];
+        let escape = incomplete_top_level_escape_start(prefix).unwrap_or(split);
+        let utf8 = incomplete_utf8_start(prefix).unwrap_or(split);
+        let next = escape.min(utf8);
+        if next == split {
+            return (split < bytes.len()).then_some(split);
+        }
+        split = next;
+    }
+    // Only crafted output keeps cutting off one more control. Carrying all of
+    // it leaves nothing open, and the carry limit drops it once oversized.
+    Some(0)
 }
 
 fn byte_is_inside_utf8_codepoint_or_prefix(bytes: &[u8], index: usize) -> bool {
@@ -3877,7 +3898,9 @@ fn byte_is_inside_utf8_codepoint_or_prefix(bytes: &[u8], index: usize) -> bool {
             continue;
         }
 
-        let prefix = &bytes[start..=index];
+        // Every byte to the end belongs to this cut-off character, and a later
+        // one that cannot continue it shows the character never completes.
+        let prefix = &bytes[start..];
         if std::str::from_utf8(prefix).is_err() && utf8_prefix_can_be_completed(prefix, width) {
             return true;
         }
