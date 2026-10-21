@@ -2563,16 +2563,10 @@ fn match_rule(
             }
         };
 
-        // Same stepping as pcre2's own iterator: an empty match advances one
-        // byte so the search makes progress, and an empty match directly after
-        // the previous match is skipped.
-        if start == end {
-            last_end = end + 1;
-            if Some(end) == last_match {
-                continue;
-            }
-        } else {
-            last_end = end;
+        let (next_search, skip) = next_match_search(start, end, last_match);
+        last_end = next_search;
+        if skip {
+            continue;
         }
         last_match = Some(end);
         match_count += 1;
@@ -2591,6 +2585,20 @@ fn match_rule(
     }
 
     (ranges, match_count, match_error)
+}
+
+/// Returns where the search resumes after a match at `start..end`, and whether
+/// to skip that match. Same stepping as pcre2's own iterator: an empty match
+/// advances one byte so the search makes progress, and an empty match directly
+/// after the previous match is skipped. A match that starts after its end
+/// (`\K` inside a lookaround, which PCRE2 before 10.38 allows by default) steps
+/// the same way: resuming at its end would find it again forever.
+fn next_match_search(start: usize, end: usize, last_match: Option<usize>) -> (usize, bool) {
+    if start >= end {
+        (end + 1, Some(end) == last_match)
+    } else {
+        (end, false)
+    }
 }
 
 fn capture_group_index(regex: &Regex, name: &str) -> Option<usize> {
@@ -4378,6 +4386,19 @@ rules:
             super::MAX_TOTAL_PATTERN_BYTES
         );
         assert!(Highlighter::from_config(maximum_pattern).is_ok());
+    }
+
+    // PCRE2 before 10.38 allows `\K` in a lookaround by default, so a rule like
+    // `(?=ab\K)` reports a match on "xx ab" that starts at 5 and ends at 3.
+    // Resuming the search at 3 would find the same match forever.
+    #[test]
+    fn match_stepping_moves_past_a_match_that_starts_after_its_end() {
+        assert_eq!(super::next_match_search(5, 3, None), (4, false));
+        assert_eq!(super::next_match_search(5, 3, Some(3)), (4, true));
+
+        assert_eq!(super::next_match_search(0, 0, None), (1, false));
+        assert_eq!(super::next_match_search(4, 4, Some(4)), (5, true));
+        assert_eq!(super::next_match_search(1, 3, Some(0)), (3, false));
     }
 
     #[test]
