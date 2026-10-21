@@ -1648,6 +1648,102 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Copy, Debug)]
+    enum ChunkPipeline {
+        Library,
+        Preserve,
+        Sanitize,
+        Strip,
+    }
+
+    /// Runs `chunks` through the library highlighter alone, or through the
+    /// per-read filter and highlighter the way `highlight_stream` does.
+    fn run_chunk_pipeline(chunks: &[&[u8]], pipeline: ChunkPipeline) -> Vec<u8> {
+        let mut streaming = crate::highlight::StreamingHighlighter::new(sample_highlighter());
+        let mut output = Vec::new();
+        let (strip_existing_ansi, sanitize) = match pipeline {
+            ChunkPipeline::Library => {
+                for chunk in chunks {
+                    output.extend(streaming.push(chunk));
+                }
+                output.extend(streaming.finish());
+                return output;
+            }
+            ChunkPipeline::Preserve => (false, false),
+            ChunkPipeline::Sanitize => (false, true),
+            ChunkPipeline::Strip => (true, false),
+        };
+        let mut state = super::ChunkFilterState::default();
+        for chunk in chunks {
+            let prepared = super::prepare_chunk(chunk, strip_existing_ansi, sanitize, &mut state);
+            output.extend(streaming.push_chunk(&prepared));
+        }
+        // Mirrors the end of `highlight_stream`.
+        if !state.carry.is_empty() {
+            let trailing = if super::is_incomplete_utf8_prefix(&state.carry) {
+                std::mem::take(&mut state.carry)
+            } else if strip_existing_ansi {
+                super::strip_ansi(&state.carry)
+            } else if sanitize {
+                super::strip_string_escapes(&state.carry)
+            } else {
+                std::mem::take(&mut state.carry)
+            };
+            output.extend(streaming.push_chunk(&super::AnsiChunk::new(trailing)));
+        }
+        output.extend(streaming.finish());
+        output
+    }
+
+    // Where a read boundary falls inside a UTF-8 character or a string payload
+    // must not change what reaches the terminal.
+    #[test]
+    fn read_boundaries_inside_characters_and_payloads_do_not_change_output() {
+        for input in [
+            // A C1-valued byte that may complete a character inside a CSI.
+            b"\x1b[\xe2\x9d\\".as_slice(),
+            // An ESC whose next character is cut off by the read.
+            b"\x90\x1b\xe2\x90\x9d".as_slice(),
+            // A C1 byte inside a terminated OSC payload.
+            b"\x1b]0;\x90t\x07visible\x1b\\after".as_slice(),
+        ] {
+            for pipeline in [
+                ChunkPipeline::Library,
+                ChunkPipeline::Preserve,
+                ChunkPipeline::Sanitize,
+                ChunkPipeline::Strip,
+            ] {
+                let whole = run_chunk_pipeline(&[input], pipeline);
+                let bytewise: Vec<&[u8]> = input.chunks(1).collect();
+                assert_eq!(
+                    run_chunk_pipeline(&bytewise, pipeline),
+                    whole,
+                    "{pipeline:?} bytewise {input:02x?}"
+                );
+                for split in 1..input.len() {
+                    let (first, second) = input.split_at(split);
+                    assert_eq!(
+                        run_chunk_pipeline(&[first, second], pipeline),
+                        whole,
+                        "{pipeline:?} split at {split} of {input:02x?}"
+                    );
+                }
+            }
+        }
+
+        assert_eq!(
+            run_chunk_pipeline(
+                &[b"\x1b]0;\x90t\x07vis", b"ible\x1b\\after"],
+                ChunkPipeline::Sanitize
+            ),
+            b"visible\x1b\\after"
+        );
+        assert_eq!(
+            super::incomplete_sanitize_start(b"\x1b]0;\x90t\x07vis"),
+            None
+        );
+    }
+
     #[test]
     fn preserve_mode_hides_split_string_payloads_from_dynamic_profile_detection() {
         for (prefix, tail) in [

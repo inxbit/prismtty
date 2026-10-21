@@ -3430,6 +3430,12 @@ pub(crate) fn is_incomplete_utf8_prefix(bytes: &[u8]) -> bool {
     incomplete_utf8_start(bytes) == Some(0)
 }
 
+/// True when a UTF-8 character starting at `idx` is cut off by the end of
+/// `bytes`.
+fn is_partial_utf8_char_at_end(bytes: &[u8], idx: usize) -> bool {
+    bytes.len() - idx < 4 && is_incomplete_utf8_prefix(&bytes[idx..])
+}
+
 /// The leading length of `pending` that is safe to surface now: up to a trailing
 /// incomplete escape OR a trailing incomplete UTF-8 sequence, whichever begins
 /// earlier. Their completing bytes arrive in the same burst, so emitting a
@@ -3572,35 +3578,15 @@ fn escape_is_incomplete_at(bytes: &[u8], start: usize) -> bool {
     incomplete_top_level_escape_start(&bytes[start..]) == Some(0)
 }
 
+/// Where a sanitize read must be split so the incomplete tail is carried.
+/// Raw and UTF-8 C1 strings are top-level controls like their ESC forms, so
+/// the top-level scan finds them; a C1 byte inside another string's payload
+/// is not a control and must not split that string.
 pub(crate) fn incomplete_sanitize_start(bytes: &[u8]) -> Option<usize> {
     let escape = incomplete_top_level_escape_start(bytes).unwrap_or(bytes.len());
     let utf8 = incomplete_utf8_start(bytes).unwrap_or(bytes.len());
-    let c1 = incomplete_c1_string_escape_start(bytes).unwrap_or(bytes.len());
-    let split = escape.min(utf8).min(c1);
+    let split = escape.min(utf8);
     (split < bytes.len()).then_some(split)
-}
-
-fn incomplete_c1_string_escape_start(bytes: &[u8]) -> Option<usize> {
-    for start in (0..bytes.len()).rev() {
-        let Some((kind, _payload_start)) = StringControlKind::at(bytes, start) else {
-            continue;
-        };
-        if !matches!(
-            kind,
-            StringControlKind::C1Osc(_) | StringControlKind::C1String(_, _)
-        ) {
-            continue;
-        }
-        if matches!(
-            kind,
-            StringControlKind::C1Osc(1) | StringControlKind::C1String(_, 1)
-        ) && byte_is_inside_utf8_codepoint_or_prefix(bytes, start)
-        {
-            continue;
-        }
-        return c1_string_escape_is_incomplete_at(bytes, start).then_some(start);
-    }
-    None
 }
 
 fn byte_is_inside_utf8_codepoint_or_prefix(bytes: &[u8], index: usize) -> bool {
@@ -3649,23 +3635,6 @@ fn utf8_prefix_can_be_completed(prefix: &[u8], expected_width: usize) -> bool {
         _ => (0x80..=0xbf).contains(&first_continuation),
     };
     first_is_valid && prefix[2..].iter().all(|byte| (0x80..=0xbf).contains(byte))
-}
-
-fn c1_string_escape_is_incomplete_at(bytes: &[u8], start: usize) -> bool {
-    if bytes.len().saturating_sub(start) > MAX_INCOMPLETE_ESCAPE_BYTES {
-        return false;
-    }
-    let Some((kind, mut payload)) = StringControlKind::at(bytes, start) else {
-        return false;
-    };
-    let complete = match kind {
-        StringControlKind::C1Osc(_) => string_terminator_end(bytes, &mut payload, true).is_some(),
-        StringControlKind::C1String(_, _) => {
-            string_terminator_end(bytes, &mut payload, false).is_some()
-        }
-        StringControlKind::EscOsc | StringControlKind::EscString(_) => true,
-    };
-    !complete
 }
 
 enum EscapeScan {
@@ -3802,10 +3771,12 @@ fn scan_esc_intermediate_for_neutralization(bytes: &[u8], start: usize) -> Escap
 }
 
 /// Matches the tokenizer: a non-ASCII byte ends the escape before it, so the
-/// character stays visible text. A trailing `C2` may still become a UTF-8 C1
-/// control that cancels the escape, so it waits for the next byte.
+/// character stays visible text. A character cut off by the end of the buffer
+/// waits with the escape: a trailing `C2` may still become a UTF-8 C1 control
+/// that cancels it, and an ESC split from the character would be read at the
+/// end of a buffer, where it is still open.
 fn non_ascii_after_escape_scan(bytes: &[u8], start: usize, idx: usize) -> EscapeScan {
-    if bytes[idx] == 0xc2 && idx + 1 == bytes.len() {
+    if is_partial_utf8_char_at_end(bytes, idx) {
         return incomplete_escape_scan_result(bytes, start, MAX_INCOMPLETE_NON_STRING_ESCAPE_BYTES);
     }
     EscapeScan::Complete(idx)
@@ -3847,6 +3818,11 @@ fn scan_c1_csi_for_neutralization(bytes: &[u8], start: usize, mut idx: usize) ->
         if let Some(width) = valid_utf8_char_width_at(bytes, idx) {
             idx += width;
             continue;
+        }
+        if is_partial_utf8_char_at_end(bytes, idx) {
+            // A C1-valued byte that completes this character is text, not a
+            // control that cancels the sequence, so wait for the rest of it.
+            break;
         }
         let byte = bytes[idx];
         idx += 1;
@@ -3902,6 +3878,11 @@ fn scan_csi_for_neutralization(bytes: &[u8], start: usize, mut idx: usize) -> Es
         if let Some(width) = valid_utf8_char_width_at(bytes, idx) {
             idx += width;
             continue;
+        }
+        if is_partial_utf8_char_at_end(bytes, idx) {
+            // A C1-valued byte that completes this character is text, not a
+            // control that cancels the sequence, so wait for the rest of it.
+            break;
         }
         let byte = bytes[idx];
         idx += 1;
@@ -6269,6 +6250,7 @@ rules:
         // A trailing C2 can still become a UTF-8 C1 control that cancels the
         // ESC, so the ESC is carried with it instead of being emitted alone.
         assert_eq!(super::incomplete_sanitize_start(b"a\x1b\xc2"), Some(1));
+        assert_eq!(super::incomplete_sanitize_start(b"a\x1b\xe2\x90"), Some(1));
         assert_eq!(super::incomplete_sanitize_start(b"a\x1b(\xc2"), Some(1));
         assert_eq!(
             super::strip_string_escapes(b"a\x1b\xc2\x9d0;t\x07b"),
