@@ -3174,22 +3174,24 @@ mod tests {
     }
 
     // The read loop must consult `should_rerun_auto_detect` before each pass,
-    // or the gate tested above saves nothing. A line that arrives a byte per
-    // read gets a pass for its first read, one at its line end and one at end
-    // of input for the unterminated tail after it, and none for the bytes in
-    // between.
+    // or the gate tested above saves nothing. Output that arrives a byte per
+    // read gets a pass for its first read and one at each line end, and none
+    // for the bytes in between. End of input adds one for an unterminated
+    // tail but none after a final line end, since each pass restarts the
+    // count of new bytes.
     #[test]
     fn byte_paced_output_reruns_startup_detection_only_at_line_ends() {
         use crate::cli::profile_selection::DETECTION_PASSES;
 
         /// Hands the stream one byte per read, as keystroke echo or a slow
         /// serial console does.
-        struct BytePacedReader(std::vec::IntoIter<u8>);
-        impl std::io::Read for BytePacedReader {
+        struct BytePacedReader<'a>(&'a [u8]);
+        impl std::io::Read for BytePacedReader<'_> {
             fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-                match self.0.next() {
-                    Some(byte) => {
+                match self.0.split_first() {
+                    Some((&byte, rest)) => {
                         buf[0] = byte;
+                        self.0 = rest;
                         Ok(1)
                     }
                     None => Ok(0),
@@ -3197,21 +3199,34 @@ mod tests {
             }
         }
 
-        let options = crate::cli::args::Options::default();
-        let input = super::InputSource {
-            interactive: false,
-            pty_fd: None,
-            idle_fd: None,
-            recent_input: None,
+        let detection_passes = |output: &[u8]| {
+            let options = crate::cli::args::Options::default();
+            let input = super::InputSource {
+                interactive: false,
+                pty_fd: None,
+                idle_fd: None,
+                recent_input: None,
+            };
+            // The built-in store, so a profiles.d detection hint on this host
+            // cannot end detection early and change the count.
+            let session = super::HighlightSession::new(
+                &options,
+                crate::profiles::ProfileStore::builtin(),
+                false,
+                vec!["generic".to_string()],
+            )
+            .expect("session builds");
+            let prepared = super::PreparedSession { session };
+            let trace = super::IoTrace::open(None).expect("no-op trace");
+            let reader = BytePacedReader(output);
+            DETECTION_PASSES.with(|passes| passes.set(0));
+
+            super::highlight_stream(reader, &mut Vec::new(), prepared, input, None, trace, None)
+                .expect("highlight_stream succeeds");
+            DETECTION_PASSES.with(std::cell::Cell::get)
         };
-        let prepared = super::prepare_session(&options, false).expect("session prepares");
-        let trace = super::IoTrace::open(None).expect("no-op trace");
-        let reader = BytePacedReader(b"show version\nuptime".to_vec().into_iter());
-        DETECTION_PASSES.with(|passes| passes.set(0));
 
-        super::highlight_stream(reader, &mut Vec::new(), prepared, input, None, trace, None)
-            .expect("highlight_stream succeeds");
-
-        assert_eq!(DETECTION_PASSES.with(std::cell::Cell::get), 3);
+        assert_eq!(detection_passes(b"show version\nuptime"), 3);
+        assert_eq!(detection_passes(b"show version\nuptime\n"), 3);
     }
 }
