@@ -207,15 +207,17 @@ impl ProfileRuntime {
                         self.input_line.pop();
                     }
                 }
-                byte if (byte.is_ascii_graphic() || *byte == b' ' || *byte == b'\t')
+                byte if (byte.is_ascii_graphic() || *byte == b' ')
                     && self.input_line_reliable
                     && self.input_line.len() < INPUT_LINE_LIMIT =>
                 {
                     self.input_line.push(*byte as char);
                 }
-                byte if byte.is_ascii_graphic() || *byte == b' ' || *byte == b'\t' => {
+                byte if byte.is_ascii_graphic() || *byte == b' ' => {
                     self.invalidate_input_line();
                 }
+                // TAB asks the shell to complete the word, so like the other
+                // editing keys it leaves the typed text unreliable.
                 _ => self.invalidate_input_line(),
             }
         }
@@ -1789,6 +1791,33 @@ mod tests {
                 target: None,
             })
         );
+    }
+
+    // The shell completes a TAB-finished word on screen, so the typed text
+    // before the TAB is not the host that the close message will name.
+    #[test]
+    fn tab_completed_ssh_target_unwinds_on_the_completed_host_close() {
+        let store = ProfileStore::builtin();
+        let mut runtime = ProfileRuntime::new(names(&["generic", "linux-unix"]));
+
+        runtime.observe_input(b"ssh rou\t\r");
+        assert_eq!(
+            runtime.pending_remote,
+            Some(super::RemoteAttempt {
+                policy: super::ClosePolicy::SshLike,
+                target: None,
+            })
+        );
+        assert_eq!(
+            runtime.observe_output(b"--- JUNOS 22.4R3 Kernel 64-bit\n", &store),
+            Some(names(&["generic", "juniper"]))
+        );
+        runtime.accept_transition();
+        assert_eq!(
+            runtime.observe_output(b"Connection to router-a closed.\n", &store),
+            Some(names(&["generic", "linux-unix"]))
+        );
+        assert_eq!(runtime.stack_len(), 0);
     }
 
     #[test]
