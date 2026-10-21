@@ -1291,12 +1291,12 @@ impl StreamingHighlighter {
             };
 
             let prompt = combined.prefix(prefix_len);
-            let mut remainder = AnsiChunk::new(combined.bytes[prefix_len..].to_vec());
+            let remainder = AnsiChunk::new(combined.bytes[prefix_len..].to_vec());
             let mut output = self.emit_prompt_echo_passthrough(prompt.bytes());
             self.observe_interactive_visible_chunk(&AnsiChunk::new(output.clone()));
 
             let split_at = interactive_split_at_chunk(&remainder, false, self.alternate_screen);
-            let processed = split_prepared_pending(&mut remainder, split_at, &mut self.pending);
+            let processed = split_prepared_pending(remainder, split_at, &mut self.pending);
             self.pending_from_prompt_echo_remainder = !self.pending.is_empty();
             self.pending_from_interactive_split = false;
 
@@ -1316,12 +1316,12 @@ impl StreamingHighlighter {
             };
 
             let prompt = combined.prefix(prefix_len);
-            let mut remainder = AnsiChunk::new(combined.bytes[prefix_len..].to_vec());
+            let remainder = AnsiChunk::new(combined.bytes[prefix_len..].to_vec());
             let mut output = self.emit_prompt_echo_passthrough(prompt.bytes());
             self.observe_interactive_visible_chunk(&AnsiChunk::new(output.clone()));
 
             let split_at = interactive_split_at_chunk(&remainder, false, self.alternate_screen);
-            let processed = split_prepared_pending(&mut remainder, split_at, &mut self.pending);
+            let processed = split_prepared_pending(remainder, split_at, &mut self.pending);
             self.pending_from_prompt_echo_remainder = !self.pending.is_empty();
             self.pending_from_interactive_split = false;
 
@@ -1340,7 +1340,7 @@ impl StreamingHighlighter {
         } else {
             streaming_split_at(&combined)
         };
-        let processed = split_prepared_pending(&mut combined, split_at, &mut self.pending);
+        let processed = split_prepared_pending(combined, split_at, &mut self.pending);
         self.pending_from_prompt_echo_remainder = false;
         self.pending_from_interactive_split = !self.pending.is_empty();
 
@@ -1549,6 +1549,20 @@ impl StreamingHighlighter {
         }
 
         let mut output = Vec::new();
+        // Outside the alternate screen and without a screen switch, every token
+        // below lands in `highlightable` and rebuilds `input` byte for byte, so
+        // highlight the already tokenized chunk instead.
+        if !self.alternate_screen
+            && !input.tokens.iter().any(|token| {
+                matches!(token, Token::Ansi(bytes) if alternate_screen_command(bytes).is_some())
+            })
+        {
+            if !input.bytes.is_empty() {
+                self.highlight_prepared(input, &mut output);
+            }
+            return output;
+        }
+
         let mut highlightable = Vec::new();
 
         for token in &input.tokens {
@@ -1609,10 +1623,14 @@ impl StreamingHighlighter {
         }
 
         let chunk = AnsiChunk::new(std::mem::take(input));
+        self.highlight_prepared(&chunk, output);
+    }
+
+    fn highlight_prepared(&mut self, chunk: &AnsiChunk, output: &mut Vec<u8>) {
         if self.passthrough_single_byte_chunks {
             let reset_mode = self.interactive_reset_mode();
             output.extend(self.highlighter.highlight_chunk_with_interactive_overlay(
-                &chunk,
+                chunk,
                 Some(&mut self.benchmark),
                 reset_mode,
                 &mut self.native_sgr,
@@ -1621,7 +1639,7 @@ impl StreamingHighlighter {
             ));
         } else {
             output.extend(self.highlighter.highlight_chunk_with_native_sgr(
-                &chunk,
+                chunk,
                 Some(&mut self.benchmark),
                 ResetMode::Full,
                 &mut NativeSgrState::default(),
@@ -3549,14 +3567,10 @@ fn ansi_token_end_containing(tokens: &[Token], index: usize) -> Option<usize> {
     None
 }
 
-fn split_prepared_pending(
-    chunk: &mut AnsiChunk,
-    split_at: usize,
-    pending: &mut Vec<u8>,
-) -> AnsiChunk {
+fn split_prepared_pending(chunk: AnsiChunk, split_at: usize, pending: &mut Vec<u8>) -> AnsiChunk {
     if split_at >= chunk.bytes.len() {
         pending.clear();
-        return chunk.clone();
+        return chunk;
     }
 
     *pending = chunk.bytes[split_at..].to_vec();
@@ -6659,6 +6673,28 @@ rules:
                 "{name} renders style starts outside SgrStartCache"
             );
         }
+    }
+
+    #[test]
+    fn primary_screen_streaming_reuses_the_tokenized_chunk() {
+        let source = include_str!("highlight.rs");
+        let fast_path_source = source
+            .split("fn highlight_streaming_chunk")
+            .nth(1)
+            .expect("function exists")
+            .split("let mut highlightable")
+            .next()
+            .expect("fast path precedes the token loop");
+        assert!(fast_path_source.contains("self.highlight_prepared(input"));
+
+        let split_source = source
+            .split("fn split_prepared_pending")
+            .nth(1)
+            .expect("function exists")
+            .split("\n}\n")
+            .next()
+            .expect("function ends");
+        assert!(!split_source.contains(".clone()"));
     }
 
     #[test]
