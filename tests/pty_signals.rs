@@ -1140,11 +1140,13 @@ fn job_control_signals_restore_stop_and_resume_wrapper_and_child() {
 /// the wrapper's pid to `$PRISMTTY_WRAPPER_PID` and the wrapped child's to
 /// `$PRISMTTY_CHILD_PID` so both can be cleaned up.
 struct JobControlShell {
+    // Dropped first, so the wrapper and the wrapped child are killed before
+    // the shell, whatever state the test left them in.
+    _guards: (PidGuard, PidGuard),
     session: PtySession,
     master: Box<dyn portable_pty::MasterPty + Send>,
-    // Declared after the session so the wrapper and the wrapped child are
-    // killed before the shell, whatever state the test left them in.
-    _guards: (PidGuard, PidGuard),
+    wrapper_pid_path: std::path::PathBuf,
+    spawned_at: Instant,
     _marker_dir: tempfile::TempDir,
 }
 
@@ -1170,12 +1172,40 @@ impl JobControlShell {
             .slave
             .spawn_command(builder)
             .expect("spawn job-control shell");
+        let spawned_at = Instant::now();
         drop(pair.slave);
         Self {
+            _guards: guards,
             session: PtySession::new(child, &*pair.master),
             master: pair.master,
-            _guards: guards,
+            wrapper_pid_path,
+            spawned_at,
             _marker_dir: marker_dir,
+        }
+    }
+
+    fn wrapper_pid(&self) -> libc::pid_t {
+        wait_for_pid_file(&self.wrapper_pid_path, Duration::from_secs(10))
+    }
+
+    /// The shell's terminal, opened so its settings can be read and set.
+    fn tty(&self) -> File {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_NOCTTY)
+            .open(self.master.tty_name().expect("shell PTY tty name"))
+            .expect("open shell tty")
+    }
+
+    /// Waits out the window in which external SIGCONT senders react to a new
+    /// process, so a stop sent now is not cut short; see POST_EXEC_SETTLE.
+    fn settle(&self) {
+        let settle = POST_EXEC_SETTLE.saturating_sub(self.spawned_at.elapsed());
+        if !settle.is_zero() {
+            thread::sleep(settle);
         }
     }
 
@@ -1206,6 +1236,84 @@ fn background_wrapper_keeps_running_after_fg() {
         contains_bytes(&output, b"GOT-2:hello") && contains_bytes(&output, b"FG-DONE-2:0"),
         "wrapper stopped again after fg: {:?}",
         String::from_utf8_lossy(&output)
+    );
+}
+
+/// A wrapper started in the background must not put the shell's terminal in
+/// raw mode: the shell owns its settings until `fg` hands the terminal over.
+#[test]
+fn background_wrapper_enters_raw_mode_only_once_in_the_foreground() {
+    use nix::sys::termios::{LocalFlags, tcgetattr};
+
+    let shell = JobControlShell::spawn(
+        "set -m; \"$PTTY\" sh -c 'echo $$ > \"$PRISMTTY_CHILD_PID\"; exec sleep 30' & echo $! > \"$PRISMTTY_WRAPPER_PID\"; sleep 2; fg %1",
+    );
+    let tty = shell.tty();
+    let original = tcgetattr(&tty).expect("original tty attrs");
+    let sample_until = shell.spawned_at + Duration::from_millis(1500);
+    while Instant::now() < sample_until {
+        let attrs = tcgetattr(&tty).expect("tty attrs");
+        assert!(
+            attrs.local_flags.contains(LocalFlags::ISIG),
+            "a background wrapper put the shell's terminal in raw mode"
+        );
+        thread::sleep(Duration::from_micros(500));
+    }
+    assert_eq!(
+        tcgetattr(&tty).expect("tty attrs"),
+        original,
+        "a background wrapper changed the shell's terminal settings"
+    );
+
+    assert!(
+        wait_for_condition(Duration::from_secs(10), || {
+            tcgetattr(&tty)
+                .map(|attrs| !attrs.local_flags.contains(LocalFlags::ICANON))
+                .unwrap_or(false)
+        }),
+        "the wrapper never entered raw mode after fg"
+    );
+}
+
+/// After a stop the shell owns the terminal again and may change its settings.
+/// `bg` continues the wrapper without handing the terminal back, so it must
+/// leave those settings alone instead of applying raw mode and then, when its
+/// next read stops it, restoring the cooked mode it saved earlier.
+#[test]
+fn wrapper_resumed_with_bg_leaves_the_shells_terminal_settings_alone() {
+    use nix::sys::termios::{LocalFlags, tcgetattr};
+
+    let shell = JobControlShell::spawn(
+        "set -m; \"$PTTY\" sh -c 'echo $PPID > \"$PRISMTTY_WRAPPER_PID\"; echo $$ > \"$PRISMTTY_CHILD_PID\"; exec sleep 30'; stty -echo; bg %1; echo \"BG-$((1+1))\"; sleep 30",
+    );
+    let wrapper_pid = shell.wrapper_pid();
+    let tty = shell.tty();
+    assert!(
+        wait_for_condition(Duration::from_secs(10), || {
+            tcgetattr(&tty)
+                .map(|attrs| !attrs.local_flags.contains(LocalFlags::ICANON))
+                .unwrap_or(false)
+        }),
+        "the foreground wrapper never entered raw mode"
+    );
+    shell.settle();
+
+    // SAFETY: kill has no memory-safety preconditions; the target is a process this test spawned.
+    assert_eq!(unsafe { libc::kill(wrapper_pid, libc::SIGTSTP) }, 0);
+    let output = shell.wait_for_output(b"BG-2");
+    assert!(
+        contains_bytes(&output, b"BG-2"),
+        "the shell never resumed the wrapper with bg: {:?}",
+        String::from_utf8_lossy(&output)
+    );
+    thread::sleep(Duration::from_millis(500));
+
+    let attrs = tcgetattr(&tty).expect("tty attrs");
+    assert!(
+        !attrs.local_flags.contains(LocalFlags::ECHO)
+            && attrs.local_flags.contains(LocalFlags::ICANON),
+        "a background wrapper overwrote the shell's terminal settings: {:?}",
+        attrs.local_flags
     );
 }
 

@@ -1065,6 +1065,10 @@ struct RawModeState {
     stdin_fd: RawFd,
     original: libc::termios,
     raw: libc::termios,
+    /// Set when the snapshot was taken while another job owned the terminal:
+    /// `original` is then that job's mode and is read again once this process
+    /// reaches the foreground.
+    snapshot_stale: bool,
 }
 
 enum RawModeLifecycle {
@@ -1079,15 +1083,23 @@ impl RawModeLifecycle {
     /// holds the lifecycle mutex across both this transition and `apply`, so a
     /// terminating signal cannot restore cooked mode and then lose a race to
     /// a late raw-mode activation.
+    /// `apply` returns the state it applied, or `None` when the process is a
+    /// background job; raw mode then waits for the resume that brings it to
+    /// the foreground.
     fn activate_with(
         &mut self,
         terminal: RawModeState,
-        apply: impl FnOnce(&RawModeState) -> io::Result<()>,
+        apply: impl FnOnce(&RawModeState) -> io::Result<Option<RawModeState>>,
     ) -> io::Result<bool> {
         match self {
             Self::Inactive => {
-                apply(&terminal)?;
-                *self = Self::Active(terminal);
+                *self = match apply(&terminal)? {
+                    Some(active) => Self::Active(active),
+                    None => Self::Suspended(RawModeState {
+                        snapshot_stale: true,
+                        ..terminal
+                    }),
+                };
                 Ok(true)
             }
             Self::Terminating => Ok(false),
@@ -1129,13 +1141,15 @@ impl RawModeLifecycle {
         Ok(())
     }
 
+    /// Stays suspended when `apply` returns `None`, as for `activate_with`.
     fn resume_with(
         &mut self,
-        apply: impl FnOnce(&RawModeState) -> io::Result<()>,
+        apply: impl FnOnce(&RawModeState) -> io::Result<Option<RawModeState>>,
     ) -> io::Result<()> {
         if let Self::Suspended(terminal) = *self {
-            apply(&terminal)?;
-            *self = Self::Active(terminal);
+            if let Some(active) = apply(&terminal)? {
+                *self = Self::Active(active);
+            }
         }
         Ok(())
     }
@@ -1150,25 +1164,11 @@ struct RawModeGuard {
 impl RawModeGuard {
     fn enable(state: SharedRawModeState) -> Result<Self, CliError> {
         let stdin = io::stdin();
-        let stdin_fd = stdin.as_fd().as_raw_fd();
-        let original = terminal_attrs(stdin_fd)?;
-        let mut raw = original;
-        // SAFETY: `raw` is a valid termios copied from tcgetattr; cfmakeraw only rewrites its
-        // fields.
-        unsafe {
-            libc::cfmakeraw(&mut raw);
-        }
-        let terminal = RawModeState {
-            stdin_fd,
-            original,
-            raw,
-        };
+        let terminal = raw_mode_state_for(stdin.as_fd().as_raw_fd())?;
         let activated = state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .activate_with(terminal, |terminal| {
-                set_terminal_attrs_retrying_eintr(terminal.stdin_fd, &terminal.raw)
-            })?;
+            .activate_with(terminal, apply_raw_mode_in_foreground)?;
         if !activated {
             return Err(io::Error::new(
                 io::ErrorKind::Interrupted,
@@ -1210,16 +1210,53 @@ fn suspend_raw_mode_from_signal_state(state: &Mutex<RawModeLifecycle>) -> io::Re
     state
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .suspend_with(|active| restore_terminal_attrs(active.stdin_fd, &active.original))
+        .suspend_with(|active| {
+            // A background job leaves the mode to the job that owns the
+            // terminal; restoring would overwrite that job's settings.
+            if owns_terminal(active.stdin_fd) == Some(false) {
+                return Ok(());
+            }
+            restore_terminal_attrs(active.stdin_fd, &active.original)
+        })
 }
 
 fn reapply_raw_mode_from_signal_state(state: &Mutex<RawModeLifecycle>) -> io::Result<()> {
     state
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .resume_with(|suspended| {
-            set_terminal_attrs_retrying_eintr(suspended.stdin_fd, &suspended.raw)
-        })
+        .resume_with(apply_raw_mode_in_foreground)
+}
+
+fn raw_mode_state_for(stdin_fd: RawFd) -> io::Result<RawModeState> {
+    let original = terminal_attrs(stdin_fd)?;
+    let mut raw = original;
+    // SAFETY: `raw` is a valid termios copied from tcgetattr; cfmakeraw only rewrites its
+    // fields.
+    unsafe {
+        libc::cfmakeraw(&mut raw);
+    }
+    Ok(RawModeState {
+        stdin_fd,
+        original,
+        raw,
+        snapshot_stale: false,
+    })
+}
+
+/// Applies raw mode unless this process is a background job, which returns
+/// `None` and leaves the terminal to its foreground job. The signal masks in
+/// force here hold SIGTTOU, so the kernel would not refuse the write itself.
+fn apply_raw_mode_in_foreground(terminal: &RawModeState) -> io::Result<Option<RawModeState>> {
+    if owns_terminal(terminal.stdin_fd) == Some(false) {
+        return Ok(None);
+    }
+    let terminal = if terminal.snapshot_stale {
+        raw_mode_state_for(terminal.stdin_fd)?
+    } else {
+        *terminal
+    };
+    set_terminal_attrs_retrying_eintr(terminal.stdin_fd, &terminal.raw)?;
+    Ok(Some(terminal))
 }
 
 fn set_terminal_attrs_retrying_eintr(fd: RawFd, attrs: &libc::termios) -> io::Result<()> {
@@ -2196,14 +2233,15 @@ mod tests {
                 // SAFETY: termios is a plain C struct; this state is never applied to a terminal
                 // (stdin_fd is -1).
                 raw: unsafe { std::mem::zeroed() },
+                snapshot_stale: false,
             };
             activation_ready_tx.send(()).unwrap();
             activation_state
                 .lock()
                 .unwrap()
-                .activate_with(terminal, |_| {
+                .activate_with(terminal, |terminal| {
                     activation_applied.store(true, Ordering::Release);
-                    Ok(())
+                    Ok(Some(*terminal))
                 })
                 .unwrap()
         });
@@ -2231,6 +2269,7 @@ mod tests {
             // SAFETY: termios is a plain C struct; this state is never applied to a terminal
             // (stdin_fd is -1).
             raw: unsafe { std::mem::zeroed() },
+            snapshot_stale: false,
         };
         let mut lifecycle = super::RawModeLifecycle::Active(terminal);
 
@@ -2247,6 +2286,47 @@ mod tests {
             })
             .expect("cleanup retry succeeds");
         assert!(matches!(lifecycle, super::RawModeLifecycle::Terminating));
+    }
+
+    #[test]
+    fn raw_mode_waits_for_the_foreground_when_started_in_the_background() {
+        let terminal = super::RawModeState {
+            stdin_fd: -1,
+            // SAFETY: termios is a plain C struct; this state is never applied to a terminal
+            // (stdin_fd is -1).
+            original: unsafe { std::mem::zeroed() },
+            // SAFETY: termios is a plain C struct; this state is never applied to a terminal
+            // (stdin_fd is -1).
+            raw: unsafe { std::mem::zeroed() },
+            snapshot_stale: false,
+        };
+        let mut lifecycle = super::RawModeLifecycle::Inactive;
+
+        assert!(
+            lifecycle
+                .activate_with(terminal, |_| Ok(None))
+                .expect("background activation succeeds")
+        );
+        assert!(
+            matches!(lifecycle, super::RawModeLifecycle::Suspended(suspended) if suspended.snapshot_stale),
+            "a background start must wait suspended and re-read the terminal later"
+        );
+
+        lifecycle
+            .resume_with(|_| Ok(None))
+            .expect("background resume succeeds");
+        assert!(
+            matches!(lifecycle, super::RawModeLifecycle::Suspended(_)),
+            "a resume in the background must not enter raw mode"
+        );
+
+        lifecycle
+            .resume_with(|_| Ok(Some(terminal)))
+            .expect("foreground resume succeeds");
+        assert!(
+            matches!(lifecycle, super::RawModeLifecycle::Active(active) if !active.snapshot_stale),
+            "the resume that brings the wrapper forward keeps the state it applied"
+        );
     }
 
     #[test]
