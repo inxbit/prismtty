@@ -548,13 +548,16 @@ pub(super) fn run_command(options: Options, command: Vec<OsString>) -> Result<Ex
 
     let mut signal_mask = SessionSignalMask::block()?;
     let mut terminal_session = TerminalSession::start(interactive)?;
-    let mut child = pair
-        .slave
-        .spawn_command(builder)
-        .map_err(|source| CliError::Spawn {
-            code: spawn_failure_exit_code(&program, cwd.as_deref()),
-            source,
-        })?;
+    let mut child = if interactive {
+        pair.slave
+            .spawn_command(builder)
+            .map_err(|source| CliError::Spawn {
+                code: spawn_failure_exit_code(&program, cwd.as_deref()),
+                source,
+            })?
+    } else {
+        spawn_with_caller_stdin(&builder, &*pair.master)?
+    };
     drop(pair.slave);
     set_forward_child_pid(child.process_id().map(|pid| pid as i32).unwrap_or(0));
     cleanup_child_on_err(signal_mask.restore(), &mut child)?;
@@ -748,12 +751,12 @@ fn program_candidates(program: &OsStr, cwd: Option<&Path>) -> Vec<PathBuf> {
 const SCRIPT_HEADER_BYTES: u64 = 256;
 
 /// Checks the `#!` interpreter of a script before it is spawned. A script
-/// whose interpreter cannot be executed only fails in execve, after the fork,
-/// and portable-pty closes every descriptor above 2 in the child, std's
-/// exec-error pipe included, so the child aborts with "fatal runtime error"
-/// instead of the spawn reporting the failure. The line is parsed as the
-/// kernel does: only a blank or the line end ends the name, so a CRLF script
-/// names `/bin/sh\r`.
+/// whose interpreter cannot be executed only fails in execve, after the fork.
+/// portable-pty, which spawns the command from a terminal, closes every
+/// descriptor above 2 in the child, std's exec-error pipe included, so the
+/// child aborts with "fatal runtime error" instead of the spawn reporting the
+/// failure. The line is parsed as the kernel does: only a blank or the line
+/// end ends the name, so a CRLF script names `/bin/sh\r`.
 fn unusable_script_interpreter(program: &OsStr, cwd: Option<&Path>) -> Option<CliError> {
     use std::os::unix::ffi::OsStrExt;
 
@@ -795,6 +798,204 @@ fn unusable_script_interpreter(program: &OsStr, cwd: Option<&Path>) -> Option<Cl
             interpreter
         ),
     })
+}
+
+/// Spawns the wrapped command when stdin is not a terminal. The child reads
+/// the caller's stdin itself, so every read sees what `cmd < file` would: the
+/// data of a pipe or file, then end of input, however often it reads. The PTY
+/// slave is its stdout, stderr and controlling terminal. portable-pty always
+/// puts the slave on stdin, so this mirrors its spawn otherwise: the program
+/// is resolved against the same directory and PATH, with the same messages,
+/// SHELL is set when unset (the builder's environment is the process's own on
+/// this path), and the child starts as a session leader with default signal
+/// dispositions and an empty signal mask. Inherited descriptors are marked
+/// close-on-exec rather than closed, which keeps std's exec-error pipe
+/// working, so an execve failure is reported instead of aborting the child.
+fn spawn_with_caller_stdin(
+    builder: &CommandBuilder,
+    master: &dyn portable_pty::MasterPty,
+) -> Result<Box<dyn portable_pty::Child + Send + Sync>, CliError> {
+    use std::os::unix::process::CommandExt;
+    use std::process::{Command, Stdio};
+
+    let argv = builder.get_argv();
+    let dir = builder
+        .get_cwd()
+        .map(Path::new)
+        .filter(|dir| dir.is_dir())
+        .map_or_else(|| home_dir(builder), Path::to_path_buf);
+    let program = resolve_program(&argv[0], &dir).map_err(|source| CliError::Spawn {
+        code: spawn_failure_exit_code(&argv[0], Some(&dir)),
+        source,
+    })?;
+    let tty_name = master
+        .tty_name()
+        .ok_or_else(|| io::Error::other("PTY slave name is unavailable"))?;
+    // O_NOCTTY: a session leader without a controlling terminal would
+    // otherwise take this one, and the child could no longer claim it.
+    let slave = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NOCTTY)
+        .open(tty_name)?;
+    let inherited = inherited_fds();
+    // SAFETY: sigset_t is a plain C type; sigemptyset below initializes it before it is used.
+    let mut empty_mask = unsafe { mem::zeroed::<libc::sigset_t>() };
+    // SAFETY: `empty_mask` is a valid, exclusively borrowed sigset_t.
+    unsafe {
+        libc::sigemptyset(&mut empty_mask);
+    }
+
+    let mut command = Command::new(&program);
+    command
+        .arg0(&argv[0])
+        .args(&argv[1..])
+        .current_dir(&dir)
+        .stdin(Stdio::inherit())
+        .stdout(slave.try_clone()?)
+        .stderr(slave);
+    if let Some(shell) = builder.get_env("SHELL") {
+        command.env("SHELL", shell);
+    }
+    // SAFETY: the closure runs in the forked child before exec. It only calls
+    // async-signal-safe functions (signal, sigprocmask, setsid, ioctl, fcntl)
+    // and allocates nothing: the mask and the descriptor list were prepared
+    // before the fork.
+    unsafe {
+        command.pre_exec(move || {
+            for signal in [
+                libc::SIGCHLD,
+                libc::SIGHUP,
+                libc::SIGINT,
+                libc::SIGQUIT,
+                libc::SIGTERM,
+                libc::SIGALRM,
+            ] {
+                libc::signal(signal, libc::SIG_DFL);
+            }
+            libc::sigprocmask(libc::SIG_SETMASK, &empty_mask, std::ptr::null_mut());
+            if libc::setsid() == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            // stdout is the PTY slave.
+            if libc::ioctl(libc::STDOUT_FILENO, libc::TIOCSCTTY as _, 0) == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            for &fd in &inherited {
+                // A descriptor closed since it was listed only reports EBADF.
+                libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
+            }
+            Ok(())
+        });
+    }
+    let child = command.spawn().map_err(|error| CliError::Spawn {
+        code: exec_failure_exit_code(&error),
+        source: anyhow::anyhow!("Unable to spawn {}: {error}", program.display()),
+    })?;
+    Ok(Box::new(child))
+}
+
+/// Where portable-pty starts a child that has no usable directory: $HOME,
+/// else the user's home directory, else `/`.
+fn home_dir(builder: &CommandBuilder) -> PathBuf {
+    builder
+        .get_env("HOME")
+        .and_then(OsStr::to_str)
+        .map(PathBuf::from)
+        .or_else(|| directories::BaseDirs::new().map(|dirs| dirs.home_dir().to_path_buf()))
+        .unwrap_or_else(|| PathBuf::from("/"))
+}
+
+/// Resolves the program as portable-pty's spawn does, with its messages: a
+/// name with a `/` against `dir`, any other name in each PATH entry.
+fn resolve_program(program: &OsStr, dir: &Path) -> anyhow::Result<PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
+
+    if program.as_bytes().contains(&b'/') {
+        let path = dir.join(program);
+        if path.is_dir() {
+            anyhow::bail!(
+                "Unable to spawn {} because it is a directory",
+                path.display()
+            );
+        }
+        if is_executable(&path) {
+            return Ok(path);
+        }
+        if path.exists() {
+            anyhow::bail!(
+                "Unable to spawn {} because it is not executable",
+                path.display()
+            );
+        }
+        anyhow::bail!(
+            "Unable to spawn {} because it does not exist",
+            path.display()
+        );
+    }
+    let mut errors = Vec::new();
+    for candidate in program_candidates(program, Some(dir)) {
+        if candidate.is_dir() {
+            errors.push(format!("{} exists but is a directory", candidate.display()));
+        } else if is_executable(&candidate) {
+            return Ok(candidate);
+        } else if candidate.exists() {
+            errors.push(format!(
+                "{} exists but is not executable",
+                candidate.display()
+            ));
+        }
+    }
+    errors.push(match std::env::var_os("PATH") {
+        Some(path) => format!("No viable candidates found in PATH {path:?}"),
+        None => "Unable to resolve the PATH".to_owned(),
+    });
+    anyhow::bail!(
+        "Unable to spawn {} because:\n{}",
+        Path::new(program).display(),
+        errors.join(".\n")
+    )
+}
+
+/// Exit code for a resolved command whose execve failed, as a shell reports
+/// it: 127 when a file it needs does not exist (a script's interpreter, a
+/// program's loader), 126 when it cannot be executed. Anything else, such as
+/// the child failing to take the PTY, keeps the generic 1.
+fn exec_failure_exit_code(error: &io::Error) -> u8 {
+    match error.raw_os_error() {
+        Some(libc::ENOENT) => 127,
+        Some(
+            libc::EACCES
+            | libc::ENOEXEC
+            | libc::EISDIR
+            | libc::ENOTDIR
+            | libc::ELOOP
+            | libc::ENAMETOOLONG
+            | libc::ETXTBSY
+            | libc::E2BIG,
+        ) => 126,
+        _ => 1,
+    }
+}
+
+/// Descriptors above stderr that would survive an exec: ones prismtty
+/// inherited without close-on-exec, since all it opens itself is
+/// close-on-exec. Like portable-pty, this lists /dev/fd, and finds nothing
+/// where that cannot be read. Listing allocates, so it runs before the fork.
+fn inherited_fds() -> Vec<RawFd> {
+    let Ok(entries) = std::fs::read_dir("/dev/fd") else {
+        return Vec::new();
+    };
+    entries
+        .filter_map(|entry| entry.ok()?.file_name().to_str()?.parse::<RawFd>().ok())
+        .filter(|&fd| fd > 2)
+        .filter(|&fd| {
+            // SAFETY: F_GETFD takes no pointer argument; an invalid `fd` reports EBADF instead of
+            // touching memory.
+            let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+            flags >= 0 && flags & libc::FD_CLOEXEC == 0
+        })
+        .collect()
 }
 
 fn is_executable(path: &Path) -> bool {
@@ -862,10 +1063,11 @@ fn configure_child_pty(master: &dyn portable_pty::MasterPty) -> Result<(), CliEr
 }
 
 /// Queues an end of input on the child's PTY when there is no terminal to
-/// forward from, so a child that reads stdin sees EOF as it would with
-/// `cmd < /dev/null` instead of blocking forever. Only VEOF is sent, before
-/// the child exists: a newline would read as an extra empty line, and echo is
-/// off for the write because macOS echoes VEOF as `^D`.
+/// forward from. The child reads the caller's stdin itself then, but the PTY
+/// is still its controlling terminal, so a first reader of /dev/tty (a
+/// password prompt) sees EOF instead of blocking forever. Only VEOF is sent,
+/// before the child exists: a newline would read as an extra empty line, and
+/// echo is off for the write because macOS echoes VEOF as `^D`.
 fn queue_end_of_input(master: &dyn portable_pty::MasterPty) -> io::Result<()> {
     let mut pty = stdin_forward_writer(master)?;
     let fd = pty.as_raw_fd();
@@ -2429,6 +2631,9 @@ mod tests {
             .find("TerminalSession::start")
             .expect("signal watcher starts");
         let spawned = run_command.find("spawn_command").expect("child is spawned");
+        let spawned_with_caller_stdin = run_command
+            .find("spawn_with_caller_stdin(")
+            .expect("child is spawned without a terminal on stdin");
         let published = run_command
             .find("set_forward_child_pid")
             .expect("child pid is published");
@@ -2438,7 +2643,9 @@ mod tests {
 
         assert!(blocked < supervised);
         assert!(supervised < spawned);
+        assert!(supervised < spawned_with_caller_stdin);
         assert!(spawned < published);
+        assert!(spawned_with_caller_stdin < published);
         assert!(published < unblocked);
     }
 

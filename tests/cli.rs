@@ -318,9 +318,10 @@ fn wrapped_script_with_unusable_interpreter_uses_shell_exit_codes() {
     }
 }
 
-// With no terminal on stdin nothing is forwarded to the wrapped command, so it
-// gets an immediate end of input, as with `cmd < /dev/null`, instead of
-// blocking forever on its PTY. Only VEOF is sent: no stray newline or `^D`.
+// With no terminal on stdin the wrapped command reads the caller's stdin
+// itself, so it gets end of input as with `cmd < /dev/null` instead of
+// blocking forever on its PTY, and nothing shows up in the output: no stray
+// newline or `^D`.
 #[test]
 #[cfg(unix)]
 fn wrapped_command_gets_end_of_input_when_stdin_is_not_a_terminal() {
@@ -352,6 +353,160 @@ fn wrapped_command_gets_end_of_input_when_stdin_is_not_a_terminal() {
         String::from_utf8_lossy(&output.stdout),
         "",
         "the end of input showed up in the output"
+    );
+}
+
+// Every read of a non-terminal stdin sees end of input, as with
+// `cmd < /dev/null`: a second `read` or a second reader must not block
+// forever on the child's PTY.
+#[test]
+#[cfg(unix)]
+fn wrapped_command_sees_end_of_input_on_every_read_when_stdin_is_not_a_terminal() {
+    let output = Command::cargo_bin("ptty")
+        .expect("ptty binary exists")
+        .args([
+            "sh",
+            "-c",
+            "read a; echo first=$?; read b; echo second=$?; cat; echo cat=$?",
+        ])
+        .write_stdin("")
+        .timeout(Duration::from_secs(10))
+        .output()
+        .expect("ptty runs");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success()
+            && stdout.contains("first=1")
+            && stdout.contains("second=1")
+            && stdout.contains("cat=0"),
+        "a later read of stdin did not see end of input: {output:?}"
+    );
+}
+
+// A child that puts its stdin in raw mode must not read a keystroke nobody
+// typed: an end of input queued on the PTY reads as NUL (Linux) or ^D
+// (macOS) once the line discipline is not canonical.
+#[test]
+#[cfg(unix)]
+fn wrapped_command_in_raw_mode_reads_no_fabricated_input_when_stdin_is_not_a_terminal() {
+    let output = Command::cargo_bin("ptty")
+        .expect("ptty binary exists")
+        .args([
+            "sh",
+            "-c",
+            "stty raw 2>/dev/null; head -c1 | od -An -tx1; echo end",
+        ])
+        .write_stdin("")
+        .timeout(Duration::from_secs(10))
+        .output()
+        .expect("ptty runs");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success() && stdout.contains("end"),
+        "a raw-mode reader blocked: {output:?}"
+    );
+    assert!(
+        !stdout.contains(" 00") && !stdout.contains(" 04"),
+        "a raw-mode reader got a fabricated keystroke: {stdout:?}"
+    );
+}
+
+// Piped input reaches the wrapped command, as it does without the wrapper,
+// followed by end of input.
+#[test]
+#[cfg(unix)]
+fn wrapped_command_reads_piped_stdin() {
+    let output = Command::cargo_bin("ptty")
+        .expect("ptty binary exists")
+        .args([
+            "sh",
+            "-c",
+            "read a; read b; echo \"got:$a,$b\"; read c; echo third=$?",
+        ])
+        .write_stdin("first-line\nsecond-line\n")
+        .timeout(Duration::from_secs(10))
+        .output()
+        .expect("ptty runs");
+    let stdout = strip_csi(&output.stdout);
+    assert!(
+        output.status.success()
+            && stdout.contains("got:first-line,second-line")
+            && stdout.contains("third=1"),
+        "piped input did not reach the wrapped command: {output:?}"
+    );
+    assert!(
+        !stdout.contains("first-line\r\n"),
+        "piped input was echoed as if typed: {stdout:?}"
+    );
+}
+
+// A script whose interpreter is itself a script with a missing interpreter
+// passes the `#!` check and only fails in execve. The spawn must still report
+// it, with the shell's 127, instead of the child aborting.
+#[test]
+#[cfg(target_os = "linux")]
+fn wrapped_command_exec_failure_after_the_fork_uses_shell_exit_codes() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let work = tempfile::tempdir().expect("work directory");
+    let inner = work.path().join("inner");
+    fs::write(&inner, "#!/nonexistent/prismtty-interp\n").expect("write inner");
+    fs::set_permissions(&inner, fs::Permissions::from_mode(0o755)).expect("inner is executable");
+    let outer = work.path().join("outer.sh");
+    fs::write(&outer, format!("#!{}\necho ran\n", inner.display())).expect("write outer");
+    fs::set_permissions(&outer, fs::Permissions::from_mode(0o755)).expect("outer is executable");
+
+    let output = Command::cargo_bin("ptty")
+        .expect("ptty binary exists")
+        .current_dir(work.path())
+        .arg("./outer.sh")
+        .write_stdin("")
+        .timeout(Duration::from_secs(10))
+        .output()
+        .expect("ptty runs");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(127),
+        "stdout: {stdout:?} stderr: {stderr:?}"
+    );
+    assert!(
+        stderr.contains("prismtty: PTY error: Unable to spawn"),
+        "stderr: {stderr:?}"
+    );
+}
+
+// Like portable-pty's spawn, the one for a non-terminal stdin keeps
+// descriptors the caller leaked to prismtty out of the wrapped command.
+#[test]
+#[cfg(unix)]
+fn wrapped_command_does_not_inherit_the_callers_extra_descriptors() {
+    use std::os::unix::process::CommandExt;
+
+    let mut command = StdCommand::new(assert_cmd::cargo::cargo_bin("ptty"));
+    command
+        .args([
+            "sh",
+            "-c",
+            "if true 2>/dev/null >&7; then echo fd7-open; else echo fd7-closed; fi",
+        ])
+        .stdin(Stdio::null());
+    // SAFETY: dup2 is async-signal-safe and runs in the forked child before exec;
+    // dup2 clears close-on-exec on the copy, so prismtty inherits fd 7.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::dup2(2, 7) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let output = command.output().expect("ptty runs");
+    let stdout = strip_csi(&output.stdout);
+    assert!(
+        output.status.success() && stdout.contains("fd7-closed"),
+        "the wrapped command inherited fd 7: {output:?}"
     );
 }
 
