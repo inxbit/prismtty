@@ -167,7 +167,7 @@ pub struct LoadedProfileFile {
 impl PrismConfig {
     /// Parses a ChromaTerm-style YAML document into highlighting rules.
     pub fn from_chromaterm_yaml(input: &str) -> Result<Self, ConfigError> {
-        let doc: RulesDoc = serde_norway::from_str(input)?;
+        let doc = parse_rules_doc(input)?;
         Self::from_rules_doc(doc)
     }
 
@@ -186,11 +186,10 @@ impl PrismConfig {
             path: path.to_path_buf(),
             source,
         })?;
-        let doc: RulesDoc =
-            serde_norway::from_str(&input).map_err(|source| ConfigError::YamlFile {
-                path: path.to_path_buf(),
-                source,
-            })?;
+        let doc = parse_rules_doc(&input).map_err(|source| ConfigError::YamlFile {
+            path: path.to_path_buf(),
+            source,
+        })?;
         Self::from_rules_doc(doc)
     }
 
@@ -231,6 +230,11 @@ const MAX_CONFIG_FILE_BYTES: u64 = 1024 * 1024;
 
 /// Largest fixture accepted by the profiles test command.
 pub(crate) const MAX_PROFILE_TEST_FILE_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Deepest collection nesting a config or profile document may use. This is
+/// serde_norway's own recursion limit, so checking it up front rejects no
+/// document that could load.
+const MAX_YAML_NESTING: usize = 128;
 
 /// Reads one bounded regular file without allowing a FIFO open to block.
 pub(crate) fn read_bounded_regular_file(
@@ -277,6 +281,89 @@ fn read_config_file(path: &Path) -> std::io::Result<String> {
         .map_err(|source| std::io::Error::new(std::io::ErrorKind::InvalidData, source))
 }
 
+/// Parses a config or profile YAML document. Every YAML entry point goes
+/// through here, so a document within [`MAX_CONFIG_FILE_BYTES`] also stays
+/// bounded in parse time.
+fn parse_rules_doc(input: &str) -> Result<RulesDoc, serde_norway::Error> {
+    check_yaml_nesting(input)?;
+    serde_norway::from_str(input)
+}
+
+/// Rejects a document whose collections nest deeper than [`MAX_YAML_NESTING`].
+///
+/// serde_norway applies its recursion limit only after libyaml has produced
+/// every event, and libyaml's scanner does work proportional to the flow depth
+/// for each token, so a deeply nested file could take minutes to hours to
+/// reject. This walks the same events, stops as soon as the depth passes the
+/// limit, and reports it in serde_norway's own words. Syntax errors are left
+/// for serde_norway to report.
+fn check_yaml_nesting(input: &str) -> Result<(), serde_norway::Error> {
+    use std::mem::MaybeUninit;
+    use unsafe_libyaml_norway::{
+        YAML_MAPPING_END_EVENT, YAML_MAPPING_START_EVENT, YAML_SEQUENCE_END_EVENT,
+        YAML_SEQUENCE_START_EVENT, YAML_STREAM_END_EVENT, YAML_UTF8_ENCODING, yaml_event_delete,
+        yaml_event_t, yaml_parser_delete, yaml_parser_initialize, yaml_parser_parse,
+        yaml_parser_set_encoding, yaml_parser_set_input_string, yaml_parser_t,
+    };
+
+    let mut storage = MaybeUninit::<yaml_parser_t>::uninit();
+    let parser = storage.as_mut_ptr();
+    // SAFETY: `parser` points to writable, aligned storage for a
+    // yaml_parser_t, which initialize fills in before anything reads it.
+    if unsafe { yaml_parser_initialize(parser) }.fail {
+        return Ok(());
+    }
+    // SAFETY: the parser is initialized and has no encoding or input yet.
+    // `input` outlives the parser, which is deleted below, and `storage` is
+    // never moved, which matters because the parser now points to itself.
+    unsafe {
+        yaml_parser_set_encoding(parser, YAML_UTF8_ENCODING);
+        yaml_parser_set_input_string(parser, input.as_ptr(), input.len() as u64);
+    }
+
+    let mut depth = 0usize;
+    let mut too_deep_at = None;
+    loop {
+        let mut event = MaybeUninit::<yaml_event_t>::uninit();
+        // SAFETY: the parser is initialized with its input set, and `event` is
+        // writable storage that parse fills in.
+        if unsafe { yaml_parser_parse(parser, event.as_mut_ptr()) }.fail {
+            break;
+        }
+        // SAFETY: a successful parse initialized the event.
+        let mut event = unsafe { event.assume_init() };
+        let stream_end = event.type_ == YAML_STREAM_END_EVENT;
+        match event.type_ {
+            YAML_SEQUENCE_START_EVENT | YAML_MAPPING_START_EVENT => {
+                depth += 1;
+                if depth > MAX_YAML_NESTING {
+                    too_deep_at = Some(event.start_mark);
+                }
+            }
+            YAML_SEQUENCE_END_EVENT | YAML_MAPPING_END_EVENT => {
+                depth = depth.saturating_sub(1);
+            }
+            _ => {}
+        }
+        // SAFETY: the event came from a successful parse and is deleted once.
+        unsafe { yaml_event_delete(&mut event) };
+        if stream_end || too_deep_at.is_some() {
+            break;
+        }
+    }
+    // SAFETY: the parser was initialized above and is deleted exactly once.
+    unsafe { yaml_parser_delete(parser) };
+
+    match too_deep_at {
+        Some(mark) => Err(<serde_norway::Error as serde::de::Error>::custom(format!(
+            "recursion limit exceeded at line {} column {}",
+            mark.line + 1,
+            mark.column + 1
+        ))),
+        None => Ok(()),
+    }
+}
+
 /// Loads and validates a native PrismTTY profile YAML file from disk.
 pub fn load_profile_file(path: impl AsRef<Path>) -> Result<LoadedProfileFile, ConfigError> {
     let path = path.as_ref();
@@ -301,7 +388,7 @@ pub(crate) fn parse_profile_file_contents(
     path: &Path,
     input: &str,
 ) -> Result<LoadedProfileFile, ConfigError> {
-    let doc: RulesDoc = serde_norway::from_str(input).map_err(|source| ConfigError::YamlFile {
+    let doc = parse_rules_doc(input).map_err(|source| ConfigError::YamlFile {
         path: path.to_path_buf(),
         source,
     })?;
@@ -356,7 +443,7 @@ fn parse_profile_yaml_with_mode(
     input: &str,
     mode: ProfileYamlMode,
 ) -> Result<LoadedProfileFile, ConfigError> {
-    let doc: RulesDoc = serde_norway::from_str(input)?;
+    let doc = parse_rules_doc(input)?;
     profile_file_from_doc(doc, mode)
 }
 
@@ -716,5 +803,109 @@ rules:
         assert!(!message.contains('\u{7}'), "{message:?}");
         assert!(message.contains("\\x1b"), "{message:?}");
         assert!(message.contains("\\x07"), "{message:?}");
+    }
+
+    /// Runs `parse` on a worker thread so that a parser regression on a
+    /// pathological document fails the test instead of hanging it.
+    fn parse_within_time_limit<T: Send + 'static>(parse: impl FnOnce() -> T + Send + 'static) -> T {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = sender.send(parse());
+        });
+        receiver
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("YAML parsing should finish within the time limit")
+    }
+
+    const DEEP_COLOR_HEADER: &str = "rules:\n  - regex: x\n    color: ";
+
+    fn deep_flow_payloads() -> [String; 4] {
+        [
+            "[".repeat(200_000),
+            "{a: ".repeat(100_000),
+            "[\n".repeat(200_000),
+            format!("{}{}", "[".repeat(16_000), "a,".repeat(400_000)),
+        ]
+    }
+
+    #[test]
+    fn deeply_nested_flow_yaml_is_rejected_quickly() {
+        for payload in deep_flow_payloads() {
+            let config = format!("{DEEP_COLOR_HEADER}{payload}");
+            let message = parse_within_time_limit(move || {
+                PrismConfig::from_chromaterm_yaml(&config).map(|_| ())
+            })
+            .expect_err("deep config nesting must be rejected")
+            .to_string();
+            assert!(message.contains("recursion limit exceeded"), "{message}");
+
+            let profile = format!("profile:\n  name: deep\n{DEEP_COLOR_HEADER}{payload}");
+            let message = parse_within_time_limit(move || parse_profile_yaml(&profile).map(|_| ()))
+                .expect_err("deep profile nesting must be rejected")
+                .to_string();
+            assert!(message.contains("recursion limit exceeded"), "{message}");
+        }
+    }
+
+    #[test]
+    fn deeply_nested_config_and_profile_files_are_rejected_quickly() {
+        let file = tempfile::NamedTempFile::new().expect("temp file creates");
+        std::fs::write(file.path(), format!("rules: {}\n", "{".repeat(200_000)))
+            .expect("deep yaml writes");
+
+        let loaders: [fn(std::path::PathBuf) -> Result<(), super::ConfigError>; 2] = [
+            |path| PrismConfig::from_chromaterm_file(path).map(|_| ()),
+            |path| load_profile_file(path).map(|_| ()),
+        ];
+        for load in loaders {
+            let path = file.path().to_path_buf();
+            let error = parse_within_time_limit(move || load(path))
+                .expect_err("deep file nesting must be rejected");
+            let message = error.to_string();
+            assert!(
+                matches!(error, super::ConfigError::YamlFile { .. }),
+                "{message}"
+            );
+            assert!(
+                message.contains(&file.path().display().to_string()),
+                "{message}"
+            );
+            assert!(message.contains("recursion limit exceeded"), "{message}");
+        }
+    }
+
+    #[test]
+    fn yaml_nesting_limit_matches_serde_norway_recursion_limit() {
+        // The header puts the color value at depth 4, so 125 flow levels end
+        // exactly at serde_norway's limit of 128.
+        let at_limit = format!(
+            "{DEEP_COLOR_HEADER}{}{}\n",
+            "[".repeat(125),
+            "]".repeat(125)
+        );
+        let error = PrismConfig::from_chromaterm_yaml(&at_limit)
+            .expect_err("a sequence is not a valid color");
+        assert!(
+            matches!(error, super::ConfigError::InvalidStyle { .. }),
+            "{error}"
+        );
+
+        let over_limit = format!(
+            "{DEEP_COLOR_HEADER}{}{}\n",
+            "[".repeat(126),
+            "]".repeat(126)
+        );
+        let serde_error = serde_norway::from_str::<serde_norway::Value>(&over_limit)
+            .expect_err("serde_norway rejects nesting past its recursion limit");
+        assert_eq!(
+            PrismConfig::from_chromaterm_yaml(&over_limit)
+                .expect_err("nesting past the limit must be rejected")
+                .to_string(),
+            format!("failed to parse YAML: {serde_error}")
+        );
+        assert_eq!(
+            serde_error.to_string(),
+            "recursion limit exceeded at line 3 column 137"
+        );
     }
 }

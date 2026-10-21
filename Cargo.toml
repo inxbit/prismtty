@@ -36,6 +36,10 @@ portable-pty = "0.9"
 serde = { version = "1.0", features = ["derive"] }
 serde_norway = "0.9.42"
 thiserror = "2.0"
+# serde_norway's libyaml port. src/config.rs walks its parser events to bound
+# YAML nesting before serde_norway loads a document; the exact pin keeps that
+# walk on the same parser serde_norway uses.
+unsafe-libyaml-norway = "=0.2.15"
 
 [dev-dependencies]
 assert_cmd = "2.0"
