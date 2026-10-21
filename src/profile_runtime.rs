@@ -56,6 +56,9 @@ struct ProfileFrame {
     close_policy: ClosePolicy,
     target: Option<String>,
     unresolved_detection: bool,
+    /// A remote command was typed inside this connection, so a close message
+    /// that names no known target may belong to that nested attempt.
+    nested_attempt_seen: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -314,6 +317,29 @@ impl ProfileRuntime {
                 self.clear_pending_prompt();
                 return self.pop_profile();
             }
+            // OpenSSH names the HostName an ssh_config alias resolves to, not
+            // the typed alias. With no remote command typed inside this
+            // connection, a targeted ssh close naming no other connection
+            // can only be its own.
+            if self.pending_remote.is_none()
+                && self.stack.last().is_some_and(|frame| {
+                    !frame.nested_attempt_seen
+                        && close_markers.iter().any(|marker| {
+                            marker.kind == CloseMarkerKind::SshLike
+                                && frame.close_policy.accepts(marker.kind)
+                                && marker.target.as_ref().is_some_and(|target| {
+                                    !self
+                                        .stack
+                                        .iter()
+                                        .any(|frame| frame.target.as_ref() == Some(target))
+                                })
+                        })
+                })
+            {
+                self.clear_output_window();
+                self.clear_pending_prompt();
+                return self.pop_profile();
+            }
         }
 
         if self.pending_remote.as_ref().is_some_and(|pending| {
@@ -474,6 +500,9 @@ impl ProfileRuntime {
     fn arm_remote_attempt(&mut self, attempt: Option<RemoteAttempt>) {
         self.pending_remote = attempt;
         if self.pending_remote.is_some() {
+            if let Some(frame) = self.stack.last_mut() {
+                frame.nested_attempt_seen = true;
+            }
             self.baseline_locked = true;
             self.clear_output_window();
             self.clear_pending_prompt();
@@ -611,6 +640,7 @@ impl ProfileRuntime {
             close_policy: remote_attempt.policy,
             target: remote_attempt.target,
             unresolved_detection,
+            nested_attempt_seen: false,
         });
     }
 
@@ -1813,6 +1843,110 @@ mod tests {
             Some(names(&["generic", "juniper"]))
         );
         runtime.accept_transition();
+        assert_eq!(
+            runtime.observe_output(b"Connection to router-a closed.\n", &store),
+            Some(names(&["generic", "linux-unix"]))
+        );
+        assert_eq!(runtime.stack_len(), 0);
+    }
+
+    // OpenSSH reports the HostName an ssh_config alias resolves to, not the
+    // alias that was typed.
+    #[test]
+    fn ssh_alias_unwinds_on_its_hostname_close() {
+        let store = ProfileStore::builtin();
+        let mut runtime = ProfileRuntime::new(names(&["generic", "linux-unix"]));
+
+        runtime.observe_input(b"ssh rtr1\r");
+        assert_eq!(
+            runtime.observe_output(b"--- JUNOS 22.4R3 Kernel 64-bit\n", &store),
+            Some(names(&["generic", "juniper"]))
+        );
+        runtime.accept_transition();
+        assert_eq!(
+            runtime.observe_output(b"Connection to 192.0.2.1 closed.\n", &store),
+            Some(names(&["generic", "linux-unix"]))
+        );
+        assert_eq!(runtime.stack_len(), 0);
+    }
+
+    #[test]
+    fn nested_ssh_alias_unwinds_only_its_own_connection() {
+        let store = ProfileStore::builtin();
+        let mut runtime = ProfileRuntime::new(names(&["generic", "linux-unix"]));
+
+        runtime.observe_input(b"ssh router-a\r");
+        assert_eq!(
+            runtime.observe_output(b"--- JUNOS 22.4R3 Kernel 64-bit\n", &store),
+            Some(names(&["generic", "juniper"]))
+        );
+        runtime.accept_transition();
+        runtime.observe_input(b"ssh rtr2\r");
+        assert_eq!(
+            runtime.observe_output(b"Cisco IOS Software\n", &store),
+            Some(names(&["generic", "cisco"]))
+        );
+        runtime.accept_transition();
+        assert_eq!(runtime.stack_len(), 2);
+
+        // A close naming the parent's target is not the child's alias close.
+        assert_eq!(
+            runtime.observe_output(b"Connection to router-a closed.\n", &store),
+            None
+        );
+        assert_eq!(runtime.stack_len(), 2);
+
+        assert_eq!(
+            runtime.observe_output(b"Connection to 192.0.2.2 closed.\n", &store),
+            Some(names(&["generic", "juniper"]))
+        );
+        runtime.accept_transition();
+        assert_eq!(runtime.stack_len(), 1);
+        // The parent saw a nested attempt, so only its own target closes it.
+        assert_eq!(
+            runtime.observe_output(b"Connection to 192.0.2.1 closed.\n", &store),
+            None
+        );
+        assert_eq!(runtime.stack_len(), 1);
+        assert_eq!(
+            runtime.observe_output(b"Connection to router-a closed.\n", &store),
+            Some(names(&["generic", "linux-unix"]))
+        );
+        assert_eq!(runtime.stack_len(), 0);
+    }
+
+    // Once a nested attempt was typed, a close naming another host may belong
+    // to that attempt, so it must not unwind the parent connection.
+    #[test]
+    fn unmatched_close_after_a_nested_attempt_keeps_the_parent_connection() {
+        let store = ProfileStore::builtin();
+        let mut runtime = ProfileRuntime::new(names(&["generic", "linux-unix"]));
+
+        runtime.observe_input(b"ssh router-a\r");
+        assert_eq!(
+            runtime.observe_output(b"--- JUNOS 22.4R3 Kernel 64-bit\n", &store),
+            Some(names(&["generic", "juniper"]))
+        );
+        runtime.accept_transition();
+        runtime.observe_input(b"ssh hostb\r");
+        assert_eq!(runtime.observe_output(b"hello\n", &store), None);
+        for line in [
+            &b"show version\r"[..],
+            b"show route\r",
+            b"show arp\r",
+            b"show log\r",
+            b"show chassis\r",
+        ] {
+            runtime.observe_input(line);
+        }
+        assert_eq!(runtime.pending_remote, None);
+
+        assert_eq!(
+            runtime.observe_output(b"Connection to hostb closed.\n", &store),
+            None
+        );
+        assert_eq!(runtime.active_profiles(), names(&["generic", "juniper"]));
+        assert_eq!(runtime.stack_len(), 1);
         assert_eq!(
             runtime.observe_output(b"Connection to router-a closed.\n", &store),
             Some(names(&["generic", "linux-unix"]))
