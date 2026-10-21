@@ -331,6 +331,7 @@ impl ProfileRuntime {
         let detected =
             store.detect_profiles_with_lowercase(&self.output_window, &self.output_window_lower);
         if is_generic_profile_set(&detected) {
+            self.retain_unterminated_tail();
             self.clear_pending_prompt();
             return None;
         }
@@ -341,6 +342,7 @@ impl ProfileRuntime {
                 self.clear_pending_prompt();
                 let _ = self.switch_to(profiles, Some(remote_attempt), false);
             }
+            self.retain_unterminated_tail();
             self.clear_pending_prompt();
             return None;
         }
@@ -394,6 +396,8 @@ impl ProfileRuntime {
 
         if active_profile.is_some() {
             self.clear_output_window();
+        } else {
+            self.retain_unterminated_tail();
         }
         self.clear_pending_prompt();
         None
@@ -617,6 +621,22 @@ impl ProfileRuntime {
         self.output_window.clear();
         self.output_window_lower.clear();
         self.output_bytes_since_detection = 0;
+    }
+
+    /// Drops the complete lines a detection pass already examined. Signals
+    /// and prompts are matched per line, so only an unterminated trailing
+    /// line, such as a banner or prompt split across reads, needs another
+    /// look once the rest of it arrives.
+    fn retain_unterminated_tail(&mut self) {
+        if let Some(end) = self.output_window.rfind(is_line_terminator) {
+            // ASCII lowercasing keeps byte offsets, so both windows share them.
+            self.output_window.drain(..=end);
+            self.output_window_lower.drain(..=end);
+        }
+        // Output without line terminators is not a prompt line; keep only
+        // enough of it for a signal split across the next read.
+        trim_to_recent_chars(&mut self.output_window, DETECTION_BYTE_INTERVAL);
+        trim_to_recent_chars(&mut self.output_window_lower, DETECTION_BYTE_INTERVAL);
     }
 }
 
@@ -1142,6 +1162,63 @@ mod tests {
             Some(names(&["generic", "cisco"]))
         );
         assert_eq!(runtime.active_profiles(), names(&["generic", "cisco"]));
+    }
+
+    // A detection pass that changes nothing must not leave its examined lines
+    // in the window, or every later read rescans up to 64 KiB of old output.
+    #[test]
+    fn no_change_detection_does_not_rescan_examined_lines() {
+        let store = ProfileStore::builtin();
+        let filler = "plain log line without vendor words 0123456789\n".repeat(2048);
+
+        // Generic-only detection.
+        let mut runtime = ProfileRuntime::new(names(&["generic"]));
+        assert_eq!(runtime.observe_output(filler.as_bytes(), &store), None);
+        assert!(runtime.output_window.is_empty());
+        assert!(runtime.output_window_lower.is_empty());
+
+        // Weak hints with no specific profile active.
+        let mut runtime = ProfileRuntime::new(names(&["generic"]));
+        assert_eq!(
+            runtime.observe_output(b"Gi1/0/1 is up, line protocol is up\n", &store),
+            None
+        );
+        assert!(runtime.output_window.is_empty());
+
+        // Detection that only confirms the active profile.
+        let mut runtime = ProfileRuntime::new(names(&["generic", "juniper"]));
+        assert_eq!(runtime.observe_output(b"--- JUNOS 22.4R3\n", &store), None);
+        assert!(runtime.output_window.is_empty());
+
+        // An unterminated tail survives so a split banner still completes.
+        let mut runtime = ProfileRuntime::new(names(&["generic", "linux-unix"]));
+        assert_eq!(runtime.observe_output(filler.as_bytes(), &store), None);
+        assert_eq!(runtime.observe_output(b"x\nCisco I", &store), None);
+        assert_eq!(runtime.output_window, "Cisco I");
+        assert_eq!(runtime.output_window_lower, "cisco i");
+        assert_eq!(
+            runtime.observe_output(b"OS Software\n", &store),
+            Some(names(&["generic", "cisco"]))
+        );
+
+        // Output without line terminators keeps only a bounded tail.
+        let mut runtime = ProfileRuntime::new(names(&["generic", "linux-unix"]));
+        assert_eq!(runtime.observe_output(&[b'a'; 70_000], &store), None);
+        assert!(runtime.output_window.len() <= super::DETECTION_BYTE_INTERVAL);
+        assert_eq!(
+            runtime.output_window.len(),
+            runtime.output_window_lower.len()
+        );
+
+        // An armed remote attempt at an unrecognised prompt stays bounded too,
+        // although every echoed keystroke runs a detection pass.
+        let mut runtime = ProfileRuntime::new(names(&["generic", "linux-unix"]));
+        runtime.observe_input(b"ssh web01\r");
+        assert_eq!(runtime.observe_output(filler.as_bytes(), &store), None);
+        assert_eq!(runtime.observe_output(b"[admin@web01 ~]$ ", &store), None);
+        assert_eq!(runtime.observe_output(b"l", &store), None);
+        assert!(runtime.pending_remote.is_some());
+        assert_eq!(runtime.output_window, "[admin@web01 ~]$ l");
     }
 
     #[test]
