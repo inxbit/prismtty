@@ -109,6 +109,19 @@ Cargo installs the binaries only. Shell completions for zsh, bash, and fish
 live in [`completions/`](completions/); copy the file for your shell into its
 completions directory.
 
+For fish, also link `prismtty.fish` under the `ptty` and `ct` names, because fish
+only loads a completion file named after the command being completed:
+
+```sh
+cd ~/.config/fish/completions
+ln -s prismtty.fish ptty.fish
+ln -s prismtty.fish ct.fish
+```
+
+The bash-completion on-demand directory works the same way: install
+`prismtty.bash` there as `prismtty`, `ptty`, and `ct`, or source it from
+`~/.bashrc`.
+
 ### GitHub Release
 
 Prebuilt release archives and checksums are available on the

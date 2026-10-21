@@ -206,6 +206,38 @@ test('formula generation rejects a version Homebrew cannot derive from the URL',
   }
 });
 
+test('formula installs the fish completions under every command name', () => {
+  // fish only autoloads a completion file named after the command being
+  // completed, so `ptty <TAB>` and `ct <TAB>` need ptty.fish and ct.fish even
+  // though prismtty.fish already holds their completions.
+  const directory = mkdtempSync(`${tmpdir()}/prismtty-formula-`);
+  try {
+    for (const target of ['darwin-aarch64', 'darwin-x86_64', 'linux-x86_64']) {
+      writeFileSync(
+        `${directory}/prismtty-1.2.3-${target}.tar.gz.sha256`,
+        `${'a'.repeat(64)}  prismtty-1.2.3-${target}.tar.gz\n`,
+      );
+    }
+    const result = spawnSync('bash', ['scripts/generate-homebrew-formula.sh', `${directory}/prismtty.rb`, directory], {
+      encoding: 'utf8',
+      env: { ...process.env, PRISMTTY_VERSION: '1.2.3' },
+    });
+    assert.equal(result.status, 0, result.stderr);
+
+    const formula = read(`${directory}/prismtty.rb`);
+    assert.match(formula, /^\s*fish_completion\.install "completions\/prismtty\.fish"$/m);
+    for (const command of ['ptty', 'ct']) {
+      assert.match(
+        formula,
+        new RegExp(`^\\s*fish_completion\\.install_symlink fish_completion/"prismtty\\.fish" => "${command}\\.fish"$`, 'm'),
+        `formula does not install ${command}.fish`,
+      );
+    }
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test('every workflow action is pinned to a full commit SHA', () => {
   // A mutable tag (`@v4`) can be repointed at attacker code that then runs
   // with the job's token; a 40-hex SHA cannot. Local `./` actions are exempt.
