@@ -1518,6 +1518,7 @@ fn handle_session_signals_with(
                         "prismtty: could not reapply raw terminal mode: {error}"
                     ));
                 }
+                RESIZE_SIGNAL_PIPE.notify(RESIZE_WAKE_BYTE);
                 continue;
             }
             if JOB_CONTROL_SIGNALS.contains(&signal) {
@@ -1531,6 +1532,9 @@ fn handle_session_signals_with(
                         "prismtty: job-control terminal transition failed: {error}"
                     ));
                 }
+                // A resize while stopped signalled the shell, which owned the
+                // terminal then, so check the size again.
+                RESIZE_SIGNAL_PIPE.notify(RESIZE_WAKE_BYTE);
                 // Stop requests queued before the resume were satisfied by
                 // this stop, just as SIGCONT discards pending stop signals.
                 // Replaying them would stop the wrapper again right after
@@ -1672,18 +1676,35 @@ extern "C" fn notify_resize_for_signal(_signal: libc::c_int) {
 }
 
 fn resize_pty_on_signals(master: Box<dyn portable_pty::MasterPty + Send>, read_fd: RawFd) {
-    let mut last_size = current_pty_size();
+    let mut last_size = start_pty_size_sync(&*master, current_pty_size());
     while let Some(bytes) = read_signal_bytes(read_fd) {
         if bytes.contains(&RESIZE_STOP_BYTE) {
             break;
         }
-        let next_size = current_pty_size();
-        if next_size != last_size {
-            let _ = master.resize(next_size);
-            last_size = next_size;
-        }
+        last_size = sync_pty_size(&*master, last_size, current_pty_size());
     }
     close_fd(read_fd);
+}
+
+/// Compares against the PTY's own size rather than the outer terminal's: a
+/// resize made after the PTY was opened, before the SIGWINCH handler was
+/// installed, would otherwise never reach it.
+fn start_pty_size_sync(master: &dyn portable_pty::MasterPty, outer_size: PtySize) -> PtySize {
+    let pty_size = master.get_size().unwrap_or_default();
+    sync_pty_size(master, pty_size, outer_size)
+}
+
+/// Gives the PTY the outer terminal's size when it differs from the size the
+/// PTY was last given, and returns the size it was given now.
+fn sync_pty_size(
+    master: &dyn portable_pty::MasterPty,
+    last_size: PtySize,
+    outer_size: PtySize,
+) -> PtySize {
+    if outer_size != last_size {
+        let _ = master.resize(outer_size);
+    }
+    outer_size
 }
 
 fn pipe_fds() -> io::Result<(RawFd, RawFd)> {
@@ -2416,6 +2437,34 @@ mod tests {
                 .reassert_with(|_| panic!("raw mode applied outside a session"))
                 .expect("continue outside a session is a no-op");
         }
+    }
+
+    // The outer terminal can be resized after the PTY is opened and before the
+    // resize watcher's SIGWINCH handler is installed.
+    #[test]
+    fn resize_watcher_starts_from_the_ptys_own_size() {
+        let opened = portable_pty::PtySize {
+            rows: 24,
+            cols: 80,
+            ..portable_pty::PtySize::default()
+        };
+        let resized = portable_pty::PtySize {
+            rows: 30,
+            cols: 100,
+            ..portable_pty::PtySize::default()
+        };
+        let pair = portable_pty::native_pty_system()
+            .openpty(opened)
+            .expect("openpty");
+
+        let synced = super::start_pty_size_sync(&*pair.master, resized);
+
+        assert_eq!(synced, resized);
+        assert_eq!(
+            pair.master.get_size().expect("PTY size"),
+            resized,
+            "a resize made during startup never reached the PTY"
+        );
     }
 
     #[test]

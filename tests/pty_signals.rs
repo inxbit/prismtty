@@ -1423,6 +1423,48 @@ fn wrapper_resumed_with_bg_leaves_the_shells_terminal_settings_alone() {
     );
 }
 
+/// The kernel signals a resize to the terminal's foreground job, which is the
+/// shell while the wrapper is stopped. The wrapped PTY must still take the new
+/// size once `fg` resumes the wrapper.
+#[test]
+fn resize_while_stopped_reaches_the_wrapped_pty_after_fg() {
+    let shell = JobControlShell::spawn(
+        "set -m; \"$PTTY\" sh -c 'echo $PPID > \"$PRISMTTY_WRAPPER_PID\"; echo $$ > \"$PRISMTTY_CHILD_PID\"; while true; do echo \"SZ=$(stty size)\"; sleep 0.05; done'; echo \"STOPPED-$((1+1))\"; sleep 1; fg %1",
+    );
+    let wrapper_pid = shell.wrapper_pid();
+    let output = shell.wait_for_output(b"SZ=24 80");
+    assert!(
+        contains_bytes(&output, b"SZ=24 80"),
+        "the wrapped command never reported its size: {:?}",
+        String::from_utf8_lossy(&output)
+    );
+    shell.settle();
+
+    // SAFETY: kill has no memory-safety preconditions; the target is a process this test spawned.
+    assert_eq!(unsafe { libc::kill(wrapper_pid, libc::SIGTSTP) }, 0);
+    let output = shell.wait_for_output(b"STOPPED-2");
+    assert!(
+        contains_bytes(&output, b"STOPPED-2"),
+        "the wrapper never stopped: {:?}",
+        String::from_utf8_lossy(&output)
+    );
+    shell
+        .master
+        .resize(PtySize {
+            rows: 40,
+            cols: 120,
+            ..PtySize::default()
+        })
+        .expect("resize the shell's terminal");
+
+    let output = shell.wait_for_output(b"SZ=40 120");
+    assert!(
+        contains_bytes(&output, b"SZ=40 120"),
+        "the wrapped PTY kept its old size after fg: {:?}",
+        String::from_utf8_lossy(&output)
+    );
+}
+
 /// AUDIT L14: a signal delivered to prismtty is forwarded to the wrapped
 /// child's process group instead of orphaning it.
 #[test]
