@@ -588,6 +588,9 @@ impl OversizedStringControlFilter {
                         return output;
                     };
                     output.extend_from_slice(&terminator.replay[..terminator.replay_len]);
+                    // The discarded string took its cancelled prefix with it, so
+                    // a control right after the terminator starts a new chain.
+                    cancellation_root = None;
                     copy_from = terminator.end;
                     scan_from = terminator.end;
                 }
@@ -5467,6 +5470,41 @@ rules:
         output.extend(streaming.finish());
 
         assert_eq!(output, b"safe\x80after");
+    }
+
+    #[test]
+    fn oversized_string_after_cancelled_control_does_not_reuse_a_stale_drop_root() {
+        let highlighter =
+            Highlighter::from_config(PrismConfig::default()).expect("empty config compiles");
+
+        for second in [b"\x1b]0;".as_slice(), b"\x1bP".as_slice()] {
+            let mut input = b"pre\x1b[1\x1b]0;".to_vec();
+            input.extend(std::iter::repeat_n(
+                b'a',
+                super::MAX_INCOMPLETE_ESCAPE_BYTES + 1,
+            ));
+            input.push(0x07);
+            input.extend_from_slice(second);
+            input.extend(std::iter::repeat_n(
+                b'b',
+                super::MAX_INCOMPLETE_ESCAPE_BYTES + 1,
+            ));
+            input.extend_from_slice(b"\x1b\\visible\n");
+
+            let mut whole = StreamingHighlighter::new(highlighter.clone());
+            let mut output = whole.push(&input);
+            output.extend(whole.finish());
+
+            let mut chunked = StreamingHighlighter::new(highlighter.clone());
+            let mut reference = Vec::new();
+            for chunk in input.chunks(8192) {
+                reference.extend(chunked.push(chunk));
+            }
+            reference.extend(chunked.finish());
+
+            assert_eq!(output, b"previsible\n");
+            assert_eq!(output, reference);
+        }
     }
 
     #[test]
