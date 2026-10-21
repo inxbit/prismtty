@@ -3005,6 +3005,16 @@ fn emit_interactive_highlighted(
                     match wanted {
                         Some(style) => {
                             if active_style.as_ref() != Some(&style) {
+                                // A start only adds to what is drawn, so end
+                                // what the previous style set and this lacks.
+                                if let Some(previous) = active_style
+                                    .as_ref()
+                                    .filter(|previous| style_outlasts_start_of(previous, &style))
+                                {
+                                    output.extend(style_reset_bytes(
+                                        previous, native_sgr, reset_mode,
+                                    ));
+                                }
                                 output.extend_from_slice(starts.start(&style, color_mode));
                                 *active_style = Some(style);
                             }
@@ -3065,6 +3075,19 @@ impl SgrStartCache {
 
 fn is_interactive_spacing(byte: u8) -> bool {
     matches!(byte, b' ' | b'\t')
+}
+
+/// Reports whether `previous` sets a color or attribute that starting `next`
+/// on top of it would leave in place, because an SGR start only adds.
+fn style_outlasts_start_of(previous: &Style, next: &Style) -> bool {
+    (previous.foreground.is_some() && next.foreground.is_none())
+        || (previous.background.is_some() && next.background.is_none())
+        || (previous.bold && !next.bold)
+        || (previous.italic && !next.italic)
+        || (previous.underline && !next.underline)
+        || (previous.blink && !next.blink)
+        || (previous.invert && !next.invert)
+        || (previous.strike && !next.strike)
 }
 
 /// Reports whether a style shows on blank cells: a background, underline,
@@ -7340,6 +7363,46 @@ rules:
                 "\x1b[4;91;104mw\x1b]0;t\x07\x1b[4;91;104man",
                 "\x1b[24;39;49m,\x1b[92mup\n\x1b[39m",
             )
+        );
+    }
+
+    // An SGR start only adds to what is drawn, so switching the interactive
+    // overlay to another style must first end what the previous style set and
+    // the next one does not, or it stays on the text after it.
+    #[test]
+    fn interactive_overlay_ends_the_previous_style_before_starting_another() {
+        let render = |yaml: &str, input: &[u8], no_minimal_resets: bool| {
+            let config = PrismConfig::from_chromaterm_yaml(yaml).expect("config parses");
+            let highlighter =
+                Highlighter::from_config_with_color_mode(config, crate::style::ColorMode::Xterm256)
+                    .expect("rules compile");
+            let mut streaming = StreamingHighlighter::new_interactive(highlighter);
+            streaming.set_no_minimal_resets(no_minimal_resets);
+            let mut output = streaming.push(input);
+            output.extend(streaming.finish());
+            String::from_utf8(output).expect("utf8")
+        };
+
+        let background_then_foreground = "rules:\n  - description: host\n    regex: '\\bhost\\d+'\n    color: f#ffffff b#003366\n  - description: port\n    regex: ':\\d+\\b'\n    color: f#00ff00\n";
+        assert_eq!(
+            render(background_then_foreground, b"host1:22 open\nnext\n", false),
+            "\x1b[38;5;231;48;5;23mhost1\x1b[39;49m\x1b[38;5;46m:22 \x1b[39mopen\nnext\n",
+        );
+
+        let bold_then_plain = "rules:\n  - description: down\n    regex: '\\bdown\\b'\n    color: f#ff0000 bold\n  - description: port\n    regex: '\\bGi\\S+'\n    color: f#0087ff\n";
+        let output = render(bold_then_plain, b"down Gi0/1\n", true);
+        let gi = output.find("Gi0/1").expect("token is emitted");
+        let before_gi = &output[..gi];
+        assert!(
+            before_gi.rfind("\x1b[0m") > before_gi.rfind("\x1b[1;"),
+            "bold from `down` is not ended before `Gi0/1`: {output:?}"
+        );
+
+        // A switch between foreground-only styles needs no reset.
+        let foreground_only = "rules:\n  - description: host\n    regex: '\\bhost\\d+'\n    color: f#ffffff\n  - description: port\n    regex: ':\\d+\\b'\n    color: f#00ff00\n";
+        assert_eq!(
+            render(foreground_only, b"host1:22 open\n", false),
+            "\x1b[38;5;231mhost1\x1b[38;5;46m:22 \x1b[39mopen\n",
         );
     }
 
