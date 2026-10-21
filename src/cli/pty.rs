@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::ffi::{OsStr, OsString};
 use std::fs::OpenOptions;
 use std::io::{self, Read, Write};
@@ -1391,15 +1392,47 @@ impl Drop for TerminalSession {
 }
 
 fn handle_session_signals(read_fd: RawFd, raw_mode_state: SharedRawModeState) {
+    handle_session_signals_with(read_fd, &raw_mode_state, || {
+        with_terminal_restored_for_job_control(
+            || suspend_raw_mode_from_signal_state(&raw_mode_state),
+            || {
+                forward_signal_to_child(libc::SIGSTOP as u8);
+                // SAFETY: raise has no memory-safety preconditions; SIGSTOP cannot be
+                // caught and raw mode was restored just before.
+                unsafe {
+                    // Target the calling thread so Linux delivers the
+                    // stop before this worker can continue and reapply
+                    // raw mode. A process-directed kill may return
+                    // while SIGSTOP is still pending.
+                    libc::raise(libc::SIGSTOP);
+                }
+                forward_signal_to_child(libc::SIGCONT as u8);
+            },
+            || reapply_raw_mode_from_signal_state(&raw_mode_state),
+        )
+    });
+}
+
+/// Acts on the signal numbers the handlers queue in the self-pipe until the
+/// stop byte arrives. `stop_for_job_control` performs one supervised stop and
+/// returns once the wrapper has been continued.
+fn handle_session_signals_with(
+    read_fd: RawFd,
+    raw_mode_state: &Mutex<RawModeLifecycle>,
+    mut stop_for_job_control: impl FnMut() -> io::Result<()>,
+) {
+    let mut pending = VecDeque::new();
+    let mut resumed_at = None;
     while let Some(bytes) = read_signal_bytes(read_fd) {
-        for signal in bytes {
+        pending.extend(bytes);
+        while let Some(signal) = pending.pop_front() {
             if signal == RAW_SIGNAL_STOP_BYTE {
                 close_fd(read_fd);
                 return;
             }
             let signal = libc::c_int::from(signal);
             if TERMINATING_SIGNALS.contains(&signal) {
-                if let Err(error) = terminate_raw_mode_from_signal_state(&raw_mode_state) {
+                if let Err(error) = terminate_raw_mode_from_signal_state(raw_mode_state) {
                     warn(format_args!(
                         "prismtty: could not restore terminal before exit: {error}"
                     ));
@@ -1412,31 +1445,55 @@ fn handle_session_signals(read_fd: RawFd, raw_mode_state: SharedRawModeState) {
                 }
             }
             if JOB_CONTROL_SIGNALS.contains(&signal) {
-                if let Err(error) = with_terminal_restored_for_job_control(
-                    || suspend_raw_mode_from_signal_state(&raw_mode_state),
-                    || {
-                        forward_signal_to_child(libc::SIGSTOP as u8);
-                        // SAFETY: raise has no memory-safety preconditions; SIGSTOP cannot be
-                        // caught and raw mode was restored just before.
-                        unsafe {
-                            // Target the calling thread so Linux delivers the
-                            // stop before this worker can continue and reapply
-                            // raw mode. A process-directed kill may return
-                            // while SIGSTOP is still pending.
-                            libc::raise(libc::SIGSTOP);
-                        }
-                        forward_signal_to_child(libc::SIGCONT as u8);
-                    },
-                    || reapply_raw_mode_from_signal_state(&raw_mode_state),
-                ) {
+                if is_stale_stop_request(signal, resumed_at, || {
+                    owns_terminal(libc::STDIN_FILENO) == Some(true)
+                }) {
+                    continue;
+                }
+                if let Err(error) = stop_for_job_control() {
                     warn(format_args!(
                         "prismtty: job-control terminal transition failed: {error}"
                     ));
                 }
+                // Stop requests queued before the resume were satisfied by
+                // this stop, just as SIGCONT discards pending stop signals.
+                // Replaying them would stop the wrapper again right after
+                // `fg`: a background read of the terminal raises SIGTTIN
+                // each time it restarts, queueing a burst of them.
+                pending.extend(ready_signal_bytes(read_fd));
+                pending.retain(|byte| !JOB_CONTROL_SIGNALS.contains(&libc::c_int::from(*byte)));
+                resumed_at = Some(Instant::now());
             }
         }
     }
     close_fd(read_fd);
+}
+
+/// How long after a job-control resume a SIGTTIN or SIGTTOU that reaches the
+/// watcher while the wrapper is in the foreground is still taken as stale.
+const STALE_STOP_WINDOW: Duration = Duration::from_secs(1);
+
+/// The kernel raises SIGTTIN and SIGTTOU only for terminal I/O from the
+/// background. One that reaches the watcher in the foreground shortly after a
+/// resume was queued by a handler the stop interrupted mid-way, which only
+/// finishes once the wrapper is continued; it is not a new request.
+fn is_stale_stop_request(
+    signal: libc::c_int,
+    resumed_at: Option<Instant>,
+    in_foreground: impl FnOnce() -> bool,
+) -> bool {
+    signal != libc::SIGTSTP
+        && resumed_at.is_some_and(|at| at.elapsed() < STALE_STOP_WINDOW)
+        && in_foreground()
+}
+
+/// Whether this process group is the foreground job of the terminal on `fd`,
+/// or `None` when that cannot be told: `fd` is not this process's controlling
+/// terminal, or the terminal has no foreground job.
+fn owns_terminal(fd: RawFd) -> Option<bool> {
+    // SAFETY: tcgetpgrp and getpgrp have no memory-safety preconditions.
+    let (foreground, own) = unsafe { (libc::tcgetpgrp(fd), libc::getpgrp()) };
+    (foreground > 0).then_some(foreground == own)
 }
 
 fn current_pty_size() -> PtySize {
@@ -1601,6 +1658,29 @@ fn read_signal_bytes(read_fd: RawFd) -> Option<Vec<u8>> {
             return None;
         }
     }
+}
+
+/// Reads whatever is already queued in the signal pipe without waiting. The
+/// pass limit keeps a burst that is still being written from pinning the
+/// thread.
+fn ready_signal_bytes(read_fd: RawFd) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    for _ in 0..1024 {
+        let mut poll_fd = libc::pollfd {
+            fd: read_fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: `poll_fd` is a valid, exclusively borrowed pollfd and the count matches.
+        if unsafe { libc::poll(&mut poll_fd, 1, 0) } <= 0 || poll_fd.revents & libc::POLLIN == 0 {
+            break;
+        }
+        match read_signal_bytes(read_fd) {
+            Some(read) => bytes.extend(read),
+            None => break,
+        }
+    }
+    bytes
 }
 
 fn write_signal_byte(write_fd: RawFd, byte: u8) {
@@ -2241,6 +2321,65 @@ mod tests {
         assert_eq!(error.kind(), std::io::ErrorKind::Other);
         assert!(!suspended.load(Ordering::Acquire));
         assert!(!reapplied.load(Ordering::Acquire));
+    }
+
+    // A background read of the terminal raises SIGTTIN again every time it
+    // restarts, so a burst of stop requests is queued before the wrapper
+    // stops. One stop satisfies them all, as SIGCONT discards pending stops.
+    #[test]
+    fn stop_requests_queued_before_a_resume_are_coalesced() {
+        let (read_fd, write_fd) = super::pipe_fds().expect("signal pipe");
+        for _ in 0..200 {
+            super::write_signal_byte(write_fd, libc::SIGTTIN as u8);
+        }
+        super::write_signal_byte(write_fd, super::RAW_SIGNAL_STOP_BYTE);
+        let state = Mutex::new(super::RawModeLifecycle::Inactive);
+        let mut stops = 0;
+
+        super::handle_session_signals_with(read_fd, &state, || {
+            stops += 1;
+            Ok(())
+        });
+
+        assert_eq!(stops, 1, "stale stop requests stopped the wrapper again");
+        super::close_fd(write_fd);
+    }
+
+    #[test]
+    fn only_background_io_stops_shortly_after_a_resume_in_the_foreground_are_stale() {
+        let just_resumed = Some(Instant::now());
+        let long_resumed = Instant::now().checked_sub(super::STALE_STOP_WINDOW * 2);
+
+        assert!(super::is_stale_stop_request(
+            libc::SIGTTIN,
+            just_resumed,
+            || true
+        ));
+        assert!(super::is_stale_stop_request(
+            libc::SIGTTOU,
+            just_resumed,
+            || true
+        ));
+        // An explicit stop from the user is honored, and so is any request
+        // while in the background or long after the last resume.
+        assert!(!super::is_stale_stop_request(
+            libc::SIGTSTP,
+            just_resumed,
+            || true
+        ));
+        assert!(!super::is_stale_stop_request(
+            libc::SIGTTIN,
+            just_resumed,
+            || false
+        ));
+        assert!(!super::is_stale_stop_request(libc::SIGTTIN, None, || true));
+        if long_resumed.is_some() {
+            assert!(!super::is_stale_stop_request(
+                libc::SIGTTIN,
+                long_resumed,
+                || true
+            ));
+        }
     }
 
     #[test]

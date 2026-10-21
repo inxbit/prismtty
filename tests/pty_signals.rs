@@ -1133,6 +1133,82 @@ fn job_control_signals_restore_stop_and_resume_wrapper_and_child() {
     }
 }
 
+/// Runs `script` with `sh -c` as the session leader of a fresh PTY. With
+/// `set -m` the shell does job control like an interactive one: it can start
+/// the wrapper as a background job and move it between foreground and
+/// background. `PTTY` names the wrapper binary, and the script should write
+/// the wrapper's pid to `$PRISMTTY_WRAPPER_PID` and the wrapped child's to
+/// `$PRISMTTY_CHILD_PID` so both can be cleaned up.
+struct JobControlShell {
+    session: PtySession,
+    master: Box<dyn portable_pty::MasterPty + Send>,
+    // Declared after the session so the wrapper and the wrapped child are
+    // killed before the shell, whatever state the test left them in.
+    _guards: (PidGuard, PidGuard),
+    _marker_dir: tempfile::TempDir,
+}
+
+impl JobControlShell {
+    fn spawn(script: &str) -> Self {
+        let marker_dir = tempfile::tempdir().expect("marker directory");
+        let wrapper_pid_path = marker_dir.path().join("wrapper.pid");
+        let child_pid_path = marker_dir.path().join("child.pid");
+        let guards = (
+            PidGuard::from_marker(&wrapper_pid_path),
+            PidGuard::from_marker(&child_pid_path),
+        );
+        let pair = native_pty_system()
+            .openpty(PtySize::default())
+            .expect("openpty");
+        let mut builder = CommandBuilder::new("sh");
+        builder.env("PTTY", env!("CARGO_BIN_EXE_ptty"));
+        builder.env("PRISMTTY_WRAPPER_PID", &wrapper_pid_path);
+        builder.env("PRISMTTY_CHILD_PID", &child_pid_path);
+        builder.arg("-c");
+        builder.arg(script);
+        let child = pair
+            .slave
+            .spawn_command(builder)
+            .expect("spawn job-control shell");
+        drop(pair.slave);
+        Self {
+            session: PtySession::new(child, &*pair.master),
+            master: pair.master,
+            _guards: guards,
+            _marker_dir: marker_dir,
+        }
+    }
+
+    fn wait_for_output(&self, needle: &[u8]) -> Vec<u8> {
+        self.session
+            .capture()
+            .wait_until(Duration::from_secs(10), |out| contains_bytes(out, needle))
+    }
+}
+
+/// A wrapper started in the background stops when it reads the terminal, and
+/// that read raises SIGTTIN again every time it restarts, so a burst of stop
+/// requests queues up before the stop. Once `fg` resumes the wrapper those
+/// requests are stale: it must keep running and forward input.
+#[test]
+fn background_wrapper_keeps_running_after_fg() {
+    let shell = JobControlShell::spawn(
+        "set -m; \"$PTTY\" sh -c 'echo $$ > \"$PRISMTTY_CHILD_PID\"; read line; echo \"GOT-$((1+1)):$line\"' & echo $! > \"$PRISMTTY_WRAPPER_PID\"; sleep 1; fg %1; echo \"FG-DONE-$((1+1)):$?\"",
+    );
+    // Typed input waits in the terminal until the wrapper, once in the
+    // foreground, reads it.
+    let mut writer = shell.master.take_writer().expect("take writer");
+    writer.write_all(b"hello\r").expect("type a line");
+    writer.flush().expect("flush typed line");
+
+    let output = shell.wait_for_output(b"FG-DONE-2");
+    assert!(
+        contains_bytes(&output, b"GOT-2:hello") && contains_bytes(&output, b"FG-DONE-2:0"),
+        "wrapper stopped again after fg: {:?}",
+        String::from_utf8_lossy(&output)
+    );
+}
+
 /// AUDIT L14: a signal delivered to prismtty is forwarded to the wrapped
 /// child's process group instead of orphaning it.
 #[test]
