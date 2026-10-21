@@ -290,6 +290,21 @@ fn juniper_prompt_highlighting_uses_the_detection_charset() {
     assert_colored("juniper", prompt, PROMPT_BLUE);
 }
 
+// After `configure`, every Junos prompt ends in `#`.
+#[test]
+fn juniper_prompt_highlights_configuration_mode_marker() {
+    for prompt in [
+        "user@router#",
+        "user@router# show | compare",
+        "ops.user-name@edge-router.example# \r\n",
+    ] {
+        assert_colored("juniper", prompt, PROMPT_BLUE);
+    }
+    // Still requires a delimiter after the marker and a bare host.
+    assert_not_colored("juniper", "user@router#x", PROMPT_BLUE);
+    assert_not_colored("juniper", "root@linux:~# ls", PROMPT_BLUE);
+}
+
 #[test]
 fn versa_prompt_rejects_an_undelimited_tail() {
     assert_colored("versa", "admin@versa-lab-01>", PROMPT_BLUE);
