@@ -1141,6 +1141,26 @@ impl RawModeLifecycle {
         Ok(())
     }
 
+    /// Applies raw mode again once the process has been continued. A stop by
+    /// SIGSTOP cannot be caught and skips `suspend_with`, so the state can
+    /// still be active while the job-control shell has put its own mode back
+    /// on the terminal. A continued background job only gives up raw mode.
+    fn reassert_with(
+        &mut self,
+        apply: impl FnOnce(&RawModeState) -> io::Result<Option<RawModeState>>,
+    ) -> io::Result<()> {
+        match *self {
+            Self::Active(terminal) => {
+                if apply(&terminal)?.is_none() {
+                    *self = Self::Suspended(terminal);
+                }
+                Ok(())
+            }
+            Self::Suspended(_) => self.resume_with(apply),
+            Self::Inactive | Self::Terminating => Ok(()),
+        }
+    }
+
     /// Stays suspended when `apply` returns `None`, as for `activate_with`.
     fn resume_with(
         &mut self,
@@ -1225,6 +1245,13 @@ fn reapply_raw_mode_from_signal_state(state: &Mutex<RawModeLifecycle>) -> io::Re
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .resume_with(apply_raw_mode_in_foreground)
+}
+
+fn reassert_raw_mode_from_signal_state(state: &Mutex<RawModeLifecycle>) -> io::Result<()> {
+    state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .reassert_with(apply_raw_mode_in_foreground)
 }
 
 fn raw_mode_state_for(stdin_fd: RawFd) -> io::Result<RawModeState> {
@@ -1331,7 +1358,11 @@ impl SessionSignalWatcher {
         }
         RAW_MODE_SIGNAL_PIPE.arm(write_fd);
         let mut previous_signal_handlers = Vec::new();
-        for signal in TERMINATING_SIGNALS.into_iter().chain(JOB_CONTROL_SIGNALS) {
+        for signal in TERMINATING_SIGNALS
+            .into_iter()
+            .chain(JOB_CONTROL_SIGNALS)
+            .chain([libc::SIGCONT])
+        {
             if signal_is_ignored(signal) {
                 // Keep a disposition the caller chose (`nohup`, or `cmd &` in a
                 // non-interactive shell) instead of acting on the signal.
@@ -1480,6 +1511,14 @@ fn handle_session_signals_with(
                 unsafe {
                     libc::_exit(128 + signal);
                 }
+            }
+            if signal == libc::SIGCONT {
+                if let Err(error) = reassert_raw_mode_from_signal_state(raw_mode_state) {
+                    warn(format_args!(
+                        "prismtty: could not reapply raw terminal mode: {error}"
+                    ));
+                }
+                continue;
             }
             if JOB_CONTROL_SIGNALS.contains(&signal) {
                 if is_stale_stop_request(signal, resumed_at, || {
@@ -2327,6 +2366,56 @@ mod tests {
             matches!(lifecycle, super::RawModeLifecycle::Active(active) if !active.snapshot_stale),
             "the resume that brings the wrapper forward keeps the state it applied"
         );
+    }
+
+    #[test]
+    fn continue_reapplies_raw_mode_only_in_the_foreground() {
+        let terminal = super::RawModeState {
+            stdin_fd: -1,
+            // SAFETY: termios is a plain C struct; this state is never applied to a terminal
+            // (stdin_fd is -1).
+            original: unsafe { std::mem::zeroed() },
+            // SAFETY: termios is a plain C struct; this state is never applied to a terminal
+            // (stdin_fd is -1).
+            raw: unsafe { std::mem::zeroed() },
+            snapshot_stale: false,
+        };
+        let mut lifecycle = super::RawModeLifecycle::Active(terminal);
+        let mut applied = 0;
+
+        lifecycle
+            .reassert_with(|terminal| {
+                applied += 1;
+                Ok(Some(*terminal))
+            })
+            .expect("foreground continue succeeds");
+        assert_eq!(
+            applied, 1,
+            "a continued foreground session re-enters raw mode"
+        );
+        assert!(matches!(lifecycle, super::RawModeLifecycle::Active(_)));
+
+        lifecycle
+            .reassert_with(|_| Ok(None))
+            .expect("background continue succeeds");
+        assert!(
+            matches!(lifecycle, super::RawModeLifecycle::Suspended(_)),
+            "a continued background job gives the terminal up"
+        );
+
+        lifecycle
+            .reassert_with(|terminal| Ok(Some(*terminal)))
+            .expect("continue into the foreground succeeds");
+        assert!(matches!(lifecycle, super::RawModeLifecycle::Active(_)));
+
+        for mut lifecycle in [
+            super::RawModeLifecycle::Inactive,
+            super::RawModeLifecycle::Terminating,
+        ] {
+            lifecycle
+                .reassert_with(|_| panic!("raw mode applied outside a session"))
+                .expect("continue outside a session is a no-op");
+        }
     }
 
     #[test]

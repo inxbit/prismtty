@@ -1133,6 +1133,112 @@ fn job_control_signals_restore_stop_and_resume_wrapper_and_child() {
     }
 }
 
+/// SIGSTOP cannot be caught, so the wrapper stops without restoring the
+/// terminal, and a shell resets the terminal to its own cooked mode while the
+/// job is stopped. Once continued in the foreground the wrapper must enter raw
+/// mode again; otherwise Ctrl-C raises SIGINT in the wrapper and ends the
+/// session instead of reaching the wrapped command.
+#[test]
+fn uncatchable_stop_then_continue_reapplies_raw_mode() {
+    use nix::sys::termios::{LocalFlags, SetArg, tcgetattr, tcsetattr};
+    use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
+    use nix::unistd::Pid;
+
+    let pair = native_pty_system()
+        .openpty(PtySize::default())
+        .expect("openpty");
+    let tty_name = pair.master.tty_name().expect("outer PTY tty name");
+    let tty = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(tty_name)
+        .expect("open outer slave tty");
+    let original = tcgetattr(&tty).expect("original tty attrs");
+    let marker_dir = tempfile::tempdir().expect("signal child marker directory");
+    let child_pid_path = marker_dir.path().join("child.pid");
+    let mut child_guard = PidGuard::from_marker(&child_pid_path);
+    let mut builder = CommandBuilder::new(env!("CARGO_BIN_EXE_ptty"));
+    builder.env("PRISMTTY_CHILD_PID", &child_pid_path);
+    builder.arg("sh");
+    builder.arg("-c");
+    builder.arg(
+        "trap '' INT; echo $$ > \"$PRISMTTY_CHILD_PID\"; echo READY; while true; do sleep 0.05; done",
+    );
+    let child = pair
+        .slave
+        .spawn_command(builder)
+        .expect("spawn interactive ptty");
+    let spawned_at = Instant::now();
+    drop(pair.slave);
+    let mut ptty = PtySession::new(child, &*pair.master);
+    let pid = ptty.pid();
+    let ready = ptty
+        .capture()
+        .wait_until(Duration::from_secs(10), |out| contains_bytes(out, b"READY"));
+    assert!(
+        contains_bytes(&ready, b"READY"),
+        "wrapped child reached READY"
+    );
+    child_guard.set(wait_for_pid_file(&child_pid_path, Duration::from_secs(5)));
+    let is_raw = || {
+        tcgetattr(&tty)
+            .map(|attrs| !attrs.local_flags.contains(LocalFlags::ICANON))
+            .unwrap_or(false)
+    };
+    assert!(
+        wait_for_condition(Duration::from_secs(5), is_raw),
+        "ptty never entered raw mode"
+    );
+    // Stop the wrapper only once it is past the window in which external
+    // SIGCONT senders react to a new process; see POST_EXEC_SETTLE.
+    let settle = POST_EXEC_SETTLE.saturating_sub(spawned_at.elapsed());
+    if !settle.is_zero() {
+        thread::sleep(settle);
+    }
+
+    // SAFETY: kill has no memory-safety preconditions; the target is a process this test spawned.
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGSTOP) }, 0);
+    assert!(
+        wait_for_condition(Duration::from_secs(5), || {
+            matches!(
+                waitpid(
+                    Pid::from_raw(pid),
+                    Some(WaitPidFlag::WUNTRACED | WaitPidFlag::WNOHANG)
+                ),
+                Ok(WaitStatus::Stopped(..))
+            )
+        }),
+        "ptty did not stop on SIGSTOP"
+    );
+    tcsetattr(&tty, SetArg::TCSANOW, &original).expect("restore the shell's cooked mode");
+    // SAFETY: kill has no memory-safety preconditions; the target is a process this test spawned.
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGCONT) }, 0);
+    assert!(
+        wait_for_condition(Duration::from_secs(5), is_raw),
+        "ptty did not reapply raw mode after SIGCONT"
+    );
+
+    let master_fd = pair.master.as_raw_fd().expect("outer PTY master fd");
+    let interrupt = [0x03_u8];
+    // SAFETY: `interrupt` is valid for reads of its length and the master stays open for the call.
+    let written = unsafe { libc::write(master_fd, interrupt.as_ptr().cast(), interrupt.len()) };
+    assert_eq!(written, 1, "write Ctrl-C to the outer terminal");
+    assert_eq!(
+        ptty.wait_for_exit(Duration::from_millis(500)),
+        None,
+        "Ctrl-C ended the wrapper instead of reaching the wrapped command"
+    );
+
+    // SAFETY: kill has no memory-safety preconditions; the target is a process this test spawned.
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGTERM) }, 0);
+    assert_eq!(
+        ptty.wait_for_exit(Duration::from_secs(5)),
+        Some(128 + libc::SIGTERM as u32),
+        "ptty exits after cleanup signal"
+    );
+    child_guard.disarm();
+}
+
 /// Runs `script` with `sh -c` as the session leader of a fresh PTY. With
 /// `set -m` the shell does job control like an interactive one: it can start
 /// the wrapper as a background job and move it between foreground and
