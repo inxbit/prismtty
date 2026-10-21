@@ -1335,6 +1335,17 @@ impl StreamingHighlighter {
         output
     }
 
+    /// Returns the reset for an interactive highlight style that is still
+    /// active, or nothing when none is (always the case for noninteractive
+    /// streams). A caller about to wait for more input uses it so the terminal
+    /// is not left in a highlight color meanwhile; the next highlighted byte
+    /// opens its style again.
+    pub(crate) fn close_interactive_overlay(&mut self) -> Vec<u8> {
+        let mut output = Vec::new();
+        self.reset_interactive_overlay(&mut output);
+        output
+    }
+
     /// Flushes buffered interactive input echo that is only waiting for a token
     /// boundary, while keeping an incomplete trailing escape sequence buffered.
     ///

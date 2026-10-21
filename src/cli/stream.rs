@@ -157,7 +157,7 @@ pub(super) fn highlight_stream<R: Read, W: Write>(
         trace.log("FLUSH", reason.as_bytes());
         session.flush_input_echo(writer, &trace)?;
     }
-    writer.flush()?;
+    flush_before_wait(&mut session, writer, &trace, &input)?;
 
     loop {
         let read = reader.read(&mut buffer)?;
@@ -250,7 +250,7 @@ pub(super) fn highlight_stream<R: Read, W: Write>(
             trace.log("FLUSH", reason.as_bytes());
             session.flush_input_echo(writer, &trace)?;
         }
-        writer.flush()?;
+        flush_before_wait(&mut session, writer, &trace, &input)?;
     }
 
     if !chunk_filter.carry.is_empty() {
@@ -277,6 +277,28 @@ pub(super) fn highlight_stream<R: Read, W: Write>(
         );
     }
 
+    Ok(())
+}
+
+/// Hands one read's output to the terminal before the loop waits for more.
+///
+/// In stdin mode (no PTY master), nothing that reaches the terminal while
+/// prismtty waits passes through the highlighter: the terminal echoes typing
+/// on its own, and Ctrl-C, Ctrl-Z or a closed window end or stop prismtty
+/// with no chance to reset. So an open highlight color is closed first. An
+/// interactive PTY session keeps it: the child's echo comes back through the
+/// highlighter, and its signal handling resets the terminal. Noninteractive
+/// streams never hold a color open, so closing is a no-op for them.
+fn flush_before_wait<W: Write>(
+    session: &mut HighlightSession<'_>,
+    writer: &mut W,
+    trace: &IoTrace,
+    input: &InputSource,
+) -> Result<(), CliError> {
+    if input.pty_fd.is_none() {
+        session.close_interactive_overlay(writer, trace)?;
+    }
+    writer.flush()?;
     Ok(())
 }
 
@@ -526,6 +548,18 @@ impl<'a> HighlightSession<'a> {
         trace: &IoTrace,
     ) -> Result<(), CliError> {
         write_rendered(writer, trace, self.streaming.flush_buffered_echo())?;
+        Ok(())
+    }
+
+    fn close_interactive_overlay<W: Write>(
+        &mut self,
+        writer: &mut W,
+        trace: &IoTrace,
+    ) -> Result<(), CliError> {
+        let reset = self.streaming.close_interactive_overlay();
+        if !reset.is_empty() {
+            write_rendered(writer, trace, reset)?;
+        }
         Ok(())
     }
 
@@ -2363,5 +2397,111 @@ mod tests {
         );
         // The arrow key stays in recent_input: this path never consumes it.
         assert_eq!(recent.lock().unwrap().as_slice(), b"\x1b[A");
+    }
+
+    /// Collects written bytes where a reader can see them mid-stream.
+    #[derive(Clone, Default)]
+    struct SharedWriter(std::rc::Rc<std::cell::RefCell<Vec<u8>>>);
+
+    impl std::io::Write for SharedWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.borrow_mut().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Returns one chunk, then records what had been written by the time the
+    /// stream asked for more: the point where a real stream blocks, and what
+    /// the terminal shows while it waits.
+    struct BlockingPointReader {
+        chunk: Option<Vec<u8>>,
+        written: SharedWriter,
+        shown_while_blocked: Option<Vec<u8>>,
+    }
+
+    impl std::io::Read for &mut BlockingPointReader {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if let Some(chunk) = self.chunk.take() {
+                buf[..chunk.len()].copy_from_slice(&chunk);
+                return Ok(chunk.len());
+            }
+            self.shown_while_blocked = Some(self.written.0.borrow().clone());
+            Ok(0)
+        }
+    }
+
+    fn shown_while_blocked(chunk: &[u8], pty_fd: Option<std::os::fd::RawFd>) -> Vec<u8> {
+        let options = crate::cli::args::Options {
+            profiles: vec!["cisco".to_string()],
+            no_auto_detect: true,
+            no_dynamic_profile: true,
+            ..Default::default()
+        };
+        let mut writer = SharedWriter::default();
+        let mut reader = BlockingPointReader {
+            chunk: Some(chunk.to_vec()),
+            written: writer.clone(),
+            shown_while_blocked: None,
+        };
+        let input = super::InputSource {
+            interactive: true,
+            pty_fd,
+            recent_input: None,
+        };
+        let prepared = super::prepare_session(&options, true).expect("session prepares");
+        let trace = super::IoTrace::open(None).expect("no-op trace");
+        super::highlight_stream(&mut reader, &mut writer, prepared, input, None, trace, None)
+            .expect("highlight_stream succeeds");
+        reader
+            .shown_while_blocked
+            .expect("the stream read past the chunk")
+    }
+
+    // Stdin mode installs no signal handlers and the terminal echoes typing on
+    // its own, so a highlight color left open while waiting for input leaked
+    // into everything after Ctrl-C, Ctrl-Z or idle typing in `tail -f | ct`.
+    // While blocked the terminal must look exactly as it would at EOF.
+    #[test]
+    fn stdin_mode_closes_the_highlight_color_before_waiting_for_input() {
+        let chunk = b"Gi0/1 192.0.2.1 down\r\n";
+        let options = crate::cli::args::Options {
+            profiles: vec!["cisco".to_string()],
+            ..Default::default()
+        };
+        let mut at_eof = Vec::new();
+        let mut session = super::prepare_session(&options, true)
+            .expect("session prepares")
+            .session;
+        let trace = super::IoTrace::open(None).expect("no-op trace");
+        session
+            .push(
+                &mut at_eof,
+                &trace,
+                &crate::highlight::AnsiChunk::from_slice(chunk),
+            )
+            .expect("push succeeds");
+        let open_color = at_eof.clone();
+        session
+            .finish(&mut at_eof, &trace)
+            .expect("finish succeeds");
+        assert_ne!(open_color, at_eof, "the chunk must leave a color open");
+
+        assert_eq!(
+            String::from_utf8_lossy(&shown_while_blocked(chunk, None)),
+            String::from_utf8_lossy(&at_eof)
+        );
+
+        // PTY mode keeps the overlay across reads: the child's own echo comes
+        // back through the highlighter, and EOF or a signal resets it.
+        let pty = nix::pty::openpty(None, None).expect("openpty");
+        let master_fd = std::os::fd::AsRawFd::as_raw_fd(&pty.master);
+        assert_eq!(
+            String::from_utf8_lossy(&shown_while_blocked(chunk, Some(master_fd))),
+            String::from_utf8_lossy(&open_color)
+        );
     }
 }
