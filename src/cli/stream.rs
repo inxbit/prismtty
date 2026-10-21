@@ -28,6 +28,9 @@ use super::runtime::ReloadWatcher;
 use super::trace::IoTrace;
 
 const AUTO_DETECT_SAMPLE_LIMIT: usize = 64 * 1024;
+/// New output after which startup detection reruns even without a line end or
+/// prompt, the interval the dynamic runtime uses.
+const AUTO_DETECT_BYTE_INTERVAL: usize = 4096;
 
 #[derive(Default)]
 struct ChunkFilterState {
@@ -122,6 +125,7 @@ pub(super) fn highlight_stream<R: Read, W: Write>(
         &mut chunk_filter,
     );
     let mut detection_sample = first_chunk.bytes().to_vec();
+    let mut bytes_since_auto_detect = 0usize;
     input_bytes += read;
     let profile_names =
         select_profile_names_with_store(options, session.profile_store(), &detection_sample)?;
@@ -213,28 +217,36 @@ pub(super) fn highlight_stream<R: Read, W: Write>(
         }
         if auto_detect_pending && detection_sample.len() < AUTO_DETECT_SAMPLE_LIMIT {
             detection_sample.extend_from_slice(chunk.bytes());
-            let next_profile_names = select_profile_names_with_store(
-                options,
-                session.profile_store(),
-                &detection_sample,
-            )?;
-            if next_profile_names.as_slice() != session.profile_names() {
-                if apply_automatic_profile_switch(
-                    &mut session,
-                    writer,
-                    &trace,
-                    None,
-                    next_profile_names,
-                ) {
-                    auto_detect_pending =
-                        should_continue_auto_detect(options, session.profile_names());
-                } else {
+            bytes_since_auto_detect += chunk.bytes().len();
+            if should_rerun_auto_detect(
+                chunk.visible_bytes(),
+                bytes_since_auto_detect,
+                detection_sample.len(),
+            ) {
+                bytes_since_auto_detect = 0;
+                let next_profile_names = select_profile_names_with_store(
+                    options,
+                    session.profile_store(),
+                    &detection_sample,
+                )?;
+                if next_profile_names.as_slice() != session.profile_names() {
+                    if apply_automatic_profile_switch(
+                        &mut session,
+                        writer,
+                        &trace,
+                        None,
+                        next_profile_names,
+                    ) {
+                        auto_detect_pending =
+                            should_continue_auto_detect(options, session.profile_names());
+                    } else {
+                        auto_detect_pending = false;
+                        session.report_current();
+                    }
+                } else if detection_sample.len() >= AUTO_DETECT_SAMPLE_LIMIT {
                     auto_detect_pending = false;
                     session.report_current();
                 }
-            } else if detection_sample.len() >= AUTO_DETECT_SAMPLE_LIMIT {
-                auto_detect_pending = false;
-                session.report_current();
             }
         }
         if reload_watcher
@@ -709,6 +721,26 @@ fn observe_dynamic_profile(
         }
     }
     runtime.observe_output(chunk.visible_bytes(), store)
+}
+
+/// Whether startup detection should rescan its sample after a chunk whose
+/// visible bytes are `visible`. Each pass strips and scans the whole sample,
+/// so passing on every read cost milliseconds per byte of keystroke echo or
+/// serial output; like `ProfileRuntime`, it waits for a line end, a
+/// prompt-like ending, [`AUTO_DETECT_BYTE_INTERVAL`] bytes of new output, or a
+/// full sample, which gets the final pass.
+fn should_rerun_auto_detect(
+    visible: &[u8],
+    bytes_since_detection: usize,
+    sample_len: usize,
+) -> bool {
+    bytes_since_detection >= AUTO_DETECT_BYTE_INTERVAL
+        || sample_len >= AUTO_DETECT_SAMPLE_LIMIT
+        || visible.iter().any(|byte| matches!(byte, b'\r' | b'\n'))
+        || matches!(
+            visible.trim_ascii_end().last(),
+            Some(b'#' | b'>' | b'$' | b'%')
+        )
 }
 
 fn apply_automatic_profile_switch<W: Write>(
@@ -2591,5 +2623,41 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(1));
 
         assert!(!super::wait_idle(None, Duration::from_secs(5)));
+    }
+
+    // Startup detection rescans its whole sample, so running it on every read
+    // made byte-paced output (keystroke echo, a serial console) cost
+    // milliseconds per byte once the sample grew. Like the dynamic runtime, it
+    // reruns only at a line end, a prompt-like ending, every 4 KiB of new
+    // output, and once more when the sample is full.
+    #[test]
+    fn startup_auto_detect_reruns_at_line_ends_prompts_and_intervals() {
+        use super::{
+            AUTO_DETECT_BYTE_INTERVAL, AUTO_DETECT_SAMPLE_LIMIT, should_rerun_auto_detect,
+        };
+
+        assert!(!should_rerun_auto_detect(b"x", 1, 100));
+        assert!(!should_rerun_auto_detect(b"show ver", 8, 100));
+        assert!(!should_rerun_auto_detect(b"", 4, 100));
+        assert!(should_rerun_auto_detect(b"version 17.3\n", 13, 100));
+        assert!(should_rerun_auto_detect(b"\r", 1, 100));
+        for prompt in [&b"Router1#"[..], b"#", b"admin@mx480> ", b"$ ", b"%"] {
+            assert!(
+                should_rerun_auto_detect(prompt, prompt.len(), 100),
+                "{:?}",
+                String::from_utf8_lossy(prompt)
+            );
+        }
+        assert!(!should_rerun_auto_detect(
+            b"x",
+            AUTO_DETECT_BYTE_INTERVAL - 1,
+            100
+        ));
+        assert!(should_rerun_auto_detect(
+            b"x",
+            AUTO_DETECT_BYTE_INTERVAL,
+            100
+        ));
+        assert!(should_rerun_auto_detect(b"x", 1, AUTO_DETECT_SAMPLE_LIMIT));
     }
 }

@@ -988,6 +988,73 @@ fn show_profile_promotes_after_delayed_nexus_banner() {
     );
 }
 
+/// Writes `chunks` to `prismtty --show-profile` one pipe write at a time, with
+/// a pause between them so each tends to arrive as its own read, and returns
+/// what it reported on stderr.
+fn show_profile_for_paced_input(chunks: &[&[u8]]) -> String {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let mut child = StdCommand::new(assert_cmd::cargo::cargo_bin("prismtty"))
+        .env("HOME", temp.path())
+        .env("XDG_CONFIG_HOME", temp.path().join("xdg"))
+        .env("PRISMTTY_RUNTIME_DIR", temp.path().join("runtime"))
+        .arg("--show-profile")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn prismtty");
+
+    let mut stdin = child.stdin.take().expect("stdin pipe");
+    for chunk in chunks {
+        stdin.write_all(chunk).expect("write chunk");
+        stdin.flush().expect("flush chunk");
+        thread::sleep(Duration::from_millis(10));
+    }
+    drop(stdin);
+
+    let output = child.wait_with_output().expect("prismtty output");
+    assert!(output.status.success());
+    String::from_utf8(output.stderr).expect("stderr is UTF-8")
+}
+
+// Detection waits for a line end, a prompt-like ending or 4 KiB of output
+// rather than rescanning on every read. A prompt has no line end, so its last
+// byte must still trigger the pass that selects the profile.
+#[test]
+fn byte_paced_prompt_selects_its_profile() {
+    let prompt = b"Router1#";
+    let stderr = show_profile_for_paced_input(&prompt.chunks(1).collect::<Vec<_>>());
+
+    assert!(
+        stderr.contains("prismtty: profiles selected: generic, cisco"),
+        "{stderr:?}"
+    );
+}
+
+#[test]
+fn byte_paced_banner_line_selects_its_profile() {
+    let banner = b"Cisco IOS XE Software\n";
+    let stderr = show_profile_for_paced_input(&banner.chunks(1).collect::<Vec<_>>());
+
+    assert!(
+        stderr.contains("prismtty: profiles selected: generic, cisco"),
+        "{stderr:?}"
+    );
+}
+
+#[test]
+fn long_unterminated_line_still_selects_its_profile() {
+    let padding = b"x ".repeat(2500);
+    let mut chunks: Vec<&[u8]> = vec![b"\r\n", b"Cisco IOS XE Software "];
+    chunks.extend(padding.chunks(500));
+    let stderr = show_profile_for_paced_input(&chunks);
+
+    assert!(
+        stderr.contains("prismtty: profiles selected: generic, cisco"),
+        "{stderr:?}"
+    );
+}
+
 #[test]
 fn reload_flag_requests_reload_without_reading_stdin() {
     let runtime = tempfile::tempdir().expect("temp runtime");
