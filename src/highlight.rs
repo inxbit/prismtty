@@ -167,9 +167,10 @@ pub struct StreamingHighlighter {
 
 /// Incrementally tracks an incomplete terminal string control. Once the
 /// control exceeds the bounded carry budget, its payload is discarded until a
-/// BEL/ST terminator or CAN/SUB cancellation arrives. This prevents bytes
-/// inside a hostile oversized OSC/DCS/SOS/PM/APC payload from being
-/// reinterpreted as top-level terminal controls on a later read.
+/// BEL/ST terminator, a CAN/SUB cancellation, or an ESC that starts another
+/// control arrives. This prevents bytes inside a hostile oversized
+/// OSC/DCS/SOS/PM/APC payload from being reinterpreted as top-level terminal
+/// controls on a later read.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct OversizedStringControlFilter {
     mode: OversizedStringControlMode,
@@ -276,7 +277,10 @@ impl TrackedStringControl {
 
     fn scan_more(&mut self, bytes: &[u8]) -> TrackedStringScan {
         while self.scanned < bytes.len() {
-            if self.total_bytes >= MAX_INCOMPLETE_ESCAPE_BYTES {
+            // The budget covers the cancelled controls and ESC-ended strings
+            // carried in front of this string too, so such a chain cannot grow
+            // the carry without bound.
+            if self.carry_offset + self.total_bytes >= MAX_INCOMPLETE_ESCAPE_BYTES {
                 return TrackedStringScan::Oversized(self.scanned);
             }
             let byte = bytes[self.scanned];
@@ -294,6 +298,9 @@ impl TrackedStringControl {
                             .expect("tentative UTF-8 suffix is part of the scanned buffer"),
                     );
                 }
+                StringPayloadScan::RestartAtEscape => {
+                    return TrackedStringScan::Restart(self.scanned - 2);
+                }
             }
         }
         TrackedStringScan::Incomplete
@@ -308,6 +315,8 @@ impl TrackedStringControl {
 
 enum TrackedStringScan {
     Complete(usize),
+    /// The string ended at this ESC, which starts the next control.
+    Restart(usize),
     Incomplete,
     Oversized(usize),
 }
@@ -319,6 +328,9 @@ enum StringPayloadScan {
         replay: [u8; MAX_TENTATIVE_UTF8_SUFFIX_BYTES],
         replay_len: usize,
     },
+    /// The previous byte was an ESC that does not start ST: the string ended
+    /// before it, and that ESC and the current byte begin a new control.
+    RestartAtEscape,
 }
 
 struct DiscardedTerminator {
@@ -349,6 +361,27 @@ impl DiscardedStringControl {
                         end: start + offset,
                         replay,
                         replay_len,
+                    });
+                }
+                StringPayloadScan::RestartAtEscape => {
+                    // Bytes are fed contiguously, so the ESC is the byte before
+                    // the current one. Resume there; if it closed the previous
+                    // chunk it is no longer in `bytes`, so replay it.
+                    let mut replay = [0; MAX_TENTATIVE_UTF8_SUFFIX_BYTES];
+                    return Some(match (start + offset).checked_sub(1) {
+                        Some(escape) => DiscardedTerminator {
+                            end: escape,
+                            replay,
+                            replay_len: 0,
+                        },
+                        None => {
+                            replay[0] = 0x1b;
+                            DiscardedTerminator {
+                                end: 0,
+                                replay,
+                                replay_len: 1,
+                            }
+                        }
                     });
                 }
             }
@@ -385,7 +418,8 @@ impl StringPayloadScanner {
         }
     }
 
-    /// Reports a BEL/ST terminator or CAN/SUB cancellation. A raw ST that was
+    /// Reports a BEL/ST terminator, a CAN/SUB cancellation, or an ESC that
+    /// ends the string by starting another control. A raw ST that was
     /// tentatively consumed as UTF-8 is retained until the full codepoint is
     /// valid, so malformed input can terminate before the byte that disproves
     /// the candidate without dropping that visible suffix byte.
@@ -431,6 +465,9 @@ impl StringPayloadScanner {
             if byte == b'\\' {
                 return StringPayloadScan::CompleteAfterCurrent;
             }
+            // Like a terminal's parser, any other byte after ESC ends the
+            // string before that ESC, which then starts a new control.
+            return StringPayloadScan::RestartAtEscape;
         }
 
         if matches!(byte, 0x18 | 0x1a) || (self.allows_bel && byte == 0x07) || byte == 0x9c {
@@ -518,6 +555,10 @@ impl OversizedStringControlFilter {
             if tracked.align_with_reassembled_carry(bytes) {
                 match tracked.scan_more(bytes) {
                     TrackedStringScan::Complete(end) => scan_from = end,
+                    TrackedStringScan::Restart(escape) => {
+                        cancellation_root = Some(tracked.drop_start);
+                        scan_from = escape;
+                    }
                     TrackedStringScan::Incomplete => {
                         self.mode = OversizedStringControlMode::Tracking(tracked);
                         return bytes.to_vec();
@@ -567,6 +608,12 @@ impl OversizedStringControlFilter {
                 TrackedStringScan::Complete(end) => {
                     cancellation_root = None;
                     scan_from = end;
+                }
+                TrackedStringScan::Restart(escape) => {
+                    // Like a cancelled control, the ended string is carried and
+                    // dropped together with whatever its ESC starts.
+                    cancellation_root = Some(drop_start);
+                    scan_from = escape;
                 }
                 TrackedStringScan::Incomplete => {
                     tracked.drop_start =
@@ -2656,8 +2703,14 @@ fn string_terminator_end(input: &[u8], idx: &mut usize, allows_bel: bool) -> Opt
         if input[*idx] == 0x9c && !byte_is_inside_utf8_codepoint_or_prefix(input, *idx) {
             return Some(*idx + 1);
         }
-        if input[*idx] == 0x1b && *idx + 1 < input.len() && input[*idx + 1] == b'\\' {
-            return Some(*idx + 2);
+        if input[*idx] == 0x1b && *idx + 1 < input.len() {
+            // ESC \ is ST; any other ESC ends the string and starts a new
+            // control, as it does in a terminal's parser.
+            return Some(if input[*idx + 1] == b'\\' {
+                *idx + 2
+            } else {
+                *idx
+            });
         }
         *idx += 1;
     }
@@ -3393,15 +3446,19 @@ fn neutralize_incomplete_escape_at_eof(bytes: &mut Vec<u8>) {
     };
 
     let mut current = root;
+    let mut chain_has_string_control = false;
     loop {
-        let is_string_control = StringControlKind::at(bytes, current).is_some();
+        chain_has_string_control |= StringControlKind::at(bytes, current).is_some();
         match scan_escape_for_neutralization(bytes, current) {
             EscapeScan::Restart(restart) => {
                 neutralize_control_start(bytes, current);
                 current = restart;
             }
             EscapeScan::IncompleteWithinLimit | EscapeScan::IncompleteOversized => {
-                if is_string_control {
+                // A string ended by the ESC of a later control in the chain is
+                // dropped with it, like an unfinished one: emitting the string
+                // without that ESC would leave the terminal inside it.
+                if chain_has_string_control {
                     bytes.truncate(root);
                 } else {
                     neutralize_control_start(bytes, current);
@@ -3479,9 +3536,10 @@ pub(crate) fn incomplete_escape_start(bytes: &[u8]) -> Option<usize> {
 
 /// Returns the start of the first top-level terminal sequence that is still
 /// open at the end of `bytes`. String-control payload bytes are skipped as one
-/// sequence, so an ESC or C1 byte inside an unfinished OSC/DCS/SOS/PM/APC
-/// cannot be mistaken for a newer top-level control and cause the outer
-/// introducer to be emitted prematurely.
+/// sequence, so a C1 byte inside an unfinished OSC/DCS/SOS/PM/APC cannot be
+/// mistaken for a newer top-level control and cause the outer introducer to be
+/// emitted prematurely. An ESC that does not start ST ends the string, as it
+/// does in a terminal, and the string is carried with the control it starts.
 fn incomplete_top_level_escape_start(bytes: &[u8]) -> Option<usize> {
     let mut idx = 0usize;
     let mut cancellation_root = None;
@@ -3612,8 +3670,10 @@ fn c1_string_escape_is_incomplete_at(bytes: &[u8], start: usize) -> bool {
 
 enum EscapeScan {
     Complete(usize),
-    /// The current control was cancelled and parsing restarts at this nested
-    /// ESC/C1 introducer, which must not be swallowed as parameter/final data.
+    /// The current control was cancelled, or a string control was ended, by
+    /// this nested ESC/C1 introducer. Parsing restarts there, so it must not be
+    /// swallowed as parameter/final data, and the ended control is carried
+    /// with whatever the introducer starts.
     Restart(usize),
     IncompleteWithinLimit,
     IncompleteOversized,
@@ -3823,8 +3883,11 @@ fn scan_c1_string_for_neutralization(
         {
             return EscapeScan::Complete(idx + 1);
         }
-        if bytes[idx] == 0x1b && idx + 1 < bytes.len() && bytes[idx + 1] == b'\\' {
-            return EscapeScan::Complete(idx + 2);
+        if bytes[idx] == 0x1b && idx + 1 < bytes.len() {
+            if bytes[idx + 1] == b'\\' {
+                return EscapeScan::Complete(idx + 2);
+            }
+            return EscapeScan::Restart(idx);
         }
         idx += 1;
     }
@@ -3878,8 +3941,11 @@ fn scan_st_terminated_for_neutralization(
         if bytes[idx] == 0x9c && !byte_is_inside_utf8_codepoint_or_prefix(bytes, idx) {
             return EscapeScan::Complete(idx + 1);
         }
-        if bytes[idx] == 0x1b && idx + 1 < bytes.len() && bytes[idx + 1] == b'\\' {
-            return EscapeScan::Complete(idx + 2);
+        if bytes[idx] == 0x1b && idx + 1 < bytes.len() {
+            if bytes[idx + 1] == b'\\' {
+                return EscapeScan::Complete(idx + 2);
+            }
+            return EscapeScan::Restart(idx);
         }
         idx += 1;
     }
@@ -4641,6 +4707,128 @@ rules:
         }
     }
 
+    // A VT parser ends a string control at any ESC that does not start ST and
+    // parses that ESC as a new control, so an ESC-ended or stray OSC must not
+    // hold back or discard the output after it.
+    #[test]
+    fn escape_ends_string_controls_like_a_vt_parser() {
+        let highlighter =
+            Highlighter::from_config(PrismConfig::default()).expect("empty config compiles");
+
+        for input in [
+            b"x\x1b]0;t\x1b[0m hello world\n".as_slice(),
+            b"a\x1bPq\x1b[0m\nback\n".as_slice(),
+            b"a\x9d0;t\x1b[0m\nback\n".as_slice(),
+            b"a\x1b]0;t\x1b\x18back\n".as_slice(),
+        ] {
+            let mut whole = StreamingHighlighter::new(highlighter.clone());
+            let mut output = whole.push(input);
+            output.extend(whole.finish());
+            assert_eq!(output, input);
+
+            let mut bytewise = StreamingHighlighter::new(highlighter.clone());
+            let mut output = Vec::new();
+            for byte in input {
+                output.extend(bytewise.push(&[*byte]));
+            }
+            output.extend(bytewise.finish());
+            assert_eq!(output, input);
+        }
+
+        assert_eq!(super::strip_ansi(b"x\x1b]0;t\x1b[0m hi"), b"x hi");
+        assert_eq!(
+            super::strip_string_escapes(b"x\x1b]0;t\x1b[0m hi"),
+            b"x\x1b[0m hi"
+        );
+        assert_eq!(
+            super::strip_string_escapes(b"x\x9d0;t\x1b[0m hi"),
+            b"x\x1b[0m hi"
+        );
+        // A nested introducer starts a string of its own, which is stripped too.
+        assert_eq!(
+            super::strip_string_escapes(b"x\x1b]0;t\x1b]52;c;eA==\x07y"),
+            b"xy"
+        );
+
+        let mut input = b"start\x1b]".to_vec();
+        let mut visible = b"start".to_vec();
+        for line in 0..2000 {
+            input.extend_from_slice(format!("\x1b[32mline {line}\x1b[0m\n").as_bytes());
+            visible.extend_from_slice(format!("line {line}\n").as_bytes());
+        }
+        let mut streaming = StreamingHighlighter::new(highlighter);
+        let mut output = Vec::new();
+        for chunk in input.chunks(8192) {
+            output.extend(streaming.push(chunk));
+        }
+        output.extend(streaming.finish());
+        assert_eq!(output, input);
+        assert_eq!(super::strip_ansi(&output), visible);
+    }
+
+    #[test]
+    fn oversized_string_discard_ends_at_an_escape_that_starts_a_new_control() {
+        let highlighter =
+            Highlighter::from_config(PrismConfig::default()).expect("empty config compiles");
+
+        for introducer in [
+            b"\x1b]0;".as_slice(),
+            b"\x1bP".as_slice(),
+            b"\x9d0;".as_slice(),
+        ] {
+            for reads in [
+                [b"".as_slice(), b"\x1b[1mafter\x1b[0m\n".as_slice()],
+                [b"\x1b".as_slice(), b"[1mafter\x1b[0m\n".as_slice()],
+                [b"\x1b[".as_slice(), b"1mafter\x1b[0m\n".as_slice()],
+            ] {
+                let mut first = b"safe".to_vec();
+                first.extend_from_slice(introducer);
+                first.extend(std::iter::repeat_n(
+                    b'x',
+                    super::MAX_INCOMPLETE_ESCAPE_BYTES + 1,
+                ));
+
+                let mut streaming = StreamingHighlighter::new(highlighter.clone());
+                let mut output = streaming.push(&first);
+                for read in reads {
+                    output.extend(streaming.push(read));
+                }
+                output.extend(streaming.finish());
+                assert_eq!(output, b"safe\x1b[1mafter\x1b[0m\n");
+
+                // The same bytes in one push end the discard at the same ESC.
+                let mut whole = StreamingHighlighter::new(highlighter.clone());
+                let mut input = first.clone();
+                input.extend(reads.concat());
+                let mut output = whole.push(&input);
+                output.extend(whole.finish());
+                assert_eq!(output, b"safe\x1b[1mafter\x1b[0m\n");
+            }
+        }
+    }
+
+    #[test]
+    fn chain_of_escape_ended_strings_stays_within_the_carry_budget() {
+        let highlighter =
+            Highlighter::from_config(PrismConfig::default()).expect("empty config compiles");
+        let mut streaming = StreamingHighlighter::new(highlighter);
+        let mut string = b"\x1b]".to_vec();
+        string.resize(64, b'a');
+
+        let mut output = Vec::new();
+        for _ in 0..512 {
+            output.extend(streaming.push(&string));
+            assert!(
+                streaming.pending.len() <= super::MAX_INCOMPLETE_ESCAPE_BYTES + string.len(),
+                "pending grew to {} bytes",
+                streaming.pending.len()
+            );
+        }
+        output.extend(streaming.push(b"\x07after\n"));
+        output.extend(streaming.finish());
+        assert!(super::strip_ansi(&output).ends_with(b"after\n"));
+    }
+
     #[test]
     fn streaming_finish_drops_cancelled_prefix_with_unterminated_nested_string() {
         let highlighter =
@@ -5297,7 +5485,7 @@ rules:
         let highlighter = Highlighter::from_config(PrismConfig::default()).expect("empty config");
 
         for input in [
-            b"\x1b]0;hidden\n\x1b[2J\x07user@host$ cmd\n".as_slice(),
+            b"\x1b]0;hidden\n\x9b2J\x07user@host$ cmd\n".as_slice(),
             b"\x1bPignored\r\n\x1b[31m\x1b\\user@host$ cmd\n".as_slice(),
             b"\x9d0;hidden\n\x9b2J\x9cuser@host$ cmd\n".as_slice(),
         ] {
@@ -5494,7 +5682,10 @@ rules:
                 ));
 
                 let mut output = streaming.push(&first);
-                output.extend(streaming.push(b"\x1b[2J\x9b2J"));
+                // A nested 7-bit ESC would end the string as it does in a
+                // terminal, so the nested control is the C1 form, which a
+                // terminal keeps as payload.
+                output.extend(streaming.push(b"\x9b2J"));
                 if terminator == b"\x1b\\" {
                     output.extend(streaming.push(b"\x1b"));
                     output.extend(streaming.push(b"\\after"));
@@ -5510,7 +5701,7 @@ rules:
                     "payload escaped from {introducer:02x?}: {output:02x?}"
                 );
                 assert!(
-                    !output.windows(4).any(|window| window == b"\x1b[2J"),
+                    !output.windows(3).any(|window| window == b"\x9b2J"),
                     "nested CSI became active for {introducer:02x?}: {output:02x?}"
                 );
             }
@@ -5533,13 +5724,13 @@ rules:
         output.extend(streaming.push(b"\xa9"));
         output.extend(streaming.push(b"\xe2"));
         output.extend(streaming.push(b"\x9d"));
-        output.extend(streaming.push(b"\x9c\x1b[2J"));
+        output.extend(streaming.push(b"\x9c\x9b2J"));
         output.extend(streaming.push(b"\x1b"));
         output.extend(streaming.push(b"\\after"));
         output.extend(streaming.finish());
 
         assert_eq!(output, b"safeafter");
-        assert!(!output.windows(4).any(|window| window == b"\x1b[2J"));
+        assert!(!output.windows(3).any(|window| window == b"\x9b2J"));
     }
 
     #[test]
@@ -5760,7 +5951,7 @@ rules:
         for suffix in [
             b"\x1b]0;unfinished title".as_slice(),
             b"\x1b]0;payload with nested csi \x1b[".as_slice(),
-            b"\x1b]0;payload with complete nested csi \x1b[31m".as_slice(),
+            b"\x1b[1\x1b]0;ended title\x1b[".as_slice(),
             b"\x1bPunfinished dcs".as_slice(),
             b"\x1bXunfinished sos".as_slice(),
             b"\x1b^unfinished pm".as_slice(),
@@ -5782,6 +5973,14 @@ rules:
 
             assert_eq!(output, b"safe prefix", "unsafe EOF output: {output:02x?}");
         }
+
+        // A complete 7-bit control ends the string as it would in a terminal,
+        // so neither is unfinished at EOF.
+        let input = b"safe prefix\x1b]0;title ended by a complete csi \x1b[31m";
+        let mut streaming = StreamingHighlighter::new_interactive(highlighter);
+        let mut output = streaming.push(input);
+        output.extend(streaming.finish());
+        assert_eq!(output, input);
     }
 
     #[test]

@@ -444,6 +444,41 @@ fn raw_c1_filtering_contract_matches_strip_and_sanitize_modes() {
     }
 }
 
+// A terminal ends a string control at an ESC that does not start ST, so a
+// stray OSC introducer must not hold back or discard the output after it.
+#[test]
+fn escape_ended_string_controls_do_not_hide_later_output() {
+    let mut empty_config = tempfile::NamedTempFile::new().expect("empty config");
+    writeln!(empty_config, "rules: []").expect("write empty config");
+    let mut input = b"x\x1b]0;t\x1b[0m hello world\nstart\x1b]".to_vec();
+    let mut sanitized = b"x\x1b[0m hello world\nstart".to_vec();
+    for line in 0..2000 {
+        let colored = format!("\x1b[32mline {line}\x1b[0m\n");
+        input.extend_from_slice(colored.as_bytes());
+        sanitized.extend_from_slice(colored.as_bytes());
+    }
+
+    for (args, expected) in [
+        (vec![], input.as_slice()),
+        (vec!["--sanitize"], sanitized.as_slice()),
+    ] {
+        let mut cmd = Command::cargo_bin("prismtty").expect("binary exists");
+        cmd.args(&args)
+            .arg("--config")
+            .arg(empty_config.path())
+            .write_stdin(input.clone());
+        let output = cmd.output().expect("command runs");
+
+        assert!(output.status.success(), "{output:?}");
+        assert!(
+            output.stdout == expected,
+            "{args:?} changed the output: {} of {} bytes",
+            output.stdout.len(),
+            expected.len()
+        );
+    }
+}
+
 #[test]
 fn profiles_list_includes_v1_builtin_profiles() {
     let mut cmd = Command::cargo_bin("prismtty").expect("binary exists");

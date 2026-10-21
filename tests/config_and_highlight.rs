@@ -891,7 +891,12 @@ fn streaming_highlighter_discards_earliest_oversized_unterminated_string() {
     let output = streaming.push(&input);
 
     assert!(output.is_empty(), "unterminated OSC payload leaked");
-    assert_eq!(streaming.push(b"\x07visible\n"), b"visible\n");
+    // The second introducer ends the discarded string, as it does in a
+    // terminal, and starts an OSC of its own.
+    let mut expected = b"\x1b]52;".to_vec();
+    expected.extend(std::iter::repeat_n(b'B', 1_000));
+    expected.extend(b"\x07visible\n");
+    assert_eq!(streaming.push(b"\x07visible\n"), expected);
 }
 
 #[test]

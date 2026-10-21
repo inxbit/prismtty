@@ -1626,6 +1626,28 @@ mod tests {
         assert!(!visible.contains(&0x1b), "open ESC reached the output");
     }
 
+    // The terminal ends a string control at an ESC that does not start ST, so
+    // a split OSC must not swallow the control or the text after it.
+    #[test]
+    fn filtered_modes_end_split_string_escapes_at_the_next_escape() {
+        for (strip_existing_ansi, sanitize, expected) in [
+            (false, false, b"x\x1b]0;t\x1b[0m hello".as_slice()),
+            (false, true, b"x\x1b[0m hello".as_slice()),
+            (true, false, b"x hello".as_slice()),
+        ] {
+            let mut state = super::ChunkFilterState::default();
+            let mut output =
+                super::prepare_chunk(b"x\x1b]0;t", strip_existing_ansi, sanitize, &mut state)
+                    .bytes()
+                    .to_vec();
+            output.extend_from_slice(
+                super::prepare_chunk(b"\x1b[0m hello", strip_existing_ansi, sanitize, &mut state)
+                    .bytes(),
+            );
+            assert_eq!(output, expected);
+        }
+    }
+
     #[test]
     fn preserve_mode_hides_split_string_payloads_from_dynamic_profile_detection() {
         for (prefix, tail) in [
@@ -1804,8 +1826,10 @@ mod tests {
             let mut output = super::prepare_chunk(&first, false, true, &mut carry)
                 .bytes()
                 .to_vec();
+            // A nested 7-bit ESC would end the string as it does in a terminal,
+            // so the nested control is the C1 form, which stays payload.
             output.extend_from_slice(
-                super::prepare_chunk(b"\x1b[2J\x9b2J", false, true, &mut carry).bytes(),
+                super::prepare_chunk(b"\x9b2J", false, true, &mut carry).bytes(),
             );
             if terminator == b"\x1b\\" {
                 output.extend_from_slice(
@@ -1880,7 +1904,7 @@ mod tests {
             b"\xa9".as_slice(),
             b"\xe2".as_slice(),
             b"\x9d".as_slice(),
-            b"\x9c\x1b[2J".as_slice(),
+            b"\x9c\x9b2J".as_slice(),
             b"\x1b".as_slice(),
             b"\\after".as_slice(),
         ] {
@@ -1947,9 +1971,7 @@ mod tests {
         let mut output = super::prepare_chunk(&first, false, true, &mut carry)
             .bytes()
             .to_vec();
-        output.extend_from_slice(
-            super::prepare_chunk(b"\x1b[2J\x9b2J", false, true, &mut carry).bytes(),
-        );
+        output.extend_from_slice(super::prepare_chunk(b"\x9b2J", false, true, &mut carry).bytes());
         output.extend_from_slice(
             super::prepare_chunk(b"\x07Jafter", false, true, &mut carry).bytes(),
         );
