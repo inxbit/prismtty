@@ -411,11 +411,15 @@ impl ProfileRuntime {
             if let Some(profile) =
                 store.prompt_transition_profile(&detected, &self.output_window, active_profile)
             {
+                // Without a remote hint, only a prompt waiting for input (the
+                // unterminated last line) is trusted on first sight; a
+                // prompt-shaped line in local output must repeat.
                 if store.prompt_switches_on_first_detection(
                     &profile,
                     has_remote_hint,
                     at_local_baseline,
-                ) {
+                ) && (has_remote_hint || self.waiting_at_prompt(store, &profile))
+                {
                     let remote_attempt = self.pending_remote.take();
                     self.clear_output_window();
                     self.clear_pending_prompt();
@@ -537,6 +541,11 @@ impl ProfileRuntime {
             || looks_like_prompt_detection_boundary(text)
     }
 
+    fn waiting_at_prompt(&self, store: &ProfileStore, profile: &str) -> bool {
+        let tail = unterminated_tail(&self.output_window);
+        looks_like_prompt_detection_boundary(tail) && store.matches_runtime_prompt(profile, tail)
+    }
+
     fn at_local_baseline(&self, store: &ProfileStore) -> bool {
         self.stack.is_empty()
             && self.active_profiles == self.baseline_profiles
@@ -573,6 +582,10 @@ impl ProfileRuntime {
             self.clear_pending_prompt();
             self.switch_to(detected, remote_attempt, at_local_baseline)
         } else {
+            // The repeat must come from new output, not from the next pass
+            // finding the same complete line again. A prompt waiting for
+            // input is the unterminated tail and stays.
+            self.retain_unterminated_tail();
             None
         }
     }
@@ -1024,6 +1037,12 @@ fn contains_remote_open_failure(text: &str, policy: ClosePolicy) -> bool {
             ClosePolicy::Generic => false,
         }
     })
+}
+
+/// The trailing line of `text` that no line terminator has ended yet.
+fn unterminated_tail(text: &str) -> &str {
+    text.rfind(is_line_terminator)
+        .map_or(text, |end| &text[end + 1..])
 }
 
 fn looks_like_prompt_detection_boundary(text: &str) -> bool {
@@ -1647,6 +1666,43 @@ mod tests {
         assert_eq!(
             runtime.observe_output(b"exit\r\n\r\nConnection to mx1 closed.\r\n", &store),
             Some(names(&["generic", "linux-unix"]))
+        );
+    }
+
+    // Compiler arrows, `C#` and `word # comment` lines look like vendor
+    // prompts, but one such line of local output must not switch the shell.
+    #[test]
+    fn single_prompt_shaped_local_lines_do_not_switch_local_baseline() {
+        let store = ProfileStore::builtin();
+        let mut runtime = ProfileRuntime::new(names(&["generic", "linux-unix"]));
+
+        for chunk in [
+            &b"user@host:~$ "[..],
+            b"cargo build\r\nwarning: unused variable: `x`\r\n  --> src/main.rs:3:9\r\n",
+            b"user@host:~$ ",
+            b"echo 'C# rocks'\r\nC# rocks\r\n",
+            b"user@host:~$ ",
+            b"printf 'C# rocks\\ndone\\n'\r\nC# rocks\r\n",
+            b"done\r\n",
+            b"user@host:~$ ",
+            b"cat build.sh\r\nfor target in a b; do\r\n  make \"$target\"\r\ndone # build every target\r\n",
+            b"user@host:~$ ",
+        ] {
+            assert_eq!(
+                runtime.observe_output(chunk, &store),
+                None,
+                "{:?}",
+                String::from_utf8_lossy(chunk)
+            );
+        }
+        assert_eq!(runtime.active_profiles(), names(&["generic", "linux-unix"]));
+        assert_eq!(runtime.stack_len(), 0);
+
+        // A Fortinet prompt waiting for input still switches on first sight.
+        runtime.observe_input(b"fw\r");
+        assert_eq!(
+            runtime.observe_output(b"fw\r\nFW-EDGE # ", &store),
+            Some(names(&["generic", "fortinet"]))
         );
     }
 

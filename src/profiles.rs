@@ -1063,6 +1063,12 @@ impl ProfileStore {
             .cloned()
     }
 
+    pub(crate) fn matches_runtime_prompt(&self, profile_name: &str, text: &str) -> bool {
+        self.profiles
+            .get(profile_name)
+            .is_some_and(|profile| profile.matches_runtime_prompt(text))
+    }
+
     pub(crate) fn prompt_switches_on_first_detection(
         &self,
         profile_name: &str,
@@ -1263,7 +1269,9 @@ fn looks_like_cisco_prompt_line(line: &str) -> bool {
     let Some(marker) = marker else {
         return false;
     };
-    if marker == 0 {
+    // Hostnames start with a letter or digit; `-->` and `--->` are compiler
+    // and build-tool arrows.
+    if marker == 0 || !prompt.as_bytes()[0].is_ascii_alphanumeric() {
         return false;
     }
     let body = &prompt[..marker];
@@ -1896,6 +1904,35 @@ mod tests {
             PromptMatcherKind::CiscoHostMarker
                 .matches_startup("CoreSW#\nArubaOS-CX Version 10.13\nhpe-restd\n",)
         );
+    }
+
+    #[test]
+    fn cisco_prompt_matcher_requires_an_alphanumeric_hostname_start() {
+        let store = ProfileStore::builtin();
+        let cisco = "cisco".to_string();
+
+        for sample in [
+            "  --> src/main.rs:3:9\n",
+            " ---> Running in 1a2b3c\n",
+            "-> next step\n",
+            "(config)#\n",
+        ] {
+            assert!(
+                !store.detect_profiles(sample).contains(&cisco),
+                "{sample:?} is not a Cisco prompt"
+            );
+        }
+        for sample in [
+            "R1#\n",
+            "2960>\n",
+            "Router(config-if)#\n",
+            "N9K-CORE-01# show version\n",
+        ] {
+            assert!(
+                store.detect_profiles(sample).contains(&cisco),
+                "{sample:?} is a Cisco prompt"
+            );
+        }
     }
 
     #[test]
