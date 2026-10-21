@@ -351,20 +351,28 @@ impl ProfileRuntime {
                 && self.stack.last().is_some_and(|frame| {
                     !frame.nested_attempt_seen
                         && close_markers.iter().any(|marker| {
-                            marker.kind == CloseMarkerKind::SshLike
-                                && frame.close_policy.accepts(marker.kind)
-                                && marker.target.as_ref().is_some_and(|target| {
-                                    !self
-                                        .stack
-                                        .iter()
-                                        .any(|frame| frame.target.as_ref() == Some(target))
-                                })
+                            frame.close_policy.accepts(marker.kind)
+                                && is_untracked_ssh_close(marker, &self.stack)
                         })
                 })
             {
                 self.clear_output_window();
                 self.clear_pending_prompt();
                 return self.pop_profile();
+            }
+            // Likewise an alias attempt that no output resolved ends on the
+            // close naming its HostName; left pending, the next prompt would
+            // record a connection that never closes.
+            if self.pending_remote.as_ref().is_some_and(|pending| {
+                close_markers.iter().any(|marker| {
+                    pending.policy.accepts(marker.kind)
+                        && is_untracked_ssh_close(marker, &self.stack)
+                })
+            }) {
+                self.pending_remote = None;
+                self.clear_output_window();
+                self.clear_pending_prompt();
+                return None;
             }
         }
 
@@ -1084,6 +1092,16 @@ fn ssh_close_target(line: &str) -> Option<&str> {
         }
     }
     None
+}
+
+/// A targeted ssh close naming no tracked connection's target.
+fn is_untracked_ssh_close(marker: &ObservedCloseMarker, stack: &[ProfileFrame]) -> bool {
+    marker.kind == CloseMarkerKind::SshLike
+        && marker.target.as_ref().is_some_and(|target| {
+            !stack
+                .iter()
+                .any(|frame| frame.target.as_ref() == Some(target))
+        })
 }
 
 fn close_marker_matches(
@@ -2348,6 +2366,67 @@ mod tests {
         runtime.accept_transition();
         assert_eq!(
             runtime.observe_output(b"Connection to 192.0.2.1 closed.\n", &store),
+            Some(names(&["generic", "linux-unix"]))
+        );
+        assert_eq!(runtime.stack_len(), 0);
+    }
+
+    // An alias session whose device no profile recognises closes under its
+    // HostName while its attempt is still pending. That close ends the
+    // attempt, or the next prompt records a connection that never closes.
+    #[test]
+    fn untracked_alias_close_ends_its_pending_attempt() {
+        let store = ProfileStore::builtin();
+        let mut runtime = ProfileRuntime::new(names(&["generic", "linux-unix"]));
+
+        runtime.observe_input(b"ssh web\r");
+        assert_eq!(
+            runtime.observe_output(b"ssh web\r\n[admin@web01 ~]$ ", &store),
+            None
+        );
+        runtime.observe_input(b"uptime\r");
+        runtime.observe_input(b"exit\r");
+        assert_eq!(
+            runtime.observe_output(
+                b"exit\r\nConnection to 192.0.2.10 closed.\r\nuser@laptop:~$ ",
+                &store
+            ),
+            None
+        );
+        assert_eq!(runtime.pending_remote, None);
+        assert_eq!(runtime.observe_output(b"user@laptop:~$ ", &store), None);
+        assert_eq!(runtime.stack_len(), 0);
+        runtime.observe_input(b"fw\r");
+        assert_eq!(
+            runtime.observe_output(b"fw\r\nFW-EDGE # ", &store),
+            Some(names(&["generic", "fortinet"]))
+        );
+
+        // Nested in a tracked connection, the parent stays open.
+        let mut runtime = ProfileRuntime::new(names(&["generic", "linux-unix"]));
+        runtime.observe_input(b"ssh router-a\r");
+        assert_eq!(
+            runtime.observe_output(b"--- JUNOS 22.4R3 Kernel 64-bit\r\nlab@mx1> ", &store),
+            Some(names(&["generic", "juniper"]))
+        );
+        runtime.accept_transition();
+        runtime.observe_input(b"ssh web\r");
+        assert_eq!(
+            runtime.observe_output(b"ssh web\r\n[admin@web01 ~]$ ", &store),
+            None
+        );
+        runtime.observe_input(b"exit\r");
+        assert_eq!(
+            runtime.observe_output(
+                b"exit\r\nConnection to 192.0.2.10 closed.\r\nlab@mx1> ",
+                &store
+            ),
+            None
+        );
+        assert_eq!(runtime.pending_remote, None);
+        assert_eq!(runtime.stack_len(), 1);
+        assert_eq!(
+            runtime.observe_output(b"exit\r\nConnection to router-a closed.\r\n", &store),
             Some(names(&["generic", "linux-unix"]))
         );
         assert_eq!(runtime.stack_len(), 0);
