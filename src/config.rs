@@ -247,6 +247,12 @@ const MAX_EXPANDED_YAML_BYTES: usize = 4 * MAX_CONFIG_FILE_BYTES as usize;
 /// large sequence of tiny scalars is bounded too.
 const YAML_NODE_OVERHEAD: usize = 16;
 
+/// Most bytes the tags of a config or profile document may add up to. libyaml
+/// resolves each tag against its `%TAG` directive into a fresh string, so
+/// without this bound one long directive prefix used by many short tags could
+/// expand a file within [`MAX_CONFIG_FILE_BYTES`] to many gigabytes.
+const MAX_YAML_TAG_BYTES: usize = 4 * MAX_CONFIG_FILE_BYTES as usize;
+
 /// Reads one bounded regular file without allowing a FIFO open to block.
 pub(crate) fn read_bounded_regular_file(
     path: &Path,
@@ -300,8 +306,9 @@ fn parse_rules_doc(input: &str) -> Result<RulesDoc, serde_norway::Error> {
     serde_norway::from_str(input)
 }
 
-/// Rejects a document whose collections nest deeper than [`MAX_YAML_NESTING`]
-/// or whose aliases add more than [`MAX_EXPANDED_YAML_BYTES`] to it.
+/// Rejects a document whose collections nest deeper than [`MAX_YAML_NESTING`],
+/// whose aliases add more than [`MAX_EXPANDED_YAML_BYTES`] to it, or whose
+/// tags add up to more than [`MAX_YAML_TAG_BYTES`].
 ///
 /// serde_norway applies its recursion limit only after libyaml has produced
 /// every event, and libyaml's scanner does work proportional to the flow depth
@@ -309,9 +316,10 @@ fn parse_rules_doc(input: &str) -> Result<RulesDoc, serde_norway::Error> {
 /// reject. serde_norway also copies an anchored node again for every alias and
 /// only limits how many alias jumps a document makes relative to its own size,
 /// so a large anchored scalar or sequence referenced many times could exhaust
-/// memory before any PrismTTY limit applies.
+/// memory before any PrismTTY limit applies. Likewise libyaml spells out each
+/// tag in full, and serde_norway keeps every one.
 ///
-/// This walks the same events and stops as soon as either limit is passed,
+/// This walks the same events and stops as soon as any limit is passed,
 /// reporting too deep a document in serde_norway's own words. Each alias is
 /// charged the expanded size of the node it names, from the scalar lengths
 /// libyaml reports, so it does not matter whether serde_norway later reads a
@@ -344,9 +352,11 @@ fn check_yaml_limits(input: &str) -> Result<(), serde_norway::Error> {
     }
 
     let mut rejection = None;
-    // Expanded size of the document so far, and how much of it aliases added.
+    // Expanded size of the document so far, how much of it aliases added, and
+    // how much its tags take.
     let mut expanded = 0usize;
     let mut alias_bytes = 0usize;
+    let mut tag_bytes = 0usize;
     // Each anchor name maps to a slot holding the expanded size of the node it
     // names, or `None` while that collection is still open: an alias inside
     // it would repeat it without end. Like serde_norway, the latest definition
@@ -368,7 +378,19 @@ fn check_yaml_limits(input: &str) -> Result<(), serde_norway::Error> {
         let mut event = unsafe { event.assume_init() };
         // SAFETY: the event came from a successful parse and is not deleted
         // until the anchor borrowed from it is no longer used.
-        let anchor = unsafe { yaml_event_anchor(&event) };
+        let (anchor, tag_len) = unsafe { yaml_event_anchor_and_tag(&event) };
+        tag_bytes = tag_bytes.saturating_add(tag_len);
+        if tag_bytes > MAX_YAML_TAG_BYTES {
+            let mark = event.start_mark;
+            rejection = Some(format!(
+                "YAML tags expand the document by more than {MAX_YAML_TAG_BYTES} bytes \
+                 at line {} column {}",
+                mark.line + 1,
+                mark.column + 1
+            ));
+        }
+        // A copy of a node made for an alias copies its tag as well.
+        let node_size = YAML_NODE_OVERHEAD.saturating_add(tag_len);
         let mut stop = event.type_ == YAML_STREAM_END_EVENT;
         match event.type_ {
             YAML_DOCUMENT_START_EVENT => {
@@ -378,7 +400,7 @@ fn check_yaml_limits(input: &str) -> Result<(), serde_norway::Error> {
             YAML_SCALAR_EVENT => {
                 // SAFETY: a scalar event carries the scalar variant.
                 let length = unsafe { event.data.scalar.length } as usize;
-                let size = YAML_NODE_OVERHEAD.saturating_add(length);
+                let size = node_size.saturating_add(length);
                 expanded = expanded.saturating_add(size);
                 if let Some(name) = anchor {
                     anchors.insert(name.to_vec(), anchor_sizes.len());
@@ -392,7 +414,7 @@ fn check_yaml_limits(input: &str) -> Result<(), serde_norway::Error> {
                     anchor_sizes.len() - 1
                 });
                 open.push((expanded, slot));
-                expanded = expanded.saturating_add(YAML_NODE_OVERHEAD);
+                expanded = expanded.saturating_add(node_size);
                 if open.len() > MAX_YAML_NESTING {
                     let mark = event.start_mark;
                     rejection = Some(format!(
@@ -451,35 +473,50 @@ fn check_yaml_limits(input: &str) -> Result<(), serde_norway::Error> {
     }
 }
 
-/// The anchor that an alias, scalar, sequence or mapping event names, if any.
+/// The anchor that an alias, scalar, sequence or mapping event names, if any,
+/// and the length of the tag a scalar, sequence or mapping event carries.
 ///
 /// # Safety
 ///
 /// `event` must come from a successful `yaml_parser_parse` and not have been
 /// deleted yet.
-unsafe fn yaml_event_anchor(event: &unsafe_libyaml_norway::yaml_event_t) -> Option<&[u8]> {
+unsafe fn yaml_event_anchor_and_tag(
+    event: &unsafe_libyaml_norway::yaml_event_t,
+) -> (Option<&[u8]>, usize) {
+    use std::ffi::CStr;
     use unsafe_libyaml_norway::{
         YAML_ALIAS_EVENT, YAML_MAPPING_START_EVENT, YAML_SCALAR_EVENT, YAML_SEQUENCE_START_EVENT,
     };
 
     // SAFETY: each arm reads the variant of the event data that its event type
     // carries.
-    let anchor = unsafe {
+    let (anchor, tag) = unsafe {
         match event.type_ {
-            YAML_ALIAS_EVENT => event.data.alias.anchor,
-            YAML_SCALAR_EVENT => event.data.scalar.anchor,
-            YAML_SEQUENCE_START_EVENT => event.data.sequence_start.anchor,
-            YAML_MAPPING_START_EVENT => event.data.mapping_start.anchor,
-            _ => return None,
+            YAML_ALIAS_EVENT => (event.data.alias.anchor, std::ptr::null_mut()),
+            YAML_SCALAR_EVENT => (event.data.scalar.anchor, event.data.scalar.tag),
+            YAML_SEQUENCE_START_EVENT => (
+                event.data.sequence_start.anchor,
+                event.data.sequence_start.tag,
+            ),
+            YAML_MAPPING_START_EVENT => (
+                event.data.mapping_start.anchor,
+                event.data.mapping_start.tag,
+            ),
+            _ => return (None, 0),
         }
     };
-    if anchor.is_null() {
-        return None;
-    }
     // SAFETY: libyaml stores a non-null anchor as a NUL-terminated string that
     // the event owns until it is deleted, which the returned slice's borrow of
     // `event` rules out.
-    Some(unsafe { std::ffi::CStr::from_ptr(anchor.cast()) }.to_bytes())
+    let anchor = (!anchor.is_null()).then(|| unsafe { CStr::from_ptr(anchor.cast()) }.to_bytes());
+    let tag_len = if tag.is_null() {
+        0
+    } else {
+        // SAFETY: libyaml stores a non-null tag as a NUL-terminated string
+        // that the event owns until it is deleted.
+        unsafe { CStr::from_ptr(tag.cast()) }.to_bytes().len()
+    };
+    (anchor, tag_len)
 }
 
 /// Loads and validates a native PrismTTY profile YAML file from disk.
@@ -1121,6 +1158,24 @@ rules:
             );
             assert!(message.contains("YAML aliases expand"), "{message}");
         }
+    }
+
+    #[test]
+    fn yaml_tag_expansion_is_bounded() {
+        let config = PrismConfig::from_chromaterm_yaml(
+            "%TAG !e! tag:example.com,2000:\n---\nrules:\n  - {regex: !e!x y, color: bold}\n",
+        )
+        .expect("an ordinary tag directive parses");
+        assert_eq!(config.rules[0].regex, "y");
+
+        // libyaml spells out the 200 KB directive prefix again for each tag.
+        let mut yaml = format!("%TAG !e! tag:{}\n---\nrules:\n", "a".repeat(200_000));
+        yaml.push_str(&"  - {regex: !e!x y, color: bold}\n".repeat(40));
+        let message =
+            parse_within_time_limit(move || PrismConfig::from_chromaterm_yaml(&yaml).map(|_| ()))
+                .expect_err("tag expansion past the budget must be rejected")
+                .to_string();
+        assert!(message.contains("YAML tags expand"), "{message}");
     }
 
     #[test]
