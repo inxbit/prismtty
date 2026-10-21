@@ -28,7 +28,7 @@ use crate::terminal_text::escape_untrusted;
 use args::{Action, Options, parse_args, print_help};
 use profile_selection::profile_store;
 use pty::run_command;
-use runtime::{ReloadWatcher, RuntimeRegistration, request_reload};
+use runtime::{register_for_reload, request_reload};
 use stream::{InputSource, highlight_stream, prepare_session};
 use trace::IoTrace;
 
@@ -245,9 +245,8 @@ fn run_stdin(options: Options) -> Result<ExitCode, CliError> {
     // Reject a bad config before reading: with empty input it would otherwise
     // never be loaded, and with input it would cost the first chunk.
     let prepared = prepare_session(&options, interactive)?;
-    let _registration = RuntimeRegistration::register()?;
-    let reload_watcher = Some(ReloadWatcher::new());
     let trace = IoTrace::open(options.trace_io.as_deref())?;
+    let (_registration, reload_watcher) = register_for_reload();
     let stdin = io::stdin();
     highlight_stream(
         stdin.lock(),

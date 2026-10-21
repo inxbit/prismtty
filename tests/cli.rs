@@ -1271,3 +1271,38 @@ fn closed_stderr_does_not_stop_highlighting() {
         String::from_utf8_lossy(&output.stdout)
     );
 }
+
+// Registration only serves `--reload`. A runtime path another user squatted
+// (here a plain file, which needs no second account to set up) must disable
+// reload for the session, not stop the highlighting.
+#[test]
+fn unusable_runtime_dir_only_disables_reload() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let squatted = temp.path().join("runtime-is-a-file");
+    fs::write(&squatted, "").expect("plain file writes");
+
+    isolated("prismtty", temp.path())
+        .env("PRISMTTY_RUNTIME_DIR", &squatted)
+        .args(["--profile", "generic"])
+        .write_stdin("192.0.2.44 down\n")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("192.0.2.44"))
+        .stdout(predicate::str::contains("\u{1b}["))
+        .stderr(predicate::str::contains("reload disabled"));
+    isolated("ptty", temp.path())
+        .env("PRISMTTY_RUNTIME_DIR", &squatted)
+        .args(["--profile", "generic", "printf", "192.0.2.44 down\\n"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("192.0.2.44"))
+        .stderr(predicate::str::contains("reload disabled"));
+    // An explicit --reload still reports the problem.
+    isolated("prismtty", temp.path())
+        .env("PRISMTTY_RUNTIME_DIR", &squatted)
+        .arg("--reload")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("not a directory"));
+    assert_eq!(fs::read(&squatted).expect("file reads"), b"");
+}

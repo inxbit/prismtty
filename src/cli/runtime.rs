@@ -8,7 +8,29 @@ use nix::libc;
 #[cfg(unix)]
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 
+use crate::terminal_text::escape_untrusted;
+
 const PID_DIR_NAME: &str = "pids.d";
+
+/// Registers this session for `prismtty --reload`, which is all registration
+/// is for. A runtime directory that cannot be used (another user created it
+/// first, it is not a directory, TMPDIR is read-only) therefore disables
+/// reload for the session with one warning instead of stopping the
+/// highlighting. The reload marker in such a directory is never watched,
+/// since whoever controls the directory could keep touching it.
+pub(super) fn register_for_reload() -> (Option<RuntimeRegistration>, Option<ReloadWatcher>) {
+    match RuntimeRegistration::register() {
+        Ok(registration) => (Some(registration), Some(ReloadWatcher::new())),
+        Err(error) => {
+            let _ = writeln!(
+                io::stderr(),
+                "prismtty: live reload disabled for this session: {}",
+                escape_untrusted(&error.to_string())
+            );
+            (None, None)
+        }
+    }
+}
 
 pub(super) struct RuntimeRegistration {
     path: PathBuf,
@@ -163,7 +185,12 @@ fn ensure_private_runtime_dir(dir: &Path) -> io::Result<()> {
     match builder.create(dir) {
         Ok(()) => {}
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
-        Err(error) => return Err(error),
+        Err(error) => {
+            return Err(io::Error::new(
+                error.kind(),
+                format!("cannot create runtime directory {}: {error}", dir.display()),
+            ));
+        }
     }
 
     let metadata = fs::symlink_metadata(dir)?;
@@ -288,6 +315,25 @@ mod tests {
         super::ensure_private_runtime_dir(&runtime).expect("runtime dir tightens");
 
         assert_eq!(mode(&runtime), 0o700);
+    }
+
+    // An unusable TMPDIR used to surface as a bare "Permission denied" with
+    // nothing to say which path was refused.
+    #[cfg(unix)]
+    #[test]
+    fn runtime_dir_create_error_names_the_path() {
+        let temp = tempfile::tempdir().expect("tempdir creates");
+        let file = temp.path().join("file");
+        std::fs::write(&file, "").expect("file writes");
+        let runtime = file.join("runtime");
+
+        let error = super::ensure_private_runtime_dir(&runtime)
+            .expect_err("a directory cannot be created under a file");
+
+        assert!(
+            error.to_string().contains(&runtime.display().to_string()),
+            "{error}"
+        );
     }
 
     #[cfg(unix)]

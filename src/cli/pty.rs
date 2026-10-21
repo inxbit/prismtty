@@ -25,7 +25,7 @@ use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use super::CliError;
 use super::args::Options;
 use super::profile_selection::dynamic_profile_enabled;
-use super::runtime::{ReloadWatcher, RuntimeRegistration};
+use super::runtime::register_for_reload;
 use super::stream::{InputSource, highlight_stream, prepare_session};
 use super::trace::IoTrace;
 
@@ -520,11 +520,11 @@ pub(super) fn run_command(options: Options, command: Vec<OsString>) -> Result<Ex
     let pair = pty_system.openpty(current_pty_size())?;
     let interactive = io::stdin().is_terminal();
     // Everything that can reject the invocation runs before the child exists,
-    // so a typo in a flag or a broken config never runs part of the command.
+    // so a typo in a flag or a broken config never runs part of the command,
+    // and a reload warning prints before the terminal goes raw.
     let prepared = prepare_session(&options, interactive)?;
     let trace = IoTrace::open(options.trace_io.as_deref())?;
-    let _registration = RuntimeRegistration::register()?;
-    let reload_watcher = Some(ReloadWatcher::new());
+    let (_registration, reload_watcher) = register_for_reload();
 
     let program = cwd_relative_program(command_name);
     let mut builder = CommandBuilder::new(&program);
