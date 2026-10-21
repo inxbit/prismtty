@@ -252,10 +252,12 @@ impl ProfileRuntime {
 
     fn invalidate_input_line(&mut self) {
         if self.input_line_reliable {
-            self.unreliable_remote_attempt = remote_attempt(&self.input_line).map(|mut attempt| {
-                attempt.target = None;
-                attempt
-            });
+            self.unreliable_remote_attempt =
+                self.typed_remote_attempt(&self.input_line)
+                    .map(|mut attempt| {
+                        attempt.target = None;
+                        attempt
+                    });
         }
         self.input_line.clear();
         self.input_line_reliable = false;
@@ -552,10 +554,18 @@ impl ProfileRuntime {
     }
 
     fn submit_input_line(&mut self) {
-        match remote_attempt(self.input_line.trim_start()) {
+        match self.typed_remote_attempt(self.input_line.trim_start()) {
             Some(attempt) => self.arm_remote_attempt(attempt),
             None => self.age_pending_remote(),
         }
+    }
+
+    /// Where the local baseline's profiles are active (the local shell or a
+    /// host like it), `ssh` is OpenSSH. A network device's own `ssh` takes
+    /// keywords after the host (`vrf management`, `routing-instance mgmt`),
+    /// so OpenSSH's rules for commands that open no session do not apply.
+    fn typed_remote_attempt(&self, line: &str) -> Option<RemoteAttempt> {
+        remote_attempt(line, self.active_profiles == self.baseline_profiles)
     }
 
     /// A login can take a few typed lines (user name, password, the Enter
@@ -761,7 +771,7 @@ fn profile_set(profile: &str) -> Vec<String> {
     vec!["generic".to_string(), profile.to_string()]
 }
 
-fn remote_attempt(line: &str) -> Option<RemoteAttempt> {
+fn remote_attempt(line: &str, openssh_client: bool) -> Option<RemoteAttempt> {
     let words = split_shell_words(line);
     let command = words
         .as_ref()
@@ -820,7 +830,7 @@ fn remote_attempt(line: &str) -> Option<RemoteAttempt> {
     }
     // A remote command without a forced tty, or a query or background
     // invocation, never opens an interactive session to close again.
-    if no_session || (remote_command && !force_tty) {
+    if openssh_client && (no_session || (remote_command && !force_tty)) {
         return None;
     }
     Some(RemoteAttempt { policy, target })
@@ -1470,6 +1480,56 @@ mod tests {
                 Some(names(&["generic", "linux-unix"])),
                 "{command:?}"
             );
+        }
+    }
+
+    // A network device's own ssh takes keywords after the host, so a nested
+    // jump typed there still opens a session that closes again.
+    #[test]
+    fn device_ssh_keywords_after_the_host_still_track_the_nested_session() {
+        let store = ProfileStore::builtin();
+        for (login, outer, jump, banner, nested, close) in [
+            (
+                &b"--- JUNOS 22.4R3 Kernel 64-bit\r\nlab@mx1> "[..],
+                "juniper",
+                &b"ssh 192.0.2.1 routing-instance mgmt_junos\r"[..],
+                &b"Cisco IOS Software, C3750E Software\r\ncore-sw#"[..],
+                "cisco",
+                &b"Connection to 192.0.2.1 closed.\r\nlab@mx1> "[..],
+            ),
+            (
+                b"Cisco Nexus Operating System (NX-OS) Software\r\ncore-sw# ",
+                "cisco",
+                b"ssh admin@192.0.2.5 vrf management\r",
+                b"--- JUNOS 22.4R3 Kernel 64-bit\r\nlab@mx1> ",
+                "juniper",
+                b"Connection to 192.0.2.5 closed.\r\ncore-sw# ",
+            ),
+        ] {
+            let mut runtime = ProfileRuntime::new(names(&["generic", "linux-unix"]));
+            runtime.observe_input(b"ssh outer\r");
+            assert_eq!(
+                runtime.observe_output(login, &store),
+                Some(names(&["generic", outer]))
+            );
+            runtime.accept_transition();
+            runtime.observe_input(jump);
+            assert!(
+                runtime.pending_remote.is_some(),
+                "{:?}",
+                String::from_utf8_lossy(jump)
+            );
+            assert_eq!(
+                runtime.observe_output(banner, &store),
+                Some(names(&["generic", nested]))
+            );
+            runtime.accept_transition();
+            assert_eq!(runtime.stack_len(), 2);
+            assert_eq!(
+                runtime.observe_output(close, &store),
+                Some(names(&["generic", outer]))
+            );
+            assert_eq!(runtime.stack_len(), 1);
         }
     }
 
