@@ -353,6 +353,41 @@ fn trace_output_bytes(path: &Path) -> Vec<u8> {
         .collect()
 }
 
+/// The reason traced for each flush of a held-back tail, decoded from the
+/// `FLUSH` lines of a `--trace-io` file.
+fn trace_flush_reasons(path: &Path) -> Vec<String> {
+    let Ok(trace) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    trace
+        .lines()
+        .filter_map(|line| line.split_once(" FLUSH ").map(|(_, bytes)| bytes))
+        .map(|bytes| {
+            let bytes: Vec<u8> = bytes
+                .split_whitespace()
+                .filter_map(|byte| u8::from_str_radix(byte, 16).ok())
+                .collect();
+            String::from_utf8_lossy(&bytes).into_owned()
+        })
+        .collect()
+}
+
+/// Asserts that an echo trigger, not the program-output holdback, drew the
+/// tail. The holdback also makes the tail visible, only 250 ms late, so
+/// visibility alone cannot tell a broken echo trigger apart. The trace line is
+/// written before the tail is drawn, so a visible tail's reason is on file.
+fn assert_drawn_by_echo_trigger(path: &Path, reason: &str) {
+    let reasons = trace_flush_reasons(path);
+    assert!(
+        reasons.iter().any(|traced| traced == reason),
+        "tail was not drawn by the {reason:?} trigger; traced flushes: {reasons:?}"
+    );
+    assert!(
+        !reasons.iter().any(|traced| traced == "holdback"),
+        "echo waited out the program-output holdback; traced flushes: {reasons:?}"
+    );
+}
+
 /// Makes a FIFO for a child to wait on with `read -r _ < "$gate"`. Unlike a
 /// file the child polls with `sleep`, the child resumes the moment
 /// [`release_fifo_gate`] writes to it, so the pause it ends is the test's own
@@ -525,7 +560,11 @@ fn pasted_line_is_fully_visible_without_extra_input() {
         })
         .expect("openpty");
 
+    let trace_dir = tempfile::tempdir().expect("trace tempdir");
+    let trace_path = trace_dir.path().join("echo.trace");
     let mut builder = CommandBuilder::new(env!("CARGO_BIN_EXE_ptty"));
+    builder.arg("--trace-io");
+    builder.arg(&trace_path);
     builder.arg("sh");
     builder.arg("-c");
     builder.arg("printf 'READY\\n'; exec cat");
@@ -565,6 +604,7 @@ fn pasted_line_is_fully_visible_without_extra_input() {
         visible.contains(target),
         "pasted line never fully surfaced without extra input; saw: {visible:?}"
     );
+    assert_drawn_by_echo_trigger(&trace_path, "echo-suffix");
 }
 
 fn count_subslice(haystack: &[u8], needle: &[u8]) -> usize {
@@ -770,7 +810,11 @@ fn raw_mode_paste_line_is_visible_without_extra_input() {
         })
         .expect("openpty");
 
+    let trace_dir = tempfile::tempdir().expect("trace tempdir");
+    let trace_path = trace_dir.path().join("echo.trace");
     let mut builder = CommandBuilder::new(env!("CARGO_BIN_EXE_ptty"));
+    builder.arg("--trace-io");
+    builder.arg(&trace_path);
     builder.arg("sh");
     builder.arg("-c");
     builder.arg("stty raw -echo 2>/dev/null; printf 'READY\\n'; exec cat");
@@ -808,6 +852,7 @@ fn raw_mode_paste_line_is_visible_without_extra_input() {
         visible.contains(target),
         "raw-mode pasted line never fully surfaced without extra input; saw: {visible:?}"
     );
+    assert_drawn_by_echo_trigger(&trace_path, "echo-suffix");
 }
 
 /// The char-by-char mirror of the nsupdate report: in a raw/ECHO-off session the
@@ -825,7 +870,11 @@ fn raw_mode_typed_chars_are_visible_without_extra_input() {
         })
         .expect("openpty");
 
+    let trace_dir = tempfile::tempdir().expect("trace tempdir");
+    let trace_path = trace_dir.path().join("echo.trace");
     let mut builder = CommandBuilder::new(env!("CARGO_BIN_EXE_ptty"));
+    builder.arg("--trace-io");
+    builder.arg(&trace_path);
     builder.arg("sh");
     builder.arg("-c");
     builder.arg("stty raw -echo 2>/dev/null; printf 'READY\\n'; exec cat");
@@ -869,6 +918,7 @@ fn raw_mode_typed_chars_are_visible_without_extra_input() {
         visible.contains("showversion"),
         "raw-mode typed token never surfaced without a delimiter; saw: {visible:?}"
     );
+    assert_drawn_by_echo_trigger(&trace_path, "echo-suffix");
 }
 
 /// History recall: a shell rewrites the current input line by backspacing over
@@ -893,7 +943,11 @@ fn history_recall_redraw_tail_is_visible_without_extra_input() {
         })
         .expect("openpty");
 
+    let trace_dir = tempfile::tempdir().expect("trace tempdir");
+    let trace_path = trace_dir.path().join("echo.trace");
     let mut builder = CommandBuilder::new(env!("CARGO_BIN_EXE_ptty"));
+    builder.arg("--trace-io");
+    builder.arg(&trace_path);
     builder.env("PRISMTTY_TEST_CONTINUE", &continue_path);
     builder.arg("sh");
     builder.arg("-c");
@@ -936,6 +990,7 @@ fn history_recall_redraw_tail_is_visible_without_extra_input() {
         visible.contains(target),
         "recalled history line lost its tail until the next keypress; saw: {visible:?}"
     );
+    assert_drawn_by_echo_trigger(&trace_path, "line-edit-redraw");
 }
 
 /// The same recall, delivered in two reads. Over ssh the transport splits a
@@ -956,7 +1011,11 @@ fn split_history_recall_redraw_tail_is_visible_without_extra_input() {
         })
         .expect("openpty");
 
+    let trace_dir = tempfile::tempdir().expect("trace tempdir");
+    let trace_path = trace_dir.path().join("echo.trace");
     let mut builder = CommandBuilder::new(env!("CARGO_BIN_EXE_ptty"));
+    builder.arg("--trace-io");
+    builder.arg(&trace_path);
     builder.env("PRISMTTY_TEST_CONTINUE", &continue_path);
     builder.arg("sh");
     builder.arg("-c");
@@ -1000,6 +1059,7 @@ fn split_history_recall_redraw_tail_is_visible_without_extra_input() {
         visible.contains(target),
         "split recall lost its tail until the next keypress; saw: {visible:?}"
     );
+    assert_drawn_by_echo_trigger(&trace_path, "line-edit-redraw");
 }
 
 /// A line editor that redraws with cursor movement rather than backspaces
@@ -1019,7 +1079,11 @@ fn csi_history_recall_redraw_tail_is_visible_without_extra_input() {
         })
         .expect("openpty");
 
+    let trace_dir = tempfile::tempdir().expect("trace tempdir");
+    let trace_path = trace_dir.path().join("echo.trace");
     let mut builder = CommandBuilder::new(env!("CARGO_BIN_EXE_ptty"));
+    builder.arg("--trace-io");
+    builder.arg(&trace_path);
     builder.env("PRISMTTY_TEST_CONTINUE", &continue_path);
     builder.arg("sh");
     builder.arg("-c");
@@ -1061,6 +1125,7 @@ fn csi_history_recall_redraw_tail_is_visible_without_extra_input() {
         visible.contains(target),
         "cursor-movement recall lost its tail until the next keypress; saw: {visible:?}"
     );
+    assert_drawn_by_echo_trigger(&trace_path, "line-edit-redraw");
 }
 
 /// Runs `program args` on a terminal while the child holds its last write open
