@@ -37,9 +37,10 @@ serde = { version = "1.0", features = ["derive"] }
 serde_norway = "0.9.42"
 thiserror = "2.0"
 # serde_norway's libyaml port. src/config.rs walks its parser events to bound
-# YAML nesting before serde_norway loads a document; the exact pin keeps that
-# walk on the same parser serde_norway uses.
-unsafe-libyaml-norway = "=0.2.15"
+# YAML nesting, aliases and tags before serde_norway loads a document. Cargo
+# unifies the two requirements on one 0.2.x release, so the walk always sees
+# the events serde_norway sees, and patch releases still apply to both.
+unsafe-libyaml-norway = "0.2.15"
 
 [dev-dependencies]
 assert_cmd = "2.0"
