@@ -1334,7 +1334,7 @@ impl StreamingHighlighter {
                 self.alternate_screen,
             )
         } else {
-            streaming_split_at(combined.bytes())
+            streaming_split_at(&combined)
         };
         let processed = split_prepared_pending(&mut combined, split_at, &mut self.pending);
         self.pending_from_prompt_echo_remainder = false;
@@ -3373,7 +3373,8 @@ fn chunk_contains_prompt_echo_anywhere(visible: &[u8]) -> bool {
     false
 }
 
-fn streaming_split_at(bytes: &[u8]) -> usize {
+fn streaming_split_at(chunk: &AnsiChunk) -> usize {
+    let bytes = chunk.bytes();
     if bytes.is_empty() {
         return 0;
     }
@@ -3394,7 +3395,7 @@ fn streaming_split_at(bytes: &[u8]) -> usize {
     while start > 0 && is_token_continuation(bytes[start - 1]) {
         start -= 1;
     }
-    if let Some(ansi_end) = ansi_sequence_end_containing(bytes, start) {
+    if let Some(ansi_end) = ansi_token_end_containing(&chunk.tokens, start) {
         start = ansi_end;
     }
 
@@ -3476,25 +3477,21 @@ fn neutralize_incomplete_escape_at_eof(bytes: &mut Vec<u8>) {
     }
 }
 
-fn ansi_sequence_end_containing(bytes: &[u8], index: usize) -> Option<usize> {
-    let mut end = index.min(bytes.len());
-    while end > 0 {
-        let start = bytes[..end]
-            .iter()
-            .rposition(|byte| *byte == 0x1b || is_c1_control(*byte))?;
-        if byte_is_inside_utf8_codepoint_or_prefix(bytes, start) {
-            end = start;
-            continue;
+/// The end of the control token that `index` falls inside, if any. Walking
+/// the chunk's tokens takes one pass and agrees with how the chunk is
+/// highlighted, where scanning back from `index` would rescan every earlier
+/// string introducer up to a terminator they share.
+fn ansi_token_end_containing(tokens: &[Token], index: usize) -> Option<usize> {
+    let mut offset = 0usize;
+    for token in tokens {
+        if offset >= index {
+            return None;
         }
-        let control_end = if bytes[start] == 0x1b {
-            ansi_sequence_end(bytes, start)
-        } else {
-            c1_sequence_end(bytes, start)
-        };
-        if start < index && index < control_end {
-            return Some(control_end);
+        let end = offset + token.as_bytes().len();
+        if matches!(token, Token::Ansi(_)) && index < end {
+            return Some(end);
         }
-        end = start;
+        offset = end;
     }
     None
 }
@@ -3525,7 +3522,7 @@ fn interactive_split_at_chunk(
     {
         incomplete_top_level_escape_start(chunk.bytes()).unwrap_or(chunk.bytes.len())
     } else {
-        streaming_split_at(chunk.bytes())
+        streaming_split_at(chunk)
     }
 }
 
@@ -5007,6 +5004,41 @@ rules:
         let mut streaming = StreamingHighlighter::new(highlighter);
         assert_eq!(streaming.push(b"abc\x1bN\n"), b"abc\x1bN\n");
         assert!(streaming.finish().is_empty());
+    }
+
+    // Many string introducers that share one far terminator must not make the
+    // split point search rescan to that terminator from each of them.
+    #[test]
+    fn split_point_search_stays_linear_for_shared_string_terminators() {
+        for (introducer, terminator) in [
+            (b"\x90x".as_slice(), b"\x9c".as_slice()),
+            (b"\x9dx".as_slice(), b"\x07".as_slice()),
+        ] {
+            let mut chunk = introducer.repeat(4094);
+            chunk.extend_from_slice(terminator);
+            chunk.extend_from_slice(b"tok");
+            assert_eq!(
+                super::streaming_split_at(&super::AnsiChunk::from_slice(&chunk)),
+                chunk.len() - 3
+            );
+
+            let highlighter =
+                Highlighter::from_config(PrismConfig::default()).expect("empty config compiles");
+            let mut streaming = StreamingHighlighter::new(highlighter);
+            let started = std::time::Instant::now();
+            let mut output = Vec::new();
+            for _ in 0..32 {
+                output.extend(streaming.push(&chunk));
+            }
+            output.extend(streaming.finish());
+            let elapsed = started.elapsed();
+
+            assert_eq!(output, chunk.repeat(32));
+            assert!(
+                elapsed < std::time::Duration::from_secs(2),
+                "32 reads of {introducer:02x?} chains took {elapsed:?}"
+            );
+        }
     }
 
     // A run of cancelled controls is carried from its first control, so the
