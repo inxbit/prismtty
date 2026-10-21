@@ -22,6 +22,10 @@ const PCRE2_JIT_STACK_LIMIT_BYTES: usize = 32 * 1024;
 const PCRE2_MATCH_LIMIT: usize = 100_000;
 const PCRE2_DEPTH_LIMIT: usize = 1_000;
 const MAX_COMPILED_RULES: usize = 512;
+/// Longest visible prompt (ASCII whitespace trimmed) that `looks_like_prompt_tail`
+/// accepts. A prompt candidate end is never ASCII whitespace, so no candidate end
+/// past this offset can begin a prompt echo; scans stop there.
+const MAX_PROMPT_TAIL_BYTES: usize = 180;
 /// How many runtime match errors a rule may hit on one chunk before the scan
 /// gives up. Each error means PCRE2 spent its whole match budget at that
 /// starting position, so recovery has to stay bounded; a handful is enough to
@@ -1975,7 +1979,7 @@ fn prompt_echo_sgr_bounds(
         return Some((0, command_start));
     }
 
-    for prompt_end in 1..line.len() {
+    for prompt_end in 1..line.len().min(MAX_PROMPT_TAIL_BYTES + 1) {
         if !is_prompt_tail_candidate_end(&line[..prompt_end]) {
             continue;
         }
@@ -1996,7 +2000,7 @@ fn prompt_echo_sgr_bounds(
 
 fn looks_like_prompt_tail(line: &[u8]) -> bool {
     let trimmed = trim_ascii_whitespace_end(line);
-    if trimmed.is_empty() || trimmed.len() > 180 {
+    if trimmed.is_empty() || trimmed.len() > MAX_PROMPT_TAIL_BYTES {
         return false;
     }
     let Some(last) = trimmed.last() else {
@@ -2226,7 +2230,7 @@ fn is_in_place_line_edit_sequence(bytes: &[u8]) -> bool {
 }
 
 fn contains_prompt_echo_in_visible_line(line: &[u8]) -> bool {
-    for prompt_end in 1..line.len() {
+    for prompt_end in 1..line.len().min(MAX_PROMPT_TAIL_BYTES + 1) {
         if !is_prompt_tail_candidate_end(&line[..prompt_end]) {
             continue;
         }
@@ -5787,6 +5791,62 @@ rules:
             "a $-prompt completion redraw tail must qualify"
         );
         assert_eq!(super::strip_ansi(&streaming.flush_buffered_echo()), b"log");
+    }
+
+    // Every position of a line full of Unicode prompt markers is a candidate
+    // prompt end. Candidates past the prompt length limit can never match, so
+    // scanning them made each line quadratic.
+    #[test]
+    fn interactive_marker_flood_line_is_linear() {
+        let highlighter =
+            Highlighter::from_config(PrismConfig::default()).expect("empty config compiles");
+        let mut streaming = StreamingHighlighter::new_interactive(highlighter);
+        let mut line = b"!".to_vec();
+        for _ in 0..4095 {
+            line.extend_from_slice("»".as_bytes());
+        }
+        line.push(b'\n');
+
+        let started = std::time::Instant::now();
+        let mut output = Vec::new();
+        for _ in 0..8 {
+            output.extend(streaming.push(&line));
+        }
+        output.extend(streaming.finish());
+
+        assert_eq!(output.len(), line.len() * 8);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(3),
+            "marker flood took {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn prompt_echo_scan_bound_matches_prompt_length_limit() {
+        let limit = super::MAX_PROMPT_TAIL_BYTES;
+        let at_limit = format!("{}# show run", "a".repeat(limit - 1));
+        assert!(super::contains_prompt_echo_in_visible_line(
+            at_limit.as_bytes()
+        ));
+        assert!(super::prompt_echo_sgr_bounds(at_limit.as_bytes(), false).is_some());
+
+        let past_limit = format!("{}# show run", "a".repeat(limit));
+        assert!(!super::contains_prompt_echo_in_visible_line(
+            past_limit.as_bytes()
+        ));
+        assert!(super::prompt_echo_sgr_bounds(past_limit.as_bytes(), false).is_none());
+
+        // `»` is two bytes, so these prompts are exactly at and one byte past
+        // the limit.
+        let unicode_at_limit = format!("{}» ls", "a".repeat(limit - 2));
+        assert!(super::contains_prompt_echo_in_visible_line(
+            unicode_at_limit.as_bytes()
+        ));
+        let unicode_past_limit = format!("{}» ls", "a".repeat(limit - 1));
+        assert!(!super::contains_prompt_echo_in_visible_line(
+            unicode_past_limit.as_bytes()
+        ));
     }
 
     #[test]
