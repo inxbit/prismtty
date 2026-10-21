@@ -26,7 +26,7 @@ use super::CliError;
 use super::args::Options;
 use super::profile_selection::dynamic_profile_enabled;
 use super::runtime::{ReloadWatcher, RuntimeRegistration};
-use super::stream::{InputSource, highlight_stream};
+use super::stream::{InputSource, highlight_stream, prepare_session};
 use super::trace::IoTrace;
 
 const STRIPPED_ITERM_ENV: [&str; 6] = [
@@ -519,6 +519,12 @@ pub(super) fn run_command(options: Options, command: Vec<OsString>) -> Result<Ex
     let pty_system = native_pty_system();
     let pair = pty_system.openpty(current_pty_size())?;
     let interactive = io::stdin().is_terminal();
+    // Everything that can reject the invocation runs before the child exists,
+    // so a typo in a flag or a broken config never runs part of the command.
+    let prepared = prepare_session(&options, interactive)?;
+    let trace = IoTrace::open(options.trace_io.as_deref())?;
+    let _registration = RuntimeRegistration::register()?;
+    let reload_watcher = Some(ReloadWatcher::new());
 
     let program = cwd_relative_program(command_name);
     let mut builder = CommandBuilder::new(&program);
@@ -551,7 +557,6 @@ pub(super) fn run_command(options: Options, command: Vec<OsString>) -> Result<Ex
     set_forward_child_pid(child.process_id().map(|pid| pid as i32).unwrap_or(0));
     cleanup_child_on_err(signal_mask.restore(), &mut child)?;
 
-    let trace = cleanup_child_on_err(IoTrace::open(options.trace_io.as_deref()), &mut child)?;
     let (profile_input_tx, profile_input_rx) = if dynamic_profile_enabled(&options, interactive) {
         let (tx, rx) = mpsc::sync_channel(PROFILE_INPUT_QUEUE_CAPACITY);
         (Some(tx), Some(rx))
@@ -612,12 +617,10 @@ pub(super) fn run_command(options: Options, command: Vec<OsString>) -> Result<Ex
         cleanup_child_on_err(PtyResizeWatcher::start(pair.master), &mut child)?;
 
     let mut stdout = io::stdout();
-    let _registration = cleanup_child_on_err(RuntimeRegistration::register(), &mut child)?;
-    let reload_watcher = Some(ReloadWatcher::new());
     let stream_result = highlight_stream(
         &mut reader,
         &mut stdout,
-        &options,
+        prepared,
         InputSource {
             interactive,
             pty_fd,

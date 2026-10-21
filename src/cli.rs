@@ -29,7 +29,7 @@ use args::{Action, Options, parse_args, print_help};
 use profile_selection::profile_store;
 use pty::run_command;
 use runtime::{ReloadWatcher, RuntimeRegistration, request_reload};
-use stream::{InputSource, highlight_stream};
+use stream::{InputSource, highlight_stream, prepare_session};
 use trace::IoTrace;
 
 #[cfg(feature = "completion-generation")]
@@ -221,16 +221,19 @@ fn run_inner(args: Vec<OsString>) -> Result<ExitCode, CliError> {
 }
 
 fn run_stdin(options: Options) -> Result<ExitCode, CliError> {
+    let mut stdout = io::stdout();
+    let interactive = stdin_mode_interactive_highlighting(stdout.is_terminal());
+    // Reject a bad config before reading: with empty input it would otherwise
+    // never be loaded, and with input it would cost the first chunk.
+    let prepared = prepare_session(&options, interactive)?;
     let _registration = RuntimeRegistration::register()?;
     let reload_watcher = Some(ReloadWatcher::new());
     let trace = IoTrace::open(options.trace_io.as_deref())?;
     let stdin = io::stdin();
-    let mut stdout = io::stdout();
-    let interactive = stdin_mode_interactive_highlighting(stdout.is_terminal());
     highlight_stream(
         stdin.lock(),
         &mut stdout,
-        &options,
+        prepared,
         InputSource {
             interactive,
             pty_fd: None,

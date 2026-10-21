@@ -59,15 +59,39 @@ pub(super) struct InputSource {
     pub(super) recent_input: Option<Arc<Mutex<Vec<u8>>>>,
 }
 
+/// The profile store, overlay config and initial highlighter, loaded and
+/// compiled before the stream has any side effect: before `run_command`
+/// spawns the child and before `run_stdin` reads its input. An unknown
+/// `--profile`, a broken config or a malformed profiles.d file then fails the
+/// run up front, instead of killing a command that already started or passing
+/// silently when the command prints nothing.
+pub(super) struct PreparedSession<'a> {
+    session: HighlightSession<'a>,
+}
+
+pub(super) fn prepare_session(
+    options: &Options,
+    interactive: bool,
+) -> Result<PreparedSession<'_>, CliError> {
+    let store = profile_store()?;
+    // No output has been seen yet, so this is the forced `--profile` list or
+    // the generic set that first-chunk auto-detection starts from.
+    let profile_names = select_profile_names_with_store(options, &store, b"")?;
+    let session = HighlightSession::new(options, store, interactive, profile_names)?;
+    Ok(PreparedSession { session })
+}
+
 pub(super) fn highlight_stream<R: Read, W: Write>(
     mut reader: R,
     writer: &mut W,
-    options: &Options,
+    prepared: PreparedSession<'_>,
     input: InputSource,
     mut reload_watcher: Option<ReloadWatcher>,
     trace: IoTrace,
     profile_input_rx: Option<mpsc::Receiver<Vec<u8>>>,
 ) -> Result<(), CliError> {
+    let mut session = prepared.session;
+    let options = session.options;
     let started = Instant::now();
     let mut input_bytes = 0usize;
     let mut buffer = [0_u8; 8192];
@@ -86,9 +110,13 @@ pub(super) fn highlight_stream<R: Read, W: Write>(
     );
     let mut detection_sample = first_chunk.bytes().to_vec();
     input_bytes += read;
-    let store = profile_store()?;
-    let profile_names = select_profile_names_with_store(options, &store, &detection_sample)?;
-    let mut session = HighlightSession::new(options, store, input.interactive, profile_names)?;
+    let profile_names =
+        select_profile_names_with_store(options, session.profile_store(), &detection_sample)?;
+    // A set detected from the first chunk is a switch away from the prepared
+    // one like any later detection, so a profiles.d profile that fails to
+    // compile keeps the last good rules instead of ending the run.
+    let first_switch_accepted = profile_names.as_slice() == session.profile_names()
+        || apply_automatic_profile_switch(&mut session, writer, &trace, None, profile_names);
     session.report_current();
     let dynamic_profiles =
         dynamic_profile_enabled(options, input.interactive) && profile_input_rx.is_some();
@@ -97,8 +125,9 @@ pub(super) fn highlight_stream<R: Read, W: Write>(
     } else {
         None
     };
-    let mut auto_detect_pending =
-        !dynamic_profiles && should_continue_auto_detect(options, session.profile_names());
+    let mut auto_detect_pending = !dynamic_profiles
+        && first_switch_accepted
+        && should_continue_auto_detect(options, session.profile_names());
     if let Some(next_profile_names) = observe_dynamic_profile(
         &mut profile_runtime,
         profile_input_rx.as_ref(),
@@ -2215,8 +2244,9 @@ mod tests {
         let trace_file = tempfile::NamedTempFile::new().expect("trace temp file");
         let trace_path = trace_file.path().to_path_buf();
         let trace = super::IoTrace::open(Some(trace_path.as_path())).expect("trace opens");
+        let prepared = super::prepare_session(&options, true).expect("session prepares");
 
-        super::highlight_stream(reader, &mut writer, &options, input, None, trace, None)
+        super::highlight_stream(reader, &mut writer, prepared, input, None, trace, None)
             .expect("highlight_stream succeeds");
 
         let trace_text = std::fs::read_to_string(&trace_path).expect("read trace");
@@ -2292,8 +2322,9 @@ mod tests {
         let trace_file = tempfile::NamedTempFile::new().expect("trace temp file");
         let trace_path = trace_file.path().to_path_buf();
         let trace = super::IoTrace::open(Some(trace_path.as_path())).expect("trace opens");
+        let prepared = super::prepare_session(&options, true).expect("session prepares");
 
-        super::highlight_stream(reader, &mut writer, &options, input, None, trace, None)
+        super::highlight_stream(reader, &mut writer, prepared, input, None, trace, None)
             .expect("highlight_stream succeeds");
 
         let trace_text = std::fs::read_to_string(&trace_path).expect("read trace");

@@ -1046,3 +1046,122 @@ fn profiles_d_override_of_a_builtin_warns_on_stderr() {
         "user profile 'cisco' from profiles.d overrides the built-in",
     ));
 }
+
+/// A command whose config and runtime lookups stay inside `dir`, so neither
+/// the user's nor the machine's PrismTTY state can leak into the test.
+fn isolated(bin: &str, dir: &std::path::Path) -> Command {
+    let mut cmd = Command::cargo_bin(bin).expect("binary exists");
+    cmd.env("HOME", dir)
+        .env("XDG_CONFIG_HOME", dir.join("xdg"))
+        .env("PRISMTTY_RUNTIME_DIR", dir.join("runtime"));
+    cmd
+}
+
+const WRITE_MARKER: &str = "echo ran > \"$PRISMTTY_TEST_MARKER\"";
+
+#[test]
+fn unknown_forced_profile_is_rejected_before_wrapped_command_runs() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let marker = temp.path().join("marker");
+
+    isolated("ptty", temp.path())
+        .env("PRISMTTY_TEST_MARKER", &marker)
+        .args(["-p", "nosuch", "sh", "-c", WRITE_MARKER])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("unknown profile 'nosuch'"));
+    assert!(!marker.exists(), "the wrapped command ran before the check");
+}
+
+#[test]
+fn broken_config_is_rejected_before_wrapped_command_runs() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let marker = temp.path().join("marker");
+    let config = temp.path().join("bad.yml");
+    fs::write(
+        &config,
+        "rules:\n  - description: bad\n    regex: \"(\"\n    color: f#ff0000\n",
+    )
+    .expect("config writes");
+
+    isolated("ptty", temp.path())
+        .env("PRISMTTY_TEST_MARKER", &marker)
+        .arg("--config")
+        .arg(&config)
+        .args(["sh", "-c", WRITE_MARKER])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("failed to compile"));
+    assert!(!marker.exists(), "the wrapped command ran before the check");
+}
+
+#[test]
+fn malformed_profiles_d_is_rejected_before_wrapped_command_runs() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let marker = temp.path().join("marker");
+    let profiles_dir = temp.path().join("xdg").join("prismtty").join("profiles.d");
+    fs::create_dir_all(&profiles_dir).expect("profiles.d creates");
+    fs::write(profiles_dir.join("bad.yml"), "profile: [unterminated\n").expect("profile writes");
+
+    isolated("ptty", temp.path())
+        .env("PRISMTTY_TEST_MARKER", &marker)
+        .args(["sh", "-c", WRITE_MARKER])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("failed to parse YAML"));
+    assert!(!marker.exists(), "the wrapped command ran before the check");
+}
+
+#[test]
+fn trace_path_is_rejected_before_wrapped_command_runs() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let marker = temp.path().join("marker");
+
+    isolated("ptty", temp.path())
+        .env("PRISMTTY_TEST_MARKER", &marker)
+        .arg("--trace-io")
+        .arg(temp.path().join("missing-dir").join("trace"))
+        .args(["sh", "-c", WRITE_MARKER])
+        .assert()
+        .failure();
+    assert!(!marker.exists(), "the wrapped command ran before the check");
+}
+
+#[test]
+fn bad_config_is_reported_in_stdin_mode_without_input() {
+    let temp = tempfile::tempdir().expect("tempdir");
+
+    isolated("prismtty", temp.path())
+        .arg("--config")
+        .arg(temp.path().join("missing.yml"))
+        .write_stdin("")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("failed to read"));
+    isolated("prismtty", temp.path())
+        .args(["-p", "nosuch"])
+        .write_stdin("")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("unknown profile 'nosuch'"));
+}
+
+#[test]
+fn broken_profile_detected_in_first_chunk_keeps_last_good_rules() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let profiles_dir = temp.path().join("xdg").join("prismtty").join("profiles.d");
+    fs::create_dir_all(&profiles_dir).expect("profiles.d creates");
+    fs::write(
+        profiles_dir.join("broken.yml"),
+        "profile:\n  name: brokenos\n  inherits: [generic]\n  detection:\n    - BrokenOS\nrules:\n  - description: broken\n    regex: '('\n    color: f#ff0000\n",
+    )
+    .expect("profile writes");
+
+    isolated("prismtty", temp.path())
+        .write_stdin("BrokenOS version 1\nline2\n")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("BrokenOS version 1"))
+        .stdout(predicate::str::contains("line2"))
+        .stderr(predicate::str::contains("automatic profile switch ignored"));
+}
