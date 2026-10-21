@@ -1850,6 +1850,15 @@ fn prompt_echo_source_sgr_plan(
     input: &[u8],
     previous_visible_tail: &[u8],
 ) -> (Vec<(usize, usize)>, Vec<usize>) {
+    // Most chunks carry no escape at all; skip building the visible-byte map
+    // for them. Any ESC, raw C1 or UTF-8 C1 (`C2 xx`) form contains one of
+    // these bytes.
+    if !input
+        .iter()
+        .any(|byte| *byte == 0x1b || is_c1_control(*byte))
+    {
+        return (Vec::new(), Vec::new());
+    }
     let (visible, ansi_ranges) = visible_byte_map_and_ansi_ranges(input);
     if visible.is_empty() || ansi_ranges.iter().all(|range| !range.is_sgr) {
         return (Vec::new(), Vec::new());
@@ -2029,7 +2038,12 @@ fn looks_like_prompt_tail(line: &[u8]) -> bool {
 fn looks_like_unicode_prompt_tail(trimmed: &[u8]) -> bool {
     // Cheap marker check first: this runs for every candidate prompt end of a
     // visible line, so the UTF-8 decode and control scan below must only run
-    // for the rare tail that actually ends in a Unicode prompt marker.
+    // for the rare tail that actually ends in a Unicode prompt marker. Every
+    // marker is multibyte UTF-8 and so ends in a non-ASCII byte; an ASCII last
+    // byte, the common case, needs no marker compares at all.
+    if trimmed.last().is_none_or(u8::is_ascii) {
+        return false;
+    }
     let Some(marker) = UNICODE_PROMPT_MARKERS
         .iter()
         .copied()
@@ -5847,6 +5861,75 @@ rules:
         assert!(!super::contains_prompt_echo_in_visible_line(
             unicode_past_limit.as_bytes()
         ));
+    }
+
+    // The Unicode prompt check skips every tail with an ASCII last byte, which
+    // is only sound while no marker ends in one.
+    #[test]
+    fn unicode_prompt_markers_end_in_non_ascii_bytes() {
+        for marker in super::UNICODE_PROMPT_MARKERS {
+            assert!(
+                marker
+                    .as_bytes()
+                    .last()
+                    .is_some_and(|last| !last.is_ascii()),
+                "{marker:?} must end in a non-ASCII byte"
+            );
+        }
+    }
+
+    #[test]
+    fn every_unicode_prompt_marker_still_starts_a_prompt_echo() {
+        for marker in super::UNICODE_PROMPT_MARKERS {
+            for line in [
+                format!("{marker} make"),
+                format!("~/src {marker} git status"),
+            ] {
+                assert!(
+                    super::contains_prompt_echo_in_visible_line(line.as_bytes()),
+                    "{line:?} is a prompt echo"
+                );
+            }
+        }
+        assert!(super::contains_prompt_echo_in_visible_line(
+            "──○ cmd".as_bytes()
+        ));
+        assert!(!super::contains_prompt_echo_in_visible_line(
+            b"plain ascii line with no prompt"
+        ));
+    }
+
+    #[test]
+    fn prompt_source_sgr_plan_is_empty_without_escapes() {
+        for input in [b"router# show version".as_slice(), "~/src ❯ ls".as_bytes()] {
+            assert_eq!(
+                super::prompt_echo_source_sgr_plan(input, b""),
+                (Vec::new(), Vec::new())
+            );
+            assert_eq!(
+                super::neutralize_prompt_echo_source_sgr(input, b"", super::ResetMode::Minimal),
+                input
+            );
+        }
+    }
+
+    #[test]
+    fn utf8_c1_prompt_source_sgr_is_neutralized_before_command_echo() {
+        let input = b"router# \xc2\x9b31mshow up";
+        let output =
+            super::neutralize_prompt_echo_source_sgr(input, b"", super::ResetMode::Minimal);
+
+        assert!(
+            !output.windows(2).any(|window| window == b"\xc2\x9b"),
+            "source C1 SGR survived: {output:02x?}"
+        );
+        assert!(
+            output
+                .windows(b"\x1b[39m".len())
+                .any(|window| window == b"\x1b[39m"),
+            "command boundary reset missing: {output:02x?}"
+        );
+        assert_eq!(super::strip_ansi(&output), b"router# show up");
     }
 
     #[test]
