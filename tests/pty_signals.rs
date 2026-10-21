@@ -798,6 +798,67 @@ fn inherited_ignored_signals_do_not_terminate_the_wrapped_job() {
     wrapped_guard.disarm();
 }
 
+/// A wrapper started as a session leader with no controlling terminal but a
+/// terminal on stdin (`setsid ptty ...`) must not take the wrapped command's
+/// PTY as its own controlling terminal: the child then cannot claim it, the
+/// spawn fails, and the PTY hangup kills the wrapper. Linux only, since BSD
+/// kernels never assign a controlling terminal on open.
+#[cfg(target_os = "linux")]
+#[test]
+fn session_leader_without_controlling_terminal_runs_the_command() {
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::process::{CommandExt, ExitStatusExt};
+    use std::process::{Command, Stdio};
+
+    let pair = native_pty_system()
+        .openpty(PtySize::default())
+        .expect("openpty");
+    let tty = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NOCTTY)
+        .open(pair.master.tty_name().expect("outer PTY tty name"))
+        .expect("open outer slave tty");
+    let capture = CaptureTask::from_master(&*pair.master);
+    let mut command = Command::new(env!("CARGO_BIN_EXE_ptty"));
+    command
+        .args(["sh", "-c", "echo CHILD-RAN"])
+        .stdin(Stdio::from(tty.try_clone().expect("stdin tty")))
+        .stdout(Stdio::from(tty.try_clone().expect("stdout tty")))
+        .stderr(Stdio::from(tty.try_clone().expect("stderr tty")));
+    // SAFETY: setsid is async-signal-safe and runs in the forked child before exec.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut ptty = ProcessGuard::new(command.spawn().expect("spawn ptty"));
+    drop(command);
+    drop(tty);
+
+    let status = ptty
+        .wait_for_exit(Duration::from_secs(10))
+        .expect("session-leader wrapper exits");
+    let output = capture.wait_until(Duration::from_secs(2), |out| {
+        contains_bytes(out, b"CHILD-RAN")
+    });
+    assert_eq!(
+        status.signal(),
+        None,
+        "wrapper was killed; output: {:?}",
+        String::from_utf8_lossy(&output)
+    );
+    assert_eq!(status.code(), Some(0));
+    assert!(
+        contains_bytes(&output, b"CHILD-RAN"),
+        "wrapped command never ran: {:?}",
+        String::from_utf8_lossy(&output)
+    );
+}
+
 fn assert_terminal_restored_after(signal: libc::c_int) {
     use nix::sys::termios::{LocalFlags, tcgetattr};
 

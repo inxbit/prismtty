@@ -3,6 +3,7 @@ use std::fs::OpenOptions;
 use std::io::{self, Read, Write};
 use std::mem;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::{
@@ -759,7 +760,13 @@ fn configure_child_pty(master: &dyn portable_pty::MasterPty) -> Result<(), CliEr
     let Some(tty_name) = master.tty_name() else {
         return Ok(());
     };
-    let slave_tty = OpenOptions::new().read(true).write(true).open(tty_name)?;
+    // O_NOCTTY: a session leader without a controlling terminal would
+    // otherwise take this one, and the child could no longer claim it.
+    let slave_tty = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NOCTTY)
+        .open(tty_name)?;
     let mut termios = source;
     normalize_child_pty_termios(&mut termios);
     tcsetattr(slave_tty.as_fd(), SetArg::TCSANOW, &termios)?;
