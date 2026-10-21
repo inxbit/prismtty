@@ -6370,6 +6370,11 @@ rules:
             let mut output = String::new();
             for chunk in &chunks {
                 output.push_str(&streaming.push_str(chunk));
+                // Surface the held-back token, so a split read leaves the
+                // highlight open until the next read brings the terminator.
+                output.push_str(
+                    &String::from_utf8(streaming.flush_buffered_echo()).expect("output is utf8"),
+                );
             }
             output.push_str(&String::from_utf8(streaming.finish()).expect("output is utf8"));
 
