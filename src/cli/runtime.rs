@@ -38,9 +38,9 @@ pub(super) struct RuntimeRegistration {
 
 impl RuntimeRegistration {
     pub(super) fn register() -> io::Result<Self> {
-        let dir = runtime_dir();
+        let (dir, origin) = runtime_dir();
         let pid = std::process::id();
-        let path = register_pid_file(&dir, pid)?;
+        let path = register_pid_file(&dir, origin, pid)?;
         Ok(Self { path })
     }
 }
@@ -74,15 +74,15 @@ impl ReloadWatcher {
 }
 
 pub(super) fn request_reload() -> io::Result<usize> {
-    let dir = runtime_dir();
-    request_reload_in_dir(&dir, process_is_alive)
+    let (dir, origin) = runtime_dir();
+    request_reload_in_dir(&dir, origin, process_is_alive)
 }
 
-fn request_reload_in_dir<F>(dir: &Path, mut is_alive: F) -> io::Result<usize>
+fn request_reload_in_dir<F>(dir: &Path, origin: DirOrigin, mut is_alive: F) -> io::Result<usize>
 where
     F: FnMut(u32) -> bool,
 {
-    ensure_private_runtime_dir(dir)?;
+    ensure_runtime_dir(dir, origin)?;
     write_private_file(
         &dir.join("reload"),
         format!("{:?}\n", SystemTime::now()).as_bytes(),
@@ -114,19 +114,32 @@ where
     Ok(count)
 }
 
-fn register_pid_file(dir: &Path, pid: u32) -> io::Result<PathBuf> {
-    ensure_private_runtime_dir(dir)?;
+fn register_pid_file(dir: &Path, origin: DirOrigin, pid: u32) -> io::Result<PathBuf> {
+    ensure_runtime_dir(dir, origin)?;
     let pid_dir = ensure_private_pid_dir(dir)?;
     let path = pid_dir.join(pid.to_string());
     write_private_file(&path, b"")?;
     Ok(path)
 }
 
-fn runtime_dir() -> PathBuf {
+/// Who chose the runtime directory, which decides whether PrismTTY may change
+/// its permissions.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DirOrigin {
+    /// PrismTTY's own per-user directory under the temp dir.
+    Default,
+    /// A directory the user named through `PRISMTTY_RUNTIME_DIR`.
+    Override,
+}
+
+fn runtime_dir() -> (PathBuf, DirOrigin) {
     if let Some(path) = std::env::var_os("PRISMTTY_RUNTIME_DIR") {
-        return PathBuf::from(path);
+        return (PathBuf::from(path), DirOrigin::Override);
     }
-    std::env::temp_dir().join(format!("prismtty-{}", current_uid()))
+    (
+        std::env::temp_dir().join(format!("prismtty-{}", current_uid())),
+        DirOrigin::Default,
+    )
 }
 
 fn current_uid() -> u32 {
@@ -135,7 +148,7 @@ fn current_uid() -> u32 {
 }
 
 fn reload_marker_path() -> PathBuf {
-    runtime_dir().join("reload")
+    runtime_dir().0.join("reload")
 }
 
 #[cfg(unix)]
@@ -177,6 +190,13 @@ fn reload_marker_time(path: &Path) -> Option<SystemTime> {
     metadata.modified().ok()
 }
 
+fn ensure_runtime_dir(dir: &Path, origin: DirOrigin) -> io::Result<()> {
+    match origin {
+        DirOrigin::Default => ensure_private_runtime_dir(dir),
+        DirOrigin::Override => ensure_user_runtime_dir(dir),
+    }
+}
+
 #[cfg(unix)]
 fn ensure_private_runtime_dir(dir: &Path) -> io::Result<()> {
     let mut builder = fs::DirBuilder::new();
@@ -185,15 +205,52 @@ fn ensure_private_runtime_dir(dir: &Path) -> io::Result<()> {
     match builder.create(dir) {
         Ok(()) => {}
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
-        Err(error) => {
-            return Err(io::Error::new(
-                error.kind(),
-                format!("cannot create runtime directory {}: {error}", dir.display()),
-            ));
-        }
+        Err(error) => return Err(create_dir_error(dir, error)),
     }
 
     let metadata = fs::symlink_metadata(dir)?;
+    ensure_owned_dir(dir, &metadata)?;
+
+    let mode = metadata.permissions().mode() & 0o777;
+    if mode != 0o700 {
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
+/// Checks a directory named through `PRISMTTY_RUNTIME_DIR` without tightening
+/// it the way PrismTTY's own directory is: it may be a home or a shared
+/// directory whose mode is not PrismTTY's to change. A missing one is created
+/// private, with its parents made the way `mkdir -p` would. An existing one
+/// keeps its mode, and one other users can write to is refused, since they
+/// could plant `pids.d` or a `reload` marker in it.
+#[cfg(unix)]
+fn ensure_user_runtime_dir(dir: &Path) -> io::Result<()> {
+    let metadata = match fs::symlink_metadata(dir) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            if let Some(parent) = dir.parent() {
+                fs::create_dir_all(parent).map_err(|error| create_dir_error(parent, error))?;
+            }
+            return ensure_private_runtime_dir(dir);
+        }
+        Err(error) => return Err(error),
+    };
+    ensure_owned_dir(dir, &metadata)?;
+    if metadata.permissions().mode() & 0o022 != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "runtime directory is writable by other users: {} (set PRISMTTY_RUNTIME_DIR to a private directory)",
+                dir.display()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn ensure_owned_dir(dir: &Path, metadata: &fs::Metadata) -> io::Result<()> {
     if !metadata.file_type().is_dir() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -209,12 +266,14 @@ fn ensure_private_runtime_dir(dir: &Path) -> io::Result<()> {
             ),
         ));
     }
-
-    let mode = metadata.permissions().mode() & 0o777;
-    if mode != 0o700 {
-        fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
-    }
     Ok(())
+}
+
+fn create_dir_error(dir: &Path, error: io::Error) -> io::Error {
+    io::Error::new(
+        error.kind(),
+        format!("cannot create runtime directory {}: {error}", dir.display()),
+    )
 }
 
 #[cfg(unix)]
@@ -294,7 +353,8 @@ mod tests {
         let reload = runtime.join("reload");
 
         super::ensure_private_runtime_dir(&runtime).expect("runtime dir creates");
-        super::register_pid_file(&runtime, 123).expect("pid file registers");
+        super::register_pid_file(&runtime, super::DirOrigin::Default, 123)
+            .expect("pid file registers");
         super::write_private_file(&reload, b"now\n").expect("reload writes");
 
         assert_eq!(mode(&runtime), 0o700);
@@ -313,6 +373,57 @@ mod tests {
             .expect("mode set");
 
         super::ensure_private_runtime_dir(&runtime).expect("runtime dir tightens");
+
+        assert_eq!(mode(&runtime), 0o700);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn user_supplied_runtime_dir_keeps_its_mode() {
+        let temp = tempfile::tempdir().expect("tempdir creates");
+        let runtime = temp.path().join("home");
+        std::fs::create_dir(&runtime).expect("runtime dir creates");
+        std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o755))
+            .expect("mode set");
+
+        super::register_pid_file(&runtime, super::DirOrigin::Override, 123)
+            .expect("a directory only its owner can write to is accepted");
+
+        assert_eq!(mode(&runtime), 0o755);
+        assert_eq!(mode(&runtime.join(super::PID_DIR_NAME)), 0o700);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn user_supplied_shared_runtime_dir_is_refused_untouched() {
+        let temp = tempfile::tempdir().expect("tempdir creates");
+        let runtime = temp.path().join("shared");
+        std::fs::create_dir(&runtime).expect("runtime dir creates");
+        std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o1777))
+            .expect("mode set");
+
+        let error = super::request_reload_in_dir(&runtime, super::DirOrigin::Override, |_| true)
+            .expect_err("a directory others can write to is refused");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        let full_mode = std::fs::metadata(&runtime)
+            .expect("metadata reads")
+            .permissions()
+            .mode()
+            & 0o7777;
+        assert_eq!(full_mode, 0o1777);
+        assert!(!runtime.join("reload").exists());
+        assert!(!runtime.join(super::PID_DIR_NAME).exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn missing_user_supplied_runtime_dir_is_created_private() {
+        let temp = tempfile::tempdir().expect("tempdir creates");
+        let runtime = temp.path().join("parent").join("runtime");
+
+        super::register_pid_file(&runtime, super::DirOrigin::Override, 123)
+            .expect("pid file registers");
 
         assert_eq!(mode(&runtime), 0o700);
     }
@@ -366,7 +477,8 @@ mod tests {
         super::write_private_file(&runtime.join("pids"), b"999\n")
             .expect("legacy pids file writes");
 
-        let pid_file = super::register_pid_file(&runtime, 123).expect("pid file registers");
+        let pid_file = super::register_pid_file(&runtime, super::DirOrigin::Default, 123)
+            .expect("pid file registers");
 
         assert!(runtime.join("pids").is_file());
         assert_eq!(
@@ -382,11 +494,14 @@ mod tests {
     fn request_reload_prunes_dead_pid_files_without_rewriting_live_entries() {
         let temp = tempfile::tempdir().expect("tempdir creates");
         let runtime = temp.path().join("runtime");
-        super::register_pid_file(&runtime, 101).expect("live pid registers");
-        super::register_pid_file(&runtime, 202).expect("dead pid registers");
+        super::register_pid_file(&runtime, super::DirOrigin::Default, 101)
+            .expect("live pid registers");
+        super::register_pid_file(&runtime, super::DirOrigin::Default, 202)
+            .expect("dead pid registers");
 
-        let count = super::request_reload_in_dir(&runtime, |pid| pid == 101)
-            .expect("reload marker writes and pids prune");
+        let count =
+            super::request_reload_in_dir(&runtime, super::DirOrigin::Default, |pid| pid == 101)
+                .expect("reload marker writes and pids prune");
 
         assert_eq!(count, 1);
         assert!(runtime.join(super::PID_DIR_NAME).join("101").exists());

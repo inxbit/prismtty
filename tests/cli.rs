@@ -1306,3 +1306,69 @@ fn unusable_runtime_dir_only_disables_reload() {
         .stderr(predicate::str::contains("not a directory"));
     assert_eq!(fs::read(&squatted).expect("file reads"), b"");
 }
+
+#[cfg(unix)]
+fn mode(path: &std::path::Path) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+
+    fs::metadata(path)
+        .expect("metadata reads")
+        .permissions()
+        .mode()
+        & 0o7777
+}
+
+// PRISMTTY_RUNTIME_DIR names a directory the user already has, such as their
+// home or a shared one. Tightening is for PrismTTY's own directory only: an
+// existing override keeps its mode, and one others can write to is refused
+// rather than silently stripped of its sticky and world-write bits.
+#[cfg(unix)]
+#[test]
+fn runtime_dir_override_keeps_its_permissions() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let readable = temp.path().join("readable");
+    let shared = temp.path().join("shared");
+    fs::create_dir(&readable).expect("dir creates");
+    fs::create_dir(&shared).expect("dir creates");
+    fs::set_permissions(&readable, fs::Permissions::from_mode(0o755)).expect("mode sets");
+    fs::set_permissions(&shared, fs::Permissions::from_mode(0o1777)).expect("mode sets");
+
+    isolated("prismtty", temp.path())
+        .env("PRISMTTY_RUNTIME_DIR", &readable)
+        .write_stdin("192.0.2.44 down\n")
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("reload disabled").not());
+    isolated("prismtty", temp.path())
+        .env("PRISMTTY_RUNTIME_DIR", &readable)
+        .arg("--reload")
+        .assert()
+        .success();
+    assert_eq!(mode(&readable), 0o755);
+    assert_eq!(mode(&readable.join("pids.d")), 0o700);
+
+    isolated("prismtty", temp.path())
+        .env("PRISMTTY_RUNTIME_DIR", &shared)
+        .write_stdin("192.0.2.44 down\n")
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("writable by other users"));
+    isolated("prismtty", temp.path())
+        .env("PRISMTTY_RUNTIME_DIR", &shared)
+        .arg("--reload")
+        .assert()
+        .failure();
+    assert_eq!(mode(&shared), 0o1777);
+    assert!(!shared.join("pids.d").exists());
+    assert!(!shared.join("reload").exists());
+
+    let missing = temp.path().join("new").join("runtime");
+    isolated("prismtty", temp.path())
+        .env("PRISMTTY_RUNTIME_DIR", &missing)
+        .write_stdin("192.0.2.44 down\n")
+        .assert()
+        .success();
+    assert_eq!(mode(&missing), 0o700);
+}
