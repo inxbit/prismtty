@@ -744,6 +744,60 @@ fn noninteractive_termination_reaps_a_signal_immune_child_group() {
     wrapped_guard.disarm();
 }
 
+/// A signal the caller ignored (`nohup`, or `cmd &` in a non-interactive
+/// shell) stays ignored: the wrapper must not catch it and end the job.
+#[test]
+fn inherited_ignored_signals_do_not_terminate_the_wrapped_job() {
+    use std::os::unix::process::CommandExt;
+    use std::process::{Command, Stdio};
+
+    let marker_dir = tempfile::tempdir().expect("marker directory");
+    let pid_path = marker_dir.path().join("child.pid");
+    let done_path = marker_dir.path().join("done");
+    let mut wrapped_guard = PidGuard::from_marker(&pid_path);
+    let mut command = Command::new(env!("CARGO_BIN_EXE_ptty"));
+    command
+        .env("PRISMTTY_PID_MARKER", &pid_path)
+        .env("PRISMTTY_DONE_MARKER", &done_path)
+        .arg("sh")
+        .arg("-c")
+        .arg("echo $$ > \"$PRISMTTY_PID_MARKER\"; sleep 1; echo done > \"$PRISMTTY_DONE_MARKER\"")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    // SAFETY: signal is async-signal-safe and runs in the forked child before exec.
+    unsafe {
+        command.pre_exec(|| {
+            libc::signal(libc::SIGHUP, libc::SIG_IGN);
+            libc::signal(libc::SIGINT, libc::SIG_IGN);
+            Ok(())
+        });
+    }
+    let mut ptty = ProcessGuard::new(command.spawn().expect("spawn ptty"));
+    wrapped_guard.set(wait_for_pid_file(&pid_path, Duration::from_secs(10)));
+
+    for signal in [libc::SIGHUP, libc::SIGINT] {
+        // SAFETY: kill has no memory-safety preconditions; the target is a process this test
+        // spawned.
+        assert_eq!(unsafe { libc::kill(ptty.pid(), signal) }, 0);
+    }
+
+    let status = ptty
+        .wait_for_exit(Duration::from_secs(10))
+        .expect("wrapper exits when the job finishes");
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "an ignored signal ended the wrapped job"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&done_path).ok().as_deref(),
+        Some("done\n"),
+        "the wrapped job did not finish"
+    );
+    wrapped_guard.disarm();
+}
+
 fn assert_terminal_restored_after(signal: libc::c_int) {
     use nix::sys::termios::{LocalFlags, tcgetattr};
 

@@ -1286,6 +1286,11 @@ impl SessionSignalWatcher {
         RAW_MODE_SIGNAL_PIPE.arm(write_fd);
         let mut previous_signal_handlers = Vec::new();
         for signal in TERMINATING_SIGNALS.into_iter().chain(JOB_CONTROL_SIGNALS) {
+            if signal_is_ignored(signal) {
+                // Keep a disposition the caller chose (`nohup`, or `cmd &` in a
+                // non-interactive shell) instead of acting on the signal.
+                continue;
+            }
             match install_signal_handler(signal, restore_raw_mode_for_signal, libc::SA_RESTART) {
                 Ok(previous) => previous_signal_handlers.push((signal, previous)),
                 Err(error) => {
@@ -1607,6 +1612,17 @@ fn close_fd(fd: RawFd) {
             libc::close(fd);
         }
     }
+}
+
+/// True when `signal` is currently ignored, for example inherited as ignored
+/// from `nohup`.
+fn signal_is_ignored(signal: libc::c_int) -> bool {
+    // SAFETY: sigaction is a plain C struct; the sigaction call fills it before it is read.
+    let mut current = unsafe { mem::zeroed::<libc::sigaction>() };
+    // SAFETY: a null new-action pointer only queries the disposition; `current` is valid for the
+    // call.
+    let queried = unsafe { libc::sigaction(signal, std::ptr::null(), &mut current) } == 0;
+    queried && current.sa_sigaction == libc::SIG_IGN
 }
 
 fn install_signal_handler(
