@@ -2559,6 +2559,57 @@ fn cisco_interface_rule_requires_a_number() {
     }
 }
 
+// NX-OS full names, IOS-XE/XR short Gig names, mGig ports, 4-level IOS-XR
+// names and bundles are interfaces too; a `fae1` hextet in a MAC or IPv6
+// address is not.
+#[test]
+fn cisco_interface_rule_covers_nxos_and_xr_names() {
+    let store = ProfileStore::builtin();
+    let config = PrismConfig::from_profiles(&store, &["cisco"]).expect("cisco loads");
+    let h = Highlighter::from_config(config).expect("rules compile");
+
+    for name in [
+        "Ethernet1/1",
+        "HundredGigE1/0/49",
+        "TenGigE0/0/0/1",
+        "TwentyFiveGigE1/0/1",
+        "Twe1/0/1",
+        "TwoGigabitEthernet1/0/1",
+        "Tw1/0/1",
+        "FiveGigabitEthernet1/0/2",
+        "GigabitEthernet0/0/0/0",
+        "GigabitEthernet0/0/0/0.100",
+        "Bundle-Ether1",
+        "FortyGigE1/0/1",
+    ] {
+        let output = h.highlight_str(&format!("{name} is up\n"));
+        assert!(
+            output.contains(&format!("\x1b[38;2;0;153;255m{name}\x1b[0m")),
+            "{name} should highlight as an interface: {output:?}"
+        );
+    }
+
+    let prose = h.highlight_str("serial loopback Te done ethernet the1 fi gi tw five\n");
+    assert!(
+        !prose.contains("\x1b[38;2;0;153;255m"),
+        "prose wrongly highlighted as an interface: {prose:?}"
+    );
+
+    let hex = h.highlight_str("0011.fae1.3344 2001:db8:fae1::1\n");
+    assert!(
+        !hex.contains("\x1b[38;2;0;153;255mfae1"),
+        "MAC/IPv6 hextet wrongly highlighted as an interface: {hex:?}"
+    );
+
+    let existing = h.highlight_str("FastEthernet0/1 Fa0/1 Gi1/0/1 Po10\n");
+    for name in ["FastEthernet0/1", "Fa0/1", "Gi1/0/1", "Po10"] {
+        assert!(
+            existing.contains(&format!("\x1b[38;2;0;153;255m{name}\x1b[0m")),
+            "{name} should still highlight: {existing:?}"
+        );
+    }
+}
+
 // AUDIT L1: the Juniper interface rule must require a unit/number, so plain
 // words are not painted as interfaces.
 #[test]
