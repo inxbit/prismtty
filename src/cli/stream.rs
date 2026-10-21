@@ -290,6 +290,18 @@ pub(super) fn highlight_stream<R: Read, W: Write>(
         flush_before_wait(&mut session, writer, &trace, &input)?;
     }
 
+    // Output that ended mid-line has had no pass since, and no later read will
+    // bring the line end that triggers one. Make it now, so a signal on an
+    // unterminated last line still selects its profile and the tail held back
+    // until `finish` is drawn with it.
+    if auto_detect_pending && bytes_since_auto_detect > 0 {
+        let next_profile_names =
+            select_profile_names_with_store(options, session.profile_store(), &detection_sample)?;
+        if next_profile_names.as_slice() != session.profile_names() {
+            apply_automatic_profile_switch(&mut session, writer, &trace, None, next_profile_names);
+        }
+    }
+
     if !chunk_filter.carry.is_empty() {
         let trailing = if is_incomplete_utf8_prefix(&chunk_filter.carry) {
             std::mem::take(&mut chunk_filter.carry)

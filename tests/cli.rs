@@ -1042,6 +1042,18 @@ fn byte_paced_banner_line_selects_its_profile() {
     );
 }
 
+// The read that brings the signal can be the last one. No later read brings
+// the line end that would trigger a pass, so the end of input must.
+#[test]
+fn unterminated_last_line_selects_its_profile() {
+    let stderr = show_profile_for_paced_input(&[b"hello\n", b"Cisco IOS XE Software"]);
+
+    assert!(
+        stderr.contains("prismtty: profiles selected: generic, cisco"),
+        "{stderr:?}"
+    );
+}
+
 #[test]
 fn long_unterminated_line_still_selects_its_profile() {
     let padding = b"x ".repeat(2500);
