@@ -1524,6 +1524,16 @@ impl StreamingHighlighter {
             let line_end = segment_start + relative_line_end;
             let boundary_end = segment_start + relative_boundary_end;
             self.emit_interactive_line_segment(&bytes[segment_start..line_end], &mut output);
+            // At the bottom of the screen a line feed scrolls in a blank line
+            // drawn in the current rendition, so a style that shows on blank
+            // cells ends before the terminator. No highlight spans one.
+            if self
+                .interactive_overlay
+                .as_ref()
+                .is_some_and(style_paints_blank_cells)
+            {
+                self.reset_interactive_overlay(&mut output);
+            }
             output.extend_from_slice(&bytes[line_end..boundary_end]);
             segment_start = boundary_end;
         }
@@ -2891,6 +2901,12 @@ fn emit_highlighted(
     for token in tokens {
         match token {
             Token::Ansi(bytes) => {
+                if let Some(style) = active_style
+                    .as_ref()
+                    .filter(|style| fills_blank_cells_with(bytes, style))
+                {
+                    output.extend(style_reset_bytes(style, native_sgr, reset_mode));
+                }
                 native_sgr.apply_sequence(bytes);
                 output.extend_from_slice(bytes);
                 if let Some(style) = &active_style {
@@ -2942,6 +2958,12 @@ fn emit_interactive_highlighted(
     for token in tokens {
         match token {
             Token::Ansi(bytes) => {
+                if let Some(style) = active_style
+                    .as_ref()
+                    .filter(|style| fills_blank_cells_with(bytes, style))
+                {
+                    output.extend(style_reset_bytes(style, native_sgr, reset_mode));
+                }
                 native_sgr.apply_sequence(bytes);
                 output.extend_from_slice(bytes);
                 if let Some(style) = active_style {
@@ -2965,7 +2987,12 @@ fn emit_interactive_highlighted(
                             output.push(*byte);
                         }
                         None => {
-                            if active_style.is_some() && !is_interactive_spacing(*byte) {
+                            // A foreground-only overlay stays open across the
+                            // spacing between highlighted columns; a style
+                            // that shows on blank cells must not paint it.
+                            if active_style.as_ref().is_some_and(|style| {
+                                !is_interactive_spacing(*byte) || style_paints_blank_cells(style)
+                            }) {
                                 let style = active_style
                                     .take()
                                     .expect("active style checked as present");
@@ -3014,6 +3041,26 @@ impl SgrStartCache {
 
 fn is_interactive_spacing(byte: u8) -> bool {
     matches!(byte, b' ' | b'\t')
+}
+
+/// Reports whether a style shows on blank cells: a background, underline,
+/// inverse or strike is drawn on spaces and on the cells a terminal fills when
+/// it erases, inserts or scrolls, while a foreground color alone is not.
+fn style_paints_blank_cells(style: &Style) -> bool {
+    style.background.is_some() || style.underline || style.invert || style.strike
+}
+
+/// Reports whether `bytes` is a control that fills cells with blanks in the
+/// current rendition (CSI erase in display or line `J`/`K`, erase, insert or
+/// delete characters `X`/`@`/`P`, insert or delete lines `L`/`M`, scroll
+/// `S`/`T`) while `style`, if left active, would show on them.
+fn fills_blank_cells_with(bytes: &[u8], style: &Style) -> bool {
+    style_paints_blank_cells(style)
+        && is_csi_sequence(bytes)
+        && matches!(
+            bytes.last(),
+            Some(b'J' | b'K' | b'X' | b'@' | b'P' | b'L' | b'M' | b'S' | b'T')
+        )
 }
 
 fn style_for_reset_mode(style: Style, reset_mode: ResetMode) -> Style {
@@ -6277,6 +6324,91 @@ rules:
 
         assert!(output.contains("\x1b[4;38;2;0;255;0;48;2;0;0;255mup"));
         assert!(output.contains("\x1b[24;39;49m"));
+    }
+
+    fn background_rule_highlighter() -> Highlighter {
+        let config = PrismConfig::from_chromaterm_yaml(
+            "rules:\n  - description: bad status\n    regex: '\\berror\\b'\n    color: f#ffffff b#ff0000\n",
+        )
+        .expect("config parses");
+        Highlighter::from_config(config).expect("highlighter builds")
+    }
+
+    // A line terminator at the bottom of the screen scrolls in a blank line
+    // filled with the current background, so a background highlight must end
+    // before it, not at the first text of the next line.
+    #[test]
+    fn interactive_background_highlight_ends_before_the_line_terminator() {
+        for chunks in [
+            vec!["disk error\r\n    retrying\r\n"],
+            vec!["disk error", "\r\n    retrying\r\n"],
+        ] {
+            let mut streaming =
+                StreamingHighlighter::new_interactive(background_rule_highlighter());
+            streaming.set_no_minimal_resets(false);
+            let mut output = String::new();
+            for chunk in &chunks {
+                output.push_str(&streaming.push_str(chunk));
+            }
+            output.push_str(&String::from_utf8(streaming.finish()).expect("output is utf8"));
+
+            assert!(
+                output.contains("error\x1b[39;49m\r\n    retrying"),
+                "{chunks:?}: {output:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn interactive_background_highlight_does_not_cover_trailing_spaces() {
+        let config = PrismConfig::from_chromaterm_yaml(
+            r##"
+rules:
+  - description: rich state
+    regex: '\bup\b'
+    color: f#00ff00 b#0000ff bold underline
+"##,
+        )
+        .expect("config parses");
+        let highlighter = Highlighter::from_config(config).expect("highlighter builds");
+        let mut streaming = StreamingHighlighter::new_interactive(highlighter);
+        streaming.set_no_minimal_resets(false);
+
+        let output = String::from_utf8(streaming.push(b"up down\n")).expect("output is utf8");
+
+        assert!(output.contains("up\x1b[24;39;49m down"), "{output:?}");
+    }
+
+    // An erase fills cells with the current background; a highlight still
+    // active at a program's `ESC [ K` must not paint the rest of the line.
+    #[test]
+    fn background_highlight_is_reset_before_an_erase_sequence() {
+        let input = b"\x1b[01;31m\x1b[Kerror\x1b[m\x1b[K on sda\n";
+        for interactive in [false, true] {
+            let mut streaming = if interactive {
+                StreamingHighlighter::new_interactive(background_rule_highlighter())
+            } else {
+                StreamingHighlighter::new(background_rule_highlighter())
+            };
+            let mut output = streaming.push(input);
+            output.extend(streaming.finish());
+            let output = String::from_utf8(output).expect("output is utf8");
+
+            let erase = output
+                .match_indices("\x1b[K")
+                .nth(1)
+                .map(|(idx, _)| idx)
+                .expect("second erase is present");
+            let last_sgr = output[..erase]
+                .rsplit("\x1b[")
+                .next()
+                .expect("an SGR precedes the erase");
+            assert!(
+                last_sgr == "0m" || last_sgr.ends_with("49m"),
+                "interactive={interactive}: {output:?}"
+            );
+            assert_eq!(super::strip_ansi(output.as_bytes()), b"error on sda\n");
+        }
     }
 
     #[test]
