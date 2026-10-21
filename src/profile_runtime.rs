@@ -5,6 +5,9 @@ const INPUT_LINE_LIMIT: usize = 4096;
 const CLOSE_MARKER_WINDOW_LIMIT: usize = 256;
 const DETECTION_BYTE_INTERVAL: usize = 4096;
 const PROFILE_STACK_LIMIT: usize = 8;
+/// Lines typed after a remote command before its attempt expires: a user
+/// name, a password, a one-time code, and the Enter that redraws a prompt.
+const REMOTE_ATTEMPT_LINE_GRACE: u8 = 4;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ClosePolicy {
@@ -97,6 +100,7 @@ pub(crate) struct ProfileRuntime {
     unreliable_remote_attempt: Option<RemoteAttempt>,
     input_escape_state: InputEscapeState,
     pending_remote: Option<RemoteAttempt>,
+    pending_remote_lines: u8,
     baseline_locked: bool,
     pending_prompt_profiles: Option<Vec<String>>,
     pending_prompt_hits: usize,
@@ -118,6 +122,7 @@ impl ProfileRuntime {
             unreliable_remote_attempt: None,
             input_escape_state: InputEscapeState::None,
             pending_remote: None,
+            pending_remote_lines: 0,
             baseline_locked,
             pending_prompt_profiles: None,
             pending_prompt_hits: 0,
@@ -199,7 +204,9 @@ impl ProfileRuntime {
                     if self.input_line_reliable {
                         self.submit_input_line();
                     } else if let Some(attempt) = self.unreliable_remote_attempt.take() {
-                        self.arm_remote_attempt(Some(attempt));
+                        self.arm_remote_attempt(attempt);
+                    } else {
+                        self.age_pending_remote();
                     }
                     self.input_line.clear();
                     self.input_line_reliable = true;
@@ -493,20 +500,34 @@ impl ProfileRuntime {
     }
 
     fn submit_input_line(&mut self) {
-        let trimmed = self.input_line.trim_start();
-        self.arm_remote_attempt(remote_attempt(trimmed));
+        match remote_attempt(self.input_line.trim_start()) {
+            Some(attempt) => self.arm_remote_attempt(attempt),
+            None => self.age_pending_remote(),
+        }
     }
 
-    fn arm_remote_attempt(&mut self, attempt: Option<RemoteAttempt>) {
-        self.pending_remote = attempt;
-        if self.pending_remote.is_some() {
-            if let Some(frame) = self.stack.last_mut() {
-                frame.nested_attempt_seen = true;
-            }
-            self.baseline_locked = true;
-            self.clear_output_window();
-            self.clear_pending_prompt();
+    /// A login can take a few typed lines (user name, password, the Enter
+    /// that redraws a prompt-only device's prompt) before output resolves
+    /// the attempt, so ordinary lines expire it only after a grace period.
+    fn age_pending_remote(&mut self) {
+        if self.pending_remote.is_none() {
+            return;
         }
+        self.pending_remote_lines = self.pending_remote_lines.saturating_add(1);
+        if self.pending_remote_lines > REMOTE_ATTEMPT_LINE_GRACE {
+            self.pending_remote = None;
+        }
+    }
+
+    fn arm_remote_attempt(&mut self, attempt: RemoteAttempt) {
+        self.pending_remote = Some(attempt);
+        self.pending_remote_lines = 0;
+        if let Some(frame) = self.stack.last_mut() {
+            frame.nested_attempt_seen = true;
+        }
+        self.baseline_locked = true;
+        self.clear_output_window();
+        self.clear_pending_prompt();
     }
 
     fn should_detect_profiles(&self, text: &str) -> bool {
@@ -1547,6 +1568,85 @@ mod tests {
         assert_eq!(
             runtime.observe_output(b"CoreSW#\n", &store),
             Some(names(&["generic", "cisco"]))
+        );
+    }
+
+    // A prompt-only device prints its second prompt only after Enter, so
+    // that keystroke must not drop the typed remote hint.
+    #[test]
+    fn nested_prompt_only_device_survives_the_enter_that_redraws_its_prompt() {
+        let store = ProfileStore::builtin();
+        let mut runtime = ProfileRuntime::new(names(&["generic", "linux-unix"]));
+
+        runtime.observe_input(b"ssh mx1\r");
+        assert_eq!(
+            runtime.observe_output(b"--- JUNOS 21.4R3.15 Kernel 64-bit\r\nlab@mx1> ", &store),
+            Some(names(&["generic", "juniper"]))
+        );
+        runtime.accept_transition();
+        runtime.observe_input(b"ssh core-sw\r");
+        assert_eq!(runtime.observe_output(b"\r\ncore-sw#", &store), None);
+        runtime.observe_input(b"\r");
+        assert_eq!(
+            runtime.observe_output(b"\r\ncore-sw#", &store),
+            Some(names(&["generic", "cisco"]))
+        );
+        runtime.accept_transition();
+        assert_eq!(
+            runtime.observe_output(b"Connection to core-sw closed.\r\n", &store),
+            Some(names(&["generic", "juniper"]))
+        );
+    }
+
+    #[test]
+    fn password_line_keeps_the_ssh_close_target() {
+        let store = ProfileStore::builtin();
+        let mut runtime = ProfileRuntime::new(names(&["generic", "linux-unix"]));
+
+        runtime.observe_input(b"ssh mx1\r");
+        assert_eq!(
+            runtime.observe_output(b"lab@mx1's password: ", &store),
+            None
+        );
+        runtime.observe_input(b"hunter2\r");
+        assert_eq!(
+            runtime.observe_output(
+                b"\r\n--- JUNOS 21.4R3.15 Kernel 64-bit\r\nlab@mx1> ",
+                &store
+            ),
+            Some(names(&["generic", "juniper"]))
+        );
+        runtime.accept_transition();
+        assert_eq!(
+            runtime
+                .stack
+                .last()
+                .and_then(|frame| frame.target.as_deref()),
+            Some("mx1")
+        );
+
+        // An attempt that no output resolves expires after a few lines.
+        runtime.observe_input(b"ssh core-sw\r");
+        for line in [
+            &b"show clock\r"[..],
+            b"exit\r",
+            b"show version\r",
+            b"show route\r",
+        ] {
+            runtime.observe_input(line);
+            assert!(runtime.pending_remote.is_some());
+        }
+        runtime.observe_input(b"show arp\r");
+        assert_eq!(runtime.pending_remote, None, "a stale attempt must expire");
+
+        assert_eq!(
+            runtime.observe_output(b"Connection to core-sw closed.\r\nlab@mx1> ", &store),
+            None
+        );
+        assert_eq!(runtime.active_profiles(), names(&["generic", "juniper"]));
+        assert_eq!(
+            runtime.observe_output(b"exit\r\n\r\nConnection to mx1 closed.\r\n", &store),
+            Some(names(&["generic", "linux-unix"]))
         );
     }
 
