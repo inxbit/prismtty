@@ -836,8 +836,9 @@ fn remote_attempt(line: &str, openssh_client: bool) -> Option<RemoteAttempt> {
             break;
         }
     }
-    // A remote command without a forced tty, or a query or background
-    // invocation, never opens an interactive session to close again.
+    // A remote command without a forced tty, a session without a tty, or a
+    // query or background invocation never opens an interactive session
+    // to close again.
     if openssh_client && (no_session || (remote_command && !force_tty)) {
         return None;
     }
@@ -848,7 +849,7 @@ fn remote_option_opens_no_session(command: &str, option: &str) -> bool {
     match command {
         "ssh" => ssh_option_flags(option)
             .iter()
-            .any(|flag| matches!(flag, 'V' | 'G' | 'N' | 'f' | 'Q' | 'O')),
+            .any(|flag| matches!(flag, 'V' | 'G' | 'N' | 'f' | 'Q' | 'O' | 'T')),
         "screen" => matches!(
             option,
             "-ls" | "-list" | "-wipe" | "-v" | "-version" | "-Q" | "-X"
@@ -1480,6 +1481,7 @@ mod tests {
             "ssh -fN -L 8080:localhost:80 jump\r",
             "ssh -O check router-a\r",
             "ssh -Q cipher\r",
+            "ssh -T git@git.example.com\r",
             "screen -ls\r",
         ] {
             let mut runtime = ProfileRuntime::new(names(&["generic", "linux-unix"]));
