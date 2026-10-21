@@ -3652,6 +3652,7 @@ fn neutralize_oversized_incomplete_escape(bytes: &mut [u8]) -> bool {
     let mut changed = false;
     let mut idx = 0usize;
     let mut cancellation_root = None;
+    let mut chain_has_string_control = false;
     while idx < bytes.len() {
         let Some(start) = next_stateful_control_start(bytes, idx) else {
             break;
@@ -3666,10 +3667,30 @@ fn neutralize_oversized_incomplete_escape(bytes: &mut [u8]) -> bool {
                 idx = end.max(start + 1);
             }
             EscapeScan::Restart(restart) => {
+                if cancellation_root.is_none() {
+                    chain_has_string_control = false;
+                }
                 cancellation_root.get_or_insert(start);
+                chain_has_string_control |= StringControlKind::at(bytes, start).is_some();
                 idx = restart;
             }
-            EscapeScan::IncompleteWithinLimit => break,
+            EscapeScan::IncompleteWithinLimit => {
+                // The chain is carried from its root, so cap all of it, not
+                // just its last control. A string tail is left to the string
+                // filter, whose budget also counts from the root.
+                if let Some(root) = cancellation_root {
+                    let limit = if chain_has_string_control {
+                        MAX_INCOMPLETE_ESCAPE_BYTES
+                    } else {
+                        MAX_INCOMPLETE_NON_STRING_ESCAPE_BYTES
+                    };
+                    if StringControlKind::at(bytes, start).is_none() && bytes.len() - root > limit {
+                        neutralize_restart_chain(bytes, root, start);
+                        changed = true;
+                    }
+                }
+                break;
+            }
             EscapeScan::IncompleteOversized => {
                 if let Some(root) = cancellation_root {
                     neutralize_restart_chain(bytes, root, start);
@@ -4986,6 +5007,60 @@ rules:
         let mut streaming = StreamingHighlighter::new(highlighter);
         assert_eq!(streaming.push(b"abc\x1bN\n"), b"abc\x1bN\n");
         assert!(streaming.finish().is_empty());
+    }
+
+    // A run of cancelled controls is carried from its first control, so the
+    // carry cap must hold for the whole run, not just its incomplete tail.
+    #[test]
+    fn incomplete_cancellation_chain_is_capped_across_pushes() {
+        let highlighter =
+            Highlighter::from_config(PrismConfig::default()).expect("empty config compiles");
+
+        for unit in [b"\x1b".as_slice(), b"\x1b[".as_slice(), b"\x9b".as_slice()] {
+            let run = unit.repeat(16);
+            let mut streaming = StreamingHighlighter::new(highlighter.clone());
+            let mut output = Vec::new();
+            for _ in 0..256 {
+                output.extend(streaming.push(&run));
+                assert!(
+                    streaming.pending.len()
+                        <= super::MAX_INCOMPLETE_NON_STRING_ESCAPE_BYTES + run.len(),
+                    "pending grew to {} for {unit:02x?}",
+                    streaming.pending.len()
+                );
+            }
+            output.extend(streaming.finish());
+
+            assert_eq!(output.len(), 256 * run.len());
+            assert!(
+                !output.contains(&0x1b) && !output.contains(&0x9b),
+                "live control survived for {unit:02x?}"
+            );
+        }
+
+        // A run that holds an ESC-ended string gets the string budget.
+        let mut input = b"\x1b]0;".to_vec();
+        input.extend(std::iter::repeat_n(b't', 2000));
+        input.extend_from_slice(b"\x1b[");
+        let mut streaming = StreamingHighlighter::new(highlighter.clone());
+        let mut output = streaming.push(&input);
+        output.extend(streaming.push(b"31mtext\n"));
+        output.extend(streaming.finish());
+        input.extend_from_slice(b"31mtext\n");
+        assert_eq!(output, input);
+
+        let mut streaming = StreamingHighlighter::new(highlighter);
+        let mut output = streaming.push(b"\x1b]0;title");
+        for _ in 0..80 {
+            output.extend(streaming.push(&[0x1b; 256]));
+            assert!(
+                streaming.pending.len() <= super::MAX_INCOMPLETE_ESCAPE_BYTES + 256,
+                "pending grew to {} after a string",
+                streaming.pending.len()
+            );
+        }
+        output.extend(streaming.finish());
+        assert!(!output.contains(&0x1b), "live ESC survived after a string");
     }
 
     // AUDIT (1.0.8): an unterminated escape longer than the cap must be treated
