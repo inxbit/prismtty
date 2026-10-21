@@ -519,10 +519,15 @@ pub(super) fn run_command(options: Options, command: Vec<OsString>) -> Result<Ex
     let pty_system = native_pty_system();
     let pair = pty_system.openpty(current_pty_size())?;
     let interactive = io::stdin().is_terminal();
+    // Output on a terminal is watched live even when stdin is redirected
+    // (`ptty cmd </dev/null`), so it gets the interactive highlighter and the
+    // holdback flush, as stdin mode does when stdout is a terminal. Raw mode,
+    // stdin forwarding and dynamic profiles stay keyed to `interactive`.
+    let live_output = interactive || io::stdout().is_terminal();
     // Everything that can reject the invocation runs before the child exists,
     // so a typo in a flag or a broken config never runs part of the command,
     // and a reload warning prints before the terminal goes raw.
-    let prepared = prepare_session(&options, interactive)?;
+    let prepared = prepare_session(&options, live_output)?;
     let trace = IoTrace::open(options.trace_io.as_deref())?;
     let (_registration, reload_watcher) = register_for_reload();
 
@@ -573,7 +578,7 @@ pub(super) fn run_command(options: Options, command: Vec<OsString>) -> Result<Ex
     // read loop polls it (idle detection). Duping keeps that use independent of
     // the resize watcher (which owns the master itself), so a resize-thread exit
     // cannot close the descriptor out from under the read loop.
-    let pty_fd_owned = if interactive {
+    let pty_fd_owned = if live_output {
         Some(cleanup_child_on_err(
             dup_master_fd(&*pair.master),
             &mut child,
@@ -581,7 +586,11 @@ pub(super) fn run_command(options: Options, command: Vec<OsString>) -> Result<Ex
     } else {
         None
     };
-    let pty_fd = pty_fd_owned.as_ref().map(AsRawFd::as_raw_fd);
+    let idle_fd = pty_fd_owned.as_ref().map(AsRawFd::as_raw_fd);
+    // Without a terminal on stdin nothing reaches the child through prismtty,
+    // so there is no echo to wait for, and the highlight color must close
+    // before each wait as in stdin mode (see `flush_before_wait`).
+    let pty_fd = idle_fd.filter(|_| interactive);
 
     // Records bytes forwarded to the child so the highlight loop can recognise
     // their echo: it surfaces a buffered trailing token on idle only when the
@@ -627,9 +636,9 @@ pub(super) fn run_command(options: Options, command: Vec<OsString>) -> Result<Ex
         &mut stdout,
         prepared,
         InputSource {
-            interactive,
+            interactive: live_output,
             pty_fd,
-            idle_fd: pty_fd,
+            idle_fd,
             recent_input: Some(recent_input),
         },
         reload_watcher,

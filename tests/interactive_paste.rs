@@ -1127,6 +1127,27 @@ fn quiet_program_output_tail_is_visible_after_holdback() {
     );
 }
 
+/// The same hold for a wrapped command whose stdin is not a terminal
+/// (`ptty cmd </dev/null` run from a terminal): its output is still watched
+/// live, so the held tail must be drawn once the program goes quiet.
+#[test]
+fn quiet_program_output_tail_is_visible_after_holdback_with_stdin_redirected() {
+    let script = format!(
+        "exec '{}' -p cisco sh -c \"printf 'Building configuration...'; \
+         while [ ! -f \\\"\\$PRISMTTY_TEST_CONTINUE\\\" ]; do sleep 0.05; done; \
+         printf '\\\\r\\\\n[OK]\\\\r\\\\n'\" </dev/null",
+        env!("CARGO_BIN_EXE_ptty")
+    );
+    let visible = shown_while_program_output_is_quiet("sh", &["-c", &script], |screen| {
+        ends_with_visible(screen, "configuration...")
+    });
+
+    assert!(
+        ends_with_visible(&visible, "Building configuration..."),
+        "quiet output of a wrapped command with stdin redirected stayed hidden; saw: {visible:?}"
+    );
+}
+
 /// The same hold in pipe mode with stdout on a terminal, where no PTY master
 /// carries the output: `tail -f` of a log that stops mid-token.
 #[test]
