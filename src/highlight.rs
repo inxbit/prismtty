@@ -2860,6 +2860,7 @@ fn emit_highlighted(
     let mut output = Vec::new();
     let mut visible_pos = 0;
     let mut active_style: Option<Style> = None;
+    let mut starts = SgrStartCache::default();
 
     for token in tokens {
         match token {
@@ -2867,7 +2868,7 @@ fn emit_highlighted(
                 native_sgr.apply_sequence(bytes);
                 output.extend_from_slice(bytes);
                 if let Some(style) = &active_style {
-                    output.extend_from_slice(style.ansi_start_with_mode(color_mode).as_bytes());
+                    output.extend_from_slice(starts.start(style, color_mode));
                 }
             }
             Token::Text(bytes) => {
@@ -2882,9 +2883,7 @@ fn emit_highlighted(
                             output.extend(style_reset_bytes(style, native_sgr, reset_mode));
                         }
                         if let Some(style) = &wanted {
-                            output.extend_from_slice(
-                                style.ansi_start_with_mode(color_mode).as_bytes(),
-                            );
+                            output.extend_from_slice(starts.start(style, color_mode));
                         }
                         active_style = wanted;
                     }
@@ -2912,6 +2911,7 @@ fn emit_interactive_highlighted(
 ) -> Vec<u8> {
     let mut output = Vec::new();
     let mut visible_pos = 0;
+    let mut starts = SgrStartCache::default();
 
     for token in tokens {
         match token {
@@ -2919,7 +2919,7 @@ fn emit_interactive_highlighted(
                 native_sgr.apply_sequence(bytes);
                 output.extend_from_slice(bytes);
                 if let Some(style) = active_style {
-                    output.extend_from_slice(style.ansi_start_with_mode(color_mode).as_bytes());
+                    output.extend_from_slice(starts.start(style, color_mode));
                 }
             }
             Token::Text(bytes) => {
@@ -2933,9 +2933,7 @@ fn emit_interactive_highlighted(
                     match wanted {
                         Some(style) => {
                             if active_style.as_ref() != Some(&style) {
-                                output.extend_from_slice(
-                                    style.ansi_start_with_mode(color_mode).as_bytes(),
-                                );
+                                output.extend_from_slice(starts.start(&style, color_mode));
                                 *active_style = Some(style);
                             }
                             output.push(*byte);
@@ -2958,6 +2956,34 @@ fn emit_interactive_highlighted(
     }
 
     output
+}
+
+/// Rendered SGR start sequences of the styles one emit call has used. A
+/// style's start is emitted at every transition into it and again after every
+/// escape inside its span, so render each one once per call instead. Bounded:
+/// past the limit the last entry is replaced.
+#[derive(Default)]
+struct SgrStartCache {
+    entries: Vec<(Style, Vec<u8>)>,
+}
+
+impl SgrStartCache {
+    const MAX_ENTRIES: usize = 16;
+
+    fn start(&mut self, style: &Style, color_mode: ColorMode) -> &[u8] {
+        let index = match self.entries.iter().position(|(cached, _)| cached == style) {
+            Some(index) => index,
+            None => {
+                if self.entries.len() == Self::MAX_ENTRIES {
+                    self.entries.pop();
+                }
+                let start = style.ansi_start_with_mode(color_mode).into_bytes();
+                self.entries.push((style.clone(), start));
+                self.entries.len() - 1
+            }
+        };
+        &self.entries[index].1
+    }
 }
 
 fn is_interactive_spacing(byte: u8) -> bool {
@@ -6552,6 +6578,117 @@ rules:
             state.restore_after_interactive_style(&prism_style),
             b"\x1b[24;4:3m"
         );
+    }
+
+    // Pins the style starts emitted at transitions and re-emitted after an
+    // escape inside a highlight, in both emit paths and color modes.
+    #[test]
+    fn style_starts_are_emitted_at_transitions_and_after_escapes() {
+        let yaml = "rules:\n  - description: state\n    regex: '\\bup\\b'\n    color: f#00ff00\n  - description: wan\n    regex: '\\bwan\\b'\n    color: f#ff0000 b#0000ff underline\n";
+        let input = b"is \x1b[32mup\x1b[0m, is \x1b[32mup\x1b[0m, u\x1b[1mp w\x1b]0;t\x07an,up\n";
+        let render = |color_mode, interactive: bool| {
+            let config = PrismConfig::from_chromaterm_yaml(yaml).expect("config parses");
+            let highlighter = Highlighter::from_config_with_color_mode(config, color_mode)
+                .expect("rules compile");
+            let mut streaming = if interactive {
+                StreamingHighlighter::new_interactive(highlighter)
+            } else {
+                StreamingHighlighter::new(highlighter)
+            };
+            let mut output = streaming.push(input);
+            output.extend(streaming.finish());
+            String::from_utf8(output).expect("utf8")
+        };
+
+        assert_eq!(
+            render(crate::style::ColorMode::TrueColor, false),
+            concat!(
+                "is \x1b[32m\x1b[38;2;0;255;0mup\x1b[0m\x1b[38;2;0;255;0m\x1b[0m, ",
+                "is \x1b[32m\x1b[38;2;0;255;0mup\x1b[0m\x1b[38;2;0;255;0m\x1b[0m, ",
+                "\x1b[38;2;0;255;0mu\x1b[1m\x1b[38;2;0;255;0mp\x1b[0m\x1b[1m ",
+                "\x1b[4;38;2;255;0;0;48;2;0;0;255mw\x1b]0;t\x07\x1b[4;38;2;255;0;0;48;2;0;0;255man",
+                "\x1b[0m\x1b[1m,\x1b[38;2;0;255;0mup\x1b[0m\x1b[1m\n",
+            )
+        );
+        assert_eq!(
+            render(crate::style::ColorMode::Xterm256, false),
+            concat!(
+                "is \x1b[32m\x1b[38;5;46mup\x1b[0m\x1b[38;5;46m\x1b[0m, ",
+                "is \x1b[32m\x1b[38;5;46mup\x1b[0m\x1b[38;5;46m\x1b[0m, ",
+                "\x1b[38;5;46mu\x1b[1m\x1b[38;5;46mp\x1b[0m\x1b[1m ",
+                "\x1b[4;38;5;196;48;5;21mw\x1b]0;t\x07\x1b[4;38;5;196;48;5;21man",
+                "\x1b[0m\x1b[1m,\x1b[38;5;46mup\x1b[0m\x1b[1m\n",
+            )
+        );
+        assert_eq!(
+            render(crate::style::ColorMode::TrueColor, true),
+            concat!(
+                "is \x1b[32m\x1b[38;2;0;255;0mup\x1b[0m\x1b[38;2;0;255;0m\x1b[39m, ",
+                "is \x1b[32m\x1b[38;2;0;255;0mup\x1b[0m\x1b[38;2;0;255;0m\x1b[39m, ",
+                "\x1b[38;2;0;255;0mu\x1b[1m\x1b[38;2;0;255;0mp ",
+                "\x1b[4;38;2;255;0;0;48;2;0;0;255mw\x1b]0;t\x07\x1b[4;38;2;255;0;0;48;2;0;0;255man",
+                "\x1b[24;39;49m,\x1b[38;2;0;255;0mup\n\x1b[39m",
+            )
+        );
+        assert_eq!(
+            render(crate::style::ColorMode::Ansi16, true),
+            concat!(
+                "is \x1b[32m\x1b[92mup\x1b[0m\x1b[92m\x1b[39m, ",
+                "is \x1b[32m\x1b[92mup\x1b[0m\x1b[92m\x1b[39m, ",
+                "\x1b[92mu\x1b[1m\x1b[92mp ",
+                "\x1b[4;91;104mw\x1b]0;t\x07\x1b[4;91;104man",
+                "\x1b[24;39;49m,\x1b[92mup\n\x1b[39m",
+            )
+        );
+    }
+
+    #[test]
+    fn emit_paths_render_style_starts_through_the_cache() {
+        let source = include_str!("highlight.rs");
+        for name in ["fn emit_highlighted(", "fn emit_interactive_highlighted("] {
+            let function_source = source
+                .split(name)
+                .nth(1)
+                .expect("function exists")
+                .split("\n}\n")
+                .next()
+                .expect("function ends");
+
+            assert!(
+                !function_source.contains("ansi_start_with_mode"),
+                "{name} renders style starts outside SgrStartCache"
+            );
+        }
+    }
+
+    #[test]
+    fn sgr_start_cache_matches_direct_rendering_past_its_bound() {
+        let styles = (0..40u8)
+            .map(|step| crate::style::Style {
+                foreground: Some(crate::style::Rgb {
+                    r: step,
+                    g: 255 - step,
+                    b: 7,
+                }),
+                underline: step % 3 == 0,
+                ..crate::style::Style::default()
+            })
+            .collect::<Vec<_>>();
+        for color_mode in [
+            crate::style::ColorMode::TrueColor,
+            crate::style::ColorMode::Xterm256,
+        ] {
+            let mut cache = super::SgrStartCache::default();
+            // In order, strided (so evicted entries come back), and repeated.
+            for idx in (0..styles.len()).chain((0..styles.len()).map(|idx| (idx * 7) % 40)) {
+                for _ in 0..2 {
+                    assert_eq!(
+                        cache.start(&styles[idx], color_mode),
+                        styles[idx].ansi_start_with_mode(color_mode).as_bytes()
+                    );
+                }
+            }
+        }
     }
 
     #[test]
