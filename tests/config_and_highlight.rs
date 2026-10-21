@@ -309,6 +309,63 @@ rules:
 }
 
 #[test]
+fn stream_restores_program_sgr_left_by_terminal_resets_and_saves() {
+    let yaml = r##"
+rules:
+  - description: bad status
+    regex: (?i)\berror\b
+    color: f#ff0000 bold
+"##;
+
+    // The program's color once the controls ran, as xterm draws it: RIS and
+    // DECSTR reset it, DECSC and mode 1049 save it, DECRC and leaving mode
+    // 1049 restore it, each screen keeps its own saved copy, and modes 47 and
+    // 1047 switch screens without saving.
+    for (program, color) in [
+        ("\x1b[?1049h\x1b[33mx\x1b[?1049l", None),
+        ("\x1b[32m\x1b[?1049h\x1b[33mx\x1b[?1049l", Some("32")),
+        ("\x1b[33mx\x1bc", None),
+        ("\x1b[33mx\x1b[!p", None),
+        ("\x1b[32m\x1b7\x1b[33mx\x1b8", Some("32")),
+        ("\x1b[32m\x1b7\x1b[33mx\x1b[!p\x1b8", None),
+        ("\x1b[32m\x1b[?1049h\x1b[33m\x1b7x\x1b[?1049l", Some("32")),
+        ("\x1b[32m\x1b[?1047h\x1b[33mx\x1b[?1047l", Some("33")),
+    ] {
+        let config = PrismConfig::from_chromaterm_yaml(yaml).expect("chromaterm config loads");
+        let highlighter = Highlighter::from_config(config).expect("rules compile");
+        let full_restore = format!(
+            "error\x1b[0m{} tail",
+            color.map_or(String::new(), |code| format!("\x1b[{code}m"))
+        );
+        let minimal_restore = format!("error \x1b[{}mtail", color.unwrap_or("39"));
+
+        for (interactive, restore) in [(false, &full_restore), (true, &minimal_restore)] {
+            // In a read of its own, and in the read with the highlighted token.
+            for chunks in [
+                vec![program.to_string(), "disk error tail\n".to_string()],
+                vec![format!("{program}disk error tail\n")],
+            ] {
+                let mut streaming = if interactive {
+                    new_interactive_streaming(highlighter.clone())
+                } else {
+                    StreamingHighlighter::new(highlighter.clone())
+                };
+                let mut output = String::new();
+                for chunk in &chunks {
+                    output.push_str(&streaming.push_str(chunk));
+                }
+                output.push_str(&String::from_utf8(streaming.finish()).expect("valid utf8"));
+
+                assert!(
+                    output.contains(restore.as_str()),
+                    "{program:?} must leave {color:?} restored after the highlight: {output:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn preserves_composed_native_sgr_after_highlighted_prompt_time() {
     let yaml = r##"
 rules:

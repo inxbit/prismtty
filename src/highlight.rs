@@ -3143,15 +3143,110 @@ fn collect_styled_spans(visible: &[u8], styles: &[Option<Style>]) -> Vec<StyledS
     spans
 }
 
+/// The program's own rendition, tracked the way an xterm-compatible terminal
+/// keeps it: SGR changes it, RIS and DECSTR reset it, and DECSC saves it and
+/// DECRC restores it. Mode 1048 saves and restores like DECSC and DECRC, and
+/// mode 1049 saves before it switches to the alternate screen and restores
+/// after it switches back; modes 47 and 1047 switch screens without saving.
+/// CSI s and CSI u are left alone: CSI s saves only while left and right
+/// margin mode is off, which is not tracked.
 #[derive(Clone, Debug, Default)]
 struct NativeSgrState {
+    rendition: SgrRendition,
+    /// The copies saved on the normal and on the alternate screen, which a
+    /// terminal keeps apart.
+    saved: [SgrRendition; 2],
+    alternate_screen: bool,
+}
+
+impl NativeSgrState {
+    fn apply_sequence(&mut self, bytes: &[u8]) {
+        match bytes {
+            b"\x1bc" => *self = Self::default(),
+            b"\x1b7" => self.save(),
+            b"\x1b8" => self.restore(),
+            _ if is_soft_terminal_reset(bytes) => {
+                self.rendition = SgrRendition::default();
+                self.saved[usize::from(self.alternate_screen)] = SgrRendition::default();
+            }
+            _ => match private_mode_sequence(bytes) {
+                Some((modes, set)) => {
+                    for mode in modes.split(|byte| *byte == b';') {
+                        match (mode, set) {
+                            (b"1048", true) => self.save(),
+                            (b"1048", false) => self.restore(),
+                            (b"1049", true) => {
+                                self.save();
+                                self.alternate_screen = true;
+                            }
+                            (b"1049", false) => {
+                                self.alternate_screen = false;
+                                self.restore();
+                            }
+                            (b"47" | b"1047", _) => self.alternate_screen = set,
+                            _ => {}
+                        }
+                    }
+                }
+                None => self.rendition.apply_sequence(bytes),
+            },
+        }
+    }
+
+    fn save(&mut self) {
+        self.saved[usize::from(self.alternate_screen)] = self.rendition.clone();
+    }
+
+    fn restore(&mut self) {
+        self.rendition = self.saved[usize::from(self.alternate_screen)].clone();
+    }
+
+    fn ansi_start(&self) -> Option<String> {
+        self.rendition.ansi_start()
+    }
+
+    fn restore_after_interactive_style(&self, style: &Style) -> Vec<u8> {
+        self.rendition.restore_after_interactive_style(style)
+    }
+}
+
+/// Reports whether `bytes` is DECSTR (`CSI ! p`), which xterm runs whatever
+/// parameters come before the `!`.
+fn is_soft_terminal_reset(bytes: &[u8]) -> bool {
+    csi_introducer_len(bytes).is_some_and(|introducer| {
+        bytes[introducer..]
+            .strip_suffix(b"!p")
+            .is_some_and(|parameters| {
+                parameters
+                    .iter()
+                    .all(|byte| byte.is_ascii_digit() || *byte == b';')
+            })
+    })
+}
+
+/// The modes of a DEC private mode set (`CSI ? Pm h`) or reset (`CSI ? Pm l`)
+/// and whether it sets them.
+fn private_mode_sequence(bytes: &[u8]) -> Option<(&[u8], bool)> {
+    let introducer = csi_introducer_len(bytes)?;
+    let (final_byte, body) = bytes[introducer..].split_last()?;
+    let set = match final_byte {
+        b'h' => true,
+        b'l' => false,
+        _ => return None,
+    };
+    Some((body.strip_prefix(b"?")?, set))
+}
+
+/// The colors and attributes that SGR sequences have set.
+#[derive(Clone, Debug, Default)]
+struct SgrRendition {
     foreground: Option<String>,
     background: Option<String>,
     underline_color: Option<String>,
     attributes: BTreeMap<u16, String>,
 }
 
-impl NativeSgrState {
+impl SgrRendition {
     fn apply_sequence(&mut self, bytes: &[u8]) {
         let Some(body_start) = csi_introducer_len(bytes) else {
             return;
@@ -6817,6 +6912,76 @@ rules:
             state.restore_after_interactive_style(&prism_style),
             b"\x1b[24;4:3m"
         );
+    }
+
+    // What xterm draws after each control sequence: RIS and DECSTR reset the
+    // rendition, DECSTR also the copy saved for the current screen, DECSC and
+    // setting mode 1048 or 1049 save it and DECRC and resetting them restore
+    // it, any number of times. The normal and the alternate screen keep
+    // separate saved copies, and leaving mode 1049 restores the normal one.
+    #[test]
+    fn native_state_follows_terminal_resets_saves_and_restores() {
+        for (input, expected) in [
+            (b"\x1b[33m\x1bc".as_slice(), None),
+            (b"\x1b[33m\x1b[!p", None),
+            (b"\x1b[33m\x1b[1!p", None),
+            (b"\x1b[33m\x9b!p", None),
+            (b"\x1b[33m\x1b7\x1b[31m\x1b8", Some("\x1b[33m")),
+            (b"\x1b[33m\x1b7\x1b[31m\x1b8\x1b[32m\x1b8", Some("\x1b[33m")),
+            (b"\x1b[33m\x1b8", None),
+            (b"\x1b[33m\x1b7\x1b[31m\x1b[!p\x1b8", None),
+            (b"\x1b[33m\x1b7\x1b[31m\x1bc\x1b8", None),
+            (b"\x1b[33m\x1b7\x1b[31m\x1b 8", Some("\x1b[31m")),
+            // SGR 0 resets the rendition but not the saved copy.
+            (b"\x1b[33m\x1b7\x1b[0m\x1b8", Some("\x1b[33m")),
+            (b"\x1b[?1049h\x1b[33m\x1b[?1049l", None),
+            (b"\x1b[33m\x1b[?1049h\x1b[31m\x1b[?1049l", Some("\x1b[33m")),
+            (
+                b"\x1b[33m\xc2\x9b?1049h\x1b[31m\x9b?1049l",
+                Some("\x1b[33m"),
+            ),
+            (
+                b"\x1b[33m\x1b[?25;1049h\x1b[31m\x1b[?1049;25l",
+                Some("\x1b[33m"),
+            ),
+            (b"\x1b[33m\x1b7\x1b[31m\x1b[?1049l", Some("\x1b[33m")),
+            (b"\x1b[33m\x1b[?1048h\x1b[31m\x1b[?1048l", Some("\x1b[33m")),
+            (b"\x1b[33m\x1b[?1047h\x1b[31m\x1b[?1047l", Some("\x1b[31m")),
+            (b"\x1b[33m\x1b[?47h\x1b[31m\x1b[?47l", Some("\x1b[31m")),
+            (
+                b"\x1b[33m\x1b[?1049h\x1b[32m\x1b7\x1b[31m\x1b[?1049l",
+                Some("\x1b[33m"),
+            ),
+            (
+                b"\x1b[33m\x1b7\x1b[?1049h\x1b[32m\x1b7\x1b[34m\x1b8",
+                Some("\x1b[32m"),
+            ),
+            (
+                b"\x1b[35m\x1b7\x1b[?1047h\x1b[32m\x1b7\x1b[?1047l\x1b8",
+                Some("\x1b[35m"),
+            ),
+            (
+                b"\x1b[35m\x1b7\x1b[31m\x1b[?1049h\x1b[?1049l\x1b[33m\x1b8",
+                Some("\x1b[31m"),
+            ),
+            (
+                b"\x1b[33m\x1b[?1049h\x1b[31m\x1b[!p\x1b[?1049l",
+                Some("\x1b[33m"),
+            ),
+            (b"\x1b[33m\x1b[?1049h\x1b[32m\x1b7\x1b[!p\x1b8", None),
+        ] {
+            let mut state = NativeSgrState::default();
+            for token in super::tokenize_ansi(input) {
+                if let super::Token::Ansi(sequence) = token {
+                    state.apply_sequence(&sequence);
+                }
+            }
+            assert_eq!(
+                state.ansi_start().as_deref(),
+                expected,
+                "after {input:02x?}"
+            );
+        }
     }
 
     // Pins the style starts emitted at transitions and re-emitted after an
