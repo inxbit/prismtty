@@ -41,6 +41,11 @@ impl RuntimeRegistration {
         let (dir, origin) = runtime_dir();
         let pid = std::process::id();
         let path = register_pid_file(&dir, origin, pid)?;
+        // A session ended by a signal never runs Drop, so its file outlives
+        // it. Clear those here to keep pids.d bounded by the live sessions.
+        if let Some(pid_dir) = path.parent() {
+            let _ = prune_pid_dir(pid_dir, process_is_alive);
+        }
         Ok(Self { path })
     }
 }
@@ -78,7 +83,7 @@ pub(super) fn request_reload() -> io::Result<usize> {
     request_reload_in_dir(&dir, origin, process_is_alive)
 }
 
-fn request_reload_in_dir<F>(dir: &Path, origin: DirOrigin, mut is_alive: F) -> io::Result<usize>
+fn request_reload_in_dir<F>(dir: &Path, origin: DirOrigin, is_alive: F) -> io::Result<usize>
 where
     F: FnMut(u32) -> bool,
 {
@@ -89,6 +94,15 @@ where
     )?;
 
     let pid_dir = ensure_private_pid_dir(dir)?;
+    prune_pid_dir(&pid_dir, is_alive)
+}
+
+/// Removes the pid files of sessions that are gone, and anything else that is
+/// not a pid file, and returns how many live sessions remain.
+fn prune_pid_dir<F>(pid_dir: &Path, mut is_alive: F) -> io::Result<usize>
+where
+    F: FnMut(u32) -> bool,
+{
     let mut count = 0usize;
     for entry in fs::read_dir(pid_dir)? {
         let entry = entry?;

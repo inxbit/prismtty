@@ -1372,3 +1372,33 @@ fn runtime_dir_override_keeps_its_permissions() {
         .success();
     assert_eq!(mode(&missing), 0o700);
 }
+
+// A session ended by a signal never removes its pid file. Registration prunes
+// the leftovers, so pids.d stays bounded by the sessions still alive instead
+// of growing until someone runs --reload.
+#[cfg(unix)]
+#[test]
+fn registration_prunes_pid_files_of_dead_sessions() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let pid_dir = temp.path().join("runtime").join("pids.d");
+    fs::create_dir_all(&pid_dir).expect("pids.d creates");
+    for dir in [temp.path().join("runtime"), pid_dir.clone()] {
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).expect("mode sets");
+    }
+    // Above any pid_max, so no live process can have this id.
+    fs::write(pid_dir.join("999999999"), "").expect("stale pid file writes");
+    fs::write(pid_dir.join("not-a-pid"), "").expect("stray file writes");
+
+    isolated("prismtty", temp.path())
+        .write_stdin("192.0.2.44 down\n")
+        .assert()
+        .success();
+
+    let left: Vec<_> = fs::read_dir(&pid_dir)
+        .expect("pids.d reads")
+        .map(|entry| entry.expect("entry reads").file_name())
+        .collect();
+    assert!(left.is_empty(), "stale pid files survived: {left:?}");
+}
