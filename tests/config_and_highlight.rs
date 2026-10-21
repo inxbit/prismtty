@@ -524,6 +524,34 @@ fn detects_arista_from_ceos_banner_and_highlights_eos_interfaces() {
     assert!(output.contains("\x1b[38;2;0;153;255mVlan1191"));
 }
 
+// Modular and breakout ports have three levels (slot/port/lane); the whole
+// name is one interface.
+#[test]
+fn arista_interface_rule_covers_three_level_names() {
+    let store = ProfileStore::builtin();
+    let config = PrismConfig::from_profiles(&store, &["arista"]).expect("arista loads");
+    let highlighter = Highlighter::from_config(config).expect("rules compile");
+    let output = highlighter.highlight_str(
+        "Ethernet3/1/1 is up\nEt3/1/1  connected\nEthernet3/1/1.100\nEthernet49/1\n",
+    );
+
+    for name in [
+        "Ethernet3/1/1",
+        "Et3/1/1",
+        "Ethernet3/1/1.100",
+        "Ethernet49/1",
+    ] {
+        assert!(
+            output.contains(&format!("\x1b[38;2;0;153;255m{name}\x1b[0m")),
+            "{name} should highlight as one interface: {output:?}"
+        );
+    }
+    assert!(
+        !output.contains("Ethernet3/1\x1b[0m/1"),
+        "three-level name split: {output:?}"
+    );
+}
+
 #[test]
 fn cisco_nexus_interface_status_highlights_operational_reason_codes() {
     let store = ProfileStore::builtin();

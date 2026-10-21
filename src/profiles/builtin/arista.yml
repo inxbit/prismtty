@@ -18,7 +18,7 @@ profile:
     runtime_prompt: arista_host_marker
 rules:
   - description: Arista interface
-    regex: '(?i)\b(Ethernet|Et|Management|Ma|Port-Channel|Po|Vlan|Loopback|Lo)\d+(/\d+)?(\.\d+)?\b'
+    regex: '(?i)\b(Ethernet|Et|Management|Ma|Port-Channel|Po|Vlan|Loopback|Lo)\d+(/\d+){0,2}(\.\d+)?\b'
     color: f#0099ff
   - description: MLAG
     regex: '(?i)\b(mlag|peer-link|peer-address|reload-delay)\b'
