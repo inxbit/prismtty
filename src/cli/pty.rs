@@ -919,9 +919,10 @@ fn dup_master_fd(master: &dyn portable_pty::MasterPty) -> io::Result<OwnedFd> {
             "PTY master file descriptor is unavailable",
         )
     })?;
-    // SAFETY: `fd` is the live PTY master descriptor. `dup` returns a fresh
-    // descriptor that `OwnedFd` takes sole ownership of and closes on drop.
-    let duped = unsafe { libc::dup(fd) };
+    // SAFETY: `fd` is the live PTY master descriptor. F_DUPFD_CLOEXEC returns a
+    // fresh close-on-exec descriptor that `OwnedFd` takes sole ownership of and
+    // closes on drop.
+    let duped = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
     if duped < 0 {
         return Err(io::Error::last_os_error());
     }
@@ -1718,11 +1719,37 @@ fn sync_pty_size(
     outer_size
 }
 
+/// Creates a close-on-exec pipe. The signal self-pipe exists before the
+/// wrapped command is spawned, and portable-pty's /dev/fd scan, the only other
+/// thing that keeps it out of the child, does nothing when /proc is missing.
+/// macOS has no pipe2, so the flag is set afterwards; the only fork is the
+/// spawn on this same thread, so no child can inherit the ends in between.
 fn pipe_fds() -> io::Result<(RawFd, RawFd)> {
     let mut fds = [0; 2];
     // SAFETY: `fds` is a valid array of two c_int that pipe fills on success.
-    if unsafe { libc::pipe(fds.as_mut_ptr()) } == 0 {
-        Ok((fds[0], fds[1]))
+    if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    for fd in fds {
+        if let Err(error) = set_fd_cloexec(fd) {
+            close_fd(fds[0]);
+            close_fd(fds[1]);
+            return Err(error);
+        }
+    }
+    Ok((fds[0], fds[1]))
+}
+
+fn set_fd_cloexec(fd: RawFd) -> io::Result<()> {
+    // SAFETY: F_GETFD takes no pointer argument; an invalid `fd` reports EBADF instead of touching
+    // memory.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    if flags < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: F_SETFD takes an integer flags argument.
+    if unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) } == 0 {
+        Ok(())
     } else {
         Err(io::Error::last_os_error())
     }
@@ -2739,6 +2766,43 @@ mod tests {
         );
         assert!(started.elapsed() >= Duration::from_millis(50));
         assert_eq!(slot.write_fd.load(Ordering::SeqCst), -1);
+    }
+
+    fn fd_is_close_on_exec(fd: RawFd) -> bool {
+        // SAFETY: F_GETFD takes no pointer argument; an invalid `fd` reports EBADF.
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        assert!(
+            flags >= 0,
+            "fcntl(F_GETFD) on {fd}: {}",
+            std::io::Error::last_os_error()
+        );
+        flags & libc::FD_CLOEXEC != 0
+    }
+
+    // The signal self-pipe exists before the wrapped command is spawned, and
+    // portable-pty's /dev/fd scan, the only other thing that keeps it out of
+    // the child, does nothing when /proc is not mounted.
+    #[test]
+    fn self_pipe_ends_are_close_on_exec() {
+        let (read_fd, write_fd) = super::pipe_fds().expect("pipe");
+        let read_cloexec = fd_is_close_on_exec(read_fd);
+        let write_cloexec = fd_is_close_on_exec(write_fd);
+        super::close_fd(read_fd);
+        super::close_fd(write_fd);
+        assert!(read_cloexec, "self-pipe read end lacks FD_CLOEXEC");
+        assert!(write_cloexec, "self-pipe write end lacks FD_CLOEXEC");
+    }
+
+    #[test]
+    fn master_dup_is_close_on_exec() {
+        let pair = portable_pty::native_pty_system()
+            .openpty(portable_pty::PtySize::default())
+            .expect("openpty");
+        let duped = super::dup_master_fd(&*pair.master).expect("dup master");
+        assert!(
+            fd_is_close_on_exec(std::os::fd::AsRawFd::as_raw_fd(&duped)),
+            "PTY master dup lacks FD_CLOEXEC"
+        );
     }
 
     #[test]
