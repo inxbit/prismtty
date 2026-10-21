@@ -366,6 +366,64 @@ rules:
 }
 
 #[test]
+fn stream_ends_highlight_before_the_terminal_saves_the_rendition() {
+    let yaml = r##"
+rules:
+  - description: bad status
+    regex: (?i)\berror\b
+    color: f#ff0000
+"##;
+    let config = PrismConfig::from_chromaterm_yaml(yaml).expect("chromaterm config loads");
+    let highlighter = Highlighter::from_config(config).expect("rules compile");
+
+    // A save made while the highlight is drawn would bring the highlight
+    // color back with the restore, onto text the rule never matched.
+    for (interactive, chunks, saved) in [
+        (
+            false,
+            &["disk error\x1b7 tail\x1b8 more\n"][..],
+            "error\x1b[0m\x1b7",
+        ),
+        (
+            false,
+            &["disk error\x1b[?1048h tail\n"][..],
+            "error\x1b[0m\x1b[?1048h",
+        ),
+        (
+            true,
+            &["disk error\x1b7 tail\x1b8 more\n"][..],
+            "error\x1b[39m\x1b7",
+        ),
+        (
+            true,
+            &["disk error \x1b7tail\x1b8 more\n"][..],
+            "error \x1b[39m\x1b7",
+        ),
+        (
+            true,
+            &["disk error ", "\x1b[?1049hx\x1b[?1049l more\n"][..],
+            "error \x1b[39m\x1b[?1049h",
+        ),
+    ] {
+        let mut streaming = if interactive {
+            new_interactive_streaming(highlighter.clone())
+        } else {
+            StreamingHighlighter::new(highlighter.clone())
+        };
+        let mut output = String::new();
+        for chunk in chunks {
+            output.push_str(&streaming.push_str(chunk));
+        }
+        output.push_str(&String::from_utf8(streaming.finish()).expect("valid utf8"));
+
+        assert!(
+            output.contains(saved),
+            "the highlight must end before {chunks:?} saves the rendition: {output:?}"
+        );
+    }
+}
+
+#[test]
 fn preserves_composed_native_sgr_after_highlighted_prompt_time() {
     let yaml = r##"
 rules:

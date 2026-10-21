@@ -1579,6 +1579,9 @@ impl StreamingHighlighter {
             match &token {
                 Token::Ansi(bytes) if is_alternate_screen_enable(bytes) => {
                     self.flush_highlightable(&mut highlightable, &mut output);
+                    if saves_rendition(bytes) {
+                        self.reset_interactive_overlay(&mut output);
+                    }
                     self.native_sgr.apply_sequence(bytes);
                     self.alternate_screen = true;
                     self.prompt_echo_passthrough = false;
@@ -2904,7 +2907,7 @@ fn emit_highlighted(
             Token::Ansi(bytes) => {
                 if let Some(style) = active_style
                     .as_ref()
-                    .filter(|style| fills_blank_cells_with(bytes, style))
+                    .filter(|style| saves_rendition(bytes) || fills_blank_cells_with(bytes, style))
                 {
                     output.extend(style_reset_bytes(style, native_sgr, reset_mode));
                 }
@@ -2961,7 +2964,7 @@ fn emit_interactive_highlighted(
             Token::Ansi(bytes) => {
                 if let Some(style) = active_style
                     .as_ref()
-                    .filter(|style| fills_blank_cells_with(bytes, style))
+                    .filter(|style| saves_rendition(bytes) || fills_blank_cells_with(bytes, style))
                 {
                     output.extend(style_reset_bytes(style, native_sgr, reset_mode));
                 }
@@ -3064,6 +3067,18 @@ fn fills_blank_cells_with(bytes: &[u8], style: &Style) -> bool {
                     bytes.last(),
                     Some(b'J' | b'K' | b'X' | b'@' | b'P' | b'L' | b'M' | b'S' | b'T')
                 )))
+}
+
+/// Reports whether `bytes` makes the terminal save the current rendition:
+/// DECSC, or setting mode 1048 or 1049. A highlight left active there would be
+/// saved with it and come back with the restore, on text it never matched.
+fn saves_rendition(bytes: &[u8]) -> bool {
+    bytes == b"\x1b7"
+        || private_mode_sequence(bytes).is_some_and(|(modes, set)| {
+            set && modes
+                .split(|byte| *byte == b';')
+                .any(|mode| matches!(mode, b"1048" | b"1049"))
+        })
 }
 
 /// Reports whether `bytes` is index (`ESC D`), next line (`ESC E`) or reverse
@@ -6981,6 +6996,174 @@ rules:
                 expected,
                 "after {input:02x?}"
             );
+        }
+    }
+
+    /// The foreground xterm draws each visible byte of `bytes` in, modeled
+    /// apart from `NativeSgrState`: SGR sets it, RIS and DECSTR reset it, and
+    /// DECSC and modes 1048 and 1049 save it and DECRC and those modes restore
+    /// it, with a saved copy per screen.
+    fn drawn_foregrounds(bytes: &[u8]) -> Vec<(u8, Option<String>)> {
+        let mut foreground: Option<String> = None;
+        let mut saved: [Option<String>; 2] = [None, None];
+        let mut screen = 0;
+        let mut drawn = Vec::new();
+        for token in super::tokenize_ansi(bytes) {
+            let control = match token {
+                super::Token::Text(text) => {
+                    drawn.extend(text.iter().map(|byte| (*byte, foreground.clone())));
+                    continue;
+                }
+                super::Token::Ansi(control) => control,
+            };
+            match control.as_slice() {
+                b"\x1bc" => {
+                    foreground = None;
+                    saved = [None, None];
+                    screen = 0;
+                }
+                b"\x1b[!p" => {
+                    foreground = None;
+                    saved[screen] = None;
+                }
+                b"\x1b7" | b"\x1b[?1048h" => saved[screen] = foreground.clone(),
+                b"\x1b8" | b"\x1b[?1048l" => foreground = saved[screen].clone(),
+                b"\x1b[?1049h" => {
+                    saved[screen] = foreground.clone();
+                    screen = 1;
+                }
+                b"\x1b[?1049l" => {
+                    screen = 0;
+                    foreground = saved[0].clone();
+                }
+                b"\x1b[?47h" | b"\x1b[?1047h" => screen = 1,
+                b"\x1b[?47l" | b"\x1b[?1047l" => screen = 0,
+                sgr if sgr.starts_with(b"\x1b[") && sgr.ends_with(b"m") => {
+                    let parameters =
+                        std::str::from_utf8(&sgr[2..sgr.len() - 1]).expect("test SGR is ASCII");
+                    let codes = parameters.split(';').collect::<Vec<_>>();
+                    let mut idx = 0;
+                    while idx < codes.len() {
+                        match codes[idx] {
+                            "" | "0" | "39" => foreground = None,
+                            "38" => {
+                                let len = if codes[idx + 1] == "5" { 3 } else { 5 };
+                                foreground = Some(codes[idx..idx + len].join(";"));
+                                idx += len - 1;
+                            }
+                            code if code.len() == 2 && code.starts_with('3') => {
+                                foreground = Some(code.to_string());
+                            }
+                            _ => {}
+                        }
+                        idx += 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+        drawn
+    }
+
+    // However reads split the output, highlighting must leave every byte it
+    // does not highlight in the color the program drew it in, through the
+    // terminal's resets, saves and restores of that color.
+    #[test]
+    fn highlighting_keeps_program_colors_through_terminal_resets_and_saves() {
+        const FRAGMENTS: &[&[u8]] = &[
+            b"\x1b[31m",
+            b"\x1b[32m",
+            b"\x1b[33m",
+            b"\x1b[39m",
+            b"\x1b[0m",
+            b"\x1b[1m",
+            b"\x1b7",
+            b"\x1b8",
+            b"\x1bc",
+            b"\x1b[!p",
+            b"\x1b[?1048h",
+            b"\x1b[?1048l",
+            b"\x1b[?1049h",
+            b"\x1b[?1049l",
+            b"\x1b[?1047h",
+            b"\x1b[?1047l",
+            b"\x1b[?47h",
+            b"\x1b[?47l",
+            b"error",
+            b" ",
+            b"x",
+            b"\n",
+        ];
+        let config = PrismConfig::from_chromaterm_yaml(
+            "rules:\n  - description: bad status\n    regex: '\\berror\\b'\n    color: f#ff0000\n",
+        )
+        .expect("config parses");
+        let highlighter = Highlighter::from_config(config).expect("rule compiles");
+
+        let mut seed = 0x5eed_c010_4ba5_e5e1_u64;
+        let mut below = |bound: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % bound as u64) as usize
+        };
+        for _ in 0..1000 {
+            let mut input = Vec::new();
+            for _ in 0..1 + below(40) {
+                input.extend_from_slice(FRAGMENTS[below(FRAGMENTS.len())]);
+            }
+            let program = drawn_foregrounds(&input);
+            let visible = program.iter().map(|(byte, _)| *byte).collect::<Vec<_>>();
+            let mut highlightable = vec![false; visible.len()];
+            for (start, _) in visible
+                .windows(b"error".len())
+                .enumerate()
+                .filter(|(_, window)| *window == b"error")
+            {
+                highlightable[start..start + b"error".len()].fill(true);
+            }
+
+            let mut random = Vec::new();
+            let mut start = 0;
+            while start < input.len() {
+                let end = input.len().min(start + 1 + below(16));
+                random.push(&input[start..end]);
+                start = end;
+            }
+            for chunks in [vec![input.as_slice()], random, input.chunks(1).collect()] {
+                for interactive in [false, true] {
+                    let mut streaming = if interactive {
+                        StreamingHighlighter::new_interactive(highlighter.clone())
+                    } else {
+                        StreamingHighlighter::new(highlighter.clone())
+                    };
+                    let mut output = Vec::new();
+                    for chunk in &chunks {
+                        output.extend(streaming.push(chunk));
+                    }
+                    output.extend(streaming.finish());
+
+                    let drawn = drawn_foregrounds(&output);
+                    assert_eq!(
+                        drawn.iter().map(|(byte, _)| *byte).collect::<Vec<_>>(),
+                        visible,
+                        "visible text changed for {input:02x?}"
+                    );
+                    for (idx, ((byte, color), (_, program_color))) in
+                        drawn.iter().zip(&program).enumerate()
+                    {
+                        if highlightable[idx] || matches!(byte, b' ' | b'\n') {
+                            continue;
+                        }
+                        assert_eq!(
+                            color,
+                            program_color,
+                            "byte {idx} of {input:02x?} in {} reads (interactive: {interactive}): {output:02x?}",
+                            chunks.len()
+                        );
+                    }
+                }
+            }
         }
     }
 
