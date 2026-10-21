@@ -357,7 +357,7 @@ impl ProfileRuntime {
         let active_profile = store.active_specific_profile(&self.active_profiles);
         let at_local_baseline = self.at_local_baseline(store);
         if let Some(profile) =
-            store.strong_transition_profile(&detected, &self.output_window, active_profile)
+            store.strong_transition_profile(&detected, &self.output_window_lower, active_profile)
         {
             let remote_attempt = self.pending_remote.take();
             self.clear_output_window();
