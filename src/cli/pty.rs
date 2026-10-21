@@ -624,6 +624,7 @@ pub(super) fn run_command(options: Options, command: Vec<OsString>) -> Result<Ex
         InputSource {
             interactive,
             pty_fd,
+            idle_fd: pty_fd,
             recent_input: Some(recent_input),
         },
         reload_watcher,

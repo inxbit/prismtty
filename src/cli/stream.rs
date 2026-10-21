@@ -41,12 +41,24 @@ struct ChunkFilterState {
 /// the first few megabytes and would otherwise read as a silent hang.
 const SLOW_RULE_WARN_THRESHOLD: Duration = Duration::from_secs(5);
 
+/// How long an interactive stream holds back a trailing token of program
+/// output, waiting for the read that may complete it, before drawing it
+/// anyway. Long enough that a token split across writes a few tens of
+/// milliseconds apart still highlights as one span; short enough that output
+/// the program has already sent never waits on its next byte, which can be
+/// seconds away (Cisco `ping` prints one dot per two-second probe).
+const PROGRAM_OUTPUT_HOLDBACK: Duration = Duration::from_millis(250);
+
 /// Describes the stream's input source for interactive echo handling. It groups
 /// the facts the read loop needs to surface buffered echo promptly without
 /// disturbing program-output highlighting:
 /// - `interactive`: whether this is an interactive terminal session (echo present),
 /// - `pty_fd`: the PTY master to poll so an echo burst's buffered trailing token
 ///   is flushed once the child goes idle (a paste echoes back in one large read),
+/// - `idle_fd`: the descriptor the stream reads from, polled so a trailing
+///   token held back from quiet program output is drawn after
+///   [`PROGRAM_OUTPUT_HOLDBACK`]: the PTY master, or stdin in stdin mode. Its
+///   reads must not be buffered ahead of the poll,
 /// - `recent_input`: the bytes the stdin forwarder recently sent to the child.
 ///   The loop flushes a buffered trailing token only when it is a byte-for-byte
 ///   suffix of this (a heuristic for genuine input echo). The match is byte
@@ -56,6 +68,7 @@ const SLOW_RULE_WARN_THRESHOLD: Duration = Duration::from_secs(5);
 pub(super) struct InputSource {
     pub(super) interactive: bool,
     pub(super) pty_fd: Option<RawFd>,
+    pub(super) idle_fd: Option<RawFd>,
     pub(super) recent_input: Option<Arc<Mutex<Vec<u8>>>>,
 }
 
@@ -160,6 +173,18 @@ pub(super) fn highlight_stream<R: Read, W: Write>(
     flush_before_wait(&mut session, writer, &trace, &input)?;
 
     loop {
+        // No echo trigger drew the held-back tail, so it is most likely
+        // program output whose next byte may complete it. Wait for that byte
+        // only so long; a program that has gone quiet still gets its output
+        // drawn.
+        if input.interactive
+            && !session.buffered_echo().is_empty()
+            && wait_idle(input.idle_fd, PROGRAM_OUTPUT_HOLDBACK)
+        {
+            trace.log("FLUSH", b"holdback");
+            session.flush_input_echo(writer, &trace)?;
+            flush_before_wait(&mut session, writer, &trace, &input)?;
+        }
         let read = reader.read(&mut buffer)?;
         if read == 0 {
             break;
@@ -857,6 +882,10 @@ fn prepare_chunk(
 /// Screen safety does not rely on any of these heuristics: the session only emits
 /// the child's own output bytes, never `recent_input`, so a non-echoed secret is
 /// never drawn (it produces no buffered token).
+///
+/// A tail none of these match is program output and stays buffered, but only
+/// for [`PROGRAM_OUTPUT_HOLDBACK`]: the read loop draws it once the source has
+/// been quiet that long.
 fn should_flush_input_echo(
     interactive: bool,
     pty_fd: Option<RawFd>,
@@ -952,6 +981,36 @@ fn poll_idle(pty_fd: Option<RawFd>, error_is_idle: bool) -> bool {
         ready <= 0
     } else {
         ready == 0
+    }
+}
+
+/// Waits up to `timeout` for input on `fd` and reports whether none arrived (a
+/// clean `poll == 0`). Readable data, a hangup and errors all return false at
+/// once so the next read handles them; with no descriptor there is nothing to
+/// wait on and it returns false. A poll interrupted by a signal (a SIGWINCH)
+/// resumes with the time left, so the wait stays bounded either way.
+fn wait_idle(fd: Option<RawFd>, timeout: Duration) -> bool {
+    let Some(fd) = fd else {
+        return false;
+    };
+    let deadline = Instant::now() + timeout;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        // Rounded up, so the wait never reports idle before the timeout.
+        let timeout_ms =
+            libc::c_int::try_from(remaining.as_micros().div_ceil(1000)).unwrap_or(libc::c_int::MAX);
+        let mut poll_fd = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: `poll_fd` is one valid, initialized entry; `poll` only reads
+        // `fd`/`events` and writes `revents`, and the timeout bounds the wait.
+        let ready = unsafe { libc::poll(&mut poll_fd, 1, timeout_ms) };
+        if ready < 0 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+            continue;
+        }
+        return ready == 0;
     }
 }
 
@@ -2287,6 +2346,7 @@ mod tests {
         let input = super::InputSource {
             interactive: true,
             pty_fd: Some(master_fd),
+            idle_fd: None,
             recent_input: Some(recent.clone()),
         };
         // Real trace so we can assert the prompt-echo flush fired DURING the read
@@ -2369,6 +2429,7 @@ mod tests {
         let input = super::InputSource {
             interactive: true,
             pty_fd: Some(master_fd),
+            idle_fd: None,
             recent_input: Some(recent.clone()),
         };
         let trace_file = tempfile::NamedTempFile::new().expect("trace temp file");
@@ -2450,6 +2511,7 @@ mod tests {
         let input = super::InputSource {
             interactive: true,
             pty_fd,
+            idle_fd: None,
             recent_input: None,
         };
         let prepared = super::prepare_session(&options, true).expect("session prepares");
@@ -2503,5 +2565,31 @@ mod tests {
             String::from_utf8_lossy(&shown_while_blocked(chunk, Some(master_fd))),
             String::from_utf8_lossy(&open_color)
         );
+    }
+
+    // The holdback wait is bounded both ways: a quiet source is reported idle
+    // only once the full timeout has passed, and pending output ends the wait
+    // at once so a busy stream gains no latency.
+    #[test]
+    fn wait_idle_waits_out_a_quiet_source_and_returns_early_on_output() {
+        use std::os::fd::AsRawFd;
+        use std::time::{Duration, Instant};
+
+        let pty = nix::pty::openpty(None, None).expect("openpty");
+        let master_fd = pty.master.as_raw_fd();
+        let slave_fd = pty.slave.as_raw_fd();
+
+        let started = Instant::now();
+        assert!(super::wait_idle(Some(master_fd), Duration::from_millis(50)));
+        assert!(started.elapsed() >= Duration::from_millis(50));
+
+        // SAFETY: `slave_fd` is the open PTY slave from openpty and the buffer
+        // is a valid 1-byte slice.
+        assert_eq!(unsafe { libc::write(slave_fd, b"x".as_ptr().cast(), 1) }, 1);
+        let started = Instant::now();
+        assert!(!super::wait_idle(Some(master_fd), Duration::from_secs(5)));
+        assert!(started.elapsed() < Duration::from_secs(1));
+
+        assert!(!super::wait_idle(None, Duration::from_secs(5)));
     }
 }

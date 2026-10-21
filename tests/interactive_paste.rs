@@ -551,7 +551,8 @@ fn contains_sgr_span(haystack: &[u8], token: &[u8]) -> bool {
 /// input echo, so it must NOT fire for buffered program-output tokens — there is
 /// no pending input echo. Regression guard for the bulk-output highlighting that
 /// an unconditional idle flush would break (cisco "Vlan1191" split as
-/// "...Vlan11" + "91" across two reads with an inter-write gap).
+/// "...Vlan11" + "91" across two reads with an inter-write gap). The gap here is
+/// a few tens of milliseconds, well inside the program-output holdback.
 #[test]
 fn split_program_output_token_keeps_single_highlight_span() {
     let trace_dir = tempfile::tempdir().expect("trace tempdir");
@@ -585,7 +586,8 @@ fn split_program_output_token_keeps_single_highlight_span() {
     drop(pair.slave);
 
     // Pure program output: we never write to the master, so no input echo is
-    // pending and the idle flush must leave the buffered token alone.
+    // pending and, within the holdback window, the idle flush must leave the
+    // buffered token alone.
     let session = PtySession::new(child, &*pair.master);
     let prefix_crossed_boundary = wait_for_condition(Duration::from_secs(5), || {
         contains_bytes(&trace_output_bytes(&trace_path), b"show: Vlan11")
@@ -986,5 +988,89 @@ fn csi_history_recall_redraw_tail_is_visible_without_extra_input() {
     assert!(
         visible.contains(target),
         "cursor-movement recall lost its tail until the next keypress; saw: {visible:?}"
+    );
+}
+
+/// Runs `program args` on a terminal while the child holds its last write open
+/// on a file gate, and returns what the terminal showed once `shown` held or
+/// three seconds passed, before the gate was released. Nothing is ever typed,
+/// so no echo trigger can surface the held output.
+fn shown_while_program_output_is_quiet(
+    program: &str,
+    args: &[&str],
+    shown: impl Fn(&str) -> bool,
+) -> String {
+    let gate_dir = tempfile::tempdir().expect("gate tempdir");
+    let continue_path = gate_dir.path().join("continue");
+    let pair = native_pty_system()
+        .openpty(PtySize {
+            rows: 24,
+            cols: 200,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("openpty");
+
+    let mut builder = CommandBuilder::new(program);
+    builder.env("PRISMTTY_TEST_CONTINUE", &continue_path);
+    builder.args(args);
+    let child = pair.slave.spawn_command(builder).expect("spawn child");
+    drop(pair.slave);
+
+    let session = PtySession::new(child, &*pair.master);
+    let output = session
+        .capture()
+        .wait_until(Duration::from_secs(3), |out| shown(&visible_output(out)));
+    std::fs::write(&continue_path, b"continue").expect("release the gate");
+    visible_output(&output)
+}
+
+fn ends_with_visible(screen: &str, tail: &str) -> bool {
+    screen.trim_end_matches(['\r', '\n']).ends_with(tail)
+}
+
+/// Program output that ends mid-token is held back so a token split across
+/// reads still highlights as one span. When the program then goes quiet, as
+/// Cisco `ping` does for two seconds per unanswered probe, that hold must end:
+/// the dots used to stay invisible until the summary line arrived.
+#[test]
+fn quiet_program_output_tail_is_visible_after_holdback() {
+    let visible = shown_while_program_output_is_quiet(
+        env!("CARGO_BIN_EXE_ptty"),
+        &[
+            "-p",
+            "cisco",
+            "sh",
+            "-c",
+            "printf 'Sending 5, 100-byte ICMP Echos:\\r\\n..'; \
+             while [ ! -f \"$PRISMTTY_TEST_CONTINUE\" ]; do sleep 0.05; done; \
+             printf '\\r\\nSuccess rate is 0 percent\\r\\n'",
+        ],
+        |screen| ends_with_visible(screen, ".."),
+    );
+
+    assert!(
+        ends_with_visible(&visible, ".."),
+        "quiet program output stayed hidden; saw: {visible:?}"
+    );
+}
+
+/// The same hold in pipe mode with stdout on a terminal, where no PTY master
+/// carries the output: `tail -f` of a log that stops mid-token.
+#[test]
+fn quiet_piped_output_tail_is_visible_after_holdback() {
+    let script = format!(
+        "{{ printf 'Building configuration...'; \
+         while [ ! -f \"$PRISMTTY_TEST_CONTINUE\" ]; do sleep 0.05; done; \
+         printf '\\n[OK]\\n'; }} | '{}' -p cisco",
+        env!("CARGO_BIN_EXE_prismtty")
+    );
+    let visible = shown_while_program_output_is_quiet("sh", &["-c", &script], |screen| {
+        ends_with_visible(screen, "configuration...")
+    });
+
+    assert!(
+        ends_with_visible(&visible, "Building configuration..."),
+        "quiet piped output stayed hidden; saw: {visible:?}"
     );
 }

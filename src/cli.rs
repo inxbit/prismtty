@@ -14,6 +14,7 @@ mod trace;
 
 use std::ffi::OsString;
 use std::io::{self, Write};
+use std::os::fd::AsRawFd;
 use std::process::ExitCode;
 
 use is_terminal::IsTerminal;
@@ -255,6 +256,10 @@ fn run_stdin(options: Options) -> Result<ExitCode, CliError> {
         InputSource {
             interactive,
             pty_fd: None,
+            // The stream reads 8 KiB at a time, no less than the stdin lock's
+            // buffer, so each read goes straight to the descriptor and a poll
+            // of it sees everything not yet read.
+            idle_fd: interactive.then(|| stdin.as_raw_fd()),
             recent_input: None,
         },
         reload_watcher,
