@@ -183,7 +183,7 @@ enum OversizedStringControlMode {
     Discarding(DiscardedStringControl),
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum StringControlKind {
     EscOsc,
     EscString(u8),
@@ -194,11 +194,16 @@ enum StringControlKind {
 impl StringControlKind {
     fn at(bytes: &[u8], start: usize) -> Option<(Self, usize)> {
         match *bytes.get(start)? {
-            0x1b => match *bytes.get(start + 1)? {
-                b']' => Some((Self::EscOsc, start + 2)),
-                byte @ (b'P' | b'X' | b'^' | b'_') => Some((Self::EscString(byte), start + 2)),
-                _ => None,
-            },
+            0x1b => {
+                let introducer = skip_escape_state_controls(bytes, start + 1);
+                match *bytes.get(introducer)? {
+                    b']' => Some((Self::EscOsc, introducer + 1)),
+                    byte @ (b'P' | b'X' | b'^' | b'_') => {
+                        Some((Self::EscString(byte), introducer + 1))
+                    }
+                    _ => None,
+                }
+            }
             _ => match c1_control_at(bytes, start)? {
                 (0x9d, width) => Some((Self::C1Osc(width), start + width)),
                 (byte @ (0x90 | 0x98 | 0x9e | 0x9f), width) => {
@@ -214,14 +219,7 @@ impl StringControlKind {
     }
 
     fn matches_at(self, bytes: &[u8], start: usize) -> bool {
-        match self {
-            Self::EscOsc => bytes.get(start..start + 2) == Some(b"\x1b]"),
-            Self::EscString(byte) => {
-                bytes.get(start) == Some(&0x1b) && bytes.get(start + 1) == Some(&byte)
-            }
-            Self::C1Osc(width) => c1_control_at(bytes, start) == Some((0x9d, width)),
-            Self::C1String(byte, width) => c1_control_at(bytes, start) == Some((byte, width)),
-        }
+        Self::at(bytes, start).is_some_and(|(kind, _payload_start)| kind == self)
     }
 
     fn sequence_end(self, bytes: &[u8], start: usize) -> usize {
@@ -2555,23 +2553,37 @@ fn c1_sequence_end(input: &[u8], start: usize) -> usize {
 }
 
 fn ansi_sequence_end(input: &[u8], start: usize) -> usize {
-    if start + 1 >= input.len() {
+    let introducer = skip_escape_state_controls(input, start + 1);
+    if introducer >= input.len() {
         return input.len();
     }
-    if c1_control_at(input, start + 1).is_some() {
-        return start + 1;
+    if c1_control_at(input, introducer).is_some() {
+        return introducer;
     }
 
-    match input[start + 1] {
-        b'[' => csi_sequence_end(input, start + 2),
-        b']' => osc_sequence_end(input, start + 2),
-        b'P' | b'X' | b'^' | b'_' => string_sequence_end(input, start + 2),
+    match input[introducer] {
+        b'[' => csi_sequence_end(input, introducer + 1),
+        b']' => osc_sequence_end(input, introducer + 1),
+        b'P' | b'X' | b'^' | b'_' => string_sequence_end(input, introducer + 1),
         0x20..=0x2f => esc_intermediate_sequence_end(input, start),
         // A non-ASCII byte is never part of the escape, so a UTF-8 character
         // after ESC stays whole visible text.
-        0x1b | 0x80..=0xff => start + 1,
-        _ => (start + 2).min(input.len()),
+        0x1b | 0x80..=0xff => introducer,
+        _ => introducer + 1,
     }
+}
+
+/// VT parsers execute C0 controls other than CAN, SUB and ESC, and ignore
+/// DEL, without leaving the escape state, so the first byte after such a run
+/// still selects the sequence: `ESC NUL ]` opens an OSC.
+fn skip_escape_state_controls(bytes: &[u8], mut idx: usize) -> usize {
+    while matches!(
+        bytes.get(idx),
+        Some(0x00..=0x17 | 0x19 | 0x1c..=0x1f | 0x7f)
+    ) {
+        idx += 1;
+    }
+    idx
 }
 
 fn esc_intermediate_sequence_end(input: &[u8], start: usize) -> usize {
@@ -3686,23 +3698,25 @@ fn scan_escape_for_neutralization(bytes: &[u8], start: usize) -> EscapeScan {
             _ => EscapeScan::Complete(start + width),
         };
     }
-    if start + 1 >= bytes.len() {
+    let introducer = skip_escape_state_controls(bytes, start + 1);
+    if introducer >= bytes.len() {
         return incomplete_escape_scan_result(bytes, start, MAX_INCOMPLETE_NON_STRING_ESCAPE_BYTES);
     }
-    if c1_control_at(bytes, start + 1).is_some() {
-        return EscapeScan::Restart(start + 1);
+    if c1_control_at(bytes, introducer).is_some() {
+        return EscapeScan::Restart(introducer);
     }
 
-    match bytes[start + 1] {
-        b'[' => scan_csi_for_neutralization(bytes, start),
-        b']' => scan_st_terminated_for_neutralization(bytes, start, true),
-        b'P' | b'X' | b'^' | b'_' => scan_st_terminated_for_neutralization(bytes, start, false),
-        b'N' | b'O' => scan_single_shift_for_neutralization(bytes, start, start + 2),
+    match bytes[introducer] {
+        b'[' => scan_csi_for_neutralization(bytes, start, introducer + 1),
+        b']' => scan_st_terminated_for_neutralization(bytes, start, introducer + 1, true),
+        b'P' | b'X' | b'^' | b'_' => {
+            scan_st_terminated_for_neutralization(bytes, start, introducer + 1, false)
+        }
+        b'N' | b'O' => scan_single_shift_for_neutralization(bytes, start, introducer + 1),
         0x20..=0x2f => scan_esc_intermediate_for_neutralization(bytes, start),
-        0x1b | 0x80..=0x9f => EscapeScan::Restart(start + 1),
-        0xa0..=0xff => non_ascii_after_escape_scan(bytes, start, start + 1),
-        0x18 | 0x1a => EscapeScan::Complete(start + 2),
-        _ => EscapeScan::Complete((start + 2).min(bytes.len())),
+        0x1b | 0x80..=0x9f => EscapeScan::Restart(introducer),
+        0xa0..=0xff => non_ascii_after_escape_scan(bytes, start, introducer),
+        _ => EscapeScan::Complete(introducer + 1),
     }
 }
 
@@ -3817,8 +3831,7 @@ fn scan_c1_string_for_neutralization(
     incomplete_escape_scan_result(bytes, start, MAX_INCOMPLETE_ESCAPE_BYTES)
 }
 
-fn scan_csi_for_neutralization(bytes: &[u8], start: usize) -> EscapeScan {
-    let mut idx = start + 2;
+fn scan_csi_for_neutralization(bytes: &[u8], start: usize, mut idx: usize) -> EscapeScan {
     while idx < bytes.len() {
         if bytes[idx] == 0x1b || c1_control_at(bytes, idx).is_some() {
             return EscapeScan::Restart(idx);
@@ -3842,9 +3855,9 @@ fn scan_csi_for_neutralization(bytes: &[u8], start: usize) -> EscapeScan {
 fn scan_st_terminated_for_neutralization(
     bytes: &[u8],
     start: usize,
+    mut idx: usize,
     allows_bel: bool,
 ) -> EscapeScan {
-    let mut idx = start + 2;
     while idx < bytes.len() {
         if idx.saturating_sub(start) > MAX_INCOMPLETE_ESCAPE_BYTES {
             return EscapeScan::IncompleteOversized;
@@ -3919,6 +3932,18 @@ pub fn strip_string_escapes(input: &[u8]) -> Vec<u8> {
                     EscapeScan::Complete(end) => {
                         sanitized.extend_from_slice(&input[root..end]);
                         idx = end;
+                        break;
+                    }
+                    EscapeScan::IncompleteOversized
+                        if input[current] == 0x1b
+                            && skip_escape_state_controls(input, current + 1) == input.len() =>
+                    {
+                        // The terminal is still in the escape state after these
+                        // controls, so emitting the ESC would let a `]` in the
+                        // next read open a string control.
+                        sanitized.extend_from_slice(&input[root..current]);
+                        sanitized.extend_from_slice(&input[current + 1..]);
+                        idx = input.len();
                         break;
                     }
                     EscapeScan::IncompleteWithinLimit | EscapeScan::IncompleteOversized => {
@@ -4445,6 +4470,79 @@ rules:
         }
     }
 
+    // A VT parser executes C0 controls (except CAN, SUB and ESC) and ignores
+    // DEL without leaving the escape state, so `ESC NUL ]` still opens an OSC.
+    #[test]
+    fn sanitize_strips_string_escapes_after_escape_state_controls() {
+        for control in [0x00u8, 0x01, b'\r', b'\n', 0x19, 0x1c, 0x1f, 0x7f] {
+            for (introducer, terminator) in [
+                (b"]52;c;U0VDUkVU".as_slice(), b"\x07".as_slice()),
+                (b"]2;TITLE".as_slice(), b"\x1b\\".as_slice()),
+                (b"P1$qm".as_slice(), b"\x1b\\".as_slice()),
+                (b"_apc".as_slice(), b"\x1b\\".as_slice()),
+            ] {
+                let input = [
+                    b"a\x1b".as_slice(),
+                    &[control],
+                    introducer,
+                    terminator,
+                    b"b",
+                ]
+                .concat();
+                assert_eq!(
+                    super::strip_string_escapes(&input),
+                    b"ab",
+                    "string survived after {control:#04x}: {input:02x?}"
+                );
+                let unterminated = [b"a\x1b".as_slice(), &[control, control], introducer].concat();
+                assert_eq!(super::strip_string_escapes(&unterminated), b"a");
+                assert_eq!(super::incomplete_sanitize_start(&unterminated), Some(1));
+            }
+            let split = [b"ok\x1b".as_slice(), &[control]].concat();
+            assert_eq!(super::incomplete_sanitize_start(&split), Some(2));
+        }
+
+        // CAN and SUB still cancel the escape, so the bracket is plain text.
+        assert_eq!(super::strip_string_escapes(b"\x1b\x18]x"), b"\x1b\x18]x");
+        assert_eq!(super::strip_string_escapes(b"\x1b\x1a]x"), b"\x1b\x1a]x");
+
+        // An escape left open by a long run of controls is not emitted, since
+        // the terminal would still be waiting to read a string introducer.
+        let mut oversized = b"ok\x1b".to_vec();
+        oversized.extend(std::iter::repeat_n(
+            0,
+            super::MAX_INCOMPLETE_NON_STRING_ESCAPE_BYTES + 1,
+        ));
+        let sanitized = super::strip_string_escapes(&oversized);
+        assert!(!sanitized.contains(&0x1b), "open ESC was emitted");
+        assert_eq!(sanitized.len(), oversized.len() - 1);
+    }
+
+    // Preserve mode keeps such a string as one opaque control, so highlighting
+    // cannot insert SGR bytes inside what the terminal reads as a title.
+    #[test]
+    fn escape_state_controls_before_a_string_introducer_stay_in_one_token() {
+        let input = b"x\x1b\x00]2;192.0.2.1\x07y";
+        assert_eq!(super::ansi_sequence_end(input, 1), input.len() - 1);
+        assert_eq!(super::ansi_sequence_end(b"\x1b\r[31m", 0), 6);
+        assert_eq!(super::strip_ansi(input), b"xy");
+
+        let config = PrismConfig::from_chromaterm_yaml(
+            "rules:\n  - regex: '192\\.0\\.2\\.1'\n    color: f#00ff00\n",
+        )
+        .expect("config parses");
+        let highlighter = Highlighter::from_config(config).expect("rule compiles");
+        assert_eq!(highlighter.highlight_bytes(input), input);
+
+        let mut streaming = StreamingHighlighter::new(highlighter);
+        let mut output = Vec::new();
+        for byte in input {
+            output.extend(streaming.push(&[*byte]));
+        }
+        output.extend(streaming.finish());
+        assert_eq!(output, input);
+    }
+
     #[test]
     fn sanitize_drops_unterminated_strings_reached_through_cancellation() {
         for input in [
@@ -4621,6 +4719,7 @@ rules:
             b"\x1b!".as_slice(),
             b"\x1b&".as_slice(),
             b"\x1b$(".as_slice(),
+            b"\x1b\x00".as_slice(),
             b"\x1bN".as_slice(),
             b"\x1bO".as_slice(),
             b"\x8e".as_slice(),
@@ -4648,6 +4747,7 @@ rules:
             (b"\x1b ".as_slice(), b"safeafter".as_slice()),
             (b"\x1b$".as_slice(), b"safeafter".as_slice()),
             (b"\x1b$(".as_slice(), b"safeafter".as_slice()),
+            (b"\x1b\x00".as_slice(), b"safeafter".as_slice()),
             (b"\x1bN".as_slice(), b"safeBafter".as_slice()),
             (b"\x1bO".as_slice(), b"safeBafter".as_slice()),
             (b"\x8e".as_slice(), b"safeBafter".as_slice()),

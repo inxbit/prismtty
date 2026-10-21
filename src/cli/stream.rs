@@ -1603,6 +1603,29 @@ mod tests {
         );
     }
 
+    // A terminal executes the NUL and stays in the escape state, so the `]`
+    // in the next read still opens an OSC.
+    #[test]
+    fn sanitize_mode_drops_string_escape_split_after_escape_state_controls() {
+        let mut carry = super::ChunkFilterState::default();
+        let first = super::prepare_chunk(b"ok\x1b\x00", false, true, &mut carry);
+        let second = super::prepare_chunk(b"]52;c;U0VDUkVU\x07done", false, true, &mut carry);
+        let mut visible = first.bytes().to_vec();
+        visible.extend_from_slice(second.bytes());
+        assert_eq!(visible, b"okdone");
+
+        let mut carry = super::ChunkFilterState::default();
+        let mut first = b"ok\x1b".to_vec();
+        first.extend(std::iter::repeat_n(0, 2000));
+        let mut visible = super::prepare_chunk(&first, false, true, &mut carry)
+            .bytes()
+            .to_vec();
+        visible.extend_from_slice(
+            super::prepare_chunk(b"]52;c;U0VDUkVU\x07done", false, true, &mut carry).bytes(),
+        );
+        assert!(!visible.contains(&0x1b), "open ESC reached the output");
+    }
+
     #[test]
     fn preserve_mode_hides_split_string_payloads_from_dynamic_profile_detection() {
         for (prefix, tail) in [
