@@ -734,6 +734,10 @@ fn remote_attempt(line: &str) -> Option<RemoteAttempt> {
     let mut skip_option_value = false;
     let mut options_ended = false;
     let mut target = None;
+    let mut target_seen = false;
+    let mut remote_command = false;
+    let mut force_tty = false;
+    let mut no_session = false;
     for word in words.iter().skip(1) {
         if skip_option_value {
             skip_option_value = false;
@@ -745,14 +749,62 @@ fn remote_attempt(line: &str) -> Option<RemoteAttempt> {
         }
         if !options_ended && word.starts_with('-') {
             skip_option_value = remote_option_takes_value(&command, word);
+            no_session |= remote_option_opens_no_session(&command, word);
+            force_tty |= command == "ssh" && ssh_option_flags(word).contains(&'t');
             continue;
         }
+        if target_seen {
+            // OpenSSH parses options again after the host, so the first
+            // other word after it starts a remote command.
+            remote_command = true;
+            break;
+        }
+        target_seen = true;
         if is_literal_remote_target(word) {
             target = Some(normalize_remote_target(word));
         }
-        break;
+        if command != "ssh" {
+            break;
+        }
+    }
+    // A remote command without a forced tty, or a query or background
+    // invocation, never opens an interactive session to close again.
+    if no_session || (remote_command && !force_tty) {
+        return None;
     }
     Some(RemoteAttempt { policy, target })
+}
+
+fn remote_option_opens_no_session(command: &str, option: &str) -> bool {
+    match command {
+        "ssh" => ssh_option_flags(option)
+            .iter()
+            .any(|flag| matches!(flag, 'V' | 'G' | 'N' | 'f' | 'Q' | 'O')),
+        "screen" => matches!(
+            option,
+            "-ls" | "-list" | "-wipe" | "-v" | "-version" | "-Q" | "-X"
+        ),
+        _ => false,
+    }
+}
+
+/// The getopt flags of one ssh option word, up to the first flag that takes
+/// a value (the rest of the word or the next word).
+fn ssh_option_flags(option: &str) -> Vec<char> {
+    let mut flags = Vec::new();
+    let Some(cluster) = option.strip_prefix('-') else {
+        return flags;
+    };
+    if cluster.starts_with('-') {
+        return flags;
+    }
+    for flag in cluster.chars() {
+        flags.push(flag);
+        if remote_option_word_takes_value("ssh", &format!("-{flag}")) {
+            break;
+        }
+    }
+    flags
 }
 
 fn split_shell_words(line: &str) -> Option<Vec<String>> {
@@ -1334,6 +1386,76 @@ mod tests {
                 "{line:?}"
             );
         }
+    }
+
+    // These commands never open an interactive session, so nothing would ever
+    // close a frame pushed for them.
+    #[test]
+    fn non_interactive_remote_commands_do_not_leave_profile_frames() {
+        let store = ProfileStore::builtin();
+        for command in [
+            "ssh backup01 uptime\r",
+            "ssh backup01 -p 2222 uptime\r",
+            "ssh -V\r",
+            "ssh -G router-a\r",
+            "ssh -fN -L 8080:localhost:80 jump\r",
+            "ssh -O check router-a\r",
+            "ssh -Q cipher\r",
+            "screen -ls\r",
+        ] {
+            let mut runtime = ProfileRuntime::new(names(&["generic", "linux-unix"]));
+            runtime.observe_input(command.as_bytes());
+            assert_eq!(runtime.pending_remote, None, "{command:?}");
+            runtime.observe_output(b"some output\r\nuser@laptop:~$ ", &store);
+            assert_eq!(runtime.stack_len(), 0, "{command:?} left a profile frame");
+            runtime.observe_input(b"fw\r");
+            assert_eq!(
+                runtime.observe_output(b"fw\r\nFW-EDGE # ", &store),
+                Some(names(&["generic", "fortinet"])),
+                "{command:?}"
+            );
+            assert_eq!(
+                runtime.observe_output(b"Connection to fw closed.\n", &store),
+                Some(names(&["generic", "linux-unix"])),
+                "{command:?}"
+            );
+        }
+    }
+
+    // OpenSSH parses options again after the host, and a forced tty keeps a
+    // remote command interactive.
+    #[test]
+    fn interactive_ssh_commands_keep_their_close_target() {
+        for line in [
+            "ssh router-a -p 2222\r",
+            "ssh router-a -l admin -o ServerAliveInterval=30\r",
+            "ssh -t router-a ssh core-sw\r",
+            "ssh router-a -tt ssh core-sw\r",
+            "ssh -vt router-a show version\r",
+        ] {
+            let mut runtime = ProfileRuntime::new(names(&["generic", "linux-unix"]));
+            runtime.observe_input(line.as_bytes());
+            assert_eq!(
+                runtime
+                    .pending_remote
+                    .as_ref()
+                    .and_then(|attempt| attempt.target.as_deref()),
+                Some("router-a"),
+                "{line:?}"
+            );
+        }
+
+        let store = ProfileStore::builtin();
+        let mut runtime = ProfileRuntime::new(names(&["generic", "linux-unix"]));
+        runtime.observe_input(b"ssh -t jump ssh router-a\r");
+        assert_eq!(
+            runtime.observe_output(b"Cisco IOS Software\n", &store),
+            Some(names(&["generic", "cisco"]))
+        );
+        assert_eq!(
+            runtime.observe_output(b"Connection to jump closed.\n", &store),
+            Some(names(&["generic", "linux-unix"]))
+        );
     }
 
     #[test]
