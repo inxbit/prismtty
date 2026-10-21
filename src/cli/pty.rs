@@ -3,6 +3,7 @@ use std::fs::OpenOptions;
 use std::io::{self, Read, Write};
 use std::mem;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::{
     Arc, Mutex,
@@ -526,7 +527,13 @@ pub(super) fn run_command(options: Options, command: Vec<OsString>) -> Result<Ex
 
     let mut signal_mask = SessionSignalMask::block()?;
     let mut terminal_session = TerminalSession::start(interactive)?;
-    let mut child = pair.slave.spawn_command(builder)?;
+    let mut child = pair
+        .slave
+        .spawn_command(builder)
+        .map_err(|source| CliError::Spawn {
+            code: spawn_failure_exit_code(&program, cwd.as_deref()),
+            source,
+        })?;
     drop(pair.slave);
     set_forward_child_pid(child.process_id().map(|pid| pid as i32).unwrap_or(0));
     cleanup_child_on_err(signal_mask.restore(), &mut child)?;
@@ -654,6 +661,50 @@ fn cwd_relative_program(program: OsString) -> OsString {
     } else {
         program
     }
+}
+
+/// Exit code for a wrapped command that could not be spawned, following the
+/// shell convention: 127 when nothing by that name exists, 126 when it exists
+/// but is a directory or is not executable. A name that resolves to an
+/// executable failed for some other reason and keeps the generic 1.
+fn spawn_failure_exit_code(program: &OsStr, cwd: Option<&Path>) -> u8 {
+    use std::os::unix::ffi::OsStrExt;
+
+    let cwd = cwd.unwrap_or(Path::new(""));
+    let candidates: Vec<PathBuf> = if program.is_empty() {
+        Vec::new()
+    } else if program.as_bytes().contains(&b'/') {
+        vec![cwd.join(program)]
+    } else {
+        std::env::var_os("PATH")
+            .map(|path| {
+                std::env::split_paths(&path)
+                    .map(|dir| cwd.join(dir).join(program))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let mut exists = false;
+    for candidate in candidates {
+        let Ok(metadata) = std::fs::metadata(&candidate) else {
+            continue;
+        };
+        if !metadata.is_dir() && is_executable(&candidate) {
+            return 1;
+        }
+        exists = true;
+    }
+    if exists { 126 } else { 127 }
+}
+
+fn is_executable(path: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+
+    let Ok(path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+        return false;
+    };
+    // SAFETY: `path` is a valid NUL-terminated string that outlives the call.
+    unsafe { libc::access(path.as_ptr(), libc::X_OK) == 0 }
 }
 
 fn parent_terminal_is_iterm() -> bool {
@@ -1616,6 +1667,35 @@ mod tests {
                 OsString::from(unchanged)
             );
         }
+    }
+
+    #[test]
+    fn spawn_failures_map_to_shell_exit_codes() {
+        use std::ffi::OsStr;
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("temp directory");
+        let script = dir.path().join("script.sh");
+        std::fs::write(&script, "#!/bin/sh\n").expect("write script");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o644))
+            .expect("script is not executable");
+        let cwd = Some(dir.path());
+
+        assert_eq!(super::spawn_failure_exit_code(OsStr::new(""), cwd), 127);
+        assert_eq!(
+            super::spawn_failure_exit_code(OsStr::new("./missing"), cwd),
+            127
+        );
+        assert_eq!(
+            super::spawn_failure_exit_code(OsStr::new("./script.sh"), cwd),
+            126
+        );
+        assert_eq!(super::spawn_failure_exit_code(OsStr::new("./"), cwd), 126);
+        // A program that resolves to an executable failed for another reason.
+        assert_eq!(
+            super::spawn_failure_exit_code(OsStr::new("/bin/sh"), cwd),
+            1
+        );
     }
 
     #[test]

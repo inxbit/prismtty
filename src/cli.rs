@@ -54,9 +54,28 @@ pub enum CliError {
     /// PTY creation or command execution failed.
     #[error("PTY error: {0}")]
     Pty(#[from] anyhow::Error),
+    /// The wrapped command could not be started.
+    #[error("PTY error: {source}")]
+    Spawn {
+        /// Why spawning failed.
+        source: anyhow::Error,
+        /// The exit code to report: 127 not found, 126 not executable, else 1.
+        code: u8,
+    },
     /// Switching terminal modes failed.
     #[error("terminal mode error: {0}")]
     Terminal(#[from] nix::errno::Errno),
+}
+
+impl CliError {
+    /// The process exit code: what a shell reports for a wrapped command that
+    /// could not be started (127 not found, 126 not executable), otherwise 1.
+    fn exit_code(&self) -> u8 {
+        match self {
+            Self::Spawn { code, .. } => *code,
+            _ => 1,
+        }
+    }
 }
 
 /// Runs the CLI using process arguments and returns the desired exit code.
@@ -73,7 +92,7 @@ pub fn run() -> ExitCode {
                     let _ = writeln!(stderr, "prismtty: {}", escape_untrusted(line));
                 }
             }
-            ExitCode::from(1)
+            ExitCode::from(error.exit_code())
         }
     }
 }

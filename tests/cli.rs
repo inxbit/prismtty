@@ -174,6 +174,50 @@ fn wrapped_child_nonzero_exit_code_is_preserved() {
     cmd.assert().code(7);
 }
 
+// A command that cannot be started exits as a shell would, 127 when nothing by
+// that name exists and 126 when it exists but cannot be executed, so callers
+// can tell a missing tool from a tool that ran and failed.
+#[test]
+#[cfg(unix)]
+fn wrapped_command_spawn_failures_use_shell_exit_codes() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let work = tempfile::tempdir().expect("work directory");
+    let script = work.path().join("script.sh");
+    fs::write(&script, "#!/bin/sh\necho ran\n").expect("write script");
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o644))
+        .expect("script is not executable");
+    fs::create_dir(work.path().join("subdir")).expect("directory");
+
+    let cases = [
+        ("prismtty-no-such-command", 127, "No viable candidates"),
+        ("", 127, "Unable to spawn"),
+        ("./missing.sh", 127, "does not exist"),
+        ("script.sh", 126, "not executable"),
+        ("./script.sh", 126, "not executable"),
+        ("./subdir", 126, "is a directory"),
+    ];
+    for (program, code, message) in cases {
+        let output = Command::cargo_bin("ptty")
+            .expect("ptty binary exists")
+            .current_dir(work.path())
+            .env("PATH", work.path())
+            .arg(program)
+            .output()
+            .expect("ptty runs");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(
+            output.status.code(),
+            Some(code),
+            "{program:?} exit code, stderr: {stderr}"
+        );
+        assert!(
+            stderr.contains("prismtty: PTY error: Unable to spawn") && stderr.contains(message),
+            "{program:?} stderr: {stderr}"
+        );
+    }
+}
+
 /// Drops CSI sequences so assertions see the text a terminal would show.
 fn strip_csi(output: &[u8]) -> String {
     let text = String::from_utf8_lossy(output);
