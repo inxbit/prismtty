@@ -59,6 +59,15 @@ fn terminal_supports_truecolor() -> bool {
         .unwrap_or(false)
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Detection passes run on this thread. Each strips and scans the whole
+    /// sample, so stream tests count them to see how often a read loop
+    /// rescans.
+    pub(super) static DETECTION_PASSES: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
 pub(super) fn select_profile_names_with_store(
     options: &Options,
     store: &ProfileStore,
@@ -69,6 +78,8 @@ pub(super) fn select_profile_names_with_store(
     } else if options.no_auto_detect {
         vec!["generic".to_string()]
     } else {
+        #[cfg(test)]
+        DETECTION_PASSES.with(|passes| passes.set(passes.get() + 1));
         let visible_sample = strip_ansi(sample);
         let sample_text = String::from_utf8_lossy(&visible_sample);
         store.detect_profiles(&sample_text)
