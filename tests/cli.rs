@@ -1492,9 +1492,9 @@ fn runtime_dir_override_keeps_its_permissions() {
     assert_eq!(mode(&missing), 0o700);
 }
 
-// A session ended by a signal never removes its pid file. Registration prunes
-// the leftovers, so pids.d stays bounded by the sessions still alive instead
-// of growing until someone runs --reload.
+// A session killed outright, or ended by a signal in pipe mode, never removes
+// its pid file. Registration prunes the leftovers, so pids.d stays bounded by
+// the sessions still alive instead of growing until someone runs --reload.
 #[cfg(unix)]
 #[test]
 fn registration_prunes_pid_files_of_dead_sessions() {
