@@ -2118,46 +2118,61 @@ fn leading_prompt_terminator_len(bytes: &[u8], previous_visible_tail: &[u8]) -> 
 }
 
 fn prompt_echo_cr_prefix_len(bytes: &[u8], previous_visible_tail: &[u8]) -> Option<usize> {
-    for (idx, byte) in bytes.iter().enumerate() {
-        if *byte != b'\r' {
-            continue;
+    // One pass over the visible bytes: a CR inside an escape (an OSC payload,
+    // say) is not a line break, and the line before each CR is built up as the
+    // pass goes instead of re-stripping the whole prefix for every CR.
+    if !bytes.contains(&b'\r') {
+        return None;
+    }
+    let (visible, _) = visible_byte_map_and_ansi_ranges(bytes);
+    let previous_continues_prompt = contains_prompt_echo_in_visible_line(previous_visible_tail)
+        || looks_like_prompt_tail(previous_visible_tail);
+    let mut before_cr_line = Vec::new();
+    let mut after_cr_line = Vec::new();
+
+    for (visible_idx, mapped) in visible.iter().enumerate() {
+        match mapped.byte {
+            b'\r' => {}
+            b'\n' => {
+                before_cr_line.clear();
+                continue;
+            }
+            byte => {
+                before_cr_line.push(byte);
+                continue;
+            }
         }
 
-        let before_cr_visible = strip_ansi(&bytes[..idx]);
-        let line_start = before_cr_visible
-            .iter()
-            .rposition(|byte| matches!(*byte, b'\r' | b'\n'))
-            .map(|idx| idx + 1)
-            .unwrap_or(0);
-        let before_cr_line = &before_cr_visible[line_start..];
-
+        let idx = mapped.raw;
         if bytes.get(idx + 1) == Some(&b'\n') {
-            if contains_prompt_echo_in_visible_line(before_cr_line) {
+            if contains_prompt_echo_in_visible_line(&before_cr_line) {
                 return Some(idx + 2);
             }
+            before_cr_line.clear();
             continue;
         }
 
-        let after_cr = &bytes[idx + 1..];
-        if after_cr.is_empty() {
+        if idx + 1 == bytes.len() {
             return None;
         }
 
         let has_echo_before_cr = before_cr_line
             .iter()
             .any(|byte| !byte.is_ascii_whitespace())
-            && (contains_prompt_echo_in_visible_line(before_cr_line)
-                || contains_prompt_echo_in_visible_line(previous_visible_tail)
-                || looks_like_prompt_tail(previous_visible_tail));
-        if !has_echo_before_cr {
-            continue;
+            && (contains_prompt_echo_in_visible_line(&before_cr_line) || previous_continues_prompt);
+        if has_echo_before_cr {
+            after_cr_line.clear();
+            after_cr_line.extend(
+                visible[visible_idx + 1..]
+                    .iter()
+                    .map(|mapped| mapped.byte)
+                    .take_while(|byte| !matches!(*byte, b'\r' | b'\n')),
+            );
+            if !redraws_interactive_prompt_line(&after_cr_line) {
+                return Some(idx + 1);
+            }
         }
-
-        if redraws_interactive_prompt_line(after_cr) {
-            continue;
-        }
-
-        return Some(idx + 1);
+        before_cr_line.clear();
     }
 
     None
@@ -2275,13 +2290,7 @@ fn looks_like_prompt_echo_prefix(line: &[u8]) -> bool {
     true
 }
 
-fn redraws_interactive_prompt_line(bytes: &[u8]) -> bool {
-    let visible = strip_ansi(bytes);
-    let line_end = visible
-        .iter()
-        .position(|byte| matches!(*byte, b'\r' | b'\n'))
-        .unwrap_or(visible.len());
-    let line = &visible[..line_end];
+fn redraws_interactive_prompt_line(line: &[u8]) -> bool {
     looks_like_prompt_tail(line) || contains_prompt_echo_in_visible_line(line)
 }
 
@@ -5930,6 +5939,48 @@ rules:
             "command boundary reset missing: {output:02x?}"
         );
         assert_eq!(super::strip_ansi(&output), b"router# show up");
+    }
+
+    // A CR inside an OSC payload is not a line break: splitting the prompt
+    // echo there would highlight the rest of the payload and inject SGR into it.
+    #[test]
+    fn prompt_echo_split_ignores_carriage_returns_inside_string_controls() {
+        let input = b"R#show\x1b]0;a\r\n192.0.2.1\x07 more\r\n";
+        assert_eq!(
+            super::prompt_echo_line_prefix_len(input, b"R#"),
+            Some(input.len())
+        );
+
+        let config = PrismConfig::from_chromaterm_yaml(
+            "rules:\n  - description: ipv4\n    regex: '\\b192\\.0\\.2\\.\\d+\\b'\n    color: f#00ffff\n",
+        )
+        .expect("config parses");
+        let highlighter = Highlighter::from_config(config).expect("rules compile");
+        let mut streaming = StreamingHighlighter::new_interactive(highlighter);
+        let mut output = streaming.push(b"R#");
+        output.extend(streaming.push(input));
+        output.extend(streaming.finish());
+
+        let osc = b"\x1b]0;a\r\n192.0.2.1\x07";
+        assert!(
+            output.windows(osc.len()).any(|window| window == osc),
+            "OSC payload must pass through intact: {:?}",
+            String::from_utf8_lossy(&output)
+        );
+    }
+
+    #[test]
+    fn prompt_echo_carriage_return_scan_is_linear() {
+        let mut input = b"\x1b[1C".to_vec();
+        input.extend(std::iter::repeat_n(b'\r', 32 * 1024));
+
+        let started = std::time::Instant::now();
+        assert_eq!(super::prompt_echo_line_prefix_len(&input, b"R#"), None);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "carriage return scan took {:?}",
+            started.elapsed()
+        );
     }
 
     #[test]
