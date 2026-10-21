@@ -578,7 +578,7 @@ pub(super) fn run_command(options: Options, command: Vec<OsString>) -> Result<Ex
     let recent_input = Arc::new(Mutex::new(Vec::new()));
     let input_worker_failure = Arc::new(Mutex::new(None));
     if interactive {
-        let mut writer = cleanup_child_on_err(pair.master.take_writer(), &mut child)?;
+        let mut writer = cleanup_child_on_err(stdin_forward_writer(&*pair.master), &mut child)?;
         let trace = trace.clone();
         let local_echo = options.local_echo;
         let recent_input = Arc::clone(&recent_input);
@@ -867,6 +867,14 @@ fn record_recent_input(recent_input: &Mutex<Vec<u8>>, input: &[u8]) {
     if overflow > 0 {
         recent.drain(..overflow);
     }
+}
+
+/// The writer the stdin forwarder sends input through: a plain dup of the
+/// PTY master. portable-pty's own writer writes a newline and VEOF into the
+/// PTY when dropped, which would submit a partial line the user never entered
+/// (and can log out a remote shell) whenever forwarding ends.
+fn stdin_forward_writer(master: &dyn portable_pty::MasterPty) -> io::Result<std::fs::File> {
+    dup_master_fd(master).map(std::fs::File::from)
 }
 
 fn dup_master_fd(master: &dyn portable_pty::MasterPty) -> io::Result<OwnedFd> {
@@ -1843,6 +1851,47 @@ mod tests {
             record_idx < write_idx,
             "recent input must be recorded before PTY write so immediate echo can be matched"
         );
+    }
+
+    #[test]
+    fn dropping_the_stdin_forward_writer_injects_no_input() {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let pair = portable_pty::native_pty_system()
+            .openpty(portable_pty::PtySize::default())
+            .expect("openpty");
+        let slave = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_NOCTTY)
+            .open(pair.master.tty_name().expect("slave tty name"))
+            .expect("open slave tty");
+
+        let writer = super::stdin_forward_writer(&*pair.master).expect("stdin writer");
+        drop(writer);
+
+        let mut poll_fd = libc::pollfd {
+            fd: std::os::fd::AsRawFd::as_raw_fd(&slave),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: `poll_fd` is a valid, exclusively borrowed pollfd and the count matches.
+        let ready = unsafe { libc::poll(&mut poll_fd, 1, 200) };
+        assert_eq!(
+            ready, 0,
+            "ending stdin forwarding typed a line the user never entered"
+        );
+
+        let source = include_str!("pty.rs");
+        let run_command = source
+            .split("pub(super) fn run_command")
+            .nth(1)
+            .expect("run_command exists")
+            .split("fn cwd_relative_program")
+            .next()
+            .expect("run_command boundary exists");
+        assert!(run_command.contains("stdin_forward_writer("));
+        assert!(!run_command.contains("take_writer("));
     }
 
     #[test]
