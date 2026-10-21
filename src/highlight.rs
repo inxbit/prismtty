@@ -4010,9 +4010,19 @@ pub fn strip_string_escapes(input: &[u8]) -> Vec<u8> {
                     {
                         // The terminal is still in the escape state after these
                         // controls, so emitting the ESC would let a `]` in the
-                        // next read open a string control.
-                        sanitized.extend_from_slice(&input[root..current]);
-                        sanitized.extend_from_slice(&input[current + 1..]);
+                        // next read open a string control. A bare ESC that this
+                        // one cancelled leaves it in that state too.
+                        let mut open = current;
+                        while let Some(previous) =
+                            input[root..open].iter().rposition(|byte| *byte == 0x1b)
+                        {
+                            if skip_escape_state_controls(input, root + previous + 1) != open {
+                                break;
+                            }
+                            open = root + previous;
+                        }
+                        sanitized.extend_from_slice(&input[root..open]);
+                        sanitized.extend(input[open..].iter().filter(|byte| **byte != 0x1b));
                         idx = input.len();
                         break;
                     }
@@ -4578,14 +4588,22 @@ rules:
 
         // An escape left open by a long run of controls is not emitted, since
         // the terminal would still be waiting to read a string introducer.
-        let mut oversized = b"ok\x1b".to_vec();
-        oversized.extend(std::iter::repeat_n(
-            0,
-            super::MAX_INCOMPLETE_NON_STRING_ESCAPE_BYTES + 1,
-        ));
-        let sanitized = super::strip_string_escapes(&oversized);
-        assert!(!sanitized.contains(&0x1b), "open ESC was emitted");
-        assert_eq!(sanitized.len(), oversized.len() - 1);
+        // Neither is a bare escape that it cancelled, which would leave the
+        // terminal in the same state.
+        let controls = vec![0; super::MAX_INCOMPLETE_NON_STRING_ESCAPE_BYTES + 1];
+        for (prefix, expected) in [
+            (b"ok\x1b".as_slice(), b"ok".as_slice()),
+            (b"ok\x1b\x1b".as_slice(), b"ok".as_slice()),
+            (b"ok\x1b\x00\x1b".as_slice(), b"ok\x00".as_slice()),
+            (b"ok\x1b[1\x1b\x1b".as_slice(), b"ok\x1b[1".as_slice()),
+        ] {
+            let oversized = [prefix, &controls].concat();
+            assert_eq!(
+                super::strip_string_escapes(&oversized),
+                [expected, &controls].concat(),
+                "open ESC was emitted for {prefix:02x?}"
+            );
+        }
     }
 
     // Preserve mode keeps such a string as one opaque control, so highlighting
