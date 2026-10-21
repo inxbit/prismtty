@@ -1402,3 +1402,45 @@ fn registration_prunes_pid_files_of_dead_sessions() {
         .collect();
     assert!(left.is_empty(), "stale pid files survived: {left:?}");
 }
+
+// The XDG Base Directory spec says a relative XDG_CONFIG_HOME is invalid and
+// must be ignored. Honouring it loaded profiles and rules from whatever
+// directory prismtty happened to run in, such as an untrusted checkout.
+#[test]
+fn relative_xdg_config_home_is_ignored() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let checkout = temp.path().join("checkout");
+    let planted = checkout.join("rel").join("prismtty");
+    fs::create_dir_all(planted.join("profiles.d")).expect("planted dirs create");
+    fs::write(
+        planted.join("profiles.d").join("planted.yml"),
+        "profile:\n  name: planted\n  inherits: [generic]\nrules: []\n",
+    )
+    .expect("planted profile writes");
+    fs::write(
+        planted.join("config.yml"),
+        "rules:\n  - description: planted\n    regex: world\n    color: f#00ff00\n",
+    )
+    .expect("planted config writes");
+    let home = temp.path().join("home");
+    fs::create_dir(&home).expect("home creates");
+    let relative_xdg = |args: &[&str]| {
+        let mut cmd = Command::cargo_bin("prismtty").expect("binary exists");
+        cmd.current_dir(&checkout)
+            .env("HOME", &home)
+            .env("XDG_CONFIG_HOME", "rel")
+            .env("PRISMTTY_RUNTIME_DIR", temp.path().join("runtime"))
+            .args(args);
+        cmd
+    };
+
+    relative_xdg(&["profiles", "list"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("planted").not());
+    relative_xdg(&[])
+        .write_stdin("hello world\n")
+        .assert()
+        .success()
+        .stdout("hello world\n");
+}

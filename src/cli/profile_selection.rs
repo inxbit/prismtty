@@ -280,9 +280,11 @@ fn enforce_profiles_d_entry_budget(entry_count: usize) -> Result<(), CliError> {
 }
 
 fn config_base_dir() -> Option<PathBuf> {
-    if let Some(path) = std::env::var_os("XDG_CONFIG_HOME") {
-        if !path.is_empty() {
-            return Some(PathBuf::from(path));
+    // The XDG Base Directory spec treats a relative value (or an empty one)
+    // as invalid: honouring it would load config from the current directory.
+    if let Some(path) = std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from) {
+        if path.is_absolute() {
+            return Some(path);
         }
     }
     BaseDirs::new().map(|base_dirs| base_dirs.home_dir().join(".config"))
