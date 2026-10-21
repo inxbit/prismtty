@@ -3054,14 +3054,34 @@ fn style_paints_blank_cells(style: &Style) -> bool {
 /// Reports whether `bytes` is a control that fills cells with blanks in the
 /// current rendition (CSI erase in display or line `J`/`K`, erase, insert or
 /// delete characters `X`/`@`/`P`, insert or delete lines `L`/`M`, scroll
-/// `S`/`T`) while `style`, if left active, would show on them.
+/// `S`/`T`, and index, next line and reverse index) while `style`, if left
+/// active, would show on them.
 fn fills_blank_cells_with(bytes: &[u8], style: &Style) -> bool {
     style_paints_blank_cells(style)
-        && is_csi_sequence(bytes)
-        && matches!(
-            bytes.last(),
-            Some(b'J' | b'K' | b'X' | b'@' | b'P' | b'L' | b'M' | b'S' | b'T')
-        )
+        && (is_index_control(bytes)
+            || (is_csi_sequence(bytes)
+                && matches!(
+                    bytes.last(),
+                    Some(b'J' | b'K' | b'X' | b'@' | b'P' | b'L' | b'M' | b'S' | b'T')
+                )))
+}
+
+/// Reports whether `bytes` is index (`ESC D`), next line (`ESC E`) or reverse
+/// index (`ESC M`), in the 7-bit form or either C1 form. Like a line feed, each
+/// scrolls a blank line in when the cursor is on a scroll margin.
+fn is_index_control(bytes: &[u8]) -> bool {
+    matches!(
+        bytes,
+        b"\x1bD"
+            | b"\x1bE"
+            | b"\x1bM"
+            | b"\x84"
+            | b"\x85"
+            | b"\x8d"
+            | b"\xc2\x84"
+            | b"\xc2\x85"
+            | b"\xc2\x8d"
+    )
 }
 
 fn style_for_reset_mode(style: Style, reset_mode: ResetMode) -> Style {
@@ -6409,6 +6429,52 @@ rules:
                 "interactive={interactive}: {output:?}"
             );
             assert_eq!(super::strip_ansi(output.as_bytes()), b"error on sda\n");
+        }
+    }
+
+    // Index, next line and reverse index scroll in a blank line at a margin,
+    // which the terminal fills with the current background as for a line feed.
+    #[test]
+    fn background_highlight_is_reset_before_an_index_control() {
+        for control in [
+            b"\x1bD".as_slice(),
+            b"\x1bE",
+            b"\x1bM",
+            b"\x84",
+            b"\x85",
+            b"\x8d",
+            b"\xc2\x84",
+            b"\xc2\x85",
+            b"\xc2\x8d",
+        ] {
+            let mut input = b"disk error".to_vec();
+            input.extend_from_slice(control);
+            input.extend_from_slice(b" retrying\n");
+            for interactive in [false, true] {
+                let mut streaming = if interactive {
+                    StreamingHighlighter::new_interactive(background_rule_highlighter())
+                } else {
+                    StreamingHighlighter::new(background_rule_highlighter())
+                };
+                let mut output = streaming.push(&input);
+                output.extend(streaming.finish());
+
+                let control_at = output
+                    .windows(control.len())
+                    .position(|window| window == control)
+                    .expect("control is passed through");
+                let before = String::from_utf8_lossy(&output[..control_at]);
+                let last_sgr = before
+                    .rsplit("\x1b[")
+                    .next()
+                    .expect("an SGR precedes the control");
+                assert!(
+                    before.contains("48;2;255;0;0merror")
+                        && (last_sgr == "0m" || last_sgr.ends_with("49m")),
+                    "interactive={interactive} control={control:02x?}: {:?}",
+                    String::from_utf8_lossy(&output)
+                );
+            }
         }
     }
 
