@@ -2567,7 +2567,9 @@ fn ansi_sequence_end(input: &[u8], start: usize) -> usize {
         b']' => osc_sequence_end(input, start + 2),
         b'P' | b'X' | b'^' | b'_' => string_sequence_end(input, start + 2),
         0x20..=0x2f => esc_intermediate_sequence_end(input, start),
-        0x1b | 0x80..=0x9f => start + 1,
+        // A non-ASCII byte is never part of the escape, so a UTF-8 character
+        // after ESC stays whole visible text.
+        0x1b | 0x80..=0xff => start + 1,
         _ => (start + 2).min(input.len()),
     }
 }
@@ -2576,7 +2578,7 @@ fn esc_intermediate_sequence_end(input: &[u8], start: usize) -> usize {
     let mut idx = start + 1;
     while idx < input.len() {
         let byte = input[idx];
-        if byte == 0x1b || is_c1_control(byte) {
+        if byte == 0x1b || byte >= 0x80 {
             return idx;
         }
         idx += 1;
@@ -3698,6 +3700,7 @@ fn scan_escape_for_neutralization(bytes: &[u8], start: usize) -> EscapeScan {
         b'N' | b'O' => scan_single_shift_for_neutralization(bytes, start, start + 2),
         0x20..=0x2f => scan_esc_intermediate_for_neutralization(bytes, start),
         0x1b | 0x80..=0x9f => EscapeScan::Restart(start + 1),
+        0xa0..=0xff => non_ascii_after_escape_scan(bytes, start, start + 1),
         0x18 | 0x1a => EscapeScan::Complete(start + 2),
         _ => EscapeScan::Complete((start + 2).min(bytes.len())),
     }
@@ -3710,6 +3713,9 @@ fn scan_esc_intermediate_for_neutralization(bytes: &[u8], start: usize) -> Escap
         if byte == 0x1b || c1_control_at(bytes, idx).is_some() {
             return EscapeScan::Restart(idx);
         }
+        if byte >= 0x80 {
+            return non_ascii_after_escape_scan(bytes, start, idx);
+        }
         idx += 1;
         if matches!(byte, 0x18 | 0x1a) || (0x30..=0x7e).contains(&byte) {
             return EscapeScan::Complete(idx);
@@ -3719,6 +3725,16 @@ fn scan_esc_intermediate_for_neutralization(bytes: &[u8], start: usize) -> Escap
         }
     }
     incomplete_escape_scan_result(bytes, start, MAX_INCOMPLETE_NON_STRING_ESCAPE_BYTES)
+}
+
+/// Matches the tokenizer: a non-ASCII byte ends the escape before it, so the
+/// character stays visible text. A trailing `C2` may still become a UTF-8 C1
+/// control that cancels the escape, so it waits for the next byte.
+fn non_ascii_after_escape_scan(bytes: &[u8], start: usize, idx: usize) -> EscapeScan {
+    if bytes[idx] == 0xc2 && idx + 1 == bytes.len() {
+        return incomplete_escape_scan_result(bytes, start, MAX_INCOMPLETE_NON_STRING_ESCAPE_BYTES);
+    }
+    EscapeScan::Complete(idx)
 }
 
 fn scan_single_shift_for_neutralization(bytes: &[u8], start: usize, mut idx: usize) -> EscapeScan {
@@ -5907,6 +5923,58 @@ rules:
         assert!(!message.contains('\u{7}'), "{message:?}");
         assert!(message.contains("\\x1b"), "{message:?}");
         assert!(message.contains("\\x07"), "{message:?}");
+    }
+
+    #[test]
+    fn escape_before_a_multibyte_character_keeps_highlighted_output_utf8() {
+        for rules in [
+            "rules:\n  - regex: '\\b(up)\\b'\n    color: f#00ff00\n",
+            "rules:\n  - regex: 'link.*now'\n    color: f#00ff00\n",
+        ] {
+            let config = PrismConfig::from_chromaterm_yaml(rules).expect("config parses");
+            let highlighter = Highlighter::from_config(config).expect("rule compiles");
+            for input in [
+                "link up\u{1b}\u{e9} now\n",
+                "link up\u{1b}(\u{e9} now\n",
+                "link up\u{1b}\u{4e2d} now\n",
+            ] {
+                let output = highlighter.highlight_bytes(input.as_bytes());
+                assert!(
+                    std::str::from_utf8(&output).is_ok(),
+                    "invalid UTF-8 for {input:?}: {output:02x?}"
+                );
+                assert!(std::str::from_utf8(&super::strip_ansi(&output)).is_ok());
+                let _ = highlighter.highlight_str(input);
+                let _ = StreamingHighlighter::new(highlighter.clone()).push_str(input);
+            }
+        }
+
+        // The character stays visible text and the escape scanner agrees with
+        // the tokenizer that the bare ESC is already complete.
+        assert_eq!(
+            super::strip_ansi("a\u{1b}\u{e9}".as_bytes()),
+            "a\u{e9}".as_bytes()
+        );
+        assert_eq!(
+            super::strip_ansi("a\u{1b}(\u{e9}".as_bytes()),
+            "a\u{e9}".as_bytes()
+        );
+        assert_eq!(
+            super::incomplete_top_level_escape_start("a\u{1b}\u{e9}".as_bytes()),
+            None
+        );
+        assert_eq!(
+            super::incomplete_top_level_escape_start("a\u{1b}(\u{e9}".as_bytes()),
+            None
+        );
+        // A trailing C2 can still become a UTF-8 C1 control that cancels the
+        // ESC, so the ESC is carried with it instead of being emitted alone.
+        assert_eq!(super::incomplete_sanitize_start(b"a\x1b\xc2"), Some(1));
+        assert_eq!(super::incomplete_sanitize_start(b"a\x1b(\xc2"), Some(1));
+        assert_eq!(
+            super::strip_string_escapes(b"a\x1b\xc2\x9d0;t\x07b"),
+            b"ab".to_vec()
+        );
     }
 
     #[test]
