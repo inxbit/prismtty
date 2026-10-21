@@ -57,7 +57,7 @@ All three triggers surface echo. A buffered tail that is plain program output ma
 
 We bound the hold. At the top of the read loop, when an interactive stream has a tail buffered, it polls the descriptor it reads from (the PTY master, or stdin in stdin mode) for `PROGRAM_OUTPUT_HOLDBACK`, 250 ms. A clean `poll == 0` draws the tail (traced as `FLUSH holdback`); readable data, a hangup or an error end the wait at once and the read proceeds as before, and a poll interrupted by a signal resumes with the time left.
 
-The bound is a trade between the two failure modes. Flushing on any idle poll would split tokens a program writes a few milliseconds apart, the bulk-output case the first decision protects. The regression tests pin cross-read spans across gaps of a few tens of milliseconds (the gated `Vlan1191` test) and 120 ms (`echo_off_split_stream_while_typing`), so 250 ms keeps a margin above both while keeping the worst display lag for quiet output to a quarter of a second, against seconds to minutes before.
+The bound is a trade between the two failure modes. Flushing on any idle poll would split tokens a program writes a few milliseconds apart, the bulk-output case the first decision protects. The regression tests pin cross-read spans across gaps the test ends itself (both gated `Vlan1191` tests release the second half through a FIFO as soon as prismtty has read the first), so 250 ms keeps a wide margin above them even on a loaded machine while keeping the worst display lag for quiet output to a quarter of a second, against seconds to minutes before.
 
 ### Consequences
 
