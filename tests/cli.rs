@@ -1165,3 +1165,109 @@ fn broken_profile_detected_in_first_chunk_keeps_last_good_rules() {
         .stdout(predicate::str::contains("line2"))
         .stderr(predicate::str::contains("automatic profile switch ignored"));
 }
+
+/// An output stream whose reader is already gone, so every write fails with
+/// EPIPE at once instead of racing a `head` that exits. A socket pair is used
+/// rather than a pipe because std creates it close-on-exec, so no concurrently
+/// spawned test child can inherit the read end and keep it open.
+#[cfg(unix)]
+fn output_with_no_reader() -> Stdio {
+    let (writer, reader) = std::os::unix::net::UnixStream::pair().expect("socket pair");
+    drop(reader);
+    Stdio::from(std::os::fd::OwnedFd::from(writer))
+}
+
+#[cfg(unix)]
+fn run_with_closed_stdout(bin: &str, dir: &std::path::Path, args: &[&str]) -> std::process::Output {
+    StdCommand::new(assert_cmd::cargo::cargo_bin(bin))
+        .env("HOME", dir)
+        .env("XDG_CONFIG_HOME", dir.join("xdg"))
+        .env("PRISMTTY_RUNTIME_DIR", dir.join("runtime"))
+        .args(args)
+        .stdin(fs::File::open(dir.join("input")).expect("input opens"))
+        .stdout(output_with_no_reader())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("command runs")
+}
+
+// A reader that quits early (`| head`, `less` then `q`) is not an error: exit
+// quietly with the status a SIGPIPE-killed filter reports, 128 + 13, and never
+// panic in the informational commands.
+#[cfg(unix)]
+#[test]
+fn closed_stdout_exits_quietly_with_sigpipe_status() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    fs::write(
+        temp.path().join("input"),
+        "interface Gi0/1 192.0.2.1 up\n".repeat(4096),
+    )
+    .expect("input writes");
+    let profile = temp.path().join("profile.yml");
+    fs::write(
+        &profile,
+        "profile:\n  name: custom\nrules:\n  - description: word\n    regex: up\n    color: f#00ff00\n",
+    )
+    .expect("profile writes");
+    let profile = profile.to_str().expect("utf-8 path");
+    let fixture = temp.path().join("input");
+    let fixture = fixture.to_str().expect("utf-8 path");
+
+    let cases: &[(&str, &[&str])] = &[
+        ("prismtty", &["--profile", "cisco"]),
+        ("ptty", &["--profile", "cisco", "printf", "192.0.2.1 up\\n"]),
+        ("prismtty", &["--version"]),
+        ("prismtty", &["--help"]),
+        ("prismtty", &["--reload"]),
+        ("prismtty", &["profiles", "list"]),
+        ("prismtty", &["profiles", "show", "cisco"]),
+        ("prismtty", &["profiles", "validate", profile]),
+        ("prismtty", &["profiles", "test", "cisco", fixture]),
+    ];
+    for (bin, args) in cases {
+        let output = run_with_closed_stdout(bin, temp.path(), args);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(
+            output.status.code(),
+            Some(141),
+            "{bin} {args:?} exited {:?}; stderr: {stderr:?}",
+            output.status
+        );
+        assert!(
+            stderr.is_empty(),
+            "{bin} {args:?} wrote to stderr: {stderr:?}"
+        );
+    }
+}
+
+// Diagnostics are best effort: a dead stderr must not cost the highlighted
+// output or panic the process.
+#[cfg(unix)]
+#[test]
+fn closed_stderr_does_not_stop_highlighting() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let mut child = StdCommand::new(assert_cmd::cargo::cargo_bin("prismtty"))
+        .env("HOME", temp.path())
+        .env("XDG_CONFIG_HOME", temp.path().join("xdg"))
+        .env("PRISMTTY_RUNTIME_DIR", temp.path().join("runtime"))
+        .args(["-b", "--show-profile", "-p", "cisco"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(output_with_no_reader())
+        .spawn()
+        .expect("prismtty spawns");
+    child
+        .stdin
+        .take()
+        .expect("stdin pipe")
+        .write_all(b"GigabitEthernet0/0 192.0.2.1 YES up up\n")
+        .expect("input writes");
+    let output = child.wait_with_output().expect("prismtty exits");
+
+    assert!(output.status.success(), "exited {:?}", output.status);
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("GigabitEthernet0/0"),
+        "highlighted output was lost: {:?}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+}

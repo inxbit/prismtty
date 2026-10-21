@@ -1,5 +1,6 @@
 use std::env;
 use std::ffi::OsString;
+use std::io::{self, Write};
 use std::path::PathBuf;
 
 use clap::{ArgAction, CommandFactory, Parser};
@@ -229,10 +230,10 @@ fn parse_profiles_command(
     }
 }
 
-pub(super) fn print_help() {
+pub(super) fn print_help() -> io::Result<()> {
     let mut command = RawArgs::command();
-    command.print_help().expect("help writes to stdout");
-    println!();
+    command.print_help()?;
+    writeln!(io::stdout())
 }
 
 #[cfg(feature = "completion-generation")]

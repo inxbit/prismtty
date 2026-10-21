@@ -1,4 +1,5 @@
 use std::fs;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use directories::BaseDirs;
@@ -127,7 +128,9 @@ impl ProfileReporter {
 
     pub(super) fn report(&mut self, profile_names: &[String]) {
         if let Some(message) = self.message_for(profile_names) {
-            eprintln!("{message}");
+            // Diagnostics are best effort: a closed stderr must not cost the
+            // highlighted output.
+            let _ = writeln!(io::stderr(), "{message}");
         }
     }
 
@@ -170,7 +173,8 @@ pub(super) fn profile_store() -> Result<ProfileStore, CliError> {
             .map_err(|error| CliError::Usage(error.to_string()))?;
         if shadowed {
             let name = escape_untrusted(&name);
-            eprintln!(
+            let _ = writeln!(
+                io::stderr(),
                 "prismtty: user profile '{name}' from profiles.d overrides the built-in profile of the same name"
             );
         }

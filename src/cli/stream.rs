@@ -144,7 +144,7 @@ pub(super) fn highlight_stream<R: Read, W: Write>(
     }
     session.push(writer, &trace, &first_chunk)?;
     if let Some(warning) = session.slow_rule_warning() {
-        eprintln!("{warning}");
+        let _ = writeln!(io::stderr(), "{warning}");
     }
     if let Some(reason) = should_flush_input_echo(
         input.interactive,
@@ -227,7 +227,8 @@ pub(super) fn highlight_stream<R: Read, W: Write>(
                     }
                 }
                 Err(error) => {
-                    eprintln!(
+                    let _ = writeln!(
+                        io::stderr(),
                         "prismtty: reload ignored; keeping last known good configuration: {}",
                         escape_untrusted(&error.to_string())
                     );
@@ -236,7 +237,7 @@ pub(super) fn highlight_stream<R: Read, W: Write>(
         }
         session.push(writer, &trace, &chunk)?;
         if let Some(warning) = session.slow_rule_warning() {
-            eprintln!("{warning}");
+            let _ = writeln!(io::stderr(), "{warning}");
         }
         if let Some(reason) = should_flush_input_echo(
             input.interactive,
@@ -662,7 +663,8 @@ fn apply_automatic_profile_switch<W: Write>(
         Ok(ProfileSwitchOutcome::Unchanged | ProfileSwitchOutcome::Switched) => true,
         Ok(ProfileSwitchOutcome::Rejected) => false,
         Err(error) => {
-            eprintln!(
+            let _ = writeln!(
+                io::stderr(),
                 "prismtty: automatic profile switch ignored; keeping last known good rules: {}",
                 escape_untrusted(&error.to_string())
             );
@@ -707,7 +709,18 @@ fn new_streaming_highlighter(
 }
 
 fn print_benchmark_report(report: Option<&BenchmarkReport>, input_bytes: usize, elapsed_secs: f64) {
-    eprintln!("Benchmark results (time spent, match count):");
+    // Best effort, like every diagnostic: a closed stderr is not worth failing
+    // a run whose output was already written.
+    let _ = write_benchmark_report(&mut io::stderr().lock(), report, input_bytes, elapsed_secs);
+}
+
+fn write_benchmark_report(
+    out: &mut impl Write,
+    report: Option<&BenchmarkReport>,
+    input_bytes: usize,
+    elapsed_secs: f64,
+) -> io::Result<()> {
+    writeln!(out, "Benchmark results (time spent, match count):")?;
     if let Some(report) = report {
         let total = report.total_duration().as_secs_f64();
         let mut rules = report.rules_with_errors().collect::<Vec<_>>();
@@ -719,19 +732,24 @@ fn print_benchmark_report(report: Option<&BenchmarkReport>, input_bytes: usize, 
                 0.0
             };
             let description = escape_untrusted(&rule.description);
-            eprintln!(
+            writeln!(
+                out,
                 "{percent:>6.2}% {:>8.3}s  {:<7}  {}",
                 rule.duration.as_secs_f64(),
                 rule.match_count,
                 description
-            );
+            )?;
             if error_count > 0 {
                 let error = escape_untrusted(last_error.unwrap_or("PCRE2 match error"));
-                eprintln!("         match errors: {} (last: {})", error_count, error);
+                writeln!(
+                    out,
+                    "         match errors: {} (last: {})",
+                    error_count, error
+                )?;
             }
         }
     }
-    eprintln!("Processed {input_bytes} bytes in {elapsed_secs:.3}s");
+    writeln!(out, "Processed {input_bytes} bytes in {elapsed_secs:.3}s")
 }
 
 fn prepare_chunk(
