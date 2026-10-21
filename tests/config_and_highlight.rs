@@ -2417,6 +2417,31 @@ fn generic_syslog_ios_xr_four_part_tags_are_highlighted() {
     );
 }
 
+// The plural and doubled-consonant forms get the same state color as the
+// words they come from, matching how `denied` and `errors` are already colored.
+#[test]
+fn generic_state_rules_cover_permitted_and_failures() {
+    let store = ProfileStore::builtin();
+    let config = PrismConfig::from_profiles(&store, &["generic"]).expect("generic loads");
+    let highlighter = Highlighter::from_config(config).expect("rules compile");
+    let output = highlighter.highlight_str(
+        "list ACL-IN permitted tcp\n0 output buffer failures\npermit permits\nfailure failed\n",
+    );
+
+    for word in ["permitted", "permit", "permits"] {
+        assert!(
+            output.contains(&format!("\x1b[38;2;0;255;0m{word}\x1b[0m")),
+            "{word} should be a good state: {output:?}"
+        );
+    }
+    for word in ["failures", "failure", "failed"] {
+        assert!(
+            output.contains(&format!("\x1b[1;38;2;255;0;0m{word}\x1b[0m")),
+            "{word} should be a bad state: {output:?}"
+        );
+    }
+}
+
 // AUDIT M9: BGP transient/fault states (Active, Connect) must keep the Versa
 // blue and not be repainted green by the inherited generic good-state rule.
 #[test]

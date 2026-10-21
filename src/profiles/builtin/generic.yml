@@ -18,13 +18,13 @@ rules:
     color: f#ff9aff
     exclusive: true
   - description: bad operational state
-    regex: '(?i)\b(password|abnormal(ly)?|down|los(t|s|ing)|err(or(s)?)?|den(y|ies|ied)?|reject(ing|ed)?|drop(ped|s)?|fail(s|ed|ure)?|not[ -]connect(ed)?|disconnect(ed)?|unreachable|invalid|bad|notconnect|unusable|blocking|blocked|collision(s)?|unsynchronized|mismatch|runts|CRC|resets)\b'
+    regex: '(?i)\b(password|abnormal(ly)?|down|los(t|s|ing)|err(or(s)?)?|den(y|ies|ied)?|reject(ing|ed)?|drop(ped|s)?|fail(s|ed|ures?)?|not[ -]connect(ed)?|disconnect(ed)?|unreachable|invalid|bad|notconnect|unusable|blocking|blocked|collision(s)?|unsynchronized|mismatch|runts|CRC|resets)\b'
     color: f#ff0000 bold
   - description: warning state
     regex: '(?i)\b(warning(s)?|degraded|standby|learning|listening|passive)\b'
     color: f#ffff00
   - description: good operational state
-    regex: '(?i)\b(up|ok(ay)?|permit(ed|s)?|accept(s|ed)?|enable(d)?|online|succe((ss(ful|fully)?)|ed(ed)?)?|(?<!not )(?<!not-)connect(ed)?|reachable|valid|forwarding|synchronized|active)\b'
+    regex: '(?i)\b(up|ok(ay)?|permit(t?ed|s)?|accept(s|ed)?|enable(d)?|online|succe((ss(ful|fully)?)|ed(ed)?)?|(?<!not )(?<!not-)connect(ed)?|reachable|valid|forwarding|synchronized|active)\b'
     color: f#00ff00
   - description: syslog severe
     regex: '(%\w+(?:-\w+)?-[0-3]-\w+)\b'
