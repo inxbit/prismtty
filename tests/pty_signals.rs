@@ -1330,3 +1330,92 @@ fn input_after_child_exit_preserves_wrapped_exit_code() {
         String::from_utf8_lossy(&output)
     );
 }
+
+/// Closing the outer terminal (a window close, or a dropped ssh link) hangs
+/// up the wrapper's controlling tty: stderr becomes unwritable and SIGHUP
+/// arrives. Cleanup diagnostics must not panic there, so the wrapper still
+/// reaps the wrapped child and exits 128+SIGHUP instead of aborting.
+fn assert_hangup_exits_cleanly(script: &str, pending_input: usize) {
+    let marker_dir = tempfile::tempdir().expect("hangup marker directory");
+    let child_pid_path = marker_dir.path().join("child.pid");
+    let mut child_guard = PidGuard::from_marker(&child_pid_path);
+    let pair = native_pty_system()
+        .openpty(PtySize::default())
+        .expect("openpty");
+    let mut builder = CommandBuilder::new(env!("CARGO_BIN_EXE_ptty"));
+    builder.env("PRISMTTY_CHILD_PID", &child_pid_path);
+    builder.arg("sh");
+    builder.arg("-c");
+    builder.arg(script);
+    let child = pair
+        .slave
+        .spawn_command(builder)
+        .expect("spawn interactive ptty");
+    drop(pair.slave);
+    let mut ptty = PtyChildGuard::new(child);
+    let mut capture = CaptureTask::from_master(&*pair.master);
+    let ready = capture.wait_until(Duration::from_secs(10), |out| contains_bytes(out, b"READY"));
+    assert!(
+        contains_bytes(&ready, b"READY"),
+        "wrapped child reached READY"
+    );
+    let child_pid = wait_for_pid_file(&child_pid_path, Duration::from_secs(2));
+    child_guard.set(child_pid);
+
+    if pending_input > 0 {
+        // Queue more input than the wrapped child's PTY holds, so the input
+        // forwarder is blocked writing it when the hangup arrives.
+        let master_fd = pair.master.as_raw_fd().expect("PTY master fd");
+        // SAFETY: `master_fd` is the open PTY master; dup returns a fresh descriptor this test
+        // owns.
+        let writer_fd = unsafe { libc::dup(master_fd) };
+        assert!(writer_fd >= 0, "duplicate PTY master fd failed");
+        // SAFETY: `writer_fd` is a freshly duplicated descriptor that nothing else owns or closes.
+        let mut writer = unsafe { File::from_raw_fd(writer_fd) };
+        // SAFETY: F_GETFL and F_SETFL take integer arguments and `writer_fd` is open.
+        unsafe {
+            let flags = libc::fcntl(writer_fd, libc::F_GETFL);
+            libc::fcntl(writer_fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+        }
+        let chunk = [b'y'; 4096];
+        let mut written = 0;
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while written < pending_input && Instant::now() < deadline {
+            match writer.write(&chunk) {
+                Ok(n) => written += n,
+                Err(_) => thread::sleep(Duration::from_millis(10)),
+            }
+        }
+        thread::sleep(Duration::from_millis(200));
+    }
+
+    capture.stop_bounded();
+    drop(pair.master);
+
+    assert_eq!(
+        ptty.wait_for_exit(Duration::from_secs(10)),
+        Some(128 + libc::SIGHUP as u32),
+        "wrapper did not exit cleanly after a terminal hangup"
+    );
+    assert!(
+        wait_for_condition(Duration::from_secs(5), || !process_exists(child_pid)),
+        "wrapped child survived a terminal hangup"
+    );
+    child_guard.disarm();
+}
+
+#[test]
+fn terminal_hangup_exits_cleanly_and_reaps_child() {
+    assert_hangup_exits_cleanly(
+        "echo $$ > \"$PRISMTTY_CHILD_PID\"; echo READY; exec sleep 1000",
+        0,
+    );
+}
+
+#[test]
+fn terminal_hangup_with_blocked_input_forwarder_still_terminates() {
+    assert_hangup_exits_cleanly(
+        "echo $$ > \"$PRISMTTY_CHILD_PID\"; stty raw -echo; echo READY; exec sleep 1000",
+        128 * 1024,
+    );
+}

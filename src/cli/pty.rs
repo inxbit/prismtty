@@ -481,6 +481,13 @@ fn with_terminal_restored_for_job_control(
     reapply()
 }
 
+/// Prints a diagnostic to stderr. Unlike `eprintln!` it never panics, so an
+/// unwritable stderr (EIO once the controlling terminal hangs up) cannot
+/// abort cleanup or kill the signal watcher before it reaps the child.
+fn warn(args: std::fmt::Arguments<'_>) {
+    let _ = writeln!(io::stderr(), "{args}");
+}
+
 /// Runs `body`, catching a panic so it surfaces as a clear diagnostic instead
 /// of silently killing a detached worker thread (which could otherwise leave
 /// the session wedged with no error). Returns `false` if `body` panicked.
@@ -488,7 +495,9 @@ fn run_supervised(name: &str, body: impl FnOnce()) -> bool {
     if std::panic::catch_unwind(std::panic::AssertUnwindSafe(body)).is_ok() {
         return true;
     }
-    eprintln!("prismtty: the {name} thread stopped unexpectedly (panic)");
+    warn(format_args!(
+        "prismtty: the {name} thread stopped unexpectedly (panic)"
+    ));
     false
 }
 
@@ -1135,7 +1144,9 @@ impl RawModeGuard {
 impl Drop for RawModeGuard {
     fn drop(&mut self) {
         if let Err(error) = terminate_raw_mode_from_signal_state(&self.state) {
-            eprintln!("prismtty: could not restore terminal during cleanup: {error}");
+            warn(format_args!(
+                "prismtty: could not restore terminal during cleanup: {error}"
+            ));
         }
     }
 }
@@ -1270,7 +1281,9 @@ impl SessionSignalWatcher {
 
     fn stop(&mut self) {
         if let Err(error) = terminate_raw_mode_from_signal_state(&self.raw_mode_state) {
-            eprintln!("prismtty: could not restore terminal during cleanup: {error}");
+            warn(format_args!(
+                "prismtty: could not restore terminal during cleanup: {error}"
+            ));
         }
         restore_signal_handlers(&self.previous_signal_handlers);
         self.previous_signal_handlers.clear();
@@ -1343,7 +1356,9 @@ fn handle_session_signals(read_fd: RawFd, raw_mode_state: SharedRawModeState) {
             let signal = libc::c_int::from(signal);
             if TERMINATING_SIGNALS.contains(&signal) {
                 if let Err(error) = terminate_raw_mode_from_signal_state(&raw_mode_state) {
-                    eprintln!("prismtty: could not restore terminal before exit: {error}");
+                    warn(format_args!(
+                        "prismtty: could not restore terminal before exit: {error}"
+                    ));
                 }
                 terminate_and_reap_forwarded_child(signal);
                 // SAFETY: _exit never returns and skips destructors by design: the terminal was
@@ -1370,7 +1385,9 @@ fn handle_session_signals(read_fd: RawFd, raw_mode_state: SharedRawModeState) {
                     },
                     || reapply_raw_mode_from_signal_state(&raw_mode_state),
                 ) {
-                    eprintln!("prismtty: job-control terminal transition failed: {error}");
+                    warn(format_args!(
+                        "prismtty: job-control terminal transition failed: {error}"
+                    ));
                 }
             }
         }
@@ -2022,6 +2039,17 @@ mod tests {
             })
             .expect("cleanup retry succeeds");
         assert!(matches!(lifecycle, super::RawModeLifecycle::Terminating));
+    }
+
+    #[test]
+    fn session_diagnostics_do_not_panic_on_an_unwritable_stderr() {
+        let source = include_str!("pty.rs");
+        let runtime_source = source.split("mod tests").next().unwrap_or(source);
+
+        assert!(
+            !runtime_source.contains("eprintln!(") && !runtime_source.contains("println!("),
+            "print macros panic on EIO after a terminal hangup; use warn()"
+        );
     }
 
     #[test]
