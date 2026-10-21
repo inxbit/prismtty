@@ -529,6 +529,9 @@ pub(super) fn run_command(options: Options, command: Vec<OsString>) -> Result<Ex
     let program = cwd_relative_program(command_name);
     let mut builder = CommandBuilder::new(&program);
     let cwd = child_working_directory();
+    if let Some(error) = unusable_script_interpreter(&program, cwd.as_deref()) {
+        return Err(error);
+    }
     if let Some(cwd) = &cwd {
         builder.cwd(cwd);
     }
@@ -707,10 +710,26 @@ fn cwd_relative_program(program: OsString) -> OsString {
 /// but is a directory or is not executable. A name that resolves to an
 /// executable failed for some other reason and keeps the generic 1.
 fn spawn_failure_exit_code(program: &OsStr, cwd: Option<&Path>) -> u8 {
+    let mut exists = false;
+    for candidate in program_candidates(program, cwd) {
+        let Ok(metadata) = std::fs::metadata(&candidate) else {
+            continue;
+        };
+        if !metadata.is_dir() && is_executable(&candidate) {
+            return 1;
+        }
+        exists = true;
+    }
+    if exists { 126 } else { 127 }
+}
+
+/// The paths execvp would try for `program`, in order: the name itself
+/// against `cwd` when it contains `/`, otherwise each PATH entry.
+fn program_candidates(program: &OsStr, cwd: Option<&Path>) -> Vec<PathBuf> {
     use std::os::unix::ffi::OsStrExt;
 
     let cwd = cwd.unwrap_or(Path::new(""));
-    let candidates: Vec<PathBuf> = if program.is_empty() {
+    if program.is_empty() {
         Vec::new()
     } else if program.as_bytes().contains(&b'/') {
         vec![cwd.join(program)]
@@ -722,18 +741,60 @@ fn spawn_failure_exit_code(program: &OsStr, cwd: Option<&Path>) -> u8 {
                     .collect()
             })
             .unwrap_or_default()
-    };
-    let mut exists = false;
-    for candidate in candidates {
-        let Ok(metadata) = std::fs::metadata(&candidate) else {
-            continue;
-        };
-        if !metadata.is_dir() && is_executable(&candidate) {
-            return 1;
-        }
-        exists = true;
     }
-    if exists { 126 } else { 127 }
+}
+
+/// Size of the start of a file the kernel reads to find a `#!` line.
+const SCRIPT_HEADER_BYTES: u64 = 256;
+
+/// Checks the `#!` interpreter of a script before it is spawned. A script
+/// whose interpreter cannot be executed only fails in execve, after the fork,
+/// and portable-pty closes every descriptor above 2 in the child, std's
+/// exec-error pipe included, so the child aborts with "fatal runtime error"
+/// instead of the spawn reporting the failure. The line is parsed as the
+/// kernel does: only a blank or the line end ends the name, so a CRLF script
+/// names `/bin/sh\r`.
+fn unusable_script_interpreter(program: &OsStr, cwd: Option<&Path>) -> Option<CliError> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let script = program_candidates(program, cwd)
+        .into_iter()
+        .find(|candidate| !candidate.is_dir() && is_executable(candidate))?;
+    // Opening an executable FIFO for reading would wait for a writer.
+    if !script.is_file() {
+        return None;
+    }
+    let mut header = Vec::new();
+    std::fs::File::open(&script)
+        .ok()?
+        .take(SCRIPT_HEADER_BYTES)
+        .read_to_end(&mut header)
+        .ok()?;
+    let line = header.strip_prefix(b"#!")?;
+    let line = &line[..line.iter().position(|&byte| byte == b'\n')?];
+    let start = line.iter().position(|byte| !matches!(byte, b' ' | b'\t'))?;
+    let line = &line[start..];
+    let end = line
+        .iter()
+        .position(|byte| matches!(byte, b' ' | b'\t' | b'\0'))
+        .unwrap_or(line.len());
+    let interpreter = Path::new(OsStr::from_bytes(&line[..end]));
+    // A relative interpreter is found from the child's directory.
+    let interpreter_path = cwd.unwrap_or(Path::new("")).join(interpreter);
+    let code = match std::fs::metadata(&interpreter_path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => 127,
+        Err(_) => 126,
+        Ok(metadata) if metadata.is_dir() || !is_executable(&interpreter_path) => 126,
+        Ok(_) => return None,
+    };
+    Some(CliError::Spawn {
+        code,
+        source: anyhow::anyhow!(
+            "Unable to spawn {} because of a bad interpreter {:?}",
+            script.display(),
+            interpreter
+        ),
+    })
 }
 
 fn is_executable(path: &Path) -> bool {
@@ -2037,6 +2098,67 @@ mod tests {
             super::spawn_failure_exit_code(OsStr::new("/bin/sh"), cwd),
             1
         );
+    }
+
+    // The kernel ends a `#!` interpreter name only at a blank or the line end,
+    // so a CRLF script names `/bin/sh\r`, which does not exist.
+    #[test]
+    fn scripts_with_unusable_interpreters_map_to_shell_exit_codes() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStringExt;
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("temp directory");
+        let write = |name: &str, body: &str, mode: u32| {
+            let path = dir.path().join(name);
+            std::fs::write(&path, body).expect("write file");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode))
+                .expect("set mode");
+            path
+        };
+        write("crlf.sh", "#!/bin/sh\r\necho ran\r\n", 0o755);
+        write("missing.sh", "#!/nonexistent/interp -x\necho ran\n", 0o755);
+        let interp = write("interp", "#!/bin/sh\n", 0o644);
+        write(
+            "noexec.sh",
+            &format!("#!{}\necho ran\n", interp.display()),
+            0o755,
+        );
+        write("dir.sh", "#!/\necho ran\n", 0o755);
+        write("ok.sh", "#! \t/bin/sh -e\necho ran\n", 0o755);
+        write("plain.sh", "echo ran\n", 0o755);
+        write("unterminated.sh", &format!("#!/{}", "a".repeat(300)), 0o755);
+        let cwd = Some(dir.path());
+
+        let code =
+            |program: &str| match super::unusable_script_interpreter(OsStr::new(program), cwd) {
+                Some(super::CliError::Spawn { code, source }) => {
+                    assert!(
+                        source.to_string().contains("bad interpreter"),
+                        "{program}: {source}"
+                    );
+                    Some(code)
+                }
+                Some(other) => panic!("{program}: unexpected error {other}"),
+                None => None,
+            };
+        assert_eq!(code("./crlf.sh"), Some(127));
+        assert_eq!(code("./missing.sh"), Some(127));
+        assert_eq!(code("./noexec.sh"), Some(126));
+        assert_eq!(code("./dir.sh"), Some(126));
+        assert_eq!(code("./ok.sh"), None);
+        assert_eq!(code("./plain.sh"), None);
+        // A first line with no end in the bytes the kernel reads is left to
+        // execve, which reports ENOEXEC and lets execvp try /bin/sh.
+        assert_eq!(code("./unterminated.sh"), None);
+        // Nothing to check: spawn reports these itself.
+        assert_eq!(code("./absent.sh"), None);
+        assert_eq!(code("./interp"), None);
+        let fifo = std::ffi::CString::new(dir.path().join("fifo").into_os_string().into_vec())
+            .expect("FIFO path");
+        // SAFETY: `fifo` is a valid NUL-terminated path that outlives the call.
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o700) }, 0, "mkfifo");
+        assert_eq!(code("./fifo"), None);
     }
 
     #[test]

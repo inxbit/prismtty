@@ -243,6 +243,81 @@ fn wrapped_command_spawn_failures_use_shell_exit_codes() {
     }
 }
 
+// A script whose `#!` interpreter cannot be run only fails in execve, after
+// the fork, where portable-pty has closed std's exec-error pipe: the child
+// aborted with "fatal runtime error" (exit 134) drawn into the output. It must
+// get the shell's 127 or 126 and a message on stderr instead. A CRLF line end
+// makes the interpreter `/bin/sh\r`, the common case.
+#[test]
+#[cfg(unix)]
+fn wrapped_script_with_unusable_interpreter_uses_shell_exit_codes() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let work = tempfile::tempdir().expect("work directory");
+    let write = |name: &str, body: &[u8], mode: u32| {
+        let path = work.path().join(name);
+        fs::write(&path, body).expect("write file");
+        fs::set_permissions(&path, fs::Permissions::from_mode(mode)).expect("set mode");
+        path
+    };
+    let crlf = write("crlf.sh", b"#!/bin/sh\r\necho ran\r\n", 0o755);
+    write(
+        "missing.sh",
+        b"#!/nonexistent/prismtty-interp\necho ran\n",
+        0o755,
+    );
+    let interp = write("interp", b"#!/bin/sh\n", 0o644);
+    let mut noexec = b"#!".to_vec();
+    noexec.extend_from_slice(interp.to_str().expect("utf-8 path").as_bytes());
+    noexec.extend_from_slice(b" -x\necho ran\n");
+    write("noexec.sh", &noexec, 0o755);
+    write("ok.sh", b"#! /bin/sh -e\necho scriptran\n", 0o755);
+
+    let crlf = crlf.to_str().expect("utf-8 path").to_owned();
+    let cases: [(&str, i32); 6] = [
+        ("./crlf.sh", 127),
+        ("crlf.sh", 127),
+        (&crlf, 127),
+        ("./missing.sh", 127),
+        ("./noexec.sh", 126),
+        ("./ok.sh", 0),
+    ];
+    for (program, code) in cases {
+        let output = Command::cargo_bin("ptty")
+            .expect("ptty binary exists")
+            .current_dir(work.path())
+            .env("PATH", work.path())
+            .arg(program)
+            .timeout(Duration::from_secs(10))
+            .output()
+            .expect("ptty runs");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(
+            output.status.code(),
+            Some(code),
+            "{program:?} exit code, stdout: {stdout:?} stderr: {stderr:?}"
+        );
+        // Not "fatal runtime error": the highlighter colors the word "error".
+        assert!(
+            !stdout.contains("output.write(&bytes)") && !stderr.contains("output.write(&bytes)"),
+            "{program:?} stdout: {stdout:?} stderr: {stderr:?}"
+        );
+        if code == 0 {
+            assert!(
+                stdout.contains("scriptran"),
+                "{program:?} stdout: {stdout:?}"
+            );
+        } else {
+            assert!(
+                stderr.contains("prismtty: PTY error: Unable to spawn")
+                    && stderr.contains("bad interpreter"),
+                "{program:?} stderr: {stderr:?}"
+            );
+        }
+    }
+}
+
 // With no terminal on stdin nothing is forwarded to the wrapped command, so it
 // gets an immediate end of input, as with `cmd < /dev/null`, instead of
 // blocking forever on its PTY. Only VEOF is sent: no stray newline or `^D`.

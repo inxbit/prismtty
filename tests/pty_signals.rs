@@ -859,6 +859,50 @@ fn session_leader_without_controlling_terminal_runs_the_command() {
     );
 }
 
+/// From a terminal the wrapped command is spawned by portable-pty, which closes
+/// std's exec-error pipe in the child, so a script whose `#!` interpreter
+/// cannot be run must be caught before the spawn: the child aborted with
+/// "fatal runtime error" (exit 134) drawn into the output instead of failing
+/// with the shell's 127.
+#[test]
+fn interactive_script_with_unusable_interpreter_exits_127() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let work = tempfile::tempdir().expect("work directory");
+    let script = work.path().join("crlf.sh");
+    std::fs::write(&script, "#!/bin/sh\r\necho ran\r\n").expect("write script");
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+        .expect("script is executable");
+    let pair = native_pty_system()
+        .openpty(PtySize::default())
+        .expect("openpty");
+    let mut builder = CommandBuilder::new(env!("CARGO_BIN_EXE_ptty"));
+    builder.cwd(work.path());
+    builder.arg("./crlf.sh");
+    let child = pair
+        .slave
+        .spawn_command(builder)
+        .expect("spawn interactive ptty");
+    drop(pair.slave);
+    let mut ptty = PtySession::new(child, &*pair.master);
+
+    let status = ptty.wait_for_exit(Duration::from_secs(10));
+    let output = ptty.capture().wait_until(Duration::from_secs(2), |out| {
+        contains_bytes(out, b"bad interpreter")
+    });
+    assert_eq!(
+        status,
+        Some(127),
+        "output: {:?}",
+        String::from_utf8_lossy(&output)
+    );
+    assert!(
+        contains_bytes(&output, b"bad interpreter"),
+        "the bad interpreter was not reported: {:?}",
+        String::from_utf8_lossy(&output)
+    );
+}
+
 fn assert_terminal_restored_after(signal: libc::c_int) {
     use nix::sys::termios::{LocalFlags, tcgetattr};
 
