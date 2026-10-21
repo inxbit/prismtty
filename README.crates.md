@@ -82,11 +82,12 @@ shell completions. It also installs the required PCRE2 runtime dependency.
 Install from crates.io:
 
 ```sh
-cargo install prismtty
+cargo install --locked prismtty
 ```
 
 Cargo builds PrismTTY from source and installs the command binaries. You need
 Rust 1.85 or newer plus PCRE2 and `pkg-config` available on your system.
+`--locked` builds with the dependency versions audited for the release.
 
 For `cargo install` on macOS, install the native build dependencies first:
 
