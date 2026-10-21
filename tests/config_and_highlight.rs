@@ -278,6 +278,37 @@ rules:
 }
 
 #[test]
+fn noninteractive_stream_restores_program_sgr_set_in_an_earlier_push() {
+    let yaml = r##"
+rules:
+  - description: bad status
+    regex: (?i)\berror\b
+    color: f#ff0000 bold
+"##;
+
+    // The program's color arrives in an earlier read than the highlighted
+    // token: as its own write, or ahead of a token split across reads.
+    for chunks in [
+        ["\x1b[32m", "service error tail\x1b[0m\n"],
+        ["\x1b[32mservice err", "or tail\x1b[0m\n"],
+    ] {
+        let config = PrismConfig::from_chromaterm_yaml(yaml).expect("chromaterm config loads");
+        let highlighter = Highlighter::from_config(config).expect("rules compile");
+        let mut streaming = StreamingHighlighter::new(highlighter);
+        let mut output = String::new();
+        for chunk in chunks {
+            output.push_str(&streaming.push_str(chunk));
+        }
+        output.push_str(&String::from_utf8(streaming.finish()).expect("valid utf8"));
+
+        assert!(
+            output.contains("error\x1b[0m\x1b[32m tail"),
+            "program color set in an earlier push must be restored: {output:?}"
+        );
+    }
+}
+
+#[test]
 fn preserves_composed_native_sgr_after_highlighted_prompt_time() {
     let yaml = r##"
 rules:

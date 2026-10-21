@@ -1642,7 +1642,7 @@ impl StreamingHighlighter {
                 chunk,
                 Some(&mut self.benchmark),
                 ResetMode::Full,
-                &mut NativeSgrState::default(),
+                &mut self.native_sgr,
                 &mut self.disabled_rule_identities,
             ));
         }
