@@ -174,6 +174,31 @@ fn wrapped_child_nonzero_exit_code_is_preserved() {
     cmd.assert().code(7);
 }
 
+// An inherited SIGCHLD=SIG_IGN makes the kernel reap the wrapped child on its
+// own, which must not cost the wrapper the child's exit status.
+#[test]
+#[cfg(unix)]
+fn wrapped_exit_code_survives_an_inherited_ignored_sigchld() {
+    use std::os::unix::process::CommandExt;
+
+    let mut command = StdCommand::new(assert_cmd::cargo::cargo_bin("ptty"));
+    command.args(["sh", "-c", "exit 3"]).stdin(Stdio::null());
+    // SAFETY: signal is async-signal-safe and runs in the forked child before exec.
+    unsafe {
+        command.pre_exec(|| {
+            libc::signal(libc::SIGCHLD, libc::SIG_IGN);
+            Ok(())
+        });
+    }
+    let output = command.output().expect("ptty runs");
+    assert_eq!(
+        output.status.code(),
+        Some(3),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 // A command that cannot be started exits as a shell would, 127 when nothing by
 // that name exists and 126 when it exists but cannot be executed, so callers
 // can tell a missing tool from a tool that ran and failed.

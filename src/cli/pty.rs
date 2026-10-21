@@ -1277,6 +1277,7 @@ struct SessionSignalWatcher {
 
 impl SessionSignalWatcher {
     fn start(raw_mode_state: SharedRawModeState) -> io::Result<Self> {
+        ensure_child_is_reapable()?;
         let (read_fd, write_fd) = pipe_fds()?;
         if let Err(error) = set_fd_nonblocking(write_fd) {
             close_fd(read_fd);
@@ -1611,6 +1612,38 @@ fn close_fd(fd: RawFd) {
         unsafe {
             libc::close(fd);
         }
+    }
+}
+
+/// Puts SIGCHLD back to its default disposition when it was inherited as
+/// ignored (or with SA_NOCLDWAIT). Either makes the kernel reap the wrapped
+/// child itself, so waiting for it fails with ECHILD and its exit status is
+/// lost. prismtty never handles SIGCHLD, and portable-pty already resets it
+/// for the child, so nothing else sees the change.
+fn ensure_child_is_reapable() -> io::Result<()> {
+    // SAFETY: sigaction is a plain C struct; the sigaction call fills it before it is read.
+    let mut current = unsafe { mem::zeroed::<libc::sigaction>() };
+    // SAFETY: a null new-action pointer only queries the disposition; `current` is valid for the
+    // call.
+    if unsafe { libc::sigaction(libc::SIGCHLD, std::ptr::null(), &mut current) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if current.sa_sigaction != libc::SIG_IGN && current.sa_flags & libc::SA_NOCLDWAIT == 0 {
+        return Ok(());
+    }
+    // SAFETY: sigaction is a plain C struct; all-zero is SIG_DFL with no flags, and the mask is
+    // initialized below.
+    let mut default = unsafe { mem::zeroed::<libc::sigaction>() };
+    default.sa_sigaction = libc::SIG_DFL;
+    // SAFETY: `default.sa_mask` is a valid, exclusively borrowed sigset_t.
+    unsafe {
+        libc::sigemptyset(&mut default.sa_mask);
+    }
+    // SAFETY: `default` is a valid action for the call; a null old-action pointer is permitted.
+    if unsafe { libc::sigaction(libc::SIGCHLD, &default, std::ptr::null_mut()) } == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
     }
 }
 
