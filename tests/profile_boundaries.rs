@@ -160,6 +160,35 @@ fn ipv6_rule_ignores_scope_resolution_operators() {
     }
 }
 
+// A trailing period or ellipsis ends the sentence, not the address; a dot
+// followed by more of the token still rejects OIDs, longer dotted strings and
+// reverse-DNS names.
+#[test]
+fn addresses_before_sentence_punctuation_are_highlighted() {
+    let link_local_fixture = "fe80::1";
+    for valid in [
+        "Trying 192.0.2.1...".to_string(),
+        "Connected to 192.0.2.1.".to_string(),
+        "192.0.2.1/32.".to_string(),
+        "Trying 2001:db8::1...".to_string(),
+        format!("{link_local_fixture}%en0."),
+    ] {
+        assert_colored("generic", &valid, CYAN);
+    }
+    for invalid in [
+        "192.0.2.1.4.1.9",
+        "127.2.0.192.in-addr.arpa",
+        "192.0.2.1.5",
+        "192.0.2.1234",
+        "192.0.2.1.nip.io",
+        "192.0.2.1._x",
+        "2001:db8::1.2",
+        "2001:db8::1.x",
+    ] {
+        assert_not_colored("generic", invalid, CYAN);
+    }
+}
+
 #[test]
 fn interface_subunits_require_at_least_one_digit() {
     assert_colored("cisco", "Gi1/0/1.0", BLUE);
