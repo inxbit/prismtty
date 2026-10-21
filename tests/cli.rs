@@ -1291,6 +1291,10 @@ fn closed_stdout_exits_quietly_with_sigpipe_status() {
     let profile = profile.to_str().expect("utf-8 path");
     let fixture = temp.path().join("input");
     let fixture = fixture.to_str().expect("utf-8 path");
+    // Output that ends mid-line sits in stdout's buffer until it is flushed.
+    let unterminated = temp.path().join("unterminated");
+    fs::write(&unterminated, "interface Gi0/1 192.0.2.1 up").expect("fixture writes");
+    let unterminated = unterminated.to_str().expect("utf-8 path");
 
     let cases: &[(&str, &[&str])] = &[
         ("prismtty", &["--profile", "cisco"]),
@@ -1302,6 +1306,7 @@ fn closed_stdout_exits_quietly_with_sigpipe_status() {
         ("prismtty", &["profiles", "show", "cisco"]),
         ("prismtty", &["profiles", "validate", profile]),
         ("prismtty", &["profiles", "test", "cisco", fixture]),
+        ("prismtty", &["profiles", "test", "cisco", unterminated]),
     ];
     for (bin, args) in cases {
         let output = run_with_closed_stdout(bin, temp.path(), args);

@@ -233,6 +233,9 @@ fn run_inner(args: Vec<OsString>) -> Result<ExitCode, CliError> {
                 ));
             }
             stdout.write_all(&rendered)?;
+            // Output with no final line end is still buffered, and the flush
+            // at exit would drop its error.
+            stdout.flush()?;
             Ok(ExitCode::SUCCESS)
         }
         Action::Stdin => run_stdin(options),
