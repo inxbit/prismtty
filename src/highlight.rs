@@ -1816,6 +1816,10 @@ struct AnsiRange {
     start: usize,
     end: usize,
     is_sgr: bool,
+    /// The ESC or C1 control that starts this range is what ends the control
+    /// before it: a string control with no terminator, or a sequence cut
+    /// short. Removing the range would leave the terminal inside that control.
+    ends_open_control: bool,
 }
 
 fn neutralize_prompt_echo_source_sgr(
@@ -1935,7 +1939,7 @@ fn prompt_echo_source_sgr_plan(
                 let ranges_for_line = ansi_ranges
                     .iter()
                     .copied()
-                    .filter(|range| range.is_sgr)
+                    .filter(|range| range.is_sgr && !range.ends_open_control)
                     .filter(|range| range.start >= sgr_start_raw && range.start < line_raw_end)
                     .map(|range| (range.start, range.end))
                     .collect::<Vec<_>>();
@@ -1971,11 +1975,21 @@ fn visible_byte_map_and_ansi_ranges(input: &[u8]) -> (Vec<VisibleByte>, Vec<Ansi
             } else {
                 ansi_sequence_end(input, idx)
             };
+            let is_sgr = is_csi_sequence(&input[idx..end])
+                && input.get(end.saturating_sub(1)) == Some(&b'm');
+            let ends_open_control = is_sgr
+                && ansi_ranges.last().is_some_and(|previous: &AnsiRange| {
+                    previous.end == idx
+                        && !matches!(
+                            scan_escape_for_neutralization(input, previous.start),
+                            EscapeScan::Complete(_)
+                        )
+                });
             ansi_ranges.push(AnsiRange {
                 start: idx,
                 end,
-                is_sgr: is_csi_sequence(&input[idx..end])
-                    && input.get(end.saturating_sub(1)) == Some(&b'm'),
+                is_sgr,
+                ends_open_control,
             });
             idx = end;
         } else if let Some(width) = valid_utf8_char_width_at(input, idx) {
@@ -6206,6 +6220,50 @@ rules:
             "OSC payload must pass through intact: {:?}",
             String::from_utf8_lossy(&output)
         );
+    }
+
+    // A string control with no terminator ends at the ESC of the next control,
+    // and a CSI or escape sequence cut short ends there too. When that next
+    // control is a source SGR on a prompt echo, removing it would leave the
+    // terminal inside the earlier control, hiding the text after it.
+    #[test]
+    fn prompt_echo_keeps_source_sgr_that_ends_an_open_control() {
+        let highlighter =
+            Highlighter::from_config(PrismConfig::default()).expect("empty config compiles");
+
+        for opener in [
+            b"\x90".as_slice(),
+            b"\xc2\x90",
+            b"\x9d0;t",
+            b"\x1bPq",
+            b"\x1b]0;t",
+            b"\x1bX",
+            b"\x1b^",
+            b"\x1b_",
+            b"\x1b[3",
+            b"\x9b3",
+            b"\x1b(",
+            b"\x1b",
+        ] {
+            let mut input = b">0] \x1b[31m # \x18".to_vec();
+            input.extend_from_slice(opener);
+            input.extend_from_slice(b"\x1b[31m \r\n end");
+
+            let mut streaming = StreamingHighlighter::new_interactive(highlighter.clone());
+            let mut output = streaming.push(&input);
+            output.extend(streaming.finish());
+
+            assert!(
+                super::strip_ansi(&output).ends_with(b" \r\n end"),
+                "text after {opener:02x?} was hidden: {output:02x?}"
+            );
+        }
+
+        // An SGR after a control that ended on its own is still removed.
+        let input = b"R# \x1bP\x18\x1b[31mshow";
+        let output =
+            super::neutralize_prompt_echo_source_sgr(input, b"", super::ResetMode::Minimal);
+        assert_eq!(output, b"R# \x1bP\x18\x1b[39mshow");
     }
 
     #[test]
