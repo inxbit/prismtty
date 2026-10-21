@@ -64,9 +64,24 @@ struct ProfileFrame {
     nested_attempt_seen: bool,
 }
 
+/// How firmly output identified the active profile's device.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum ActiveEvidence {
+    /// Prompt-only detection, which cannot tell apart vendors that share a
+    /// prompt shape, or a profile restored by a close.
+    #[default]
+    Weak,
+    /// A strong banner selected the profile; its prompt has not appeared.
+    Banner,
+    /// The device's prompt followed its banner, so later strong signals of
+    /// other vendors are command output such as neighbor descriptions.
+    BannerAndPrompt,
+}
+
 #[derive(Clone, Debug)]
 struct ProfileTransitionState {
     active_profiles: Vec<String>,
+    active_evidence: ActiveEvidence,
     baseline_profiles: Vec<String>,
     stack: Vec<ProfileFrame>,
     pending_remote: Option<RemoteAttempt>,
@@ -90,6 +105,7 @@ enum InputEscapeState {
 #[derive(Clone, Debug)]
 pub(crate) struct ProfileRuntime {
     active_profiles: Vec<String>,
+    active_evidence: ActiveEvidence,
     baseline_profiles: Vec<String>,
     stack: Vec<ProfileFrame>,
     output_window: String,
@@ -112,6 +128,7 @@ impl ProfileRuntime {
         let baseline_locked = !is_generic_profile_set(&initial_profiles);
         Self {
             active_profiles: initial_profiles.clone(),
+            active_evidence: ActiveEvidence::Weak,
             baseline_profiles: initial_profiles,
             stack: Vec::new(),
             output_window: String::new(),
@@ -363,6 +380,17 @@ impl ProfileRuntime {
         }
         self.output_bytes_since_detection = 0;
 
+        // Gate on the evidence from before this read, so a read carrying a
+        // banner and a prompt can never block that banner's own switch.
+        let banner_and_prompt = self.active_evidence == ActiveEvidence::BannerAndPrompt;
+        if self.active_evidence == ActiveEvidence::Banner
+            && store
+                .active_specific_profile(&self.active_profiles)
+                .is_some_and(|profile| store.matches_runtime_prompt(profile, &self.output_window))
+        {
+            self.active_evidence = ActiveEvidence::BannerAndPrompt;
+        }
+
         let detected =
             store.detect_profiles_with_lowercase(&self.output_window, &self.output_window_lower);
         if is_generic_profile_set(&detected) {
@@ -385,6 +413,7 @@ impl ProfileRuntime {
         if self.should_learn_baseline(&detected, store) {
             self.baseline_profiles = detected.clone();
             self.active_profiles = detected.clone();
+            self.active_evidence = ActiveEvidence::Weak;
             self.baseline_locked = true;
             self.clear_output_window();
             self.clear_pending_prompt();
@@ -393,20 +422,37 @@ impl ProfileRuntime {
 
         let active_profile = store.active_specific_profile(&self.active_profiles);
         let at_local_baseline = self.at_local_baseline(store);
-        if let Some(profile) =
-            store.strong_transition_profile(&detected, &self.output_window_lower, active_profile)
-        {
-            let remote_attempt = self.pending_remote.take();
-            self.clear_output_window();
-            self.clear_pending_prompt();
-            return self.switch_to(profile_set(&profile), remote_attempt, at_local_baseline);
-        }
-
         let unresolved_remote = self
             .stack
             .last()
             .is_some_and(|frame| frame.unresolved_detection);
         let has_remote_hint = self.pending_remote.is_some() || unresolved_remote;
+        // Once a banner-identified device shows its prompt, another vendor's
+        // strong signal is command output, such as an LLDP or CDP neighbor's
+        // system description, unless a remote command was typed.
+        let identified_remote = banner_and_prompt
+            && !has_remote_hint
+            && active_profile.is_some_and(|profile| !store.is_local_baseline_profile(profile));
+        let strong_profile = if identified_remote {
+            None
+        } else {
+            store.strong_transition_profile(&detected, &self.output_window_lower, active_profile)
+        };
+        if let Some(profile) = strong_profile {
+            let remote_attempt = self.pending_remote.take();
+            let evidence = if self.waiting_at_prompt(store, &profile) {
+                ActiveEvidence::BannerAndPrompt
+            } else {
+                ActiveEvidence::Banner
+            };
+            self.clear_output_window();
+            self.clear_pending_prompt();
+            let transition =
+                self.switch_to(profile_set(&profile), remote_attempt, at_local_baseline);
+            self.active_evidence = evidence;
+            return transition;
+        }
+
         if has_remote_hint || active_profile.is_none() || at_local_baseline {
             if let Some(profile) =
                 store.prompt_transition_profile(&detected, &self.output_window, active_profile)
@@ -452,6 +498,7 @@ impl ProfileRuntime {
         };
         let rejected_remote = rollback.pending_remote;
         self.active_profiles = rollback.active_profiles;
+        self.active_evidence = rollback.active_evidence;
         self.baseline_profiles = rollback.baseline_profiles;
         self.stack = rollback.stack;
         self.pending_remote = None;
@@ -494,6 +541,7 @@ impl ProfileRuntime {
     fn transition_state(&self) -> ProfileTransitionState {
         ProfileTransitionState {
             active_profiles: self.active_profiles.clone(),
+            active_evidence: self.active_evidence,
             baseline_profiles: self.baseline_profiles.clone(),
             stack: self.stack.clone(),
             pending_remote: self.pending_remote.clone(),
@@ -608,11 +656,13 @@ impl ProfileRuntime {
             self.push_frame(remote_attempt);
             let changed = profiles != self.active_profiles;
             self.active_profiles = profiles;
+            self.active_evidence = ActiveEvidence::Weak;
             return changed.then(|| self.active_profiles.clone());
         }
         if profiles == self.active_profiles {
             return None;
         }
+        self.active_evidence = ActiveEvidence::Weak;
         if let Some(stack_index) = self
             .stack
             .iter()
@@ -642,6 +692,7 @@ impl ProfileRuntime {
     }
 
     fn pop_profile(&mut self) -> Option<Vec<String>> {
+        self.active_evidence = ActiveEvidence::Weak;
         let next = self
             .stack
             .pop()
@@ -1826,6 +1877,100 @@ mod tests {
             runtime.observe_output(b"fw\r\nFW-EDGE # ", &store),
             Some(names(&["generic", "fortinet"]))
         );
+    }
+
+    // Neighbor tables (LLDP/CDP) print other vendors' banners as command
+    // output once a banner-identified device is at its prompt.
+    #[test]
+    fn locked_remote_ignores_vendor_strong_signals_in_neighbor_output() {
+        let store = ProfileStore::builtin();
+        let mut runtime = ProfileRuntime::new(names(&["generic", "linux-unix"]));
+
+        runtime.observe_input(b"ssh mx1\r");
+        assert_eq!(
+            runtime.observe_output(b"--- JUNOS 22.4R3 Kernel 64-bit\n", &store),
+            Some(names(&["generic", "juniper"]))
+        );
+        runtime.accept_transition();
+        assert_eq!(runtime.observe_output(b"lab@mx1> ", &store), None);
+        runtime.observe_input(b"show lldp neighbors interface ge-0/0/0\r");
+        assert_eq!(
+            runtime.observe_output(
+                b"show lldp neighbors interface ge-0/0/0\r\nSystem Description : Cisco IOS Software, C3750E Software (C3750E-UNIVERSALK9-M), Version 15.0(2)SE11\r\n\r\nlab@mx1> ",
+                &store
+            ),
+            None
+        );
+        assert_eq!(runtime.active_profiles(), names(&["generic", "juniper"]));
+        assert_eq!(
+            runtime.observe_output(b"Connection to mx1 closed.\n", &store),
+            Some(names(&["generic", "linux-unix"]))
+        );
+    }
+
+    #[test]
+    fn locked_remote_with_banner_and_prompt_in_one_read_ignores_neighbor_output() {
+        let store = ProfileStore::builtin();
+        for (neighbor, profile) in [
+            (
+                &b"System Description: \r\nJuniper Networks, Inc. mx480 internet router, kernel JUNOS 18.4R1-S5\r\ncore-sw1#"[..],
+                "juniper",
+            ),
+            (b"Gi1/0/2  up  up  ubuntu-build01 eth0\r\ncore-sw1#", "linux-unix"),
+        ] {
+            let mut runtime = ProfileRuntime::new(names(&["generic", "linux-unix"]));
+            runtime.observe_input(b"ssh core-sw1\r");
+            assert_eq!(
+                runtime.observe_output(
+                    b"Cisco Nexus Operating System (NX-OS) Software\r\ncore-sw1# ",
+                    &store
+                ),
+                Some(names(&["generic", "cisco"]))
+            );
+            runtime.accept_transition();
+            runtime.observe_input(b"show lldp neighbors detail\r");
+            assert_eq!(
+                runtime.observe_output(neighbor, &store),
+                None,
+                "{profile} neighbor output switched the profile"
+            );
+            assert_eq!(runtime.active_profiles(), names(&["generic", "cisco"]));
+            assert_eq!(runtime.stack_len(), 1);
+
+            // A typed remote command still lets the next banner switch.
+            runtime.observe_input(b"ssh mx1\r");
+            assert_eq!(
+                runtime.observe_output(b"--- JUNOS 22.4R3 Kernel 64-bit\n", &store),
+                Some(names(&["generic", "juniper"]))
+            );
+            assert_eq!(runtime.stack_len(), 2);
+        }
+    }
+
+    // A prompt alone cannot tell apart vendors that share a prompt shape, so
+    // `show version` output may still refine a prompt-detected profile.
+    #[test]
+    fn prompt_detected_remote_still_refines_from_show_version() {
+        let store = ProfileStore::builtin();
+        let mut runtime = ProfileRuntime::new(names(&["generic", "linux-unix"]));
+
+        runtime.observe_input(b"ssh lab-aruba-01\r");
+        assert_eq!(runtime.observe_output(b"\r\nLAB-ARUBA-01# ", &store), None);
+        runtime.observe_input(b"\r");
+        assert_eq!(
+            runtime.observe_output(b"\r\nLAB-ARUBA-01# ", &store),
+            Some(names(&["generic", "cisco"]))
+        );
+        runtime.accept_transition();
+        runtime.observe_input(b"show version\r");
+        assert_eq!(
+            runtime.observe_output(
+                b"show version\r\nArubaOS-CX 10.13.1000\r\nLAB-ARUBA-01# ",
+                &store
+            ),
+            Some(names(&["generic", "arubacx"]))
+        );
+        assert_eq!(runtime.stack_len(), 1);
     }
 
     #[test]
