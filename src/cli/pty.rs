@@ -508,7 +508,13 @@ pub(super) fn run_command(options: Options, command: Vec<OsString>) -> Result<Ex
     let pair = pty_system.openpty(current_pty_size())?;
     let interactive = io::stdin().is_terminal();
 
-    let mut builder = CommandBuilder::new(command_name);
+    let program = cwd_relative_program(command_name);
+    let mut builder = CommandBuilder::new(&program);
+    // portable-pty starts the child in $HOME unless a directory is set.
+    let cwd = std::env::current_dir().ok();
+    if let Some(cwd) = &cwd {
+        builder.cwd(cwd);
+    }
     for arg in command_args {
         builder.arg(arg);
     }
@@ -626,6 +632,28 @@ pub(super) fn run_command(options: Options, command: Vec<OsString>) -> Result<Ex
     }
     stream_result?;
     Ok(ExitCode::from(exit?))
+}
+
+/// Prefixes a relative program path with a directory part (`bin/tool`) with
+/// `./`. Like execvp, a name containing `/` is resolved against the working
+/// directory, but portable-pty only does that for `./` and `../` paths and
+/// searches PATH for anything else.
+fn cwd_relative_program(program: OsString) -> OsString {
+    use std::os::unix::ffi::OsStrExt;
+    use std::path::{Component, Path};
+
+    let path = Path::new(&program);
+    let explicit = matches!(
+        path.components().next(),
+        Some(Component::CurDir | Component::ParentDir)
+    );
+    if path.is_relative() && !explicit && program.as_bytes().contains(&b'/') {
+        let mut prefixed = OsString::from("./");
+        prefixed.push(&program);
+        prefixed
+    } else {
+        program
+    }
 }
 
 fn parent_terminal_is_iterm() -> bool {
@@ -1572,6 +1600,22 @@ mod tests {
         assert_eq!(super::exit_code_byte(255), 255);
         assert_eq!(super::exit_code_byte(256), 255);
         assert_eq!(super::exit_code_byte(u32::MAX), 255);
+    }
+
+    #[test]
+    fn relative_program_paths_with_a_directory_resolve_against_the_cwd() {
+        use std::ffi::OsString;
+
+        assert_eq!(
+            super::cwd_relative_program(OsString::from("bin/tool")),
+            OsString::from("./bin/tool")
+        );
+        for unchanged in ["tool", "./tool", "../bin/tool", "/usr/bin/tool", ""] {
+            assert_eq!(
+                super::cwd_relative_program(OsString::from(unchanged)),
+                OsString::from(unchanged)
+            );
+        }
     }
 
     #[test]

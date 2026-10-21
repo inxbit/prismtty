@@ -174,6 +174,74 @@ fn wrapped_child_nonzero_exit_code_is_preserved() {
     cmd.assert().code(7);
 }
 
+/// Drops CSI sequences so assertions see the text a terminal would show.
+fn strip_csi(output: &[u8]) -> String {
+    let text = String::from_utf8_lossy(output);
+    let mut plain = String::new();
+    let mut chars = text.chars();
+    while let Some(ch) = chars.next() {
+        if ch == '\u{1b}' {
+            if chars.next() == Some('[') {
+                for next in chars.by_ref() {
+                    if ('@'..='~').contains(&next) {
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+        plain.push(ch);
+    }
+    plain
+}
+
+// The wrapped command starts in the caller's directory, not $HOME, and a
+// relative program path resolves against it the way execvp does.
+#[test]
+#[cfg(unix)]
+fn wrapped_command_runs_in_callers_working_directory() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let work = tempfile::tempdir().expect("work directory");
+    let home = tempfile::tempdir().expect("home directory");
+    let work_path = work
+        .path()
+        .canonicalize()
+        .expect("canonical work directory");
+    fs::create_dir(work_path.join("bin")).expect("bin directory");
+    for script in ["probe.sh", "bin/probe.sh"] {
+        let path = work_path.join(script);
+        fs::write(&path, "#!/bin/sh\necho \"marker-$(pwd -P)\"\n").expect("write probe");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).expect("probe is executable");
+    }
+    let expected = format!("marker-{}\r\n", work_path.display());
+
+    let commands: [&[&str]; 3] = [
+        &["sh", "-c", "echo \"marker-$(pwd -P)\""],
+        &["./probe.sh"],
+        &["bin/probe.sh"],
+    ];
+    for command in commands {
+        let output = Command::cargo_bin("ptty")
+            .expect("ptty binary exists")
+            .current_dir(&work_path)
+            .env("HOME", home.path())
+            .args(command)
+            .output()
+            .expect("ptty runs");
+        assert!(
+            output.status.success(),
+            "{command:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            strip_csi(&output.stdout),
+            expected,
+            "{command:?} did not run in the caller's directory"
+        );
+    }
+}
+
 #[test]
 fn accepts_chromaterm_cli_compatibility_flags() {
     let mut config = tempfile::NamedTempFile::new().expect("temp config");
