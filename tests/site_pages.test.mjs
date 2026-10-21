@@ -246,7 +246,7 @@ test('README files keep their public contract', () => {
 test('documented cargo install builds from the audited Cargo.lock', () => {
   // Without --locked, cargo install re-resolves every dependency to its newest
   // compatible version instead of the lockfile that CI and release audit.
-  for (const file of ['README.md', 'README.crates.md', INDEX]) {
+  for (const file of ['README.md', 'README.crates.md', 'PRODUCT.md', INDEX]) {
     const text = read(file);
     assert.match(text, /cargo install --locked prismtty/, `${file}: document cargo install --locked`);
     assert.doesNotMatch(text, /cargo install prismtty\b/, `${file}: cargo install without --locked`);

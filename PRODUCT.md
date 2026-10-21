@@ -36,7 +36,7 @@ Guardrail: the repo holds no comparison against any other tool. Describe what Pr
 ## Operating Context
 
 - Runs locally in the user's terminal emulator, macOS and Linux only (Windows: WSL). Prebuilt binaries for darwin-aarch64, darwin-x86_64, linux-x86_64.
-- Install: `brew install inxbit/tap/prismtty` (prismtty, ptty, ct, completions, example profiles, PCRE2); `cargo install prismtty` (Rust 1.85+, PCRE2, pkg-config); GitHub release tarballs with `.sha256` and attestations.
+- Install: `brew install inxbit/tap/prismtty` (prismtty, ptty, ct, completions, example profiles, PCRE2); `cargo install --locked prismtty` (Rust 1.85+, PCRE2, pkg-config); GitHub release tarballs with `.sha256` and attestations.
 - A session is one wrapped shell launched from the terminal profile; signals are forwarded and exit codes preserved. `prismtty --reload` hot-reloads running sessions after config edits.
 - Config: `~/.config/prismtty/config.yml` + `profiles.d/` user profiles; ChromaTerm YAML auto-loaded from its usual paths.
 - Website: static GitHub Pages site from `docs/` on `main`, no build step, strict meta CSP, self-hosted fonts, no third-party hosts. `tests/site_pages.test.mjs` gates Pages, CI and releases. `scripts/privacy-scan.sh` scans every tracked file.
