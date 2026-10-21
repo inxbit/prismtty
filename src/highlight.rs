@@ -3687,6 +3687,8 @@ fn streaming_split_at(chunk: &AnsiChunk) -> usize {
 /// If `bytes` ends partway through a multibyte UTF-8 sequence, returns the
 /// index of that sequence's lead byte so the partial codepoint can be carried
 /// to the next chunk instead of being emitted and split by an SGR escape.
+/// Bytes that no later byte can make a character, such as `F0 8E`, are not a
+/// partial codepoint: their C1-valued bytes are controls.
 fn incomplete_utf8_start(bytes: &[u8]) -> Option<usize> {
     let mut idx = bytes.len();
     let mut continuations = 0usize;
@@ -3696,12 +3698,14 @@ fn incomplete_utf8_start(bytes: &[u8]) -> Option<usize> {
     }
     let lead = *bytes.get(idx.checked_sub(1)?)?;
     let expected = match lead {
-        0xc0..=0xdf => 2,
+        0xc2..=0xdf => 2,
         0xe0..=0xef => 3,
-        0xf0..=0xf7 => 4,
+        0xf0..=0xf4 => 4,
         _ => return None,
     };
-    (continuations + 1 < expected).then_some(idx - 1)
+    (continuations + 1 < expected
+        && (continuations == 0 || utf8_prefix_can_be_completed(&bytes[idx - 1..], expected)))
+    .then_some(idx - 1)
 }
 
 pub(crate) fn is_incomplete_utf8_prefix(bytes: &[u8]) -> bool {
@@ -6865,6 +6869,35 @@ rules:
             output.extend(streaming.finish());
             assert_eq!(output, input, "partial UTF-8 changed: {output:02x?}");
         }
+    }
+
+    // `F0 8E` can never become a character, so its `8E` is a single shift and
+    // the `9B` after it a CSI that end of input must neutralize, not bytes of
+    // a character still waiting for its end. E0 and F4 take narrower first
+    // continuations too, so `E0 9D` and `F4 90` start an OSC and a DCS.
+    #[test]
+    fn finish_neutralizes_controls_after_bytes_that_cannot_be_a_character() {
+        let highlighter =
+            Highlighter::from_config(PrismConfig::default()).expect("empty config compiles");
+
+        for input in [
+            b"\x8e\xf0\x8e\x9b".as_slice(),
+            b"\x1b\xf0\x8e\x9b".as_slice(),
+            b"\x1b[\xe0\x9d".as_slice(),
+            b"\x9b\xf4\x90".as_slice(),
+        ] {
+            let mut streaming = StreamingHighlighter::new(highlighter.clone());
+            let mut output = streaming.push(input);
+            output.extend(streaming.finish());
+
+            assert_eq!(
+                super::incomplete_top_level_escape_start(&output),
+                None,
+                "{input:02x?} left a control open: {output:02x?}"
+            );
+        }
+        assert_eq!(super::incomplete_utf8_start(b"x\xf0\x8e"), None);
+        assert_eq!(super::incomplete_utf8_start(b"x\xf0\x9f"), Some(1));
     }
 
     #[test]

@@ -2022,8 +2022,11 @@ mod tests {
             "\u{275c}".as_bytes(),
             b"\xe2",
             b"\xe2\x9d",
+            b"\xe0",
+            b"\xed",
             b"\xf0",
             b"\xf0\x9f",
+            b"\xf4",
             b"\x9f",
             b"\xff",
             b"\x1b[31m",
@@ -2135,6 +2138,9 @@ mod tests {
             b"\x1b[\xe2\x9d\xc2x\x07",
             b"\x1b\xf0\x9f\x9c\xc2\x1b[\x9c",
             b"\x1b\xf0\x9f\xa0\xc2G\x9c",
+            // No byte can complete these, so the C1 byte in each is a control.
+            b"\x9b\xe0\x9d",
+            b"\x1b[\xf4\x90",
         ];
         for input in cases {
             for pipeline in [ChunkPipeline::Sanitize, ChunkPipeline::Strip] {
