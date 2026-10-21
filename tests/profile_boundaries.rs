@@ -215,6 +215,8 @@ fn port_numbers_and_host_boundaries_are_validated() {
         "host-name:22".to_string(),
         "[2001:db8::1]:443".to_string(),
         format!("[{link_local_fixture}%en0]:22"),
+        "host:22.".to_string(),
+        "0.0.0.0:8080 ".to_string(),
     ] {
         assert_colored("linux-unix", &valid, PORT_GREEN);
     }
@@ -227,6 +229,12 @@ fn port_numbers_and_host_boundaries_are_validated() {
         "10:07:20".to_string(),
         "[fe80::1%]:22".to_string(),
         format!("[{link_local_fixture}%bad/zone]:22"),
+        // Image tags and package versions, not ports.
+        "ubuntu:22.04".to_string(),
+        "python:3.12-slim".to_string(),
+        "nginx:1.25.3".to_string(),
+        "Version: 1:2.35-0ubuntu3.8".to_string(),
+        "host:80.5".to_string(),
     ] {
         assert_not_colored("linux-unix", &invalid, PORT_GREEN);
     }
