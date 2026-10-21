@@ -2885,15 +2885,30 @@ fn is_interactive_layout_boundary_sequence(bytes: &[u8]) -> bool {
 
 /// Length of the CSI introducer at the start of `bytes`: `ESC [`, the raw C1
 /// `9B`, or its UTF-8 encoding `C2 9B` (the tokenizer accepts both C1 forms,
-/// so every classifier must too). `None` when `bytes` is not a CSI sequence.
+/// so every classifier must too). Like the tokenizer, it counts the C0
+/// controls a terminal runs between ESC and `[`. `None` when `bytes` is not a
+/// CSI sequence.
 fn csi_introducer_len(bytes: &[u8]) -> Option<usize> {
-    if bytes.starts_with(b"\x1b[") || bytes.starts_with(b"\xc2\x9b") {
+    if bytes.starts_with(b"\xc2\x9b") {
         Some(2)
     } else if bytes.starts_with(b"\x9b") {
         Some(1)
+    } else if bytes.first() == Some(&0x1b) {
+        let introducer = skip_escape_state_controls(bytes, 1);
+        (bytes.get(introducer) == Some(&b'[')).then_some(introducer + 1)
     } else {
         None
     }
+}
+
+/// The final byte of an escape sequence with no intermediates, such as the
+/// `7` of DECSC (`ESC 7`), past the C0 controls a terminal runs after ESC.
+fn escape_final_byte(bytes: &[u8]) -> Option<u8> {
+    if bytes.first() != Some(&0x1b) {
+        return None;
+    }
+    let final_byte = skip_escape_state_controls(bytes, 1);
+    (final_byte + 1 == bytes.len()).then(|| bytes[final_byte])
 }
 
 fn is_csi_sequence(bytes: &[u8]) -> bool {
@@ -3126,21 +3141,15 @@ fn saves_rendition(bytes: &[u8]) -> bool {
 }
 
 /// Reports whether `bytes` is index (`ESC D`), next line (`ESC E`) or reverse
-/// index (`ESC M`), in the 7-bit form or either C1 form. Like a line feed, each
-/// scrolls a blank line in when the cursor is on a scroll margin.
+/// index (`ESC M`), in the 7-bit form (with any C0 controls a terminal runs
+/// after the ESC) or either C1 form. Like a line feed, each scrolls a blank
+/// line in when the cursor is on a scroll margin.
 fn is_index_control(bytes: &[u8]) -> bool {
-    matches!(
-        bytes,
-        b"\x1bD"
-            | b"\x1bE"
-            | b"\x1bM"
-            | b"\x84"
-            | b"\x85"
-            | b"\x8d"
-            | b"\xc2\x84"
-            | b"\xc2\x85"
-            | b"\xc2\x8d"
-    )
+    matches!(escape_final_byte(bytes), Some(b'D' | b'E' | b'M'))
+        || matches!(
+            bytes,
+            b"\x84" | b"\x85" | b"\x8d" | b"\xc2\x84" | b"\xc2\x85" | b"\xc2\x8d"
+        )
 }
 
 fn style_for_reset_mode(style: Style, reset_mode: ResetMode) -> Style {
@@ -3222,7 +3231,7 @@ struct NativeSgrState {
 impl NativeSgrState {
     fn apply_sequence(&mut self, bytes: &[u8]) {
         match bytes {
-            b"\x1bc" => *self = Self::default(),
+            _ if escape_final_byte(bytes) == Some(b'c') => *self = Self::default(),
             _ if saves_cursor(bytes) => self.save(),
             _ if restores_cursor(bytes) => self.restore(),
             _ if is_soft_terminal_reset(bytes) => {
@@ -3273,14 +3282,14 @@ impl NativeSgrState {
 /// Reports whether `bytes` saves the cursor and its rendition: DECSC
 /// (`ESC 7`), or `CSI s` with no parameters (SCOSC).
 fn saves_cursor(bytes: &[u8]) -> bool {
-    bytes == b"\x1b7"
+    escape_final_byte(bytes) == Some(b'7')
         || csi_introducer_len(bytes).is_some_and(|introducer| &bytes[introducer..] == b"s")
 }
 
 /// Reports whether `bytes` restores the cursor and its rendition: DECRC
 /// (`ESC 8`), or `CSI u` with no parameters (SCORC).
 fn restores_cursor(bytes: &[u8]) -> bool {
-    bytes == b"\x1b8"
+    escape_final_byte(bytes) == Some(b'8')
         || csi_introducer_len(bytes).is_some_and(|introducer| &bytes[introducer..] == b"u")
 }
 
@@ -7145,6 +7154,16 @@ rules:
             (b"\x1b[33m\x1b[s\x1b[31m\x1b8", Some("\x1b[33m")),
             (b"\x1b[33m\x1b[s\x1b[31m\x1b[>1u\x1b[<u", Some("\x1b[31m")),
             (b"\x1b[33m\x1b[s\x1b[31m\x1b[?u", Some("\x1b[31m")),
+            // A terminal runs C0 controls after ESC and then the control.
+            (b"\x1b\x00[33m", Some("\x1b[33m")),
+            (b"\x1b[33m\x1b\x00c", None),
+            (b"\x1b[33m\x1b\x00[!p", None),
+            (b"\x1b[33m\x1b\x007\x1b[31m\x1b\r\n8", Some("\x1b[33m")),
+            (b"\x1b[33m\x1b\x7f[s\x1b[31m\x1b\x00[u", Some("\x1b[33m")),
+            (
+                b"\x1b[33m\x1b\x00[?1049h\x1b[31m\x1b\x00[?1049l",
+                Some("\x1b[33m"),
+            ),
         ] {
             let mut state = NativeSgrState::default();
             for token in super::tokenize_ansi(input) {
@@ -7177,6 +7196,14 @@ rules:
                 }
                 super::Token::Ansi(control) => control,
             };
+            // A terminal runs C0 controls between ESC and the next byte.
+            let mut control = control;
+            while control.len() > 1
+                && control[0] == 0x1b
+                && matches!(control[1], 0x00..=0x17 | 0x19 | 0x1c..=0x1f | 0x7f)
+            {
+                control.remove(1);
+            }
             match control.as_slice() {
                 b"\x1bc" => {
                     foreground = None;
@@ -7243,6 +7270,11 @@ rules:
             b"\x1b[s",
             b"\x1b[u",
             b"\x1b[>1u",
+            b"\x1b\x007",
+            b"\x1b\x008",
+            b"\x1b\x00c",
+            b"\x1b\x00[32m",
+            b"\x1b\x00[?1049h",
             b"\x1bc",
             b"\x1b[!p",
             b"\x1b[?1048h",
@@ -7714,6 +7746,35 @@ rules:
             b"ab"
         );
         assert_eq!(ranges.len(), 1);
+        assert!(ranges[0].is_sgr);
+    }
+
+    // A terminal runs C0 controls between ESC and the byte that selects the
+    // sequence, and the tokenizer keeps them in the control's token, so the
+    // classifiers must read `ESC NUL [` as a CSI and `ESC NUL 7` as DECSC.
+    #[test]
+    fn escapes_with_c0_controls_after_esc_match_their_plain_forms() {
+        assert_eq!(
+            super::tokenize_ansi(b"\x1b\x00[?1049hx").len(),
+            2,
+            "the C0 control stays in the CSI token"
+        );
+        assert_eq!(
+            super::alternate_screen_command(b"\x1b\x00[?1049h"),
+            Some(true)
+        );
+        assert!(super::is_cursor_positioning_sequence(b"\x1b\x7f[2H"));
+        assert!(super::saves_rendition(b"\x1b\x007"));
+        assert!(super::saves_rendition(b"\x1b\r\n[s"));
+        assert!(super::saves_rendition(b"\x1b\x00[?1049h"));
+        assert!(super::is_index_control(b"\x1b\x00D"));
+        assert!(!super::saves_rendition(b"\x1b\x00#7"));
+
+        let (visible, ranges) = super::visible_byte_map_and_ansi_ranges(b"a\x1b\x00[31mb");
+        assert_eq!(
+            visible.iter().map(|byte| byte.byte).collect::<Vec<_>>(),
+            b"ab"
+        );
         assert!(ranges[0].is_sgr);
     }
 

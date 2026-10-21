@@ -328,6 +328,7 @@ rules:
         ("\x1b[33mx\x1b[!p", None),
         ("\x1b[32m\x1b7\x1b[33mx\x1b8", Some("32")),
         ("\x1b[32m\x1b[s\x1b[33mx\x1b[u", Some("32")),
+        ("\x1b\x00[32m\x1b\x007\x1b[33mx\x1b\x008", Some("32")),
         ("\x1b[32m\x1b7\x1b[33mx\x1b[!p\x1b8", None),
         ("\x1b[32m\x1b[?1049h\x1b[33m\x1b7x\x1b[?1049l", Some("32")),
         ("\x1b[32m\x1b[?1047h\x1b[33mx\x1b[?1047l", Some("33")),
@@ -394,6 +395,11 @@ rules:
             false,
             &["disk error\x1b[s tail\x1b[u more\n"][..],
             "error\x1b[0m\x1b[s",
+        ),
+        (
+            false,
+            &["disk error\x1b\x007 tail\x1b\x008 more\n"][..],
+            "error\x1b[0m\x1b\x007",
         ),
         (
             true,
