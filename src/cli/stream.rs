@@ -1626,6 +1626,41 @@ mod tests {
         assert!(!visible.contains(&0x1b), "open ESC reached the output");
     }
 
+    #[test]
+    fn filtered_modes_do_not_carry_a_line_ending_after_a_single_shift() {
+        for (strip_existing_ansi, sanitize, input, expected) in [
+            (
+                false,
+                false,
+                b"last\x1bN\r\n".as_slice(),
+                b"last\x1bN\r\n".as_slice(),
+            ),
+            (
+                false,
+                true,
+                b"last\x1bN\r\n".as_slice(),
+                b"last\x1bN\r\n".as_slice(),
+            ),
+            (
+                false,
+                true,
+                b"last\x8e\n".as_slice(),
+                b"last\x8e\n".as_slice(),
+            ),
+            (
+                true,
+                false,
+                b"last\x1bO\r\n".as_slice(),
+                b"last\r\n".as_slice(),
+            ),
+        ] {
+            let mut state = super::ChunkFilterState::default();
+            let prepared = super::prepare_chunk(input, strip_existing_ansi, sanitize, &mut state);
+            assert_eq!(prepared.bytes(), expected);
+            assert!(state.carry.is_empty(), "carried {:02x?}", state.carry);
+        }
+    }
+
     // The terminal ends a string control at an ESC that does not start ST, so
     // a split OSC must not swallow the control or the text after it.
     #[test]

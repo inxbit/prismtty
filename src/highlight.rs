@@ -3787,6 +3787,11 @@ fn scan_single_shift_for_neutralization(bytes: &[u8], start: usize, mut idx: usi
         if bytes[idx] == 0x1b || c1_control_at(bytes, idx).is_some() {
             return EscapeScan::Restart(idx);
         }
+        if matches!(bytes[idx], b'\r' | b'\n') {
+            // Like the tokenizer, end the shift before a line ending rather
+            // than carry the line ending while waiting for a character.
+            return EscapeScan::Complete(idx);
+        }
         if let Some(width) = valid_utf8_char_width_at(bytes, idx) {
             return EscapeScan::Complete(idx + width);
         }
@@ -4934,6 +4939,53 @@ rules:
             assert_eq!(output, expected);
             assert_eq!(super::strip_ansi(&output), visible);
         }
+    }
+
+    // A line ending is not the character a single shift selects, so like the
+    // tokenizer the scanner ends the shift there instead of carrying the line
+    // ending with it.
+    #[test]
+    fn single_shift_before_a_line_ending_keeps_the_line_ending() {
+        for input in [
+            b"last line\x1bN\r\n".as_slice(),
+            b"last line\x1bO\n".as_slice(),
+            b"last line\x8e\r\n".as_slice(),
+            b"x\x8f\r".as_slice(),
+        ] {
+            assert_eq!(
+                super::incomplete_top_level_escape_start(input),
+                None,
+                "{input:02x?}"
+            );
+        }
+
+        let highlighter =
+            Highlighter::from_config(PrismConfig::default()).expect("empty config compiles");
+        for shift in [b"\x1bN".as_slice(), b"\x8e".as_slice()] {
+            let mut input = b"R1# show clock\r\nlast line".to_vec();
+            input.extend_from_slice(shift);
+            input.extend_from_slice(b"\r\nR1# show ver\r\nCisco\r\n");
+
+            let mut streaming = StreamingHighlighter::new_interactive(highlighter.clone());
+            let mut output = streaming.push(&input);
+            output.extend(streaming.finish());
+
+            let mut line_end = shift.to_vec();
+            line_end.extend_from_slice(b"\r\nR1# ");
+            assert!(
+                output
+                    .windows(line_end.len())
+                    .any(|window| window == line_end),
+                "line ending lost after {shift:02x?}: {output:02x?}"
+            );
+            assert_eq!(super::strip_ansi(&output), super::strip_ansi(&input));
+        }
+
+        // The line is released without waiting for more output, and EOF does
+        // not neutralize the shift.
+        let mut streaming = StreamingHighlighter::new(highlighter);
+        assert_eq!(streaming.push(b"abc\x1bN\n"), b"abc\x1bN\n");
+        assert!(streaming.finish().is_empty());
     }
 
     // AUDIT (1.0.8): an unterminated escape longer than the cap must be treated
