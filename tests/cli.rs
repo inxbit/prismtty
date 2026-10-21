@@ -348,6 +348,123 @@ fn wrapped_command_runs_in_callers_working_directory() {
     }
 }
 
+// Started from a deleted working directory, the wrapped command stays there,
+// as exec would leave it, instead of falling back to $HOME, where a relative
+// path (`rm -rf build`, `./tool`) would act on the wrong files.
+#[test]
+#[cfg(unix)]
+fn wrapped_command_in_deleted_directory_does_not_run_in_home() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let base = tempfile::tempdir().expect("base directory");
+    let home = base.path().join("home");
+    fs::create_dir_all(home.join("build")).expect("home build directory");
+    let tool = home.join("tool");
+    fs::write(&tool, "#!/bin/sh\necho ran-home-tool\n").expect("write tool");
+    fs::set_permissions(&tool, fs::Permissions::from_mode(0o755)).expect("tool is executable");
+    let ptty = assert_cmd::cargo::cargo_bin("ptty");
+
+    let run = |command: &[&str]| {
+        let work = base.path().join("work");
+        fs::create_dir(&work).expect("work directory");
+        StdCommand::new("sh")
+            .arg("-c")
+            .arg(r#"cd "$1" && rmdir "$1" && shift && exec "$@""#)
+            .arg("sh")
+            .arg(&work)
+            .arg(&ptty)
+            .args(command)
+            .env("HOME", &home)
+            .stdin(Stdio::null())
+            .output()
+            .expect("ptty runs")
+    };
+
+    let output = run(&["sh", "-c", "rm -rf build"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        home.join("build").is_dir(),
+        "`rm -rf build` ran in $HOME: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(
+        !stderr.contains("cannot enter"),
+        "the deleted directory was not entered: {stderr}"
+    );
+
+    let output = run(&["./tool"]);
+    assert!(
+        !String::from_utf8_lossy(&output.stdout).contains("ran-home-tool"),
+        "`./tool` resolved against $HOME"
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(127),
+        "a missing ./tool reports 127: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+// On Linux a process can sit in a directory it cannot search, e.g. after
+// `sudo -u postgres prismtty psql` from a private home: getcwd() still works
+// and a shell still runs commands there. The wrapped command must start (in
+// $HOME, as before, and saying so) instead of failing on chdir with
+// "Permission denied".
+#[test]
+#[cfg(unix)]
+fn wrapped_command_starts_when_the_working_directory_cannot_be_searched() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let base = tempfile::tempdir().expect("base directory");
+    let home = tempfile::tempdir().expect("home directory");
+    let locked = base
+        .path()
+        .canonicalize()
+        .expect("canonical base directory")
+        .join("locked");
+    fs::create_dir(&locked).expect("locked directory");
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o600)).expect("lock");
+    let can_search_anyway = fs::metadata(locked.join(".")).is_ok();
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o700)).expect("unlock");
+    if can_search_anyway {
+        eprintln!("skipped: this user (root?) can search a mode 0600 directory");
+        return;
+    }
+
+    // Enter the directory first, then take away search permission.
+    let output = StdCommand::new("sh")
+        .arg("-c")
+        .arg(r#"cd "$1" && chmod 0600 . && exec "$2" sh -c 'echo "marker-$(pwd -P)"'"#)
+        .arg("sh")
+        .arg(&locked)
+        .arg(assert_cmd::cargo::cargo_bin("ptty"))
+        .env("HOME", home.path())
+        .stdin(Stdio::null())
+        .output()
+        .expect("ptty runs");
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o700)).expect("unlock");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "exit {:?}, stderr: {stderr}",
+        output.status
+    );
+    let home_path = home.path().canonicalize().expect("canonical home");
+    assert!(
+        strip_csi(&output.stdout).contains(&format!("marker-{}", home_path.display())),
+        "stdout: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    // Elsewhere getcwd() itself can fail there, and the fallback is the same.
+    if cfg!(target_os = "linux") {
+        assert!(
+            stderr.contains("cannot enter the current directory"),
+            "the fallback is not reported: {stderr}"
+        );
+    }
+}
+
 #[test]
 fn accepts_chromaterm_cli_compatibility_flags() {
     let mut config = tempfile::NamedTempFile::new().expect("temp config");

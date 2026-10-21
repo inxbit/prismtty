@@ -528,8 +528,7 @@ pub(super) fn run_command(options: Options, command: Vec<OsString>) -> Result<Ex
 
     let program = cwd_relative_program(command_name);
     let mut builder = CommandBuilder::new(&program);
-    // portable-pty starts the child in $HOME unless a directory is set.
-    let cwd = std::env::current_dir().ok();
+    let cwd = child_working_directory();
     if let Some(cwd) = &cwd {
         builder.cwd(cwd);
     }
@@ -656,6 +655,29 @@ pub(super) fn run_command(options: Options, command: Vec<OsString>) -> Result<Ex
     }
     stream_result?;
     Ok(ExitCode::from(exit?))
+}
+
+/// The directory to start the wrapped command in: the caller's, whenever the
+/// child can enter it. portable-pty starts the child in $HOME when it is given
+/// no directory, or one it cannot stat. `.` still names the caller's directory
+/// when it was deleted (getcwd fails) or an ancestor cannot be searched; the
+/// child then stays there, as exec would leave it, and a relative path fails
+/// instead of acting on $HOME. Only a directory the user cannot search at all
+/// (`sudo -u postgres prismtty psql` from a private home, where getcwd still
+/// works on Linux but chdir fails) falls back to $HOME, with a warning, so the
+/// command still starts.
+fn child_working_directory() -> Option<PathBuf> {
+    let enterable = |dir: &Path| dir.is_dir() && is_executable(dir);
+    match std::env::current_dir() {
+        Ok(dir) if enterable(&dir) => Some(dir),
+        _ if enterable(Path::new(".")) => Some(PathBuf::from(".")),
+        _ => {
+            warn(format_args!(
+                "prismtty: cannot enter the current directory; running the command in $HOME"
+            ));
+            None
+        }
+    }
 }
 
 /// Prefixes a relative program path with a directory part (`bin/tool`) with
