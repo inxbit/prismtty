@@ -2040,3 +2040,89 @@ fn terminal_hangup_with_blocked_input_forwarder_still_terminates() {
         128 * 1024,
     );
 }
+
+/// The terminal's open file description is shared by every process on it, so
+/// another program (a libuv tool, a crashed TUI) can leave O_NONBLOCK set on
+/// it. The stdin forwarder must wait for input instead of treating EAGAIN as
+/// an input failure that kills the wrapped session.
+#[test]
+fn nonblocking_terminal_stdin_does_not_kill_the_session() {
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::process::{CommandExt, ExitStatusExt};
+    use std::process::{Command, Stdio};
+
+    let pair = native_pty_system()
+        .openpty(PtySize::default())
+        .expect("openpty");
+    let tty = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NOCTTY)
+        .open(pair.master.tty_name().expect("outer PTY tty name"))
+        .expect("open outer slave tty");
+    // SAFETY: F_GETFL and F_SETFL take integer arguments; `tty` is a descriptor this test owns.
+    unsafe {
+        let flags = libc::fcntl(tty.as_raw_fd(), libc::F_GETFL);
+        assert!(flags >= 0, "F_GETFL failed");
+        assert_eq!(
+            libc::fcntl(tty.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK),
+            0,
+            "F_SETFL failed"
+        );
+    }
+    let capture = CaptureTask::from_master(&*pair.master);
+    let mut command = Command::new(env!("CARGO_BIN_EXE_ptty"));
+    command
+        .args(["sh", "-c", "echo READY; read x; echo got=$x"])
+        .stdin(Stdio::from(tty.try_clone().expect("stdin tty")))
+        .stdout(Stdio::from(tty.try_clone().expect("stdout tty")))
+        .stderr(Stdio::from(tty.try_clone().expect("stderr tty")));
+    // SAFETY: setsid and ioctl are async-signal-safe and run in the forked child before exec.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() == -1 || libc::ioctl(0, libc::TIOCSCTTY as _, 0) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut ptty = ProcessGuard::new(command.spawn().expect("spawn ptty"));
+    drop(command);
+    drop(tty);
+
+    let ready = capture.wait_until(Duration::from_secs(10), |out| contains_bytes(out, b"READY"));
+    assert!(
+        contains_bytes(&ready, b"READY"),
+        "wrapped command never started: {:?}",
+        String::from_utf8_lossy(&ready)
+    );
+    // Give the forwarder time to find the non-blocking stdin empty.
+    thread::sleep(Duration::from_millis(300));
+    let mut writer = pair.master.take_writer().expect("PTY master writer");
+    writer.write_all(b"hello\r").expect("type into outer PTY");
+    writer.flush().expect("flush outer PTY");
+
+    let status = ptty
+        .wait_for_exit(Duration::from_secs(10))
+        .expect("wrapper exits after the child reads its line");
+    let output = capture.wait_until(Duration::from_secs(2), |out| {
+        contains_bytes(out, b"got=hello")
+    });
+    assert_eq!(
+        status.signal(),
+        None,
+        "output: {:?}",
+        String::from_utf8_lossy(&output)
+    );
+    assert!(
+        contains_bytes(&output, b"got=hello"),
+        "wrapped session did not receive input: {:?}",
+        String::from_utf8_lossy(&output)
+    );
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "output: {:?}",
+        String::from_utf8_lossy(&output)
+    );
+}
