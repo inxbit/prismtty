@@ -318,15 +318,16 @@ rules:
 "##;
 
     // The program's color once the controls ran, as xterm draws it: RIS and
-    // DECSTR reset it, DECSC and mode 1049 save it, DECRC and leaving mode
-    // 1049 restore it, each screen keeps its own saved copy, and modes 47 and
-    // 1047 switch screens without saving.
+    // DECSTR reset it, DECSC, CSI s and mode 1049 save it, DECRC, CSI u and
+    // leaving mode 1049 restore it, each screen keeps its own saved copy, and
+    // modes 47 and 1047 switch screens without saving.
     for (program, color) in [
         ("\x1b[?1049h\x1b[33mx\x1b[?1049l", None),
         ("\x1b[32m\x1b[?1049h\x1b[33mx\x1b[?1049l", Some("32")),
         ("\x1b[33mx\x1bc", None),
         ("\x1b[33mx\x1b[!p", None),
         ("\x1b[32m\x1b7\x1b[33mx\x1b8", Some("32")),
+        ("\x1b[32m\x1b[s\x1b[33mx\x1b[u", Some("32")),
         ("\x1b[32m\x1b7\x1b[33mx\x1b[!p\x1b8", None),
         ("\x1b[32m\x1b[?1049h\x1b[33m\x1b7x\x1b[?1049l", Some("32")),
         ("\x1b[32m\x1b[?1047h\x1b[33mx\x1b[?1047l", Some("33")),
@@ -390,6 +391,11 @@ rules:
             "error\x1b[0m\x1b[?1048h",
         ),
         (
+            false,
+            &["disk error\x1b[s tail\x1b[u more\n"][..],
+            "error\x1b[0m\x1b[s",
+        ),
+        (
             true,
             &["disk error\x1b7 tail\x1b8 more\n"][..],
             "error\x1b[39m\x1b7",
@@ -398,6 +404,11 @@ rules:
             true,
             &["disk error \x1b7tail\x1b8 more\n"][..],
             "error \x1b[39m\x1b7",
+        ),
+        (
+            true,
+            &["disk error ", "\x1b[stail\x1b[u more\n"][..],
+            "error \x1b[39m\x1b[s",
         ),
         (
             true,

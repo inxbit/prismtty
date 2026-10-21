@@ -3113,10 +3113,11 @@ fn fills_blank_cells_with(bytes: &[u8], style: &Style) -> bool {
 }
 
 /// Reports whether `bytes` makes the terminal save the current rendition:
-/// DECSC, or setting mode 1048 or 1049. A highlight left active there would be
-/// saved with it and come back with the restore, on text it never matched.
+/// DECSC or CSI s, or setting mode 1048 or 1049. A highlight left active there
+/// would be saved with it and come back with the restore, on text it never
+/// matched.
 fn saves_rendition(bytes: &[u8]) -> bool {
-    bytes == b"\x1b7"
+    saves_cursor(bytes)
         || private_mode_sequence(bytes).is_some_and(|(modes, set)| {
             set && modes
                 .split(|byte| *byte == b';')
@@ -3206,8 +3207,9 @@ fn collect_styled_spans(visible: &[u8], styles: &[Option<Style>]) -> Vec<StyledS
 /// DECRC restores it. Mode 1048 saves and restores like DECSC and DECRC, and
 /// mode 1049 saves before it switches to the alternate screen and restores
 /// after it switches back; modes 47 and 1047 switch screens without saving.
-/// CSI s and CSI u are left alone: CSI s saves only while left and right
-/// margin mode is off, which is not tracked.
+/// CSI s and CSI u with no parameters save and restore like DECSC and DECRC,
+/// as they do while left and right margin mode is off, its default; that
+/// mode is not tracked.
 #[derive(Clone, Debug, Default)]
 struct NativeSgrState {
     rendition: SgrRendition,
@@ -3221,8 +3223,8 @@ impl NativeSgrState {
     fn apply_sequence(&mut self, bytes: &[u8]) {
         match bytes {
             b"\x1bc" => *self = Self::default(),
-            b"\x1b7" => self.save(),
-            b"\x1b8" => self.restore(),
+            _ if saves_cursor(bytes) => self.save(),
+            _ if restores_cursor(bytes) => self.restore(),
             _ if is_soft_terminal_reset(bytes) => {
                 self.rendition = SgrRendition::default();
                 self.saved[usize::from(self.alternate_screen)] = SgrRendition::default();
@@ -3266,6 +3268,20 @@ impl NativeSgrState {
     fn restore_after_interactive_style(&self, style: &Style) -> Vec<u8> {
         self.rendition.restore_after_interactive_style(style)
     }
+}
+
+/// Reports whether `bytes` saves the cursor and its rendition: DECSC
+/// (`ESC 7`), or `CSI s` with no parameters (SCOSC).
+fn saves_cursor(bytes: &[u8]) -> bool {
+    bytes == b"\x1b7"
+        || csi_introducer_len(bytes).is_some_and(|introducer| &bytes[introducer..] == b"s")
+}
+
+/// Reports whether `bytes` restores the cursor and its rendition: DECRC
+/// (`ESC 8`), or `CSI u` with no parameters (SCORC).
+fn restores_cursor(bytes: &[u8]) -> bool {
+    bytes == b"\x1b8"
+        || csi_introducer_len(bytes).is_some_and(|introducer| &bytes[introducer..] == b"u")
 }
 
 /// Reports whether `bytes` is DECSTR (`CSI ! p`), which xterm runs whatever
@@ -7121,6 +7137,14 @@ rules:
                 Some("\x1b[33m"),
             ),
             (b"\x1b[33m\x1b[?1049h\x1b[32m\x1b7\x1b[!p\x1b8", None),
+            // CSI s and CSI u with no parameters save and restore like DECSC
+            // and DECRC; with parameters or a prefix they are other controls.
+            (b"\x1b[33m\x1b[s\x1b[31m\x1b[u", Some("\x1b[33m")),
+            (b"\x1b[33m\x9bs\x1b[31m\xc2\x9bu", Some("\x1b[33m")),
+            (b"\x1b[33m\x1b7\x1b[31m\x1b[u", Some("\x1b[33m")),
+            (b"\x1b[33m\x1b[s\x1b[31m\x1b8", Some("\x1b[33m")),
+            (b"\x1b[33m\x1b[s\x1b[31m\x1b[>1u\x1b[<u", Some("\x1b[31m")),
+            (b"\x1b[33m\x1b[s\x1b[31m\x1b[?u", Some("\x1b[31m")),
         ] {
             let mut state = NativeSgrState::default();
             for token in super::tokenize_ansi(input) {
@@ -7138,8 +7162,8 @@ rules:
 
     /// The foreground xterm draws each visible byte of `bytes` in, modeled
     /// apart from `NativeSgrState`: SGR sets it, RIS and DECSTR reset it, and
-    /// DECSC and modes 1048 and 1049 save it and DECRC and those modes restore
-    /// it, with a saved copy per screen.
+    /// DECSC, CSI s and modes 1048 and 1049 save it and DECRC, CSI u and those
+    /// modes restore it, with a saved copy per screen.
     fn drawn_foregrounds(bytes: &[u8]) -> Vec<(u8, Option<String>)> {
         let mut foreground: Option<String> = None;
         let mut saved: [Option<String>; 2] = [None, None];
@@ -7163,8 +7187,8 @@ rules:
                     foreground = None;
                     saved[screen] = None;
                 }
-                b"\x1b7" | b"\x1b[?1048h" => saved[screen] = foreground.clone(),
-                b"\x1b8" | b"\x1b[?1048l" => foreground = saved[screen].clone(),
+                b"\x1b7" | b"\x1b[s" | b"\x1b[?1048h" => saved[screen] = foreground.clone(),
+                b"\x1b8" | b"\x1b[u" | b"\x1b[?1048l" => foreground = saved[screen].clone(),
                 b"\x1b[?1049h" => {
                     saved[screen] = foreground.clone();
                     screen = 1;
@@ -7216,6 +7240,9 @@ rules:
             b"\x1b[1m",
             b"\x1b7",
             b"\x1b8",
+            b"\x1b[s",
+            b"\x1b[u",
+            b"\x1b[>1u",
             b"\x1bc",
             b"\x1b[!p",
             b"\x1b[?1048h",
