@@ -2386,6 +2386,37 @@ fn generic_syslog_severity_tags_are_highlighted() {
     );
 }
 
+// IOS XR tags carry a subfacility: FACILITY-SUBFACILITY-SEVERITY-MNEMONIC.
+#[test]
+fn generic_syslog_ios_xr_four_part_tags_are_highlighted() {
+    let store = ProfileStore::builtin();
+    let config = PrismConfig::from_profiles(&store, &["generic"]).expect("generic loads");
+    let highlighter = Highlighter::from_config(config).expect("rules compile");
+    let output = highlighter.highlight_str(
+        "ifmgr[245]: %PKT_INFRA-LINK-3-UPDOWN : Interface Gi0/0/0/0\n\
+         bgp[1052]: %ROUTING-BGP-5-ADJCHANGE : neighbor\n\
+         config[1]: %MGBL-CONFIG-6-DB_COMMIT : committed\n\
+         %SYS-5-CONFIG_I done\n",
+    );
+
+    assert!(
+        output.contains("\x1b[1;38;2;255;51;51m%PKT_INFRA-LINK-3-UPDOWN\x1b[0m"),
+        "{output:?}"
+    );
+    assert!(
+        output.contains("\x1b[38;2;255;255;0m%ROUTING-BGP-5-ADJCHANGE\x1b[0m"),
+        "{output:?}"
+    );
+    assert!(
+        output.contains("\x1b[38;2;101;215;253m%MGBL-CONFIG-6-DB_COMMIT\x1b[0m"),
+        "{output:?}"
+    );
+    assert!(
+        output.contains("\x1b[38;2;255;255;0m%SYS-5-CONFIG_I\x1b[0m"),
+        "{output:?}"
+    );
+}
+
 // AUDIT M9: BGP transient/fault states (Active, Connect) must keep the Versa
 // blue and not be repainted green by the inherited generic good-state rule.
 #[test]
