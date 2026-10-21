@@ -1314,6 +1314,7 @@ struct JobControlShell {
     session: PtySession,
     master: Box<dyn portable_pty::MasterPty + Send>,
     wrapper_pid_path: std::path::PathBuf,
+    child_pid_path: std::path::PathBuf,
     spawned_at: Instant,
     _marker_dir: tempfile::TempDir,
 }
@@ -1347,6 +1348,7 @@ impl JobControlShell {
             session: PtySession::new(child, &*pair.master),
             master: pair.master,
             wrapper_pid_path,
+            child_pid_path,
             spawned_at,
             _marker_dir: marker_dir,
         }
@@ -1354,6 +1356,10 @@ impl JobControlShell {
 
     fn wrapper_pid(&self) -> libc::pid_t {
         wait_for_pid_file(&self.wrapper_pid_path, Duration::from_secs(10))
+    }
+
+    fn child_pid(&self) -> libc::pid_t {
+        wait_for_pid_file(&self.child_pid_path, Duration::from_secs(10))
     }
 
     /// The shell's terminal, opened so its settings can be read and set.
@@ -1481,6 +1487,68 @@ fn wrapper_resumed_with_bg_leaves_the_shells_terminal_settings_alone() {
         !attrs.local_flags.contains(LocalFlags::ECHO)
             && attrs.local_flags.contains(LocalFlags::ICANON),
         "a background wrapper overwrote the shell's terminal settings: {:?}",
+        attrs.local_flags
+    );
+}
+
+/// SIGSTOP cannot be caught, so a wrapper it stops is still in raw mode when
+/// the shell takes the terminal back. A termination queued before the wrapper
+/// is continued is then handled in the background, and must not restore the
+/// cooked mode saved at startup over the settings the shell has made since.
+/// The caller ignores SIGCONT here: the wrapper's SIGCONT handler would
+/// otherwise race the termination and, when it ran first, give raw mode up
+/// without touching the terminal.
+#[test]
+fn termination_in_the_background_leaves_the_shells_terminal_settings_alone() {
+    use nix::sys::termios::{LocalFlags, tcgetattr};
+
+    let shell = JobControlShell::spawn(
+        "set -m; trap '' CONT; \"$PTTY\" sh -c 'echo $PPID > \"$PRISMTTY_WRAPPER_PID\"; echo $$ > \"$PRISMTTY_CHILD_PID\"; exec sleep 30'; stty sane -echo; echo \"STOPPED-$((1+1))\"; sleep 30",
+    );
+    let wrapper_pid = shell.wrapper_pid();
+    let child_pid = shell.child_pid();
+    let tty = shell.tty();
+    assert!(
+        wait_for_condition(Duration::from_secs(10), || {
+            tcgetattr(&tty)
+                .map(|attrs| !attrs.local_flags.contains(LocalFlags::ICANON))
+                .unwrap_or(false)
+        }),
+        "the foreground wrapper never entered raw mode"
+    );
+    shell.settle();
+
+    // SAFETY: kill has no memory-safety preconditions; the target is a process this test spawned.
+    assert_eq!(unsafe { libc::kill(wrapper_pid, libc::SIGSTOP) }, 0);
+    let output = shell.wait_for_output(b"STOPPED-2");
+    assert!(
+        contains_bytes(&output, b"STOPPED-2"),
+        "the shell never took the terminal back: {:?}",
+        String::from_utf8_lossy(&output)
+    );
+    // SAFETY: kill has no memory-safety preconditions; the target is a process this test spawned.
+    assert_eq!(unsafe { libc::kill(wrapper_pid, libc::SIGTERM) }, 0);
+    // SAFETY: kill has no memory-safety preconditions; the target is a process this test spawned.
+    assert_eq!(unsafe { libc::kill(wrapper_pid, libc::SIGCONT) }, 0);
+    assert!(
+        wait_for_condition(Duration::from_secs(10), || {
+            // A background read can reach the watcher before the termination
+            // and stop the wrapper again; continue it so the termination runs.
+            if process_is_stopped(wrapper_pid) {
+                // SAFETY: kill has no memory-safety preconditions; the target is a process this
+                // test spawned.
+                unsafe { libc::kill(wrapper_pid, libc::SIGCONT) };
+            }
+            !process_exists(child_pid)
+        }),
+        "the wrapper never ended the wrapped command after SIGTERM"
+    );
+
+    let attrs = tcgetattr(&tty).expect("tty attrs");
+    assert!(
+        !attrs.local_flags.contains(LocalFlags::ECHO)
+            && attrs.local_flags.contains(LocalFlags::ICANON),
+        "a background wrapper overwrote the shell's terminal settings on exit: {:?}",
         attrs.local_flags
     );
 }

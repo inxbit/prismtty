@@ -1224,7 +1224,7 @@ fn terminate_raw_mode_from_signal_state(state: &Mutex<RawModeLifecycle>) -> io::
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .begin_termination_with(|active| {
             if let Some(active) = active {
-                restore_terminal_attrs(active.stdin_fd, &active.original)?;
+                restore_cooked_mode_in_foreground(active)?;
             }
             Ok(())
         })
@@ -1234,14 +1234,19 @@ fn suspend_raw_mode_from_signal_state(state: &Mutex<RawModeLifecycle>) -> io::Re
     state
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .suspend_with(|active| {
-            // A background job leaves the mode to the job that owns the
-            // terminal; restoring would overwrite that job's settings.
-            if owns_terminal(active.stdin_fd) == Some(false) {
-                return Ok(());
-            }
-            restore_terminal_attrs(active.stdin_fd, &active.original)
-        })
+        .suspend_with(restore_cooked_mode_in_foreground)
+}
+
+/// Restores the mode saved before raw mode unless this process is a
+/// background job, which leaves the mode to the job that owns the terminal;
+/// restoring would overwrite that job's settings. An uncatchable SIGSTOP
+/// leaves the state active while the shell takes the terminal back, so this
+/// also guards a termination that arrives before the continue.
+fn restore_cooked_mode_in_foreground(active: &RawModeState) -> io::Result<()> {
+    if owns_terminal(active.stdin_fd) == Some(false) {
+        return Ok(());
+    }
+    restore_terminal_attrs(active.stdin_fd, &active.original)
 }
 
 fn reapply_raw_mode_from_signal_state(state: &Mutex<RawModeLifecycle>) -> io::Result<()> {
