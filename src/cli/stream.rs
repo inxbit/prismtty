@@ -1779,6 +1779,330 @@ mod tests {
         );
     }
 
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum VtState {
+        Ground,
+        Escape,
+        Intermediate,
+        Csi,
+        SingleShift,
+        String { allows_bel: bool },
+    }
+
+    /// Width of the UTF-8 character starting at `idx`, or of the rest of
+    /// `bytes` when the end cuts that character off. The test alphabet avoids
+    /// lead bytes with narrower continuation ranges (E0, ED, F0, F4).
+    fn utf8_text_width(bytes: &[u8], idx: usize) -> Option<usize> {
+        let width = match bytes[idx] {
+            0xc2..=0xdf => 2,
+            0xe0..=0xef => 3,
+            0xf0..=0xf4 => 4,
+            _ => return None,
+        };
+        match bytes.get(idx..idx + width) {
+            Some(character) => std::str::from_utf8(character).is_ok().then_some(width),
+            None => bytes[idx + 1..]
+                .iter()
+                .all(|byte| (0x80..=0xbf).contains(byte))
+                .then_some(bytes.len() - idx),
+        }
+    }
+
+    /// An independent model of how a VT parser walks `bytes`, with C1 controls
+    /// recognized raw or UTF-8 encoded unless they belong to a UTF-8 character,
+    /// and with the highlighter's rule that a single shift is still waiting
+    /// for its character until a printable byte or a line ending. With
+    /// `raw_c1_at_end`, a character cut off by the end is read byte by byte, so
+    /// its C1-valued bytes act as raw controls. Returns the offset of the first
+    /// string control it opens and the state it ends in.
+    fn walk_vt_parser(bytes: &[u8], raw_c1_at_end: bool) -> (Option<usize>, VtState) {
+        let mut state = VtState::Ground;
+        let mut first_string = None;
+        let mut idx = 0;
+        while idx < bytes.len() {
+            let byte = bytes[idx];
+            let mut text_width = utf8_text_width(bytes, idx);
+            if text_width.is_some_and(|width| idx + width == bytes.len())
+                && std::str::from_utf8(&bytes[idx..]).is_err()
+            {
+                if !raw_c1_at_end {
+                    // A character cut off by the end leaves the state as it is.
+                    break;
+                }
+                text_width = None;
+            }
+            let c1 = match byte {
+                0xc2 if matches!(bytes.get(idx + 1), Some(0x80..=0x9f)) => {
+                    Some((bytes[idx + 1], 2))
+                }
+                0x80..=0x9f => Some((byte, 1)),
+                _ => None,
+            };
+
+            if let VtState::String { allows_bel } = state {
+                state = match (byte, c1) {
+                    (_, Some((0x9c, width))) => {
+                        idx += width;
+                        VtState::Ground
+                    }
+                    (0x07, _) if allows_bel => VtState::Ground,
+                    (0x18 | 0x1a, _) => VtState::Ground,
+                    (0x1b, _) => VtState::Escape,
+                    _ => {
+                        idx += text_width.unwrap_or(1);
+                        continue;
+                    }
+                };
+                if c1.is_none() {
+                    idx += 1;
+                }
+                continue;
+            }
+
+            if state != VtState::Ground && byte >= 0x80 {
+                let is_csi_text = state == VtState::Csi && c1.is_none();
+                if !is_csi_text {
+                    if state == VtState::SingleShift && c1.is_none() {
+                        // The shifted character completes the single shift.
+                        state = VtState::Ground;
+                        idx += text_width.unwrap_or(1);
+                        continue;
+                    }
+                    // A C1 control or other non-ASCII byte ends the sequence
+                    // and is read again.
+                    state = VtState::Ground;
+                    continue;
+                }
+                idx += text_width.unwrap_or(1);
+                continue;
+            }
+
+            match state {
+                VtState::Ground => {
+                    if byte == 0x1b {
+                        state = VtState::Escape;
+                    } else if let Some((control, width)) = c1 {
+                        match control {
+                            0x8e | 0x8f => state = VtState::SingleShift,
+                            0x9b => state = VtState::Csi,
+                            0x90 | 0x98 | 0x9d | 0x9e | 0x9f => {
+                                first_string.get_or_insert(idx);
+                                state = VtState::String {
+                                    allows_bel: control == 0x9d,
+                                };
+                            }
+                            _ => {}
+                        }
+                        idx += width;
+                        continue;
+                    } else if let Some(width) = text_width {
+                        idx += width;
+                        continue;
+                    }
+                }
+                VtState::Escape => {
+                    state = match byte {
+                        0x00..=0x17 | 0x19 | 0x1c..=0x1f | 0x7f | 0x1b => VtState::Escape,
+                        b'[' => VtState::Csi,
+                        b'N' | b'O' => VtState::SingleShift,
+                        b']' | b'P' | b'X' | b'^' | b'_' => {
+                            first_string.get_or_insert(idx);
+                            VtState::String {
+                                allows_bel: byte == b']',
+                            }
+                        }
+                        0x20..=0x2f => VtState::Intermediate,
+                        _ => VtState::Ground,
+                    };
+                }
+                VtState::Intermediate => {
+                    state = match byte {
+                        0x1b => VtState::Escape,
+                        0x18 | 0x1a | 0x30..=0x7e => VtState::Ground,
+                        _ => VtState::Intermediate,
+                    };
+                }
+                VtState::Csi => {
+                    state = match byte {
+                        0x1b => VtState::Escape,
+                        0x18 | 0x1a | 0x40..=0x7e => VtState::Ground,
+                        _ => VtState::Csi,
+                    };
+                }
+                VtState::SingleShift => {
+                    state = match byte {
+                        0x1b => VtState::Escape,
+                        b'\r' | b'\n' => {
+                            // A line ending is not the shifted character.
+                            state = VtState::Ground;
+                            continue;
+                        }
+                        0x00..=0x1f | 0x7f if !matches!(byte, 0x18 | 0x1a) => VtState::SingleShift,
+                        _ => VtState::Ground,
+                    };
+                }
+                VtState::String { .. } => unreachable!("handled above"),
+            }
+            idx += 1;
+        }
+        (first_string, state)
+    }
+
+    struct XorShift(u64);
+
+    impl XorShift {
+        fn below(&mut self, bound: usize) -> usize {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            (self.0 % bound as u64) as usize
+        }
+    }
+
+    // Read boundaries must not change what reaches the terminal, and
+    // --sanitize output must never let a terminal open a string control,
+    // however escapes, C0/C1 controls and UTF-8 are interleaved.
+    #[test]
+    fn chunking_never_changes_filtered_output_and_sanitize_opens_no_string() {
+        const FRAGMENTS: &[&[u8]] = &[
+            b"\x1b",
+            b"\x1b[",
+            b"\x1b]",
+            b"\x1bP",
+            b"\x1bX",
+            b"\x1b^",
+            b"\x1b_",
+            b"\x1b\\",
+            b"\x1bN",
+            b"\x1b(",
+            b"\x1b ",
+            b"\x07",
+            b"\x18",
+            b"\x1a",
+            b"\x00",
+            b"\r",
+            b"\n",
+            b"\r\n",
+            b"\x7f",
+            b"\x01",
+            b"[",
+            b"]",
+            b"P",
+            b"\\",
+            b";",
+            b"0",
+            b"1",
+            b"m",
+            b"J",
+            b"a",
+            b"z",
+            b" ",
+            b"\x9b",
+            b"\x9d",
+            b"\x90",
+            b"\x9c",
+            b"\x8e",
+            b"\xc2\x9b",
+            b"\xc2\x9d",
+            b"\xc2\x9c",
+            b"\xc2",
+            "\u{e9}".as_bytes(),
+            "\u{4e2d}".as_bytes(),
+            "\u{275c}".as_bytes(),
+            b"\xe2",
+            b"\xff",
+            b"\x1b[31m",
+            b"\x1b[0m",
+            b"\x1b]0;title\x07",
+            b"\x1b\x00]2;title\x07",
+            b"\x1bPq\x1b\\",
+            b"router# show ip\n",
+        ];
+        const PIPELINES: [ChunkPipeline; 4] = [
+            ChunkPipeline::Library,
+            ChunkPipeline::Preserve,
+            ChunkPipeline::Sanitize,
+            ChunkPipeline::Strip,
+        ];
+
+        let mut rng = XorShift(0x5eed_1e55_c0de_d00d);
+        for case in 0..600 {
+            let mut input = Vec::new();
+            let large = case % 50 == 49;
+            let fragments = if large { 2500 } else { 1 + rng.below(40) };
+            for _ in 0..fragments {
+                input.extend_from_slice(FRAGMENTS[rng.below(FRAGMENTS.len())]);
+                if large && rng.below(8) == 0 {
+                    input.extend_from_slice(b"\x1b[32mline\x1b[0m\n");
+                }
+            }
+
+            let mut chunkings: Vec<Vec<&[u8]>> =
+                vec![vec![input.as_slice()], input.chunks(8192).collect()];
+            let mut random = Vec::new();
+            let mut start = 0;
+            while start < input.len() {
+                let len = 1 + rng.below(if large { 2048 } else { 16 });
+                let end = input.len().min(start + len);
+                random.push(&input[start..end]);
+                start = end;
+            }
+            chunkings.push(random);
+            if !large {
+                chunkings.push(input.chunks(1).collect());
+            }
+
+            for pipeline in PIPELINES {
+                let expected = run_chunk_pipeline(&chunkings[0], pipeline);
+                for chunks in &chunkings[1..] {
+                    let output = run_chunk_pipeline(chunks, pipeline);
+                    assert!(
+                        output == expected,
+                        "{pipeline:?} output depends on {} reads of {input:02x?}:\n{output:02x?}\n{expected:02x?}",
+                        chunks.len()
+                    );
+                }
+                // A pending single shift only selects the character set of the
+                // next character, and a non-ASCII byte after ESC ends the escape
+                // even when the end cuts its character off. Such a character can
+                // also hold a C1-valued byte that the bytes dropped after it at
+                // EOF showed to be a control, as an 8-bit terminal reads it.
+                // Every other state is an open sequence.
+                let (first_string, end_state) = walk_vt_parser(&expected, false);
+                let ends_in_partial_char = (1..=3).any(|len| {
+                    len <= expected.len()
+                        && super::is_incomplete_utf8_prefix(&expected[expected.len() - len..])
+                });
+                let settled =
+                    |state: VtState| matches!(state, VtState::Ground | VtState::SingleShift);
+                assert!(
+                    settled(end_state)
+                        || (ends_in_partial_char
+                            && (matches!(end_state, VtState::Escape | VtState::Intermediate)
+                                || settled(walk_vt_parser(&expected, true).1))),
+                    "{pipeline:?} left the terminal in {end_state:?} for {input:02x?}: {expected:02x?}"
+                );
+                if !large
+                    && matches!(pipeline, ChunkPipeline::Library | ChunkPipeline::Preserve)
+                    && walk_vt_parser(&input, false).1 == VtState::Ground
+                {
+                    // Nothing is left open at the end, so a highlighter with no
+                    // rules must pass every byte through.
+                    assert!(
+                        expected == input,
+                        "{pipeline:?} changed complete input {input:02x?}:\n{expected:02x?}"
+                    );
+                }
+                if matches!(pipeline, ChunkPipeline::Sanitize | ChunkPipeline::Strip) {
+                    assert_eq!(
+                        first_string, None,
+                        "{pipeline:?} let a string control through for {input:02x?}: {expected:02x?}"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn preserve_mode_hides_split_string_payloads_from_dynamic_profile_detection() {
         for (prefix, tail) in [
