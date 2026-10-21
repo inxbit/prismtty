@@ -942,6 +942,68 @@ fn catchable_terminating_signals_restore_raw_terminal_state() {
     }
 }
 
+/// A terminating signal ends the session through `_exit`, which skips the
+/// destructor that removes the session's pid file, so each closed window or
+/// `kill` used to leave one behind in `pids.d`.
+fn assert_pid_file_removed_after(signal: libc::c_int) {
+    let runtime_dir = tempfile::tempdir().expect("runtime directory");
+    let marker_dir = tempfile::tempdir().expect("signal child marker directory");
+    let child_pid_path = marker_dir.path().join("child.pid");
+    let mut child_guard = PidGuard::from_marker(&child_pid_path);
+    let pair = native_pty_system()
+        .openpty(PtySize::default())
+        .expect("openpty");
+    let mut builder = CommandBuilder::new(env!("CARGO_BIN_EXE_ptty"));
+    builder.env("PRISMTTY_RUNTIME_DIR", runtime_dir.path());
+    builder.env("PRISMTTY_CHILD_PID", &child_pid_path);
+    builder.arg("sh");
+    builder.arg("-c");
+    builder.arg("echo $$ > \"$PRISMTTY_CHILD_PID\"; echo READY; exec sleep 1000");
+    let child = pair
+        .slave
+        .spawn_command(builder)
+        .expect("spawn interactive ptty");
+    drop(pair.slave);
+    let mut ptty = PtySession::new(child, &*pair.master);
+    let ready = ptty
+        .capture()
+        .wait_until(Duration::from_secs(10), |out| contains_bytes(out, b"READY"));
+    assert!(
+        contains_bytes(&ready, b"READY"),
+        "wrapped child reached READY"
+    );
+    child_guard.set(wait_for_pid_file(&child_pid_path, Duration::from_secs(2)));
+    let pid_file = runtime_dir
+        .path()
+        .join("pids.d")
+        .join(ptty.pid().to_string());
+    assert!(
+        pid_file.is_file(),
+        "the session did not register: {}",
+        pid_file.display()
+    );
+
+    // SAFETY: kill has no memory-safety preconditions; the target is a process this test spawned.
+    assert_eq!(unsafe { libc::kill(ptty.pid(), signal) }, 0);
+    assert_eq!(
+        ptty.wait_for_exit(Duration::from_secs(5)),
+        Some(128 + signal as u32),
+        "interactive wrapper did not report signal-style termination"
+    );
+    assert!(
+        !pid_file.exists(),
+        "signal {signal} left the session's pid file behind"
+    );
+    child_guard.disarm();
+}
+
+#[test]
+fn terminating_signals_remove_the_session_pid_file() {
+    for signal in [libc::SIGTERM, libc::SIGHUP] {
+        assert_pid_file_removed_after(signal);
+    }
+}
+
 fn file_counter(path: &std::path::Path) -> Option<u64> {
     std::fs::read_to_string(path).ok()?.trim().parse().ok()
 }

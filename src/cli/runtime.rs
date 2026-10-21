@@ -1,6 +1,7 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::SystemTime;
 
 use nix::libc;
@@ -11,6 +12,11 @@ use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsE
 use crate::terminal_text::escape_untrusted;
 
 const PID_DIR_NAME: &str = "pids.d";
+
+/// The pid file of this process's live registration, for an exit that skips
+/// `RuntimeRegistration`'s destructor: PTY mode ends a session on a
+/// terminating signal with `_exit`.
+static REGISTERED_PID_FILE: Mutex<Option<PathBuf>> = Mutex::new(None);
 
 /// Registers this session for `prismtty --reload`, which is all registration
 /// is for. A runtime directory that cannot be used (another user created it
@@ -41,19 +47,37 @@ impl RuntimeRegistration {
         let (dir, origin) = runtime_dir();
         let pid = std::process::id();
         let path = register_pid_file(&dir, origin, pid)?;
-        // A session ended by a signal never runs Drop, so its file outlives
-        // it. Clear those here to keep pids.d bounded by the live sessions.
+        // A session killed outright, or ended by a signal in pipe mode, never
+        // removes its file. Clear those here to keep pids.d bounded by the
+        // live sessions.
         if let Some(pid_dir) = path.parent() {
             let _ = prune_pid_dir(pid_dir, process_is_alive);
         }
+        *registered_pid_file() = Some(path.clone());
         Ok(Self { path })
     }
 }
 
 impl Drop for RuntimeRegistration {
     fn drop(&mut self) {
+        *registered_pid_file() = None;
         let _ = fs::remove_file(&self.path);
     }
+}
+
+/// Removes this process's pid file ahead of an exit that skips destructors.
+/// Not async-signal-safe: call it from a thread, not a signal handler.
+pub(super) fn unregister_before_exit() {
+    let path = registered_pid_file().take();
+    if let Some(path) = path {
+        let _ = fs::remove_file(path);
+    }
+}
+
+fn registered_pid_file() -> MutexGuard<'static, Option<PathBuf>> {
+    REGISTERED_PID_FILE
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
 }
 
 pub(super) struct ReloadWatcher {

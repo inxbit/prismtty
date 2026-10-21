@@ -25,7 +25,7 @@ use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use super::CliError;
 use super::args::Options;
 use super::profile_selection::dynamic_profile_enabled;
-use super::runtime::register_for_reload;
+use super::runtime::{register_for_reload, unregister_before_exit};
 use super::stream::{InputSource, highlight_stream, prepare_session};
 use super::trace::IoTrace;
 
@@ -1510,8 +1510,10 @@ fn handle_session_signals_with(
                     ));
                 }
                 terminate_and_reap_forwarded_child(signal);
+                // This runs on the watcher thread, not in the signal handler.
+                unregister_before_exit();
                 // SAFETY: _exit never returns and skips destructors by design: the terminal was
-                // restored and the child reaped above.
+                // restored, the child reaped and the pid file removed above.
                 unsafe {
                     libc::_exit(128 + signal);
                 }
