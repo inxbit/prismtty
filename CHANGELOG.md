@@ -73,6 +73,10 @@ All notable changes to PrismTTY are documented here.
 
 ### Fixed
 
+- Keep the output of a wrapped command that exits right away on macOS, such
+  as `ptty printf ok`. When the command finished before prismtty closed its
+  side of the terminal, that close waited 0.6 s and discarded everything the
+  command had printed, so the session showed nothing and exited 0.
 - Run the wrapped command in the caller's working directory instead of
   `$HOME`, and resolve a relative program path such as `bin/tool` against it,
   so `prismtty make` or `prismtty rm -rf build` no longer act on the home
