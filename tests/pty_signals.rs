@@ -450,14 +450,44 @@ fn process_is_stopped(pid: libc::pid_t) -> bool {
 
 #[cfg(target_os = "linux")]
 fn process_is_stopped(pid: libc::pid_t) -> bool {
-    let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
-        return false;
-    };
+    process_state(pid).is_some_and(|(state, _)| state == 'T')
+}
+
+/// The state letter and the parent pid of `pid`.
+#[cfg(target_os = "linux")]
+fn process_state(pid: libc::pid_t) -> Option<(char, libc::pid_t)> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     // The comm field is parenthesised and may contain spaces; state follows it.
-    let Some(after_comm) = stat.rsplit_once(") ") else {
-        return false;
-    };
-    after_comm.1.trim_start().starts_with('T')
+    let mut fields = stat.rsplit_once(") ")?.1.split_whitespace();
+    let state = fields.next()?.chars().next()?;
+    Some((state, fields.next()?.parse().ok()?))
+}
+
+/// True while the wrapped shell `pid` is stopped with its job. dash starts a
+/// simple command such as `sleep` with vfork, and a stop that lands before
+/// the vforked child has exec'd stops that child while the shell keeps
+/// waiting for it in state D, so the shell never reaches T until the job is
+/// continued. Its job is just as frozen then, so a stopped child counts.
+#[cfg(target_os = "linux")]
+fn shell_job_is_stopped(pid: libc::pid_t) -> bool {
+    match process_state(pid) {
+        Some(('T', _)) => true,
+        Some(('D', _)) => std::fs::read_dir("/proc")
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|entry| entry.file_name().to_str()?.parse().ok())
+            .filter_map(process_state)
+            .any(|(state, parent)| state == 'T' && parent == pid),
+        _ => false,
+    }
+}
+
+/// bash, the /bin/sh of macOS, starts commands with fork, so the shell
+/// itself stops with its job.
+#[cfg(target_os = "macos")]
+fn shell_job_is_stopped(pid: libc::pid_t) -> bool {
+    process_is_stopped(pid)
 }
 
 fn process_exists(pid: libc::pid_t) -> bool {
@@ -1145,7 +1175,7 @@ fn assert_job_control_stop_resume(signal: libc::c_int) {
         if let Some(WaitStatus::Stopped(_, stopped_by)) = wait_status {
             observed_stop = Some(stopped_by);
         }
-        if !observed_child_stopped && process_is_stopped(child_pid) {
+        if !observed_child_stopped && shell_job_is_stopped(child_pid) {
             observed_child_stopped = true;
         }
         if !observed_cooked_terminal
