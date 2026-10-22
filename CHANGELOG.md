@@ -200,6 +200,12 @@ All notable changes to PrismTTY are documented here.
 - Keep splitting a read that ends in a word linear after many string controls
   that share one terminator: 1 MiB of such output took about 5 s and now takes
   0.06 s.
+- Split a read that ends in a run of controls, each ending in a character the
+  next one cuts off (such as repeated `ESC F0 9F 9C` or `ESC C2`), in about one
+  scan instead of up to eight. Such output arriving in small reads is carried
+  whole, so every read rescanned the growing carry up to eight times. In a
+  release build, 64 KiB of it in 4-byte reads took about 20 s and now takes
+  about 4 s. What is emitted and what is carried is unchanged.
 
 ### Release and QA
 
