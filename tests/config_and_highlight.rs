@@ -323,7 +323,9 @@ rules:
     // modes 47 and 1047 switch screens without saving.
     for (program, color) in [
         ("\x1b[?1049h\x1b[33mx\x1b[?1049l", None),
+        ("\x1b[?1049h\x1b[44;33mx\x1b[?1049l", None),
         ("\x1b[32m\x1b[?1049h\x1b[33mx\x1b[?1049l", Some("32")),
+        ("\x1b[32m\x1b[?1049h\x1b[0;44;33mx\x1b[?1049l", Some("32")),
         ("\x1b[33mx\x1bc", None),
         ("\x1b[33mx\x1b[!p", None),
         ("\x1b[32m\x1b7\x1b[33mx\x1b8", Some("32")),
@@ -342,9 +344,17 @@ rules:
         let minimal_restore = format!("error \x1b[{}mtail", color.unwrap_or("39"));
 
         for (interactive, restore) in [(false, &full_restore), (true, &minimal_restore)] {
-            // In a read of its own, and in the read with the highlighted token.
+            // In a read of its own, with each control in a read of its own,
+            // and in the read with the highlighted token.
+            let mut each_control = program
+                .split('\x1b')
+                .filter(|control| !control.is_empty())
+                .map(|control| format!("\x1b{control}"))
+                .collect::<Vec<_>>();
+            each_control.push("disk error tail\n".to_string());
             for chunks in [
                 vec![program.to_string(), "disk error tail\n".to_string()],
+                each_control,
                 vec![format!("{program}disk error tail\n")],
             ] {
                 let mut streaming = if interactive {
