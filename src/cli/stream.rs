@@ -2254,8 +2254,11 @@ mod tests {
                 b"a\x1b[1\x00\xc3\x9e0;t\x07b",
             ),
             (b"a\x1b]0;x\x1b\xc3\x9f0;t\x07b", b"a\xc3\x9f0;t\x07b"),
-            // Cut off by the end of the input.
+            // Cut off by the end of the input, which leaves it whole, as it
+            // would be without the ESC.
             (b"a\x1b\x00\xc3", b"a\x00\xc3"),
+            (b"a\x1b\xe2\x9d", b"a\xe2\x9d"),
+            (b"a\x1b\x07\xf0\x9f\x8e", b"a\x07\xf0\x9f\x8e"),
         ];
         for &(input, expected) in cases {
             let mut chunkings: Vec<Vec<&[u8]>> = vec![vec![input], input.chunks(1).collect()];

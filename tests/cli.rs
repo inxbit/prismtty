@@ -884,16 +884,22 @@ fn sanitize_drops_escapes_that_latin1_characters_would_complete() {
     let expected = b"a\xc3\x9d0;title\x07b\x00\xc3\x9d0;t\x07c\xc3\x9d2;t\x07\
         d\xdd52;c;U0VDUkVU\x07e\xc3\x90q\x1b\\f\x1b[1\xc3\x9e0;t\x07g\n";
 
-    let mut cmd = Command::cargo_bin("ct")
-        .unwrap_or_else(|_| Command::cargo_bin("prismtty").expect("binary exists"));
-    cmd.arg("--sanitize")
-        .arg("--config")
-        .arg(empty_config.path())
-        .write_stdin(input.as_slice());
-    let output = cmd.output().expect("command runs");
+    for (input, expected) in [
+        (input.as_slice(), expected.as_slice()),
+        // A character cut off by the end of the input stays whole.
+        (b"a\x1b\xe2\x9d", b"a\xe2\x9d"),
+    ] {
+        let mut cmd = Command::cargo_bin("ct")
+            .unwrap_or_else(|_| Command::cargo_bin("prismtty").expect("binary exists"));
+        cmd.arg("--sanitize")
+            .arg("--config")
+            .arg(empty_config.path())
+            .write_stdin(input);
+        let output = cmd.output().expect("command runs");
 
-    assert!(output.status.success(), "{output:?}");
-    assert_eq!(output.stdout, expected, "{:02x?}", output.stdout);
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(output.stdout, expected, "{:02x?}", output.stdout);
+    }
 
     // The same holds for a command's output read from its PTY.
     let output = Command::cargo_bin("ptty")

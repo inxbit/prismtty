@@ -4444,17 +4444,17 @@ pub fn strip_string_escapes(input: &[u8]) -> Vec<u8> {
                     // the Latin-1 half of its escape table, which mirrors
                     // ASCII: U+00DD opens an OSC and U+00D0 a DCS, as the raw
                     // bytes do in a Latin-1 xterm. Other terminals show the
-                    // character, so only the ESC is dropped.
+                    // character, so only the ESC is dropped. A character cut
+                    // off by the end of the input stays whole, as it did while
+                    // the ESC waited for it, so its C1-valued bytes are not
+                    // read as controls that drop it.
                     _ if escape_precedes_non_ascii(input, current) => {
-                        let character = skip_escape_state_controls(input, current + 1);
-                        extend_without_open_escapes(
-                            &mut sanitized,
-                            input,
-                            root,
-                            current,
-                            character,
-                        );
-                        idx = character;
+                        let mut end = skip_escape_state_controls(input, current + 1);
+                        if is_partial_utf8_char_at_end(input, end) {
+                            end = input.len();
+                        }
+                        extend_without_open_escapes(&mut sanitized, input, root, current, end);
+                        idx = end;
                         break;
                     }
                     EscapeScan::Complete(end) => {
@@ -5143,11 +5143,21 @@ rules:
         }
 
         // The character may be cut off by the end of the input, or follow a
-        // run of controls past the limit for an open escape.
-        assert_eq!(super::strip_string_escapes(b"a\x1b\xc3"), b"a\xc3");
-        assert_eq!(super::strip_string_escapes(b"a\x1b\x00\xc2"), b"a\x00\xc2");
+        // run of controls past the limit for an open escape. A cut-off
+        // character stays whole, though its continuation bytes look like C1
+        // controls.
+        for (input, expected) in [
+            (b"a\x1b\xc3".as_slice(), b"a\xc3".as_slice()),
+            (b"a\x1b\x00\xc2", b"a\x00\xc2"),
+            (b"a\x1b\xe2\x9d", b"a\xe2\x9d"),
+            (b"a\x1b\x07\xf0\x9f\x8e", b"a\x07\xf0\x9f\x8e"),
+            (b"a\x1b\x1b\xf0\x9f\x98", b"a\xf0\x9f\x98"),
+            (b"a\x1b[1\x1b\xe2\x90", b"a\x1b[1\xe2\x90"),
+        ] {
+            assert_eq!(super::strip_string_escapes(input), expected, "{input:02x?}");
+        }
         let controls = vec![0; super::MAX_INCOMPLETE_NON_STRING_ESCAPE_BYTES + 1];
-        for character in [b"\xc3\x9d".as_slice(), b"\xdd", b"\xc3"] {
+        for character in [b"\xc3\x9d".as_slice(), b"\xdd", b"\xc3", b"\xe2\x9d"] {
             let input = [b"ok\x1b\x1b".as_slice(), &controls, character].concat();
             assert_eq!(
                 super::strip_string_escapes(&input),
