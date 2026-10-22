@@ -18,6 +18,24 @@ All notable changes to PrismTTY are documented here.
   `E0 9D`) as a partial character at the end of a read. Their C1-valued bytes
   are treated as the controls a terminal sees, so `--sanitize` and the end of
   input neutralize the CSI, OSC or DCS they start.
+- Drop an ESC under `--sanitize` when a non-ASCII byte follows it, looking
+  past the C0 controls and DEL that a terminal runs without leaving the
+  escape. xterm reads U+00A0 to U+00FF after ESC as the ASCII byte each one
+  mirrors, so `ESC U+00DD 0;title BEL` set the window title, and in UTF-8
+  mode xterm and Alacritty skip a C1 control there, so
+  `ESC C2 80 ] 0;title BEL` did too. The character or C1 control after the
+  ESC is kept. A control that the ESC cancelled, such as `ESC [ ? 4`, is
+  dropped with it, so the bytes after it cannot complete it.
+- Drop every DOCS sequence (`ESC %`) under `--sanitize`, with the controls
+  inside it. `ESC % @` can switch xterm out of UTF-8, after which the 9D byte
+  in ordinary text such as U+201D opens an OSC.
+- Drop a CSI under `--sanitize` when it holds a non-ASCII byte (80 to FF) or
+  a C1 control cancels it, and drop any CSI that sets, resets or restores DEC
+  private mode 42 (DECNRCM). In UTF-8 mode xterm skips a C1 control inside a
+  CSI and reads U+00A0 to U+00FF there as ASCII, so `ESC [ ? 4 U+00B2 h` was
+  `CSI ? 42 h`, which switches xterm out of UTF-8 even when its utf8 resource
+  is "always". The CSIs programs normally send, such as colors, cursor
+  movement, `?25h`, `?1049h` and `?2004h`, pass as before.
 - Cap an incomplete run of cancelled controls (repeated `ESC` or `ESC [`) in the
   library's `StreamingHighlighter` from the run's first control, instead of
   keeping it pending without bound and rescanning it on every push.
