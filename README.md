@@ -192,6 +192,12 @@ prismtty --profile cisco < show-tech.txt
 journalctl -xe | prismtty --profile linux-unix
 ```
 
+A wrapped command runs in the current directory. When stdin is not a terminal
+(a script, a CI job, or `ptty make < /dev/null`), the command reads that stdin
+directly while its output still goes through the PTY and is highlighted. If the
+command cannot be found or run, PrismTTY exits with 127 or 126, as a shell does;
+otherwise it exits with the command's own status.
+
 Important options:
 
 - `-p, --profile <name>` forces one or more profiles.
@@ -283,7 +289,9 @@ prismtty --reload
 
 The next output chunk in each running PrismTTY session reloads the active config.
 Set `PRISMTTY_RUNTIME_DIR` to override the runtime directory, which is useful for
-tests or isolated sessions.
+tests or isolated sessions. An existing directory is used as it is; one that
+other users can write to is refused, which only disables live reload for that
+session.
 
 ## Built-In Profiles
 
