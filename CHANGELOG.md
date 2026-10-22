@@ -60,12 +60,16 @@ All notable changes to PrismTTY are documented here.
   so `prismtty make` or `prismtty rm -rf build` no longer act on the home
   directory. A deleted working directory is kept as well. Only when the
   directory cannot be entered at all does the command start in `$HOME`, after
-  a warning. A relative program such as `bin/tool` now sees `./bin/tool` as
+  a warning, and when `$HOME` cannot be entered either, prismtty names it and
+  exits 1. A relative program such as `bin/tool` now sees `./bin/tool` as
   `argv[0]`.
 - Exit with 127 when the wrapped command is not found and 126 when it is a
   directory or not executable, instead of 1. A script whose `#!` interpreter
   is missing or not executable, including a `/bin/sh\r` line from a CRLF file,
-  exits 127 or 126 instead of aborting with exit 134.
+  exits 127 or 126 instead of aborting with exit 134. The `#!` line is read
+  the way the kernel reads it (on macOS `#` also ends it, and on Linux a name
+  that ends past the first 128 bytes is left to the kernel), so a script the
+  system would run is never refused.
 - Report bad `-p`, `-c`, `profiles.d` and `--trace-io` values before the
   wrapped command starts, so a typo or a broken config never runs part of the
   command.
@@ -76,7 +80,8 @@ All notable changes to PrismTTY are documented here.
   highlighting.
 - Wait for the terminal instead of ending the session with "Resource
   temporarily unavailable" when another program left the terminal in
-  non-blocking mode, both for typed input and for a burst of output.
+  non-blocking mode, both for typed input and for a burst of output, and in
+  stdin mode (`cmd | prismtty`) when the output is that terminal.
 - Keep highlighting when the runtime directory cannot be created or used; live
   reload is disabled for that session with a warning.
 - Remove a wrapped session's pid file when the session ends on a signal
