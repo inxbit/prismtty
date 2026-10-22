@@ -2262,6 +2262,33 @@ mod tests {
         }
     }
 
+    // Such a run arriving in small reads is carried whole, so every read
+    // splits the growing carry again and steps back over a control per split.
+    // Each of those splits must resume the scan near it instead of rescanning
+    // the carry before it. A worker thread keeps a regression from hanging.
+    #[test]
+    fn sanitize_split_scans_a_carried_run_of_cut_off_characters_once_per_read() {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut opened_strings = Vec::new();
+            for group in [b"\x1b\xf0\x9f\x9c".as_slice(), b"\x1b\xc2".as_slice()] {
+                let input = group.repeat(64 * 1024 / group.len());
+                let mut state = super::ChunkFilterState::default();
+                for read in input.chunks(64) {
+                    let prepared = super::prepare_chunk(read, false, true, &mut state);
+                    if let Some(start) = walk_vt_parser(prepared.bytes(), false).0 {
+                        opened_strings.push((group, start));
+                    }
+                }
+            }
+            let _ = sender.send(opened_strings);
+        });
+        let opened_strings = receiver
+            .recv_timeout(std::time::Duration::from_secs(8))
+            .expect("64 KiB of each run in 64-byte reads should be split within 8s");
+        assert!(opened_strings.is_empty(), "{opened_strings:02x?}");
+    }
+
     #[test]
     fn preserve_mode_hides_split_string_payloads_from_dynamic_profile_detection() {
         for (prefix, tail) in [

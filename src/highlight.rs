@@ -20,9 +20,22 @@ const MAX_INCOMPLETE_NON_STRING_ESCAPE_BYTES: usize = 1024;
 /// How many times the sanitize split may scan the read. A clean split takes
 /// two scans, one to find it and one to check the prefix before it; each
 /// further scan steps back over one control that ends in a character the
-/// previous split cut off. Every scan reads the whole prefix, so the count is
-/// capped to keep a read linear.
+/// previous split cut off. Scans after the first resume from a stop before
+/// their split instead of the start of the read, so stepping back over a run
+/// of controls costs about one scan of the run. Only crafted output steps
+/// back this often, and past the cap the read is carried whole.
 const MAX_SANITIZE_SPLIT_PASSES: usize = 8;
+/// How far past a stop the top-level escape scan may have read to reach it:
+/// whether a character after an ESC is cut off depends on the three bytes
+/// from the stop and on whether a fourth follows. The scan of a prefix makes
+/// every stop that the scan of a longer buffer made at least this far before
+/// the prefix ends.
+const TOP_LEVEL_SCAN_LOOKAHEAD: usize = 4;
+/// The least distance between the stops that the first scan of a sanitize
+/// split keeps to resume from, so a read of many controls keeps a stop per
+/// this many bytes instead of one per control. A later scan resuming from one
+/// reads at most this much more than it would from the nearest stop.
+const SANITIZE_SPLIT_STOP_SPACING: usize = 64;
 const MAX_TENTATIVE_UTF8_SUFFIX_BYTES: usize = 2;
 const PCRE2_JIT_STACK_LIMIT_BYTES: usize = 32 * 1024;
 const PCRE2_MATCH_LIMIT: usize = 100_000;
@@ -3869,8 +3882,29 @@ pub(crate) fn incomplete_escape_start(bytes: &[u8]) -> Option<usize> {
 /// emitted prematurely. An ESC that does not start ST ends the string, as it
 /// does in a terminal, and the string is carried with the control it starts.
 fn incomplete_top_level_escape_start(bytes: &[u8]) -> Option<usize> {
-    let mut idx = 0usize;
-    let mut cancellation_root = None;
+    resume_top_level_escape_scan(bytes, TopLevelScanStop::default(), &mut |_| {})
+}
+
+/// Where the top-level escape scan stops between two controls: the offset it
+/// reads on from and the first control of the cancellation chain it is in.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct TopLevelScanStop {
+    idx: usize,
+    cancellation_root: Option<usize>,
+}
+
+/// Runs the scan of `incomplete_top_level_escape_start` on from `from`,
+/// passing each stop it makes after `from` to `stop`. Taking `stop` as a
+/// trait object keeps one copy of the scan for every caller.
+fn resume_top_level_escape_scan(
+    bytes: &[u8],
+    from: TopLevelScanStop,
+    stop: &mut dyn FnMut(TopLevelScanStop),
+) -> Option<usize> {
+    let TopLevelScanStop {
+        mut idx,
+        mut cancellation_root,
+    } = from;
     while idx < bytes.len() {
         let start = next_stateful_control_start(bytes, idx)?;
         let relative_start = start - idx;
@@ -3891,6 +3925,10 @@ fn incomplete_top_level_escape_start(bytes: &[u8]) -> Option<usize> {
             }
             EscapeScan::IncompleteOversized => return None,
         }
+        stop(TopLevelScanStop {
+            idx,
+            cancellation_root,
+        });
     }
     None
 }
@@ -3913,7 +3951,47 @@ fn escape_is_incomplete_at(bytes: &[u8], start: usize) -> bool {
 /// Before a split, one in text never completes, and the sanitizer already
 /// reads its C1-valued bytes as controls, so text that looks like lead bytes,
 /// as a legacy encoding does, is not carried with the split.
+///
+/// The scan of a prefix makes every stop that the scan of the read made at
+/// least `TOP_LEVEL_SCAN_LOOKAHEAD` bytes before the prefix ends, in the same
+/// state. So each split after the first resumes from the last such stop
+/// instead of rescanning the prefix from its start, and keeps every stop it
+/// makes for the next split to resume from.
 pub(crate) fn incomplete_sanitize_start(bytes: &[u8]) -> Option<usize> {
+    let mut stops: Vec<TopLevelScanStop> = Vec::new();
+    let escape = resume_top_level_escape_scan(bytes, TopLevelScanStop::default(), &mut |stop| {
+        if stop.idx >= stops.last().map_or(0, |last| last.idx) + SANITIZE_SPLIT_STOP_SPACING {
+            stops.push(stop);
+        }
+    })
+    .unwrap_or(bytes.len());
+    let utf8 = incomplete_utf8_start(bytes).unwrap_or(bytes.len());
+    let mut split = escape.min(utf8);
+    if split == bytes.len() {
+        return None;
+    }
+    for _ in 1..MAX_SANITIZE_SPLIT_PASSES {
+        while stops
+            .last()
+            .is_some_and(|stop| stop.idx + TOP_LEVEL_SCAN_LOOKAHEAD > split)
+        {
+            stops.pop();
+        }
+        let from = stops.last().copied().unwrap_or_default();
+        match resume_top_level_escape_scan(&bytes[..split], from, &mut |stop| stops.push(stop)) {
+            Some(start) => split = start,
+            None => return Some(split),
+        }
+    }
+    // Only crafted output keeps cutting off one more control. Carrying all of
+    // it leaves nothing open, and the carry limit drops it once oversized.
+    Some(0)
+}
+
+/// `incomplete_sanitize_start` with each split rescanning its prefix from the
+/// start, which it must match.
+#[cfg(test)]
+fn incomplete_sanitize_start_by_rescans(bytes: &[u8]) -> Option<usize> {
     let mut split = bytes.len();
     for pass in 0..MAX_SANITIZE_SPLIT_PASSES {
         let prefix = &bytes[..split];
@@ -3929,8 +4007,6 @@ pub(crate) fn incomplete_sanitize_start(bytes: &[u8]) -> Option<usize> {
         }
         split = next;
     }
-    // Only crafted output keeps cutting off one more control. Carrying all of
-    // it leaves nothing open, and the carry limit drops it once oversized.
     Some(0)
 }
 
@@ -5003,6 +5079,271 @@ rules:
         ] {
             assert_eq!(super::strip_string_escapes(input), b"safe");
             assert_eq!(super::incomplete_sanitize_start(input), Some(4));
+        }
+    }
+
+    // Each sanitize split after the first resumes the scan from a stop near it
+    // instead of rescanning its prefix, which must not move any split. That
+    // relies on the scan of a prefix making every stop the scan of the whole
+    // read made far enough before the prefix ends, so check that too.
+    #[test]
+    fn sanitize_split_resuming_its_scan_matches_rescanning_each_prefix() {
+        const FRAGMENTS: &[&[u8]] = &[
+            b"\x1b",
+            b"\x1b\x00",
+            b"\x1b\r",
+            b"\x1b\x1b",
+            b"\x1b\x18",
+            b"\x00",
+            b"\x07",
+            b"\x18",
+            b"\x1a",
+            b"\x1c",
+            b"\x7f",
+            b"\r\n",
+            b"\x9b",
+            b"\x9d",
+            b"\x90",
+            b"\x98",
+            b"\x9e",
+            b"\x9f",
+            b"\x9c",
+            b"\x8e",
+            b"\x8f",
+            b"\x84",
+            b"\xc2\x9b",
+            b"\xc2\x9d",
+            b"\xc2\x90",
+            b"\xc2\x98",
+            b"\xc2\x9e",
+            b"\xc2\x9f",
+            b"\xc2\x9c",
+            b"\xc2\x8e",
+            b"\xc2\x8f",
+            b"\x1b]0;title\x07",
+            b"\x1b]52;c;",
+            b"\x1bPq",
+            b"\x1b\\",
+            b"\x1b_",
+            b"\x1bX",
+            b"\x1b^",
+            b"\x9d0;t\x9c",
+            b"\x1b[",
+            b"\x1b[1",
+            b";1",
+            b"\x1b[1;2H",
+            b"\x1b[?25h",
+            b"\x1b[31m",
+            b"\x1b[0m",
+            b"\x1b[38;5;196m",
+            b"\x9b2J",
+            b"\x9b1",
+            b"\x1b(",
+            b"\x1b(B",
+            b"\x1b ",
+            b"\x1b%G",
+            b"\x1bN",
+            b"\x1bO",
+            b"\x1bc",
+            "\u{e9}".as_bytes(),
+            "\u{4e2d}".as_bytes(),
+            "\u{275c}".as_bytes(),
+            "\u{1f600}".as_bytes(),
+            b"\xc2",
+            b"\xe2",
+            b"\xe2\x9d",
+            b"\xe0",
+            b"\xed",
+            b"\xf0",
+            b"\xf0\x9f",
+            b"\xf0\x9f\x9c",
+            b"\xf4\x90",
+            b"\x80",
+            b"\xa9",
+            b"\xbf",
+            b"\xff",
+            // KOI8-R and CP1251 words: legacy text full of UTF-8 lead bytes.
+            b"\xd3\xcf\xcf\xc2\xdd\xc5\xce\xc9\xc5",
+            b"\xef\xf0\xe8\xe2\xe5\xf2",
+            b"\xce\xf8\xe8\xe1\xea\xe0",
+            // Controls that each end in a character the next one cuts off.
+            b"\x1b\xf0\x9f\x9c",
+            b"\x1b[\xf0\x9f\x9c",
+            b"\x1b\xe2\x9d",
+            b"\x1b\xc2",
+            b"\x9b\xf0\x9f\xc2",
+            b"a",
+            b" ",
+            b"router# show ip\n",
+        ];
+        // The reads of the other sanitize split and filtered read tests, joined.
+        const CASES: &[&[u8]] = &[
+            b"\x1b[\xe2\x9d\\",
+            b"\x90\x1b\xe2\x90\x9d",
+            b"\x1b]0;\x90t\x07visible\x1b\\after",
+            b"\x1b]0;\x90t\x07vis",
+            b"\x9b\xf0\x9f\xc2\x9c",
+            b"\x9b\xf0\x9f\xc2Gpayload\x9c",
+            b"\x9b\xf0\x9f\xc2",
+            b"\x9b\xf0\x9d\xc2\xa052;c;aGk=\x07",
+            b"\x9b\xf0\x90\xc2q\x9c",
+            b"\x9b\xe2\x9f\xc2\x9c",
+            b"\x9b\xf0\x9f\x1b\\",
+            b"\x1b[\xf0\x9f\xc2\x9c",
+            b"\x1b[\xe2\x9d\xc2x\x07",
+            b"\x1b\xf0\x9f\x9c\xc2\x1b[\x9c",
+            b"\x1b\xf0\x9f\xa0\xc2G\x9c",
+            b"\x9b\xe0\x9d",
+            b"\x1b[\xf4\x90",
+            b"\xf0\x9f\x72\xe0",
+            b"\xf0\x9f\x01",
+            b"\xf0\x9d\x9c\x1b[31m",
+            b"\x9b\xf0\x9f\xc2hidden-payload\x9c",
+            b"ok \xd3\xcf\xcf\xc2\xdd\xc5\xce\xc9\xc5\x1b[",
+            b"safe\x1b[1\x1b]52;c;unterminated",
+            b"safe\x1b(\x1b]52;c;unterminated",
+            b"safe\x9b1\x9d52;c;unterminated",
+            b"safe\x1b[1\x1b]52;c;SGVsbG8=\x07Jafter",
+            b"safe\x1b(\x1b]52;c;SGVsbG8=\x07Jafter",
+            b"safe\x9b1\x9d52;c;SGVsbG8=\x07Jafter",
+            b"safe\x1b[1\x9d52;c;SGVsbG8=\x07Jafter",
+            b"safe\x1b[1\x18\x1b]52;c;SGVsbG8=\x07Jafter",
+            b"a\x1b\xc2",
+            b"a\x1b\xe2\x90",
+            b"a\x1b(\xc2",
+            b"a\x1b\xc2\x9d0;t\x07b",
+            b"ok\x9dtitle",
+            b"ok\x9b31",
+            b"hello\x1b[31m world",
+            b"safe\x1b]52;c;aGVsbG8=\x07 after",
+            b"safe\x9d52;c;aGVsbG8=\x07 after",
+            b"safe\xc2\x9d52;c;aGVsbG8=\x07 after",
+            b"safe\xc2\x90dcs\xc2\x9c after",
+            b"ok\x1b\x00]52;c;U0VDUkVU\x07done",
+            b"x\x1b\x00]2;192.0.2.1\x07y",
+            b"last\x1bN\r\n",
+            b"last\x8e\n",
+            b"last\x1bO\r\n",
+            b"x\x1b]0;t\x1b[0m hello",
+            b"before\x1b]52;abc\x18after\n",
+            b"before\x1bPabc\x1aafter\n",
+            b"before\x9d52;abc\x18after\n",
+            b"before\x90abc\x1aafter\n",
+            b"safe\x1b]ab\x1b]\x07after",
+            b"prompt \xe2\x9d\xaf ready",
+            b"\xc2\xa9\xe2\x9d\x9c\x9b2J\x1b\\after",
+        ];
+
+        let check = |input: &[u8], lens: &mut dyn Iterator<Item = usize>| {
+            let mut stops = Vec::new();
+            super::resume_top_level_escape_scan(input, Default::default(), &mut |stop| {
+                stops.push(stop)
+            });
+            for len in lens {
+                let prefix = &input[..len];
+                assert_eq!(
+                    super::incomplete_sanitize_start(prefix),
+                    super::incomplete_sanitize_start_by_rescans(prefix),
+                    "split of {prefix:02x?}"
+                );
+                let mut prefix_stops = Vec::new();
+                super::resume_top_level_escape_scan(prefix, Default::default(), &mut |stop| {
+                    prefix_stops.push(stop)
+                });
+                let settled = |stop: &&super::TopLevelScanStop| {
+                    stop.idx + super::TOP_LEVEL_SCAN_LOOKAHEAD <= len
+                };
+                assert!(
+                    prefix_stops
+                        .iter()
+                        .filter(settled)
+                        .eq(stops.iter().filter(settled)),
+                    "stops of {prefix:02x?}: {prefix_stops:?}, whole input: {stops:?}"
+                );
+            }
+        };
+
+        // A read starts wherever the previous one left its carry, so check
+        // every part of each case.
+        for case in CASES {
+            for start in 0..case.len() {
+                let input = &case[start..];
+                check(input, &mut (0..=input.len()));
+            }
+        }
+        for control in [0x00u8, 0x01, b'\r', b'\n', 0x19, 0x1c, 0x1f, 0x7f] {
+            for introducer in [b"]52;c;U0VDUkVU".as_slice(), b"]2;TITLE", b"P1$qm", b"_apc"] {
+                let input = [b"a\x1b".as_slice(), &[control, control], introducer].concat();
+                check(&input, &mut (0..=input.len()));
+            }
+            let input = [b"ok\x1b".as_slice(), &[control]].concat();
+            check(&input, &mut (0..=input.len()));
+        }
+        for group in [
+            b"\x1b\xf0\x9f\x9c".as_slice(),
+            b"\x1b[\xf0\x9f\x9c",
+            b"\x1b\xe2\x9d",
+            b"\x1b\xc2",
+        ] {
+            let input = group.repeat(8192 / group.len());
+            check(&input, &mut (input.len() - 16..=input.len()));
+        }
+        let mut legacy = b"0m ".to_vec();
+        legacy.extend_from_slice(&b"x".repeat(4000));
+        legacy.extend_from_slice(b" \xd3\xcf\xcf\xc2\xdd\xc5\xce\xc9\xc5\x1b[");
+        check(&legacy, &mut (legacy.len() - 16..=legacy.len()));
+        // Controls at and past the size beyond which they are no longer
+        // carried, followed by a run that the split steps back over.
+        let (control_limit, string_limit) = (
+            super::MAX_INCOMPLETE_NON_STRING_ESCAPE_BYTES,
+            super::MAX_INCOMPLETE_ESCAPE_BYTES,
+        );
+        for (introducer, filler, limit) in [
+            (b"\x1b[".as_slice(), b'1', control_limit),
+            (b"\x9b", b'1', control_limit),
+            (b"ok\x1b", 0x00, control_limit),
+            (b"safe\x1b]52;c;", b'x', string_limit),
+            (b"safe\x1bP", b'x', string_limit),
+            (b"safe\xc2\x90", b'x', string_limit),
+            (b"safe\x1b[1\x1b]52;c;", b'x', string_limit),
+        ] {
+            for extra in [0, 1, 2] {
+                let mut input = introducer.to_vec();
+                input.resize(limit + extra, filler);
+                input.extend_from_slice(&b"\x1b\xc2".repeat(5));
+                let len = input.len();
+                check(&input, &mut (len - 32..=len));
+            }
+        }
+
+        let mut seed = 0x5eed_5b11_7a11_0c4e_u64;
+        let mut below = |bound: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % bound as u64) as usize
+        };
+        for case in 0..1000 {
+            let large = case % 100 == 99;
+            let fragments = if large { 1000 } else { 1 + below(24) };
+            let mut input = Vec::new();
+            for _ in 0..fragments {
+                let fragment = FRAGMENTS[below(FRAGMENTS.len())];
+                // Repeats make runs that cross the pass cap and the spacing
+                // of the stops the split keeps.
+                let repeats = if below(8) == 0 { 1 + below(40) } else { 1 };
+                for _ in 0..repeats {
+                    input.extend_from_slice(fragment);
+                }
+            }
+            // Start anywhere, as a carry can, even inside a character.
+            let input = &input[below(input.len().min(8) + 1)..];
+            if input.len() <= 128 {
+                check(input, &mut (0..=input.len()));
+            } else {
+                let lens: Vec<usize> = (0..32).map(|_| below(input.len() + 1)).collect();
+                check(input, &mut lens.into_iter().chain([input.len()]));
+            }
         }
     }
 
