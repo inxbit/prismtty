@@ -20,7 +20,7 @@ use nix::libc;
 use nix::sys::termios::{
     InputFlags, LocalFlags, OutputFlags, SetArg, Termios, tcgetattr, tcsetattr,
 };
-use portable_pty::{CommandBuilder, PtySize, native_pty_system};
+use portable_pty::{CommandBuilder, PtySize, SlavePty, native_pty_system};
 
 use super::CliError;
 use super::args::Options;
@@ -270,6 +270,27 @@ fn child_exit_is_waitable(pid: libc::pid_t) -> io::Result<bool> {
             return Err(error);
         }
     }
+}
+
+/// Closes the parent's PTY slave on a thread of its own once the wrapped
+/// child has exited. On macOS the last close of a slave waits up to 0.6 s for
+/// the master to read the output still queued and then discards it, so
+/// closing it on the thread that reads the master after a short command has
+/// already exited would discard all of that command's output. While the
+/// parent holds the slave, the child's exit there waits for its output to be
+/// read instead, and this close then runs while the read loop drains the
+/// master. The slave is closed at once when the child's pid is unknown, the
+/// wait fails or no thread can be started.
+fn close_slave_after_child_exit(slave: Box<dyn SlavePty + Send>, pid: Option<u32>) {
+    let Some(pid) = pid else {
+        drop(slave);
+        return;
+    };
+    // A failed spawn drops the closure, and the slave with it.
+    let _ = thread::Builder::new().spawn(move || {
+        let _ = wait_for_child_exit_without_reaping(pid as libc::pid_t);
+        drop(slave);
+    });
 }
 
 /// Reaps the wrapped child and returns its process-exit byte. Waits without
@@ -563,7 +584,7 @@ pub(super) fn run_command(options: Options, command: Vec<OsString>) -> Result<Ex
     } else {
         spawn_with_caller_stdin(&builder, &*pair.master)?
     };
-    drop(pair.slave);
+    close_slave_after_child_exit(pair.slave, child.process_id());
     set_forward_child_pid(child.process_id().map(|pid| pid as i32).unwrap_or(0));
     cleanup_child_on_err(signal_mask.restore(), &mut child)?;
 
@@ -3523,6 +3544,50 @@ mod tests {
             fd_is_close_on_exec(std::os::fd::AsRawFd::as_raw_fd(&duped)),
             "PTY master dup lacks FD_CLOEXEC"
         );
+    }
+
+    #[test]
+    fn output_of_a_child_that_exits_before_the_slave_is_closed_is_read() {
+        use std::io::Read;
+
+        let pair = portable_pty::native_pty_system()
+            .openpty(portable_pty::PtySize::default())
+            .expect("openpty");
+        let mut builder = portable_pty::CommandBuilder::new("printf");
+        builder.arg("short-lived output");
+        builder.cwd("/");
+        let mut child =
+            super::spawn_with_caller_stdin(&builder, &*pair.master).expect("spawn printf");
+        // Let the child write and exit while the parent still holds the slave,
+        // as a short command can before the parent reaches the close.
+        std::thread::sleep(Duration::from_millis(300));
+        super::close_slave_after_child_exit(pair.slave, child.process_id());
+
+        let mut reader = pair.master.try_clone_reader().expect("master reader");
+        let mut output = Vec::new();
+        let mut buffer = [0u8; 256];
+        loop {
+            match reader.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(read) => output.extend_from_slice(&buffer[..read]),
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                // EIO: every slave descriptor is closed (Linux).
+                Err(_) => break,
+            }
+        }
+        assert_eq!(super::reap_child(&mut child).expect("reap printf"), 0);
+        assert_eq!(output, b"short-lived output");
+
+        let source = include_str!("pty.rs");
+        let run_command = source
+            .split("pub(super) fn run_command")
+            .nth(1)
+            .expect("run_command exists")
+            .split("fn child_working_directory")
+            .next()
+            .expect("run_command boundary exists");
+        assert!(run_command.contains("close_slave_after_child_exit(pair.slave"));
+        assert!(!run_command.contains("drop(pair.slave)"));
     }
 
     #[test]
