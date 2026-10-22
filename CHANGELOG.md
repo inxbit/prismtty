@@ -2,6 +2,212 @@
 
 All notable changes to PrismTTY are documented here.
 
+## Unreleased
+
+### Security
+
+- Strip an OSC, DCS, SOS, PM or APC string under `--sanitize` when its
+  introducer follows ESC plus C0 controls or DEL (for example
+  `ESC NUL ] 2;title BEL`). A terminal executes those controls and still opens
+  the string, so the sequence used to pass through.
+- End an OSC, DCS, SOS, PM or APC string at any ESC that does not begin ST, as a
+  terminal's parser does. A stray `ESC ]` no longer holds back and then
+  discards all later output, an OSC ended by a CSI is no longer dropped at end
+  of input, and an oversized discarded string ends where the terminal ends it.
+- Stop holding bytes that can never form a character (such as `F0 8E` or
+  `E0 9D`) as a partial character at the end of a read. Their C1-valued bytes
+  are treated as the controls a terminal sees, so `--sanitize` and the end of
+  input neutralize the CSI, OSC or DCS they start.
+- Cap an incomplete run of cancelled controls (repeated `ESC` or `ESC [`) in the
+  library's `StreamingHighlighter` from the run's first control, instead of
+  keeping it pending without bound and rescanning it on every push.
+- Reject config and profile files whose YAML collections nest more than 128
+  levels deep before libyaml scans them. A file of nested `[` or `{` within the
+  1 MiB read limit could keep startup, `--reload` or `profiles validate` busy
+  for minutes, with a wrapped session's terminal in raw mode the whole time. It
+  now fails at once with the same `recursion limit exceeded` error as before.
+- Bound how far YAML aliases and `%TAG` directives can expand a config or
+  profile file. A file under the 1 MiB read limit could otherwise ask for
+  gigabytes and abort, leaving the terminal in raw mode. A document is rejected
+  once its aliases would add more than 4 MiB, when an alias sits inside the
+  collection it names, or when its resolved tags pass 4 MiB. Ordinary anchors,
+  such as a shared color, still work.
+- Leave the mode of an existing `PRISMTTY_RUNTIME_DIR` alone instead of
+  chmodding it to 0700. A runtime directory that other users can write to is
+  refused untouched, which only disables live reload.
+- Ignore a relative `XDG_CONFIG_HOME`, as the XDG spec requires, so
+  `config.yml` and `profiles.d` are never loaded from the current directory.
+- Reject a `--trace-io` path that is a FIFO instead of blocking on it with the
+  terminal in raw mode.
+- Keep prismtty's signal pipe out of the wrapped command and its descendants,
+  even where `/proc` and `/dev/fd` are unavailable.
+- Document `cargo install --locked prismtty`, so crates.io installs build with
+  the dependency versions in the audited `Cargo.lock`.
+
+### Changed
+
+- When stdin is not a terminal, the wrapped command now reads prismtty's stdin
+  directly, as with `cmd < file`, while its output still goes through the PTY.
+  Piped data reaches the command, every read after the data ends sees end of
+  input, and a command that switches its input to raw mode no longer reads a
+  stray NUL. Before, piped data was dropped and a command that read stdin
+  twice, such as a script with two `read`s, hung.
+
+### Fixed
+
+- Run the wrapped command in the caller's working directory instead of
+  `$HOME`, and resolve a relative program path such as `bin/tool` against it,
+  so `prismtty make` or `prismtty rm -rf build` no longer act on the home
+  directory. A deleted working directory is kept as well. Only when the
+  directory cannot be entered at all does the command start in `$HOME`, after
+  a warning. A relative program such as `bin/tool` now sees `./bin/tool` as
+  `argv[0]`.
+- Exit with 127 when the wrapped command is not found and 126 when it is a
+  directory or not executable, instead of 1. A script whose `#!` interpreter
+  is missing or not executable, including a `/bin/sh\r` line from a CRLF file,
+  exits 127 or 126 instead of aborting with exit 134.
+- Report bad `-p`, `-c`, `profiles.d` and `--trace-io` values before the
+  wrapped command starts, so a typo or a broken config never runs part of the
+  command.
+- Exit quietly with status 141 when the reader of the output goes away
+  (`| head`, quitting `less`) instead of printing `Broken pipe`, and stop
+  `--help`, `--version`, `profiles` and `--reload` from panicking in that case.
+  A closed or hung-up stderr no longer panics session cleanup or stops
+  highlighting.
+- Wait for the terminal instead of ending the session with "Resource
+  temporarily unavailable" when another program left the terminal in
+  non-blocking mode, both for typed input and for a burst of output.
+- Keep highlighting when the runtime directory cannot be created or used; live
+  reload is disabled for that session with a warning.
+- Remove a wrapped session's pid file when the session ends on a signal
+  (closing the terminal window, `SIGTERM`, `SIGHUP`), and prune pid files left
+  by sessions killed outright when the next session registers, so `--reload`
+  stops counting them.
+- Stop injecting a newline and end-of-file into the wrapped session when stdin
+  forwarding ends, which could submit a half-typed remote command.
+- Leave signals the caller ignored ignored, so `nohup prismtty -- job` survives
+  logout and Ctrl-C no longer ends a `prismtty -- cmd &` started from a script.
+- Report the wrapped command's exit status when prismtty inherits an ignored
+  `SIGCHLD`, instead of exiting 1 with "No child processes".
+- Start the wrapped command when prismtty runs as a session leader without a
+  controlling terminal (for example under `setsid`).
+- Let a backgrounded prismtty resume with `fg`, leave the shell's terminal
+  settings alone while prismtty is a background job (also when it is
+  terminated there), re-enter raw mode after an uncatchable `SIGSTOP`, and
+  pass resizes made while stopped or starting to the wrapped PTY.
+- Draw program output that ends mid-word, such as Cisco `ping` dots or
+  `Building configuration...`, after 250 ms of quiet instead of holding it
+  until the program writes again. This also applies to `tail -f log | ct` and
+  to a wrapped command whose stdin is redirected, when the output is a
+  terminal.
+- Close the highlight color before waiting for input in pipe mode with a
+  terminal as output, so Ctrl-C, Ctrl-Z or typing no longer leave the terminal
+  colored.
+- Restore the program's own color after a highlight in pipe mode when that
+  color was set in an earlier read, instead of resetting to the default for
+  the rest of the line.
+- Track how the terminal resets, saves and restores the program's color (RIS,
+  DECSTR, DECSC and DECRC, parameterless `CSI s` and `CSI u`, and modes 1048
+  and 1049, with separate copies for the normal and alternate screens, also
+  when C0 controls follow the ESC), so a color the terminal already dropped no
+  longer comes back after a highlight. A highlight is ended before such a
+  save, so the matching restore cannot paint it onto unrelated text.
+- End what one highlight style set before switching straight to another on a
+  terminal, so a background, underline or bold (under `--no-minimal-reset`)
+  no longer carries onto the next token, the following lines or the terminal
+  after exit. Switches between foreground-only styles, which the built-in
+  profiles use, are unchanged.
+- End background, underline, inverse and strike-through highlights before the
+  line ending, before erase or scroll sequences, and before index, next line
+  and reverse index, so they no longer bleed across trailing spaces, the next
+  line's indentation, erased cells or scrolled-in lines.
+- Highlight finished LF-ended lines that contain `%`, `#`, `>` or `$` after
+  other text (syslog lines, `df` output, route tables) when reading stdin with
+  a terminal as output; they were held back as if they were a typed command.
+- Keep a carriage return inside an OSC or other string control from splitting
+  a prompt echo, so highlight colors are no longer inserted into a window
+  title or hyperlink.
+- Keep a device's color code on an echoed prompt line when its escape is what
+  closes an unterminated string control, instead of removing it and hiding the
+  output that followed.
+- Step past a rule match that PCRE2 reports with its start after its end
+  (`\K` inside a lookaround on PCRE2 older than 10.38) instead of looping until
+  memory runs out.
+- Keep an ESC followed by a multibyte UTF-8 character from splitting that
+  character; the library calls `Highlighter::highlight_str` and
+  `StreamingHighlighter::push_str` no longer panic on it.
+- Discarding an oversized string control after a cancelled control no longer
+  panics when another oversized string follows its terminator.
+- Keep the line ending after a single shift (`ESC N`, `ESC O`, SS2 or SS3) in
+  interactive sessions, and stop turning it into `^N` at end of input.
+- Make output independent of where a read boundary falls inside a UTF-8
+  character after a control, or after a C1 byte inside a terminated OSC
+  payload; under `--sanitize` the latter could hide the text after the OSC.
+- Return to the local profile when an `ssh` session closes whose host was
+  completed with TAB, or whose ssh_config alias names a different `HostName`.
+- Keep a typed `ssh` or `telnet` hint through a password, a user name or the
+  Enter that redraws a prompt, so nested prompt-only devices are detected and
+  closing a nested session no longer unwinds its parent. Nested `ssh` typed on
+  a device CLI with trailing keywords (`vrf management`,
+  `routing-instance ...`) is still tracked.
+- Stop `ssh host command`, `ssh -T`, `ssh -V`, `ssh -O ...`, `ssh -fN ...` and
+  `screen -ls` typed at the local shell from leaving a profile frame behind
+  that kept later sessions from returning to the local profile.
+- Stop local output such as rustc `-->` arrows, a `C# ...` line or a printed
+  `done # comment` from switching the local shell to the Cisco or Fortinet
+  profile.
+- Keep a device identified by its login banner on its profile when another
+  vendor's name appears in LLDP or CDP neighbor output or an interface
+  description.
+- Keep the previous rules, with a warning, when a `profiles.d` profile that
+  startup detection picks from the first output fails to compile, instead of
+  ending the session.
+- Highlight NX-OS `Ethernet1/1`, the IOS XE and IOS XR names `HundredGigE`,
+  `FortyGigE`, `TenGigE`, `TwentyFiveGigE`, mGig ports, `Bundle-Ether` and
+  four-level IOS XR names such as `GigabitEthernet0/0/0/0` in the Cisco
+  profile, and three-level Arista names such as `Ethernet3/1/1` in full.
+- Color IOS XR four-part syslog tags such as `%PKT_INFRA-LINK-3-UPDOWN` by
+  severity, `permitted` as a good state and `failures` as a bad state.
+- Highlight IPv4 and IPv6 addresses followed by a sentence period or ellipsis
+  (`Trying 192.0.2.1...`), and the Junos configuration-mode prompt
+  `user@host#`.
+- Stop coloring part of container image tags and package versions as a port in
+  the linux-unix profile (`ubuntu:22.04`, `python:3.12-slim`, `1:2.35`).
+- Install the fish completions for `ptty` and `ct` from the Homebrew formula,
+  and document how to name completion files for manual installs.
+
+### Performance
+
+- Stop rescanning up to 64 KiB of already-examined output on every read during
+  dynamic profile detection, and match banner signals against the lowercased
+  window with a substring search. `cat` of a 4 MiB router log in a wrapped
+  shell drops from 7-8 s to about 1 s, and a slow trickle of lines no longer
+  keeps a core busy.
+- Rerun startup profile auto-detection only at a line end, a prompt or every
+  4 KiB instead of on every read, which removes per-keystroke work under
+  `--no-dynamic-profile` and stops byte-paced pipes from saturating a core.
+- Make prompt-echo detection linear on lines packed with Unicode prompt
+  markers and on output with many carriage returns: a 512 KB marker flood
+  drops from 1.7 s to 0.05 s, and CR-heavy PTY output uses about 35x less CPU.
+- Reuse each read's tokenized form, render each style's escape sequence once,
+  and skip Unicode and escape-map work for plain text, cutting instruction
+  counts by 11-17% on large router dumps.
+- Keep splitting a read that ends in a word linear after many string controls
+  that share one terminator: 1 MiB of such output took about 5 s and now takes
+  0.06 s.
+
+### Release and QA
+
+- Check in the interactive echo end-to-end tests that the echo trigger, not
+  the 250 ms program-output holdback, drew the tail, so an echo-latency
+  regression no longer passes unnoticed.
+- Gate the cross-read highlight tests on a FIFO instead of sleeps, and count a
+  shell held in `vfork` as stopped in the job-control test, so slow or loaded
+  CI runners no longer fail them.
+- Add chunking differential tests that feed the same bytes in one read, in
+  random reads and a byte at a time, and check that the output matches and
+  that `--sanitize` never leaves a string control open.
+
 ## 1.2.5 - 2026-08-20
 
 ### Fixed
