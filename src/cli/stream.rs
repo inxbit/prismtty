@@ -28,6 +28,9 @@ use super::runtime::ReloadWatcher;
 use super::trace::IoTrace;
 
 const AUTO_DETECT_SAMPLE_LIMIT: usize = 64 * 1024;
+/// New output after which startup detection reruns even without a line end or
+/// prompt, the interval the dynamic runtime uses.
+const AUTO_DETECT_BYTE_INTERVAL: usize = 4096;
 
 #[derive(Default)]
 struct ChunkFilterState {
@@ -41,12 +44,24 @@ struct ChunkFilterState {
 /// the first few megabytes and would otherwise read as a silent hang.
 const SLOW_RULE_WARN_THRESHOLD: Duration = Duration::from_secs(5);
 
+/// How long an interactive stream holds back a trailing token of program
+/// output, waiting for the read that may complete it, before drawing it
+/// anyway. Long enough that a token split across writes a few tens of
+/// milliseconds apart still highlights as one span; short enough that output
+/// the program has already sent never waits on its next byte, which can be
+/// seconds away (Cisco `ping` prints one dot per two-second probe).
+const PROGRAM_OUTPUT_HOLDBACK: Duration = Duration::from_millis(250);
+
 /// Describes the stream's input source for interactive echo handling. It groups
 /// the facts the read loop needs to surface buffered echo promptly without
 /// disturbing program-output highlighting:
 /// - `interactive`: whether this is an interactive terminal session (echo present),
 /// - `pty_fd`: the PTY master to poll so an echo burst's buffered trailing token
 ///   is flushed once the child goes idle (a paste echoes back in one large read),
+/// - `idle_fd`: the descriptor the stream reads from, polled so a trailing
+///   token held back from quiet program output is drawn after
+///   [`PROGRAM_OUTPUT_HOLDBACK`]: the PTY master, or stdin in stdin mode. Its
+///   reads must not be buffered ahead of the poll,
 /// - `recent_input`: the bytes the stdin forwarder recently sent to the child.
 ///   The loop flushes a buffered trailing token only when it is a byte-for-byte
 ///   suffix of this (a heuristic for genuine input echo). The match is byte
@@ -56,18 +71,43 @@ const SLOW_RULE_WARN_THRESHOLD: Duration = Duration::from_secs(5);
 pub(super) struct InputSource {
     pub(super) interactive: bool,
     pub(super) pty_fd: Option<RawFd>,
+    pub(super) idle_fd: Option<RawFd>,
     pub(super) recent_input: Option<Arc<Mutex<Vec<u8>>>>,
+}
+
+/// The profile store, overlay config and initial highlighter, loaded and
+/// compiled before the stream has any side effect: before `run_command`
+/// spawns the child and before `run_stdin` reads its input. An unknown
+/// `--profile`, a broken config or a malformed profiles.d file then fails the
+/// run up front, instead of killing a command that already started or passing
+/// silently when the command prints nothing.
+pub(super) struct PreparedSession<'a> {
+    session: HighlightSession<'a>,
+}
+
+pub(super) fn prepare_session(
+    options: &Options,
+    interactive: bool,
+) -> Result<PreparedSession<'_>, CliError> {
+    let store = profile_store()?;
+    // No output has been seen yet, so this is the forced `--profile` list or
+    // the generic set that first-chunk auto-detection starts from.
+    let profile_names = select_profile_names_with_store(options, &store, b"")?;
+    let session = HighlightSession::new(options, store, interactive, profile_names)?;
+    Ok(PreparedSession { session })
 }
 
 pub(super) fn highlight_stream<R: Read, W: Write>(
     mut reader: R,
     writer: &mut W,
-    options: &Options,
+    prepared: PreparedSession<'_>,
     input: InputSource,
     mut reload_watcher: Option<ReloadWatcher>,
     trace: IoTrace,
     profile_input_rx: Option<mpsc::Receiver<Vec<u8>>>,
 ) -> Result<(), CliError> {
+    let mut session = prepared.session;
+    let options = session.options;
     let started = Instant::now();
     let mut input_bytes = 0usize;
     let mut buffer = [0_u8; 8192];
@@ -85,10 +125,15 @@ pub(super) fn highlight_stream<R: Read, W: Write>(
         &mut chunk_filter,
     );
     let mut detection_sample = first_chunk.bytes().to_vec();
+    let mut bytes_since_auto_detect = 0usize;
     input_bytes += read;
-    let store = profile_store()?;
-    let profile_names = select_profile_names_with_store(options, &store, &detection_sample)?;
-    let mut session = HighlightSession::new(options, store, input.interactive, profile_names)?;
+    let profile_names =
+        select_profile_names_with_store(options, session.profile_store(), &detection_sample)?;
+    // A set detected from the first chunk is a switch away from the prepared
+    // one like any later detection, so a profiles.d profile that fails to
+    // compile keeps the last good rules instead of ending the run.
+    let first_switch_accepted = profile_names.as_slice() == session.profile_names()
+        || apply_automatic_profile_switch(&mut session, writer, &trace, None, profile_names);
     session.report_current();
     let dynamic_profiles =
         dynamic_profile_enabled(options, input.interactive) && profile_input_rx.is_some();
@@ -97,8 +142,9 @@ pub(super) fn highlight_stream<R: Read, W: Write>(
     } else {
         None
     };
-    let mut auto_detect_pending =
-        !dynamic_profiles && should_continue_auto_detect(options, session.profile_names());
+    let mut auto_detect_pending = !dynamic_profiles
+        && first_switch_accepted
+        && should_continue_auto_detect(options, session.profile_names());
     if let Some(next_profile_names) = observe_dynamic_profile(
         &mut profile_runtime,
         profile_input_rx.as_ref(),
@@ -115,7 +161,7 @@ pub(super) fn highlight_stream<R: Read, W: Write>(
     }
     session.push(writer, &trace, &first_chunk)?;
     if let Some(warning) = session.slow_rule_warning() {
-        eprintln!("{warning}");
+        let _ = writeln!(io::stderr(), "{warning}");
     }
     if let Some(reason) = should_flush_input_echo(
         input.interactive,
@@ -128,9 +174,21 @@ pub(super) fn highlight_stream<R: Read, W: Write>(
         trace.log("FLUSH", reason.as_bytes());
         session.flush_input_echo(writer, &trace)?;
     }
-    writer.flush()?;
+    flush_before_wait(&mut session, writer, &trace, &input)?;
 
     loop {
+        // No echo trigger drew the held-back tail, so it is most likely
+        // program output whose next byte may complete it. Wait for that byte
+        // only so long; a program that has gone quiet still gets its output
+        // drawn.
+        if input.interactive
+            && !session.buffered_echo().is_empty()
+            && wait_idle(input.idle_fd, PROGRAM_OUTPUT_HOLDBACK)
+        {
+            trace.log("FLUSH", b"holdback");
+            session.flush_input_echo(writer, &trace)?;
+            flush_before_wait(&mut session, writer, &trace, &input)?;
+        }
         let read = reader.read(&mut buffer)?;
         if read == 0 {
             break;
@@ -159,28 +217,36 @@ pub(super) fn highlight_stream<R: Read, W: Write>(
         }
         if auto_detect_pending && detection_sample.len() < AUTO_DETECT_SAMPLE_LIMIT {
             detection_sample.extend_from_slice(chunk.bytes());
-            let next_profile_names = select_profile_names_with_store(
-                options,
-                session.profile_store(),
-                &detection_sample,
-            )?;
-            if next_profile_names.as_slice() != session.profile_names() {
-                if apply_automatic_profile_switch(
-                    &mut session,
-                    writer,
-                    &trace,
-                    None,
-                    next_profile_names,
-                ) {
-                    auto_detect_pending =
-                        should_continue_auto_detect(options, session.profile_names());
-                } else {
+            bytes_since_auto_detect += chunk.bytes().len();
+            if should_rerun_auto_detect(
+                chunk.visible_bytes(),
+                bytes_since_auto_detect,
+                detection_sample.len(),
+            ) {
+                bytes_since_auto_detect = 0;
+                let next_profile_names = select_profile_names_with_store(
+                    options,
+                    session.profile_store(),
+                    &detection_sample,
+                )?;
+                if next_profile_names.as_slice() != session.profile_names() {
+                    if apply_automatic_profile_switch(
+                        &mut session,
+                        writer,
+                        &trace,
+                        None,
+                        next_profile_names,
+                    ) {
+                        auto_detect_pending =
+                            should_continue_auto_detect(options, session.profile_names());
+                    } else {
+                        auto_detect_pending = false;
+                        session.report_current();
+                    }
+                } else if detection_sample.len() >= AUTO_DETECT_SAMPLE_LIMIT {
                     auto_detect_pending = false;
                     session.report_current();
                 }
-            } else if detection_sample.len() >= AUTO_DETECT_SAMPLE_LIMIT {
-                auto_detect_pending = false;
-                session.report_current();
             }
         }
         if reload_watcher
@@ -198,7 +264,8 @@ pub(super) fn highlight_stream<R: Read, W: Write>(
                     }
                 }
                 Err(error) => {
-                    eprintln!(
+                    let _ = writeln!(
+                        io::stderr(),
                         "prismtty: reload ignored; keeping last known good configuration: {}",
                         escape_untrusted(&error.to_string())
                     );
@@ -207,7 +274,7 @@ pub(super) fn highlight_stream<R: Read, W: Write>(
         }
         session.push(writer, &trace, &chunk)?;
         if let Some(warning) = session.slow_rule_warning() {
-            eprintln!("{warning}");
+            let _ = writeln!(io::stderr(), "{warning}");
         }
         if let Some(reason) = should_flush_input_echo(
             input.interactive,
@@ -220,7 +287,19 @@ pub(super) fn highlight_stream<R: Read, W: Write>(
             trace.log("FLUSH", reason.as_bytes());
             session.flush_input_echo(writer, &trace)?;
         }
-        writer.flush()?;
+        flush_before_wait(&mut session, writer, &trace, &input)?;
+    }
+
+    // Output that ended mid-line has had no pass since, and no later read will
+    // bring the line end that triggers one. Make it now, so a signal on an
+    // unterminated last line still selects its profile and the tail held back
+    // until `finish` is drawn with it.
+    if auto_detect_pending && bytes_since_auto_detect > 0 {
+        let next_profile_names =
+            select_profile_names_with_store(options, session.profile_store(), &detection_sample)?;
+        if next_profile_names.as_slice() != session.profile_names() {
+            apply_automatic_profile_switch(&mut session, writer, &trace, None, next_profile_names);
+        }
     }
 
     if !chunk_filter.carry.is_empty() {
@@ -247,6 +326,28 @@ pub(super) fn highlight_stream<R: Read, W: Write>(
         );
     }
 
+    Ok(())
+}
+
+/// Hands one read's output to the terminal before the loop waits for more.
+///
+/// In stdin mode (no PTY master), nothing that reaches the terminal while
+/// prismtty waits passes through the highlighter: the terminal echoes typing
+/// on its own, and Ctrl-C, Ctrl-Z or a closed window end or stop prismtty
+/// with no chance to reset. So an open highlight color is closed first. An
+/// interactive PTY session keeps it: the child's echo comes back through the
+/// highlighter, and its signal handling resets the terminal. Noninteractive
+/// streams never hold a color open, so closing is a no-op for them.
+fn flush_before_wait<W: Write>(
+    session: &mut HighlightSession<'_>,
+    writer: &mut W,
+    trace: &IoTrace,
+    input: &InputSource,
+) -> Result<(), CliError> {
+    if input.pty_fd.is_none() {
+        session.close_interactive_overlay(writer, trace)?;
+    }
+    writer.flush()?;
     Ok(())
 }
 
@@ -499,6 +600,18 @@ impl<'a> HighlightSession<'a> {
         Ok(())
     }
 
+    fn close_interactive_overlay<W: Write>(
+        &mut self,
+        writer: &mut W,
+        trace: &IoTrace,
+    ) -> Result<(), CliError> {
+        let reset = self.streaming.close_interactive_overlay();
+        if !reset.is_empty() {
+            write_rendered(writer, trace, reset)?;
+        }
+        Ok(())
+    }
+
     /// One-time warning naming the slowest rule once its cumulative matching
     /// time crosses [`SLOW_RULE_WARN_THRESHOLD`]. A pathological (usually
     /// imported) regex degrades throughput so badly it reads as a hang; naming
@@ -622,6 +735,26 @@ fn observe_dynamic_profile(
     runtime.observe_output(chunk.visible_bytes(), store)
 }
 
+/// Whether startup detection should rescan its sample after a chunk whose
+/// visible bytes are `visible`. Each pass strips and scans the whole sample,
+/// so passing on every read cost milliseconds per byte of keystroke echo or
+/// serial output; like `ProfileRuntime`, it waits for a line end, a
+/// prompt-like ending, [`AUTO_DETECT_BYTE_INTERVAL`] bytes of new output, or a
+/// full sample, which gets the final pass.
+fn should_rerun_auto_detect(
+    visible: &[u8],
+    bytes_since_detection: usize,
+    sample_len: usize,
+) -> bool {
+    bytes_since_detection >= AUTO_DETECT_BYTE_INTERVAL
+        || sample_len >= AUTO_DETECT_SAMPLE_LIMIT
+        || visible.iter().any(|byte| matches!(byte, b'\r' | b'\n'))
+        || matches!(
+            visible.trim_ascii_end().last(),
+            Some(b'#' | b'>' | b'$' | b'%')
+        )
+}
+
 fn apply_automatic_profile_switch<W: Write>(
     session: &mut HighlightSession<'_>,
     writer: &mut W,
@@ -633,7 +766,8 @@ fn apply_automatic_profile_switch<W: Write>(
         Ok(ProfileSwitchOutcome::Unchanged | ProfileSwitchOutcome::Switched) => true,
         Ok(ProfileSwitchOutcome::Rejected) => false,
         Err(error) => {
-            eprintln!(
+            let _ = writeln!(
+                io::stderr(),
                 "prismtty: automatic profile switch ignored; keeping last known good rules: {}",
                 escape_untrusted(&error.to_string())
             );
@@ -678,7 +812,18 @@ fn new_streaming_highlighter(
 }
 
 fn print_benchmark_report(report: Option<&BenchmarkReport>, input_bytes: usize, elapsed_secs: f64) {
-    eprintln!("Benchmark results (time spent, match count):");
+    // Best effort, like every diagnostic: a closed stderr is not worth failing
+    // a run whose output was already written.
+    let _ = write_benchmark_report(&mut io::stderr().lock(), report, input_bytes, elapsed_secs);
+}
+
+fn write_benchmark_report(
+    out: &mut impl Write,
+    report: Option<&BenchmarkReport>,
+    input_bytes: usize,
+    elapsed_secs: f64,
+) -> io::Result<()> {
+    writeln!(out, "Benchmark results (time spent, match count):")?;
     if let Some(report) = report {
         let total = report.total_duration().as_secs_f64();
         let mut rules = report.rules_with_errors().collect::<Vec<_>>();
@@ -690,19 +835,24 @@ fn print_benchmark_report(report: Option<&BenchmarkReport>, input_bytes: usize, 
                 0.0
             };
             let description = escape_untrusted(&rule.description);
-            eprintln!(
+            writeln!(
+                out,
                 "{percent:>6.2}% {:>8.3}s  {:<7}  {}",
                 rule.duration.as_secs_f64(),
                 rule.match_count,
                 description
-            );
+            )?;
             if error_count > 0 {
                 let error = escape_untrusted(last_error.unwrap_or("PCRE2 match error"));
-                eprintln!("         match errors: {} (last: {})", error_count, error);
+                writeln!(
+                    out,
+                    "         match errors: {} (last: {})",
+                    error_count, error
+                )?;
             }
         }
     }
-    eprintln!("Processed {input_bytes} bytes in {elapsed_secs:.3}s");
+    writeln!(out, "Processed {input_bytes} bytes in {elapsed_secs:.3}s")
 }
 
 fn prepare_chunk(
@@ -776,6 +926,10 @@ fn prepare_chunk(
 /// Screen safety does not rely on any of these heuristics: the session only emits
 /// the child's own output bytes, never `recent_input`, so a non-echoed secret is
 /// never drawn (it produces no buffered token).
+///
+/// A tail none of these match is program output and stays buffered, but only
+/// for [`PROGRAM_OUTPUT_HOLDBACK`]: the read loop draws it once the source has
+/// been quiet that long.
 fn should_flush_input_echo(
     interactive: bool,
     pty_fd: Option<RawFd>,
@@ -871,6 +1025,36 @@ fn poll_idle(pty_fd: Option<RawFd>, error_is_idle: bool) -> bool {
         ready <= 0
     } else {
         ready == 0
+    }
+}
+
+/// Waits up to `timeout` for input on `fd` and reports whether none arrived (a
+/// clean `poll == 0`). Readable data, a hangup and errors all return false at
+/// once so the next read handles them; with no descriptor there is nothing to
+/// wait on and it returns false. A poll interrupted by a signal (a SIGWINCH)
+/// resumes with the time left, so the wait stays bounded either way.
+fn wait_idle(fd: Option<RawFd>, timeout: Duration) -> bool {
+    let Some(fd) = fd else {
+        return false;
+    };
+    let deadline = Instant::now() + timeout;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        // Rounded up, so the wait never reports idle before the timeout.
+        let timeout_ms =
+            libc::c_int::try_from(remaining.as_micros().div_ceil(1000)).unwrap_or(libc::c_int::MAX);
+        let mut poll_fd = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: `poll_fd` is one valid, initialized entry; `poll` only reads
+        // `fd`/`events` and writes `revents`, and the timeout bounds the wait.
+        let ready = unsafe { libc::poll(&mut poll_fd, 1, timeout_ms) };
+        if ready < 0 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+            continue;
+        }
+        return ready == 0;
     }
 }
 
@@ -1419,6 +1603,1226 @@ mod tests {
         );
     }
 
+    // A terminal executes the NUL and stays in the escape state, so the `]`
+    // in the next read still opens an OSC.
+    #[test]
+    fn sanitize_mode_drops_string_escape_split_after_escape_state_controls() {
+        let mut carry = super::ChunkFilterState::default();
+        let first = super::prepare_chunk(b"ok\x1b\x00", false, true, &mut carry);
+        let second = super::prepare_chunk(b"]52;c;U0VDUkVU\x07done", false, true, &mut carry);
+        let mut visible = first.bytes().to_vec();
+        visible.extend_from_slice(second.bytes());
+        assert_eq!(visible, b"okdone");
+
+        let mut carry = super::ChunkFilterState::default();
+        let mut first = b"ok\x1b".to_vec();
+        first.extend(std::iter::repeat_n(0, 2000));
+        let mut visible = super::prepare_chunk(&first, false, true, &mut carry)
+            .bytes()
+            .to_vec();
+        visible.extend_from_slice(
+            super::prepare_chunk(b"]52;c;U0VDUkVU\x07done", false, true, &mut carry).bytes(),
+        );
+        assert!(!visible.contains(&0x1b), "open ESC reached the output");
+    }
+
+    #[test]
+    fn filtered_modes_do_not_carry_a_line_ending_after_a_single_shift() {
+        for (strip_existing_ansi, sanitize, input, expected) in [
+            (
+                false,
+                false,
+                b"last\x1bN\r\n".as_slice(),
+                b"last\x1bN\r\n".as_slice(),
+            ),
+            (
+                false,
+                true,
+                b"last\x1bN\r\n".as_slice(),
+                b"last\x1bN\r\n".as_slice(),
+            ),
+            (
+                false,
+                true,
+                b"last\x8e\n".as_slice(),
+                b"last\x8e\n".as_slice(),
+            ),
+            (
+                true,
+                false,
+                b"last\x1bO\r\n".as_slice(),
+                b"last\r\n".as_slice(),
+            ),
+        ] {
+            let mut state = super::ChunkFilterState::default();
+            let prepared = super::prepare_chunk(input, strip_existing_ansi, sanitize, &mut state);
+            assert_eq!(prepared.bytes(), expected);
+            assert!(state.carry.is_empty(), "carried {:02x?}", state.carry);
+        }
+    }
+
+    // The terminal ends a string control at an ESC that does not start ST, so
+    // a split OSC must not swallow the control or the text after it.
+    #[test]
+    fn filtered_modes_end_split_string_escapes_at_the_next_escape() {
+        for (strip_existing_ansi, sanitize, expected) in [
+            (false, false, b"x\x1b]0;t\x1b[0m hello".as_slice()),
+            (false, true, b"x\x1b[0m hello".as_slice()),
+            (true, false, b"x hello".as_slice()),
+        ] {
+            let mut state = super::ChunkFilterState::default();
+            let mut output =
+                super::prepare_chunk(b"x\x1b]0;t", strip_existing_ansi, sanitize, &mut state)
+                    .bytes()
+                    .to_vec();
+            output.extend_from_slice(
+                super::prepare_chunk(b"\x1b[0m hello", strip_existing_ansi, sanitize, &mut state)
+                    .bytes(),
+            );
+            assert_eq!(output, expected);
+        }
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum ChunkPipeline {
+        Library,
+        Preserve,
+        Sanitize,
+        Strip,
+    }
+
+    /// Runs `chunks` through the library highlighter alone, or through the
+    /// per-read filter and highlighter the way `highlight_stream` does.
+    fn run_chunk_pipeline(chunks: &[&[u8]], pipeline: ChunkPipeline) -> Vec<u8> {
+        let mut streaming = crate::highlight::StreamingHighlighter::new(sample_highlighter());
+        let mut output = Vec::new();
+        let (strip_existing_ansi, sanitize) = match pipeline {
+            ChunkPipeline::Library => {
+                for chunk in chunks {
+                    output.extend(streaming.push(chunk));
+                }
+                output.extend(streaming.finish());
+                return output;
+            }
+            ChunkPipeline::Preserve => (false, false),
+            ChunkPipeline::Sanitize => (false, true),
+            ChunkPipeline::Strip => (true, false),
+        };
+        let mut state = super::ChunkFilterState::default();
+        for chunk in chunks {
+            let prepared = super::prepare_chunk(chunk, strip_existing_ansi, sanitize, &mut state);
+            output.extend(streaming.push_chunk(&prepared));
+        }
+        // Mirrors the end of `highlight_stream`.
+        if !state.carry.is_empty() {
+            let trailing = if super::is_incomplete_utf8_prefix(&state.carry) {
+                std::mem::take(&mut state.carry)
+            } else if strip_existing_ansi {
+                super::strip_ansi(&state.carry)
+            } else if sanitize {
+                super::strip_string_escapes(&state.carry)
+            } else {
+                std::mem::take(&mut state.carry)
+            };
+            output.extend(streaming.push_chunk(&super::AnsiChunk::new(trailing)));
+        }
+        output.extend(streaming.finish());
+        output
+    }
+
+    // Where a read boundary falls inside a UTF-8 character or a string payload
+    // must not change what reaches the terminal.
+    #[test]
+    fn read_boundaries_inside_characters_and_payloads_do_not_change_output() {
+        for input in [
+            // A C1-valued byte that may complete a character inside a CSI.
+            b"\x1b[\xe2\x9d\\".as_slice(),
+            // An ESC whose next character is cut off by the read.
+            b"\x90\x1b\xe2\x90\x9d".as_slice(),
+            // A C1 byte inside a terminated OSC payload.
+            b"\x1b]0;\x90t\x07visible\x1b\\after".as_slice(),
+        ] {
+            for pipeline in [
+                ChunkPipeline::Library,
+                ChunkPipeline::Preserve,
+                ChunkPipeline::Sanitize,
+                ChunkPipeline::Strip,
+            ] {
+                let whole = run_chunk_pipeline(&[input], pipeline);
+                let bytewise: Vec<&[u8]> = input.chunks(1).collect();
+                assert_eq!(
+                    run_chunk_pipeline(&bytewise, pipeline),
+                    whole,
+                    "{pipeline:?} bytewise {input:02x?}"
+                );
+                for split in 1..input.len() {
+                    let (first, second) = input.split_at(split);
+                    assert_eq!(
+                        run_chunk_pipeline(&[first, second], pipeline),
+                        whole,
+                        "{pipeline:?} split at {split} of {input:02x?}"
+                    );
+                }
+            }
+        }
+
+        assert_eq!(
+            run_chunk_pipeline(
+                &[b"\x1b]0;\x90t\x07vis", b"ible\x1b\\after"],
+                ChunkPipeline::Sanitize
+            ),
+            b"visible\x1b\\after"
+        );
+        assert_eq!(
+            super::incomplete_sanitize_start(b"\x1b]0;\x90t\x07vis"),
+            None
+        );
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum VtState {
+        Ground,
+        Escape,
+        Intermediate,
+        Csi,
+        SingleShift,
+        String { allows_bel: bool },
+    }
+
+    /// Width of the UTF-8 character starting at `idx`, or of the rest of
+    /// `bytes` when the end cuts off a character that later bytes could still
+    /// complete. E0, ED, F0 and F4 take a narrower first continuation byte.
+    fn utf8_text_width(bytes: &[u8], idx: usize) -> Option<usize> {
+        let (width, first_continuation) = match bytes[idx] {
+            0xc2..=0xdf => (2, 0x80..=0xbf),
+            0xe0 => (3, 0xa0..=0xbf),
+            0xed => (3, 0x80..=0x9f),
+            0xe1..=0xef => (3, 0x80..=0xbf),
+            0xf0 => (4, 0x90..=0xbf),
+            0xf4 => (4, 0x80..=0x8f),
+            0xf1..=0xf3 => (4, 0x80..=0xbf),
+            _ => return None,
+        };
+        match bytes.get(idx..idx + width) {
+            Some(character) => std::str::from_utf8(character).is_ok().then_some(width),
+            None => bytes[idx + 1..]
+                .iter()
+                .enumerate()
+                .all(|(position, byte)| {
+                    if position == 0 {
+                        first_continuation.contains(byte)
+                    } else {
+                        (0x80..=0xbf).contains(byte)
+                    }
+                })
+                .then_some(bytes.len() - idx),
+        }
+    }
+
+    /// An independent model of how a VT parser walks `bytes`, with C1 controls
+    /// recognized raw or UTF-8 encoded unless they belong to a UTF-8 character,
+    /// and with the highlighter's rule that a single shift is still waiting
+    /// for its character until a printable byte or a line ending. With
+    /// `raw_c1_at_end`, a character cut off by the end is read byte by byte, so
+    /// its C1-valued bytes act as raw controls. Returns the offset of the first
+    /// string control it opens and the state it ends in.
+    fn walk_vt_parser(bytes: &[u8], raw_c1_at_end: bool) -> (Option<usize>, VtState) {
+        let mut state = VtState::Ground;
+        let mut first_string = None;
+        let mut idx = 0;
+        while idx < bytes.len() {
+            let byte = bytes[idx];
+            let mut text_width = utf8_text_width(bytes, idx);
+            if text_width.is_some_and(|width| idx + width == bytes.len())
+                && std::str::from_utf8(&bytes[idx..]).is_err()
+            {
+                if !raw_c1_at_end {
+                    // A character cut off by the end leaves the state as it is.
+                    break;
+                }
+                text_width = None;
+            }
+            let c1 = match byte {
+                0xc2 if matches!(bytes.get(idx + 1), Some(0x80..=0x9f)) => {
+                    Some((bytes[idx + 1], 2))
+                }
+                0x80..=0x9f => Some((byte, 1)),
+                _ => None,
+            };
+
+            if let VtState::String { allows_bel } = state {
+                state = match (byte, c1) {
+                    (_, Some((0x9c, width))) => {
+                        idx += width;
+                        VtState::Ground
+                    }
+                    (0x07, _) if allows_bel => VtState::Ground,
+                    (0x18 | 0x1a, _) => VtState::Ground,
+                    (0x1b, _) => VtState::Escape,
+                    _ => {
+                        idx += text_width.unwrap_or(1);
+                        continue;
+                    }
+                };
+                if c1.is_none() {
+                    idx += 1;
+                }
+                continue;
+            }
+
+            if state != VtState::Ground && byte >= 0x80 {
+                let is_csi_text = state == VtState::Csi && c1.is_none();
+                if !is_csi_text {
+                    if state == VtState::SingleShift && c1.is_none() {
+                        // The shifted character completes the single shift.
+                        state = VtState::Ground;
+                        idx += text_width.unwrap_or(1);
+                        continue;
+                    }
+                    // A C1 control or other non-ASCII byte ends the sequence
+                    // and is read again.
+                    state = VtState::Ground;
+                    continue;
+                }
+                idx += text_width.unwrap_or(1);
+                continue;
+            }
+
+            match state {
+                VtState::Ground => {
+                    if byte == 0x1b {
+                        state = VtState::Escape;
+                    } else if let Some((control, width)) = c1 {
+                        match control {
+                            0x8e | 0x8f => state = VtState::SingleShift,
+                            0x9b => state = VtState::Csi,
+                            0x90 | 0x98 | 0x9d | 0x9e | 0x9f => {
+                                first_string.get_or_insert(idx);
+                                state = VtState::String {
+                                    allows_bel: control == 0x9d,
+                                };
+                            }
+                            _ => {}
+                        }
+                        idx += width;
+                        continue;
+                    } else if let Some(width) = text_width {
+                        idx += width;
+                        continue;
+                    }
+                }
+                VtState::Escape => {
+                    state = match byte {
+                        0x00..=0x17 | 0x19 | 0x1c..=0x1f | 0x7f | 0x1b => VtState::Escape,
+                        b'[' => VtState::Csi,
+                        b'N' | b'O' => VtState::SingleShift,
+                        b']' | b'P' | b'X' | b'^' | b'_' => {
+                            first_string.get_or_insert(idx);
+                            VtState::String {
+                                allows_bel: byte == b']',
+                            }
+                        }
+                        0x20..=0x2f => VtState::Intermediate,
+                        _ => VtState::Ground,
+                    };
+                }
+                VtState::Intermediate => {
+                    state = match byte {
+                        0x1b => VtState::Escape,
+                        0x18 | 0x1a | 0x30..=0x7e => VtState::Ground,
+                        _ => VtState::Intermediate,
+                    };
+                }
+                VtState::Csi => {
+                    state = match byte {
+                        0x1b => VtState::Escape,
+                        0x18 | 0x1a | 0x40..=0x7e => VtState::Ground,
+                        _ => VtState::Csi,
+                    };
+                }
+                VtState::SingleShift => {
+                    state = match byte {
+                        0x1b => VtState::Escape,
+                        b'\r' | b'\n' => {
+                            // A line ending is not the shifted character.
+                            state = VtState::Ground;
+                            continue;
+                        }
+                        0x00..=0x1f | 0x7f if !matches!(byte, 0x18 | 0x1a) => VtState::SingleShift,
+                        _ => VtState::Ground,
+                    };
+                }
+                VtState::String { .. } => unreachable!("handled above"),
+            }
+            idx += 1;
+        }
+        (first_string, state)
+    }
+
+    struct XorShift(u64);
+
+    impl XorShift {
+        fn below(&mut self, bound: usize) -> usize {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            (self.0 % bound as u64) as usize
+        }
+    }
+
+    // Read boundaries must not change what reaches the terminal, and
+    // --sanitize output must never let a terminal open a string control,
+    // however escapes, C0/C1 controls and UTF-8 are interleaved.
+    #[test]
+    fn chunking_never_changes_filtered_output_and_sanitize_opens_no_string() {
+        const FRAGMENTS: &[&[u8]] = &[
+            b"\x1b",
+            b"\x1b[",
+            b"\x1b]",
+            b"\x1bP",
+            b"\x1bX",
+            b"\x1b^",
+            b"\x1b_",
+            b"\x1b\\",
+            b"\x1bN",
+            b"\x1b(",
+            b"\x1b ",
+            b"\x07",
+            b"\x18",
+            b"\x1a",
+            b"\x00",
+            b"\r",
+            b"\n",
+            b"\r\n",
+            b"\x7f",
+            b"\x01",
+            b"[",
+            b"]",
+            b"P",
+            b"\\",
+            b";",
+            b"0",
+            b"1",
+            b"m",
+            b"J",
+            b"a",
+            b"z",
+            b" ",
+            b"\x9b",
+            b"\x9d",
+            b"\x90",
+            b"\x9c",
+            b"\x8e",
+            b"\xc2\x9b",
+            b"\xc2\x9d",
+            b"\xc2\x9c",
+            b"\xc2",
+            "\u{e9}".as_bytes(),
+            "\u{4e2d}".as_bytes(),
+            "\u{275c}".as_bytes(),
+            b"\xe2",
+            b"\xe2\x9d",
+            b"\xe0",
+            b"\xed",
+            b"\xf0",
+            b"\xf0\x9f",
+            b"\xf4",
+            b"\x9f",
+            b"\x9b\xf0\x9f\xc2",
+            b"\x9b\xf0\x9f\xc2\x9c",
+            b"\xff",
+            // Latin-1 characters that xterm reads after ESC as string
+            // introducers, ST and CSI, UTF-8 encoded and raw.
+            b"\xc3",
+            "\u{dd}".as_bytes(),
+            "\u{d0}".as_bytes(),
+            "\u{dc}".as_bytes(),
+            "\u{db}".as_bytes(),
+            b"\xdd",
+            b"\xd0",
+            b"\xdf",
+            b"\x1b\xc3\x9d0;t\x07",
+            b"\x1b\x00\xdd0;t\x07",
+            b"\x1b\x1b\xc3\x90q\x1b\\",
+            // UTF-8 C1 controls, which xterm ignores after ESC, and strings
+            // that the byte after them would open there.
+            b"\xc2\x80",
+            b"\xc2\x8e",
+            b"\x1b\xc2\x80]0;t\x07",
+            b"\x1b\x00\xc2\x9b]0;t\x07",
+            b"\x1b\xc2\x80\xc2\x81]0;t\x07",
+            b"\x1b\xc2\x80\xc3\x9d0;t\x07",
+            // Raw C1 controls, which xterm in UTF-8 mode and Alacritty also
+            // ignore after ESC.
+            b"\x1b\x80]0;x\x07",
+            b"\x1b\x9b]",
+            b"\x1b\x00\x8e]",
+            // DOCS, which can switch xterm out of UTF-8.
+            b"\x1b%@",
+            b"\x1b%/G",
+            b"\x1b%",
+            b"%",
+            // CSIs that hold a byte from 80 up, which xterm in UTF-8 mode
+            // reads as the ASCII byte it mirrors or ignores, controls that an
+            // ESC dropped before such a byte cancelled, and changes to DEC
+            // private mode 42, which can also switch xterm out of UTF-8.
+            b"\x1b[?4",
+            b"?42",
+            b"h",
+            b"l",
+            b"r",
+            "\u{b2}".as_bytes(),
+            b"\xb2",
+            "\u{301}".as_bytes(),
+            b"\x1b[?4\xc2\xb2h",
+            b"\x1b[?4\xc2\x802h",
+            b"\x1b[?4\x1b\xc2\xb2h",
+            b"\x1b[1\x1b\xc3\x9e",
+            b"\x1b[?42h",
+            b"\x1b\x00[?1;042l",
+            b"\x9b?42r",
+            b"\xc2\x9b?1:42h",
+            b"\x1b[?;;;;;;;;;;;;;;;;;;;;;;;;;;;;;4;2h",
+            b"\x1b[31m",
+            b"\x1b[0m",
+            b"\x1b]0;title\x07",
+            b"\x1b\x00]2;title\x07",
+            b"\x1bPq\x1b\\",
+            b"router# show ip\n",
+        ];
+        const PIPELINES: [ChunkPipeline; 4] = [
+            ChunkPipeline::Library,
+            ChunkPipeline::Preserve,
+            ChunkPipeline::Sanitize,
+            ChunkPipeline::Strip,
+        ];
+
+        let mut rng = XorShift(0x5eed_1e55_c0de_d00d);
+        for case in 0..600 {
+            let mut input = Vec::new();
+            let large = case % 50 == 49;
+            let fragments = if large { 2500 } else { 1 + rng.below(40) };
+            for _ in 0..fragments {
+                input.extend_from_slice(FRAGMENTS[rng.below(FRAGMENTS.len())]);
+                if large && rng.below(8) == 0 {
+                    input.extend_from_slice(b"\x1b[32mline\x1b[0m\n");
+                }
+            }
+
+            let mut chunkings: Vec<Vec<&[u8]>> =
+                vec![vec![input.as_slice()], input.chunks(8192).collect()];
+            let mut random = Vec::new();
+            let mut start = 0;
+            while start < input.len() {
+                let len = 1 + rng.below(if large { 2048 } else { 16 });
+                let end = input.len().min(start + len);
+                random.push(&input[start..end]);
+                start = end;
+            }
+            chunkings.push(random);
+            if !large {
+                chunkings.push(input.chunks(1).collect());
+            }
+
+            for pipeline in PIPELINES {
+                let expected = run_chunk_pipeline(&chunkings[0], pipeline);
+                for chunks in &chunkings[1..] {
+                    let output = run_chunk_pipeline(chunks, pipeline);
+                    assert!(
+                        output == expected,
+                        "{pipeline:?} output depends on {} reads of {input:02x?}:\n{output:02x?}\n{expected:02x?}",
+                        chunks.len()
+                    );
+                }
+                // A pending single shift only selects the character set of the
+                // next character, and a non-ASCII byte after ESC ends the escape
+                // even when the end cuts its character off. Such a character can
+                // also hold a C1-valued byte that the bytes dropped after it at
+                // EOF showed to be a control, as an 8-bit terminal reads it.
+                // Every other state is an open sequence.
+                let (first_string, end_state) = walk_vt_parser(&expected, false);
+                let ends_in_partial_char = (1..=3).any(|len| {
+                    len <= expected.len()
+                        && super::is_incomplete_utf8_prefix(&expected[expected.len() - len..])
+                });
+                let settled =
+                    |state: VtState| matches!(state, VtState::Ground | VtState::SingleShift);
+                assert!(
+                    settled(end_state)
+                        || (ends_in_partial_char
+                            && (matches!(end_state, VtState::Escape | VtState::Intermediate)
+                                || settled(walk_vt_parser(&expected, true).1))),
+                    "{pipeline:?} left the terminal in {end_state:?} for {input:02x?}: {expected:02x?}"
+                );
+                if !large
+                    && matches!(pipeline, ChunkPipeline::Library | ChunkPipeline::Preserve)
+                    && walk_vt_parser(&input, false).1 == VtState::Ground
+                {
+                    // Nothing is left open at the end, so a highlighter with no
+                    // rules must pass every byte through.
+                    assert!(
+                        expected == input,
+                        "{pipeline:?} changed complete input {input:02x?}:\n{expected:02x?}"
+                    );
+                }
+                if matches!(pipeline, ChunkPipeline::Sanitize | ChunkPipeline::Strip) {
+                    assert_eq!(
+                        first_string, None,
+                        "{pipeline:?} let a string control through for {input:02x?}: {expected:02x?}"
+                    );
+                    assert_eq!(
+                        escape_before_non_ascii_byte(&expected),
+                        None,
+                        "{pipeline:?} let a terminal read ESC with a non-ASCII byte for {input:02x?}: {expected:02x?}"
+                    );
+                    assert_eq!(
+                        docs_escape(&expected),
+                        None,
+                        "{pipeline:?} let DOCS through for {input:02x?}: {expected:02x?}"
+                    );
+                    assert_eq!(
+                        csi_that_could_switch_xterm_out_of_utf8(&expected),
+                        None,
+                        "{pipeline:?} let a CSI with a byte from 80 up or DECNRCM through for {input:02x?}: {expected:02x?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Where the C0 controls and DEL that a VT parser executes or ignores in
+    /// the escape state end, from `idx` on.
+    fn skip_escape_state_controls(bytes: &[u8], mut idx: usize) -> usize {
+        while matches!(
+            bytes.get(idx),
+            Some(0x00..=0x17 | 0x19 | 0x1c..=0x1f | 0x7f)
+        ) {
+            idx += 1;
+        }
+        idx
+    }
+
+    /// The offset of an ESC that, past its escape-state controls, is followed
+    /// by a byte from 80 up that does not start a C1 string control. xterm
+    /// looks a byte in A0-FF, or the character it starts, up in the Latin-1
+    /// half of its escape table, which mirrors ASCII and so holds string
+    /// introducers, CSI and ST. In UTF-8 mode it ignores a C1 control there,
+    /// UTF-8 encoded or a lone raw byte, and Alacritty ignores every byte from
+    /// 80 up, so the byte after that selects the sequence instead. An ESC
+    /// before a C1 string control opens the string, which the string check
+    /// finds.
+    fn escape_before_non_ascii_byte(bytes: &[u8]) -> Option<usize> {
+        (0..bytes.len())
+            .filter(|&start| bytes[start] == 0x1b)
+            .find(|&start| {
+                let next = skip_escape_state_controls(bytes, start + 1);
+                let control = match bytes.get(next..) {
+                    Some([0xc2, control @ 0x80..=0x9f, ..] | [control @ 0x80..=0x9f, ..]) => {
+                        Some(*control)
+                    }
+                    _ => None,
+                };
+                bytes.get(next).is_some_and(|byte| *byte >= 0x80)
+                    && !control
+                        .is_some_and(|control| matches!(control, 0x90 | 0x98 | 0x9d | 0x9e | 0x9f))
+            })
+    }
+
+    /// The offset of an ESC that, past its escape-state controls, starts a
+    /// DOCS sequence, which can switch xterm out of UTF-8.
+    fn docs_escape(bytes: &[u8]) -> Option<usize> {
+        (0..bytes.len()).find(|&start| {
+            bytes[start] == 0x1b
+                && bytes.get(skip_escape_state_controls(bytes, start + 1)) == Some(&b'%')
+        })
+    }
+
+    /// The offset of a CSI that holds a byte from 80 up, which xterm in UTF-8
+    /// mode reads as the ASCII byte it mirrors or ignores and Alacritty
+    /// ignores, or that sets, resets or restores DEC private mode 42, which
+    /// can switch xterm out of UTF-8. A CSI starts at ESC [, past escape-state
+    /// controls, or at a C1 CSI outside a UTF-8 character, and runs on past C0
+    /// controls, DEL and every byte from 80 up to its final byte, CAN, SUB or
+    /// ESC.
+    fn csi_that_could_switch_xterm_out_of_utf8(bytes: &[u8]) -> Option<usize> {
+        let mut idx = 0;
+        while idx < bytes.len() {
+            let parameters = match bytes[idx..] {
+                [0x1b, ..] => {
+                    let introducer = skip_escape_state_controls(bytes, idx + 1);
+                    (bytes.get(introducer) == Some(&b'[')).then_some(introducer + 1)
+                }
+                [0xc2, 0x9b, ..] => Some(idx + 2),
+                [0x9b, ..] => Some(idx + 1),
+                _ => None,
+            };
+            let Some(parameters) = parameters else {
+                idx += utf8_text_width(bytes, idx).unwrap_or(1);
+                continue;
+            };
+            let end = bytes[parameters..]
+                .iter()
+                .position(|byte| matches!(byte, 0x18 | 0x1a | 0x1b | 0x40..=0x7e))
+                .map_or(bytes.len(), |offset| parameters + offset);
+            if bytes[parameters..end].iter().any(|byte| *byte >= 0x80) {
+                return Some(idx);
+            }
+            if matches!(bytes.get(end), Some(b'h' | b'l' | b'r'))
+                && sets_dec_private_mode_42(&bytes[parameters..end])
+            {
+                return Some(idx);
+            }
+            idx = end;
+        }
+        None
+    }
+
+    /// True when xterm reads `parameters`, the bytes of a CSI before a final
+    /// h, l or r, as DEC private modes that include 42. It runs C0 controls
+    /// and ignores DEL there, ignores the whole sequence at an intermediate or
+    /// a second private marker, and keeps 30 parameters, reading every digit
+    /// after the 30th into it. A `:` counts as a `;`.
+    fn sets_dec_private_mode_42(parameters: &[u8]) -> bool {
+        let mut bytes = parameters
+            .iter()
+            .filter(|byte| !matches!(byte, 0x00..=0x1f | 0x7f));
+        if bytes.next() != Some(&b'?') {
+            return false;
+        }
+        let mut values = vec![0u32];
+        for byte in bytes {
+            match byte {
+                b'0'..=b'9' => {
+                    let value = values.last_mut().expect("a parameter");
+                    *value = (*value * 10 + u32::from(byte - b'0')).min(65_535);
+                }
+                b';' | b':' if values.len() < 30 => values.push(0),
+                b';' | b':' => {}
+                _ => return false,
+            }
+        }
+        values.contains(&42)
+    }
+
+    /// Runs `chunks` through `highlight_stream` with `--sanitize` and no
+    /// highlighting rules, one read per chunk, and returns what it wrote.
+    /// With `idle_fd`, the interactive read loop waits on that descriptor
+    /// before each read and draws its held-back output when it stays idle.
+    fn run_sanitized_stream(
+        chunks: &[&[u8]],
+        interactive: bool,
+        idle_fd: Option<std::os::fd::RawFd>,
+        trace_path: Option<&std::path::Path>,
+    ) -> Vec<u8> {
+        struct ChunkedReader(std::collections::VecDeque<Vec<u8>>);
+        impl std::io::Read for ChunkedReader {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                let Some(mut chunk) = self.0.pop_front() else {
+                    return Ok(0);
+                };
+                if chunk.len() > buf.len() {
+                    self.0.push_front(chunk.split_off(buf.len()));
+                }
+                buf[..chunk.len()].copy_from_slice(&chunk);
+                Ok(chunk.len())
+            }
+        }
+
+        let mut config = tempfile::NamedTempFile::new().expect("temp config");
+        std::io::Write::write_all(&mut config, b"rules: []\n").expect("write temp config");
+        let options = crate::cli::args::Options {
+            profiles: vec!["generic".to_string()],
+            no_auto_detect: true,
+            no_dynamic_profile: true,
+            config: Some(config.path().to_path_buf()),
+            sanitize: true,
+            ..Default::default()
+        };
+        let session = super::HighlightSession::new(
+            &options,
+            crate::profiles::ProfileStore::builtin(),
+            interactive,
+            vec!["generic".to_string()],
+        )
+        .expect("session builds");
+        let input = super::InputSource {
+            interactive,
+            pty_fd: None,
+            idle_fd,
+            recent_input: None,
+        };
+        let trace = super::IoTrace::open(trace_path).expect("trace opens");
+        let reader = ChunkedReader(chunks.iter().map(|chunk| chunk.to_vec()).collect());
+        let mut output = Vec::new();
+        super::highlight_stream(
+            reader,
+            &mut output,
+            super::PreparedSession { session },
+            input,
+            None,
+            trace,
+            None,
+        )
+        .expect("highlight_stream succeeds");
+        output
+    }
+
+    /// Asserts that `input` sanitizes to `expected` in one read, a byte per
+    /// read, and split anywhere into two or three reads, through the per-read
+    /// filter and through `highlight_stream`.
+    fn assert_sanitized_at_every_read_split(input: &[u8], expected: &[u8]) {
+        let mut chunkings: Vec<Vec<&[u8]>> = vec![vec![input], input.chunks(1).collect()];
+        for split in 1..input.len() {
+            let (first, second) = input.split_at(split);
+            chunkings.push(vec![first, second]);
+        }
+        let mut three_reads = Vec::new();
+        for split in 1..input.len() {
+            for second_split in split + 1..input.len() {
+                three_reads.push(vec![
+                    &input[..split],
+                    &input[split..second_split],
+                    &input[second_split..],
+                ]);
+            }
+        }
+        for chunks in chunkings.iter().chain(&three_reads) {
+            assert_eq!(
+                run_chunk_pipeline(chunks, ChunkPipeline::Sanitize),
+                expected,
+                "{input:02x?} in reads {chunks:02x?}"
+            );
+        }
+        for chunks in &chunkings {
+            for interactive in [false, true] {
+                assert_eq!(
+                    run_sanitized_stream(chunks, interactive, None, None),
+                    expected,
+                    "interactive {interactive}: {input:02x?} in reads {chunks:02x?}"
+                );
+            }
+        }
+    }
+
+    // The ESC and the Latin-1 character or C1 control that xterm would read
+    // with it may arrive in different reads, with the ESC's controls split
+    // anywhere and the character's UTF-8 bytes split from each other.
+    // Wherever the reads split, --sanitize drops the ESC and reads the rest
+    // on its own.
+    #[test]
+    fn sanitize_drops_escapes_before_latin1_characters_at_every_read_split() {
+        let cases: &[(&[u8], &[u8])] = &[
+            (b"a\x1b\xc3\x9d0;title\x07b", b"a\xc3\x9d0;title\x07b"),
+            (
+                b"a\x1b\x00\xc3\x9d0;title\x07b",
+                b"a\x00\xc3\x9d0;title\x07b",
+            ),
+            (b"a\x1b\x1b\xc3\x9d0;title\x07b", b"a\xc3\x9d0;title\x07b"),
+            (b"a\x1b\xdd0;title\x07b", b"a\xdd0;title\x07b"),
+            (b"a\x1b\xc3\x90q\x1b\\b", b"a\xc3\x90q\x1b\\b"),
+            (
+                b"a\x1b\x00\x1b\r\n\x7f\xd8x\x1b\\b",
+                b"a\x00\r\n\x7f\xd8x\x1b\\b",
+            ),
+            (b"a\x1b[1\x1b\x00\xc3\x9e0;t\x07b", b"a\x00\xc3\x9e0;t\x07b"),
+            (b"a\x1b]0;x\x1b\xc3\x9f0;t\x07b", b"a\xc3\x9f0;t\x07b"),
+            // A UTF-8 C1 control, which xterm ignores after ESC, is read on
+            // its own, and one that starts a string is dropped with it.
+            (b"a\x1b\xc2\x80]0;title\x07b", b"a\xc2\x80]0;title\x07b"),
+            (b"a\x1b\x00\xc2\x9b]0;t\x07b", b"a\x00\xc2\x9b]0;t\x07b"),
+            (
+                b"a\x1b\x1b\xc2\x80\xc2\x81]0;t\x07b",
+                b"a\xc2\x80\xc2\x81]0;t\x07b",
+            ),
+            (
+                b"a\x1b\xc2\x80\xc3\x9d0;t\x07b",
+                b"a\xc2\x80\xc3\x9d0;t\x07b",
+            ),
+            (b"a\x1b[1\x1b\xc2\x8e]0;t\x07b", b"a\xc2\x8e]0;t\x07b"),
+            (b"a\x1b\x00\xc2\x9d0;t\x07b", b"ab"),
+            // So is a raw C1 control, which xterm in UTF-8 mode and Alacritty
+            // ignore there too.
+            (b"a\x1b\x80]0;title\x07b", b"a\x80]0;title\x07b"),
+            (b"a\x1b\x9b]0;t\x07b", b"a\x9b]0;t\x07b"),
+            (b"a\x1b\x00\x8e]0;t\x07b", b"a\x00\x8e]0;t\x07b"),
+            (b"a\x1b\x1b\x80\x81]0;t\x07b", b"a\x80\x81]0;t\x07b"),
+            (b"a\x1b\x00\x9d0;t\x07b", b"ab"),
+            // Cut off by the end of the input, which leaves it whole, as it
+            // would be without the ESC.
+            (b"a\x1b\x00\xc3", b"a\x00\xc3"),
+            (b"a\x1b\xc2", b"a\xc2"),
+            (b"a\x1b\xe2\x9d", b"a\xe2\x9d"),
+            (b"a\x1b\x07\xf0\x9f\x8e", b"a\x07\xf0\x9f\x8e"),
+        ];
+        for &(input, expected) in cases {
+            assert_sanitized_at_every_read_split(input, expected);
+        }
+
+        let tail = super::MAX_INCOMPLETE_ESCAPE_BYTES + 16;
+        for rest in [b"\xc3\x9d0;title\x07b".as_slice(), b"\xc2\x80]0;title\x07b"] {
+            // The end of a string discarded as oversized, and the ESC that
+            // ended it, replayed when it closed the previous read.
+            let mut oversized_string = b"a\x1b]0;".to_vec();
+            oversized_string.resize(tail, b'x');
+            oversized_string.push(0x1b);
+            oversized_string.extend_from_slice(rest);
+            // A run of escape-state controls past the limit for an open escape.
+            let mut long_controls = b"a\x1b".to_vec();
+            long_controls.resize(tail, 0);
+            long_controls.extend_from_slice(rest);
+            for (input, expected) in [
+                (oversized_string, [b"a", rest].concat()),
+                (
+                    long_controls.clone(),
+                    [&long_controls[..1], &long_controls[2..]].concat(),
+                ),
+            ] {
+                let splits = (1..input.len())
+                    .filter(|split| *split < 8 || split % 1000 == 0 || split + 8 >= tail);
+                for split in splits {
+                    let (first, second) = input.split_at(split);
+                    assert_eq!(
+                        run_chunk_pipeline(&[first, second], ChunkPipeline::Sanitize),
+                        expected,
+                        "split at {split} of {} bytes",
+                        input.len()
+                    );
+                }
+                assert_eq!(run_sanitized_stream(&[&input], false, None, None), expected);
+            }
+        }
+    }
+
+    // A C1 control after a dropped ESC run goes on with the chain whose
+    // control the run's first ESC cancelled. A string control that it reaches
+    // drops the chain from that control, as the filter for oversized strings
+    // does, so the output is the same for a short string and a long one, and
+    // a chain that ends without one loses the ESC run and the control that it
+    // cancelled, wherever the reads split.
+    #[test]
+    fn sanitize_keeps_the_chain_of_a_c1_control_after_a_dropped_escape_at_every_read_split() {
+        let chains = [
+            b"a\x1b[1\x1b\xc2\x9b".as_slice(),
+            b"a\x1b(\x1b\x00\x8e",
+            b"a\x9b1\x1b\x1b\x9b",
+            b"a\x8f\x1b\xc2\x8f",
+        ];
+        for chain in chains {
+            assert_sanitized_at_every_read_split(&[chain, b"\x1b]0;t\x07b"].concat(), b"ab");
+            assert_sanitized_at_every_read_split(&[chain, b"\x1b]0;t\x07"].concat(), b"a");
+        }
+        for (input, expected) in [
+            (
+                b"a\x1b[1\x1b\xc2\x9b1mb".as_slice(),
+                b"a\xc2\x9b1mb".as_slice(),
+            ),
+            (b"a\x8e\x1b\x00\x9b1mb", b"a\x00\x9b1mb"),
+            (b"a\x1b(\x1b\x8fxb", b"a\x8fxb"),
+        ] {
+            assert_sanitized_at_every_read_split(input, expected);
+        }
+
+        let tail = super::MAX_INCOMPLETE_ESCAPE_BYTES + 16;
+        for chain in chains {
+            let mut input = [chain, b"\x1b]0;"].concat();
+            input.resize(tail, b'x');
+            input.extend_from_slice(b"\x07b");
+            let splits = (1..input.len())
+                .filter(|split| *split < 16 || split % 1000 == 0 || split + 8 >= tail);
+            for split in splits {
+                let (first, second) = input.split_at(split);
+                assert_eq!(
+                    run_chunk_pipeline(&[first, second], ChunkPipeline::Sanitize),
+                    b"ab",
+                    "split at {split} of {} bytes",
+                    input.len()
+                );
+            }
+            assert_eq!(run_sanitized_stream(&[&input], false, None, None), b"ab");
+        }
+    }
+
+    // `ESC % @` can switch xterm out of UTF-8, and its 9D in U+201D would
+    // then open an OSC. --sanitize drops every DOCS wherever the reads split,
+    // and a cut-off one is carried like any other incomplete escape.
+    #[test]
+    fn sanitize_drops_docs_at_every_read_split() {
+        for (input, expected) in [
+            (
+                "a\x1b%@\u{201d}0;title\x07b".as_bytes(),
+                "a\u{201d}0;title\x07b".as_bytes(),
+            ),
+            (b"a\x1b\x00%/Gb", b"ab"),
+            (b"a\x1b[1\x1b%Gb", b"ab"),
+            (b"a\x1b%\xc2\x80@b", b"a\xc2\x80@b"),
+            (b"a\x1b%\x80@b", b"a\x80@b"),
+            (b"a\x1b%\xc3\x80b", b"a\xc3\x80b"),
+            (b"a\x1b%\x1b]0;t\x07b", b"ab"),
+            // At the end of the input it is neutralized, as `ESC (` is.
+            (b"a\x1b%", b"a^%"),
+        ] {
+            assert_sanitized_at_every_read_split(input, expected);
+        }
+    }
+
+    // A CSI that holds a byte from 80 up or that a C1 control cancels, a
+    // control that a dropped ESC run cancelled, and a change to DEC private
+    // mode 42 can each take xterm out of UTF-8. --sanitize drops them
+    // wherever the reads split, and keeps ASCII CSIs.
+    #[test]
+    fn sanitize_drops_csis_that_could_switch_xterm_out_of_utf8_at_every_read_split() {
+        for (input, expected) in [
+            (b"a\x1b[?4\xc2\xb2hb".as_slice(), b"ab".as_slice()),
+            (b"a\x1b[?4\xb2hb", b"ab"),
+            (b"a\x9b?4\xcc\x812hb", b"ab"),
+            (b"a\x1b[?4\xc2\x802hb", b"a\xc2\x802hb"),
+            (b"a\xc2\x9b?4\x802hb", b"a\x802hb"),
+            (b"a\x1b[1\xc3\xa9\x1b[mb", b"a\x1b[mb"),
+            (
+                b"a\x1b[?4\x1b\xc2\xb2h\xe2\x80\x9d0;t\x07b",
+                b"a\xc2\xb2h\xe2\x80\x9d0;t\x07b",
+            ),
+            (b"a\x1b[1\x1b\xc3\x9eb", b"a\xc3\x9eb"),
+            (b"a\x1b(\x1b\x00\x80b", b"a\x00\x80b"),
+            (b"a\x1b[?42h\xe2\x80\x9db", b"a\xe2\x80\x9db"),
+            (b"a\x1b\x00[?1;042lb", b"ab"),
+            (b"a\xc2\x9b?1:42rb", b"ab"),
+            (b"a\x1b[?4\r2hb", b"ab"),
+            (b"a\x1b[?25h\x9b?1049lb", b"a\x1b[?25h\x9b?1049lb"),
+        ] {
+            assert_sanitized_at_every_read_split(input, expected);
+        }
+        // After 29 other parameters xterm reads `4;2` as 42.
+        let input = [b"a\x1b[?".as_slice(), &[b';'; 29], b"4;2hb"].concat();
+        assert_sanitized_at_every_read_split(&input, b"ab");
+    }
+
+    // The interactive read loop draws output held back for a token after it
+    // has been quiet for a while, but an ESC at the end of a read is carried
+    // by the sanitizer and never held there, so the flush cannot draw it
+    // before the character that the next read brings.
+    #[test]
+    fn sanitize_holdback_flush_does_not_draw_an_escape_before_a_latin1_character() {
+        use std::os::fd::AsRawFd;
+
+        let pty = nix::pty::openpty(None, None).expect("openpty");
+        for chunks in [
+            [b"a\x1b".as_slice(), b"\xc3\x9d0;title\x07b"],
+            [b"a\x1b\x00\xc3".as_slice(), b"\x9d0;title\x07b"],
+            [b"a\x1b".as_slice(), b"\xdd0;title\x07b"],
+            [b"a\x1b".as_slice(), b"\xc2\x80]0;title\x07b"],
+            [b"a\x1b\x00\xc2".as_slice(), b"\x80]0;title\x07b"],
+            [b"a\x1b".as_slice(), b"\x80]0;title\x07b"],
+        ] {
+            let trace_file = tempfile::NamedTempFile::new().expect("trace temp file");
+            let output = run_sanitized_stream(
+                &chunks,
+                true,
+                Some(pty.master.as_raw_fd()),
+                Some(trace_file.path()),
+            );
+            let expected: Vec<u8> = chunks
+                .concat()
+                .into_iter()
+                .filter(|byte| *byte != 0x1b)
+                .collect();
+            assert_eq!(output, expected, "{chunks:02x?}");
+
+            let trace_text = std::fs::read_to_string(trace_file.path()).expect("read trace");
+            let holdback = b"holdback"
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            assert!(
+                trace_text.contains(&format!("FLUSH {holdback}")),
+                "the holdback flush did not run for {chunks:02x?}; trace:\n{trace_text}"
+            );
+        }
+    }
+
+    // A UTF-8 prefix that a later byte of the read can never complete must
+    // not hide a C1 string introducer inside it: whatever splits the read,
+    // the CSI or ESC around it ends there and the introducer is stripped.
+    #[test]
+    fn sanitize_split_does_not_emit_c1_string_introducer_from_broken_utf8_prefix() {
+        let cases: &[&[u8]] = &[
+            b"\x9b\xf0\x9f\xc2\x9c",
+            b"\x9b\xf0\x9f\xc2Gpayload\x9c",
+            b"\x9b\xf0\x9f\xc2",
+            b"\x9b\xf0\x9d\xc2\xa052;c;aGk=\x07",
+            b"\x9b\xf0\x90\xc2q\x9c",
+            b"\x9b\xe2\x9f\xc2\x9c",
+            b"\x9b\xf0\x9f\x1b\\",
+            b"\x1b[\xf0\x9f\xc2\x9c",
+            b"\x1b[\xe2\x9d\xc2x\x07",
+            b"\x1b\xf0\x9f\x9c\xc2\x1b[\x9c",
+            b"\x1b\xf0\x9f\xa0\xc2G\x9c",
+            // No byte can complete these, so the C1 byte in each is a control.
+            b"\x9b\xe0\x9d",
+            b"\x1b[\xf4\x90",
+            // A cut-off character the next read shows can never complete.
+            b"\xf0\x9f\x72\xe0",
+            b"\xf0\x9f\x01",
+            // Text that a split before the escape cuts off, holding an OSC.
+            b"\xf0\x9d\x9c\x1b[31m",
+        ];
+        for input in cases {
+            for pipeline in [ChunkPipeline::Sanitize, ChunkPipeline::Strip] {
+                let whole = run_chunk_pipeline(&[input], pipeline);
+                assert_eq!(
+                    walk_vt_parser(&whole, false).0,
+                    None,
+                    "{pipeline:?} {input:02x?}: {whole:02x?}"
+                );
+                for size in 1..input.len() {
+                    let chunks: Vec<&[u8]> = input.chunks(size).collect();
+                    let output = run_chunk_pipeline(&chunks, pipeline);
+                    assert_eq!(
+                        walk_vt_parser(&output, false).0,
+                        None,
+                        "{pipeline:?} opened a string control for {input:02x?} in {size}-byte reads: {output:02x?}"
+                    );
+                    assert_eq!(
+                        output, whole,
+                        "{pipeline:?} output of {input:02x?} depends on {size}-byte reads"
+                    );
+                }
+            }
+        }
+
+        // Two writes with a pause between them are enough.
+        let output = run_chunk_pipeline(
+            &[b"\x9b\xf0\x9f\xc2", b"hidden-payload\x9c"],
+            ChunkPipeline::Sanitize,
+        );
+        assert_eq!(walk_vt_parser(&output, false).0, None, "{output:02x?}");
+
+        // Without --sanitize, the end of input still drops the string that
+        // such a C1 byte opens.
+        for pipeline in [ChunkPipeline::Library, ChunkPipeline::Preserve] {
+            let output = run_chunk_pipeline(&[b"\xf0\x9f\x01"], pipeline);
+            assert_eq!(
+                walk_vt_parser(&output, false),
+                (None, VtState::Ground),
+                "{pipeline:?}: {output:02x?}"
+            );
+        }
+    }
+
+    // Text in a legacy encoding is full of bytes that look like UTF-8 lead
+    // bytes, which are never controls. A split before an escape that the read
+    // cuts off must not step back over such text, or each read that ends that
+    // way is held back, and several in a row are dropped.
+    #[test]
+    fn sanitize_split_does_not_carry_legacy_text_before_a_cut_off_escape() {
+        // KOI8-R for "сообщение": every byte is a UTF-8 lead byte.
+        let word = b"\xd3\xcf\xcf\xc2\xdd\xc5\xce\xc9\xc5";
+        let mut read = b"ok ".to_vec();
+        read.extend_from_slice(word);
+        let text_len = read.len();
+        read.extend_from_slice(b"\x1b[");
+        assert_eq!(super::incomplete_sanitize_start(&read), Some(text_len));
+
+        let reads: Vec<Vec<u8>> = (0..8)
+            .map(|_| {
+                let mut read = b"0m ".to_vec();
+                read.extend_from_slice(&b"x".repeat(4000));
+                read.push(b' ');
+                read.extend_from_slice(word);
+                read.extend_from_slice(b"\x1b[");
+                read
+            })
+            .collect();
+        let chunks: Vec<&[u8]> = reads.iter().map(Vec::as_slice).collect();
+        let input = reads.concat();
+        for pipeline in [
+            ChunkPipeline::Preserve,
+            ChunkPipeline::Sanitize,
+            ChunkPipeline::Strip,
+        ] {
+            let whole = run_chunk_pipeline(&[&input], pipeline);
+            let output = run_chunk_pipeline(&chunks, pipeline);
+            assert!(
+                output == whole,
+                "{pipeline:?} output of {} reads is {} bytes, not {}",
+                chunks.len(),
+                output.len(),
+                whole.len()
+            );
+        }
+    }
+
+    // Each split of a sanitized read checks the prefix before it, so a read
+    // of controls that each end in a character the next one cuts off must not
+    // be rescanned once per control.
+    #[test]
+    fn sanitize_split_stays_linear_for_runs_of_cut_off_characters() {
+        for group in [
+            b"\x1b\xf0\x9f\x9c".as_slice(),
+            b"\x1b[\xf0\x9f\x9c".as_slice(),
+            b"\x1b\xe2\x9d".as_slice(),
+            b"\x1b\xc2".as_slice(),
+        ] {
+            let read = group.repeat(8192 / group.len());
+            let mut state = super::ChunkFilterState::default();
+            let started = std::time::Instant::now();
+            for _ in 0..8 {
+                let prepared = super::prepare_chunk(&read, false, true, &mut state);
+                assert_eq!(walk_vt_parser(prepared.bytes(), false).0, None);
+            }
+            let elapsed = started.elapsed();
+
+            assert!(
+                elapsed < std::time::Duration::from_secs(2),
+                "8 reads of {group:02x?} runs took {elapsed:?}"
+            );
+        }
+    }
+
+    // Such a run arriving in small reads is carried whole, so every read
+    // splits the growing carry again and steps back over a control per split.
+    // Each of those splits must resume the scan near it instead of rescanning
+    // the carry before it. The scans are measured by the bytes they cover
+    // rather than by time, so a busy machine cannot fail the test. A worker
+    // thread keeps a regression from hanging.
+    #[test]
+    fn sanitize_split_scans_a_carried_run_of_cut_off_characters_once_per_read() {
+        use crate::highlight::TOP_LEVEL_SCAN_BYTES;
+
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut opened_strings = Vec::new();
+            let mut scans = Vec::new();
+            for group in [b"\x1b\xf0\x9f\x9c".as_slice(), b"\x1b\xc2".as_slice()] {
+                let input = group.repeat(64 * 1024 / group.len());
+                let mut state = super::ChunkFilterState::default();
+                let mut reassembled = 0;
+                TOP_LEVEL_SCAN_BYTES.with(|scanned| scanned.set(0));
+                for read in input.chunks(64) {
+                    reassembled += state.carry.len() + read.len();
+                    let prepared = super::prepare_chunk(read, false, true, &mut state);
+                    if let Some(start) = walk_vt_parser(prepared.bytes(), false).0 {
+                        opened_strings.push((group, start));
+                    }
+                }
+                let scanned = TOP_LEVEL_SCAN_BYTES.with(std::cell::Cell::get);
+                scans.push((group, scanned, reassembled));
+            }
+            let _ = sender.send((opened_strings, scans));
+        });
+        let (opened_strings, scans) = receiver
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("64 KiB of each run in 64-byte reads should be split within 30s");
+        assert!(opened_strings.is_empty(), "{opened_strings:02x?}");
+        for (group, scanned, reassembled) in scans {
+            assert!(
+                scanned < 2 * reassembled,
+                "splits of {reassembled} reassembled bytes of {group:02x?} runs scanned {scanned}"
+            );
+        }
+    }
+
     #[test]
     fn preserve_mode_hides_split_string_payloads_from_dynamic_profile_detection() {
         for (prefix, tail) in [
@@ -1597,8 +3001,10 @@ mod tests {
             let mut output = super::prepare_chunk(&first, false, true, &mut carry)
                 .bytes()
                 .to_vec();
+            // A nested 7-bit ESC would end the string as it does in a terminal,
+            // so the nested control is the C1 form, which stays payload.
             output.extend_from_slice(
-                super::prepare_chunk(b"\x1b[2J\x9b2J", false, true, &mut carry).bytes(),
+                super::prepare_chunk(b"\x9b2J", false, true, &mut carry).bytes(),
             );
             if terminator == b"\x1b\\" {
                 output.extend_from_slice(
@@ -1673,7 +3079,7 @@ mod tests {
             b"\xa9".as_slice(),
             b"\xe2".as_slice(),
             b"\x9d".as_slice(),
-            b"\x9c\x1b[2J".as_slice(),
+            b"\x9c\x9b2J".as_slice(),
             b"\x1b".as_slice(),
             b"\\after".as_slice(),
         ] {
@@ -1740,9 +3146,7 @@ mod tests {
         let mut output = super::prepare_chunk(&first, false, true, &mut carry)
             .bytes()
             .to_vec();
-        output.extend_from_slice(
-            super::prepare_chunk(b"\x1b[2J\x9b2J", false, true, &mut carry).bytes(),
-        );
+        output.extend_from_slice(super::prepare_chunk(b"\x9b2J", false, true, &mut carry).bytes());
         output.extend_from_slice(
             super::prepare_chunk(b"\x07Jafter", false, true, &mut carry).bytes(),
         );
@@ -2206,6 +3610,7 @@ mod tests {
         let input = super::InputSource {
             interactive: true,
             pty_fd: Some(master_fd),
+            idle_fd: None,
             recent_input: Some(recent.clone()),
         };
         // Real trace so we can assert the prompt-echo flush fired DURING the read
@@ -2215,8 +3620,9 @@ mod tests {
         let trace_file = tempfile::NamedTempFile::new().expect("trace temp file");
         let trace_path = trace_file.path().to_path_buf();
         let trace = super::IoTrace::open(Some(trace_path.as_path())).expect("trace opens");
+        let prepared = super::prepare_session(&options, true).expect("session prepares");
 
-        super::highlight_stream(reader, &mut writer, &options, input, None, trace, None)
+        super::highlight_stream(reader, &mut writer, prepared, input, None, trace, None)
             .expect("highlight_stream succeeds");
 
         let trace_text = std::fs::read_to_string(&trace_path).expect("read trace");
@@ -2287,13 +3693,15 @@ mod tests {
         let input = super::InputSource {
             interactive: true,
             pty_fd: Some(master_fd),
+            idle_fd: None,
             recent_input: Some(recent.clone()),
         };
         let trace_file = tempfile::NamedTempFile::new().expect("trace temp file");
         let trace_path = trace_file.path().to_path_buf();
         let trace = super::IoTrace::open(Some(trace_path.as_path())).expect("trace opens");
+        let prepared = super::prepare_session(&options, true).expect("session prepares");
 
-        super::highlight_stream(reader, &mut writer, &options, input, None, trace, None)
+        super::highlight_stream(reader, &mut writer, prepared, input, None, trace, None)
             .expect("highlight_stream succeeds");
 
         let trace_text = std::fs::read_to_string(&trace_path).expect("read trace");
@@ -2314,5 +3722,231 @@ mod tests {
         );
         // The arrow key stays in recent_input: this path never consumes it.
         assert_eq!(recent.lock().unwrap().as_slice(), b"\x1b[A");
+    }
+
+    /// Collects written bytes where a reader can see them mid-stream.
+    #[derive(Clone, Default)]
+    struct SharedWriter(std::rc::Rc<std::cell::RefCell<Vec<u8>>>);
+
+    impl std::io::Write for SharedWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.borrow_mut().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Returns one chunk, then records what had been written by the time the
+    /// stream asked for more: the point where a real stream blocks, and what
+    /// the terminal shows while it waits.
+    struct BlockingPointReader {
+        chunk: Option<Vec<u8>>,
+        written: SharedWriter,
+        shown_while_blocked: Option<Vec<u8>>,
+    }
+
+    impl std::io::Read for &mut BlockingPointReader {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if let Some(chunk) = self.chunk.take() {
+                buf[..chunk.len()].copy_from_slice(&chunk);
+                return Ok(chunk.len());
+            }
+            self.shown_while_blocked = Some(self.written.0.borrow().clone());
+            Ok(0)
+        }
+    }
+
+    fn shown_while_blocked(chunk: &[u8], pty_fd: Option<std::os::fd::RawFd>) -> Vec<u8> {
+        let options = crate::cli::args::Options {
+            profiles: vec!["cisco".to_string()],
+            no_auto_detect: true,
+            no_dynamic_profile: true,
+            ..Default::default()
+        };
+        let mut writer = SharedWriter::default();
+        let mut reader = BlockingPointReader {
+            chunk: Some(chunk.to_vec()),
+            written: writer.clone(),
+            shown_while_blocked: None,
+        };
+        let input = super::InputSource {
+            interactive: true,
+            pty_fd,
+            idle_fd: None,
+            recent_input: None,
+        };
+        let prepared = super::prepare_session(&options, true).expect("session prepares");
+        let trace = super::IoTrace::open(None).expect("no-op trace");
+        super::highlight_stream(&mut reader, &mut writer, prepared, input, None, trace, None)
+            .expect("highlight_stream succeeds");
+        reader
+            .shown_while_blocked
+            .expect("the stream read past the chunk")
+    }
+
+    // Stdin mode installs no signal handlers and the terminal echoes typing on
+    // its own, so a highlight color left open while waiting for input leaked
+    // into everything after Ctrl-C, Ctrl-Z or idle typing in `tail -f | ct`.
+    // While blocked the terminal must look exactly as it would at EOF.
+    #[test]
+    fn stdin_mode_closes_the_highlight_color_before_waiting_for_input() {
+        let chunk = b"Gi0/1 192.0.2.1 down\r\n";
+        let options = crate::cli::args::Options {
+            profiles: vec!["cisco".to_string()],
+            ..Default::default()
+        };
+        let mut at_eof = Vec::new();
+        let mut session = super::prepare_session(&options, true)
+            .expect("session prepares")
+            .session;
+        let trace = super::IoTrace::open(None).expect("no-op trace");
+        session
+            .push(
+                &mut at_eof,
+                &trace,
+                &crate::highlight::AnsiChunk::from_slice(chunk),
+            )
+            .expect("push succeeds");
+        let open_color = at_eof.clone();
+        session
+            .finish(&mut at_eof, &trace)
+            .expect("finish succeeds");
+        assert_ne!(open_color, at_eof, "the chunk must leave a color open");
+
+        assert_eq!(
+            String::from_utf8_lossy(&shown_while_blocked(chunk, None)),
+            String::from_utf8_lossy(&at_eof)
+        );
+
+        // PTY mode keeps the overlay across reads: the child's own echo comes
+        // back through the highlighter, and EOF or a signal resets it.
+        let pty = nix::pty::openpty(None, None).expect("openpty");
+        let master_fd = std::os::fd::AsRawFd::as_raw_fd(&pty.master);
+        assert_eq!(
+            String::from_utf8_lossy(&shown_while_blocked(chunk, Some(master_fd))),
+            String::from_utf8_lossy(&open_color)
+        );
+    }
+
+    // The holdback wait is bounded both ways: a quiet source is reported idle
+    // only once the full timeout has passed, and pending output ends the wait
+    // at once so a busy stream gains no latency.
+    #[test]
+    fn wait_idle_waits_out_a_quiet_source_and_returns_early_on_output() {
+        use std::os::fd::AsRawFd;
+        use std::time::{Duration, Instant};
+
+        let pty = nix::pty::openpty(None, None).expect("openpty");
+        let master_fd = pty.master.as_raw_fd();
+        let slave_fd = pty.slave.as_raw_fd();
+
+        let started = Instant::now();
+        assert!(super::wait_idle(Some(master_fd), Duration::from_millis(50)));
+        assert!(started.elapsed() >= Duration::from_millis(50));
+
+        // SAFETY: `slave_fd` is the open PTY slave from openpty and the buffer
+        // is a valid 1-byte slice.
+        assert_eq!(unsafe { libc::write(slave_fd, b"x".as_ptr().cast(), 1) }, 1);
+        let started = Instant::now();
+        assert!(!super::wait_idle(Some(master_fd), Duration::from_secs(5)));
+        assert!(started.elapsed() < Duration::from_secs(1));
+
+        assert!(!super::wait_idle(None, Duration::from_secs(5)));
+    }
+
+    // Startup detection rescans its whole sample, so running it on every read
+    // made byte-paced output (keystroke echo, a serial console) cost
+    // milliseconds per byte once the sample grew. Like the dynamic runtime, it
+    // reruns only at a line end, a prompt-like ending, every 4 KiB of new
+    // output, and once more when the sample is full.
+    #[test]
+    fn startup_auto_detect_reruns_at_line_ends_prompts_and_intervals() {
+        use super::{
+            AUTO_DETECT_BYTE_INTERVAL, AUTO_DETECT_SAMPLE_LIMIT, should_rerun_auto_detect,
+        };
+
+        assert!(!should_rerun_auto_detect(b"x", 1, 100));
+        assert!(!should_rerun_auto_detect(b"show ver", 8, 100));
+        assert!(!should_rerun_auto_detect(b"", 4, 100));
+        assert!(should_rerun_auto_detect(b"version 17.3\n", 13, 100));
+        assert!(should_rerun_auto_detect(b"\r", 1, 100));
+        for prompt in [&b"Router1#"[..], b"#", b"admin@mx480> ", b"$ ", b"%"] {
+            assert!(
+                should_rerun_auto_detect(prompt, prompt.len(), 100),
+                "{:?}",
+                String::from_utf8_lossy(prompt)
+            );
+        }
+        assert!(!should_rerun_auto_detect(
+            b"x",
+            AUTO_DETECT_BYTE_INTERVAL - 1,
+            100
+        ));
+        assert!(should_rerun_auto_detect(
+            b"x",
+            AUTO_DETECT_BYTE_INTERVAL,
+            100
+        ));
+        assert!(should_rerun_auto_detect(b"x", 1, AUTO_DETECT_SAMPLE_LIMIT));
+    }
+
+    // The read loop must consult `should_rerun_auto_detect` before each pass,
+    // or the gate tested above saves nothing. Output that arrives a byte per
+    // read gets a pass for its first read and one at each line end, and none
+    // for the bytes in between. End of input adds one for an unterminated
+    // tail but none after a final line end, since each pass restarts the
+    // count of new bytes.
+    #[test]
+    fn byte_paced_output_reruns_startup_detection_only_at_line_ends() {
+        use crate::cli::profile_selection::DETECTION_PASSES;
+
+        /// Hands the stream one byte per read, as keystroke echo or a slow
+        /// serial console does.
+        struct BytePacedReader<'a>(&'a [u8]);
+        impl std::io::Read for BytePacedReader<'_> {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                match self.0.split_first() {
+                    Some((&byte, rest)) => {
+                        buf[0] = byte;
+                        self.0 = rest;
+                        Ok(1)
+                    }
+                    None => Ok(0),
+                }
+            }
+        }
+
+        let detection_passes = |output: &[u8]| {
+            let options = crate::cli::args::Options::default();
+            let input = super::InputSource {
+                interactive: false,
+                pty_fd: None,
+                idle_fd: None,
+                recent_input: None,
+            };
+            // The built-in store, so a profiles.d detection hint on this host
+            // cannot end detection early and change the count.
+            let session = super::HighlightSession::new(
+                &options,
+                crate::profiles::ProfileStore::builtin(),
+                false,
+                vec!["generic".to_string()],
+            )
+            .expect("session builds");
+            let prepared = super::PreparedSession { session };
+            let trace = super::IoTrace::open(None).expect("no-op trace");
+            let reader = BytePacedReader(output);
+            DETECTION_PASSES.with(|passes| passes.set(0));
+
+            super::highlight_stream(reader, &mut Vec::new(), prepared, input, None, trace, None)
+                .expect("highlight_stream succeeds");
+            DETECTION_PASSES.with(std::cell::Cell::get)
+        };
+
+        assert_eq!(detection_passes(b"show version\nuptime"), 3);
+        assert_eq!(detection_passes(b"show version\nuptime\n"), 3);
     }
 }

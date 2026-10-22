@@ -87,11 +87,12 @@ shell completions. It also installs the required PCRE2 runtime dependency.
 Install from crates.io:
 
 ```sh
-cargo install prismtty
+cargo install --locked prismtty
 ```
 
 Cargo builds PrismTTY from source and installs the command binaries. You need
 Rust 1.85 or newer plus PCRE2 and `pkg-config` available on your system.
+`--locked` builds with the dependency versions audited for the release.
 
 For `cargo install` on macOS, install the native build dependencies first:
 
@@ -108,6 +109,19 @@ sudo apt-get install libpcre2-dev pkg-config
 Cargo installs the binaries only. Shell completions for zsh, bash, and fish
 live in [`completions/`](completions/); copy the file for your shell into its
 completions directory.
+
+For fish, also link `prismtty.fish` under the `ptty` and `ct` names, because fish
+only loads a completion file named after the command being completed:
+
+```sh
+cd ~/.config/fish/completions
+ln -s prismtty.fish ptty.fish
+ln -s prismtty.fish ct.fish
+```
+
+The bash-completion on-demand directory works the same way: install
+`prismtty.bash` there as `prismtty`, `ptty`, and `ct`, or source it from
+`~/.bashrc`.
 
 ### GitHub Release
 
@@ -177,6 +191,12 @@ Use stdin mode for noninteractive output from files or pipes:
 prismtty --profile cisco < show-tech.txt
 journalctl -xe | prismtty --profile linux-unix
 ```
+
+A wrapped command runs in the current directory. When stdin is not a terminal
+(a script, a CI job, or `ptty make < /dev/null`), the command reads that stdin
+directly while its output still goes through the PTY and is highlighted. If the
+command cannot be found or run, PrismTTY exits with 127 or 126, as a shell does;
+otherwise it exits with the command's own status.
 
 Important options:
 
@@ -269,7 +289,9 @@ prismtty --reload
 
 The next output chunk in each running PrismTTY session reloads the active config.
 Set `PRISMTTY_RUNTIME_DIR` to override the runtime directory, which is useful for
-tests or isolated sessions.
+tests or isolated sessions. An existing directory is used as it is; one that
+other users can write to is refused, which only disables live reload for that
+session.
 
 ## Built-In Profiles
 

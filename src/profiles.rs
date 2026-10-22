@@ -340,6 +340,24 @@ enum StrongSignalKind {
 }
 
 impl StrongSignal {
+    /// Matches against `lower`, the ASCII-lowercased sample. Lowercasing keeps
+    /// byte offsets and char boundaries, so this equals a case-insensitive
+    /// scan of the original sample while using std's substring search.
+    fn matches_lower(&self, lower: &str) -> bool {
+        match self {
+            StrongSignal::Contains { value } => contains_in_lower(lower, value),
+            StrongSignal::ContainsAny { values } => {
+                values.iter().any(|value| contains_in_lower(lower, value))
+            }
+            StrongSignal::LinePrefixAndAny { prefix, values } => lower.lines().any(|line| {
+                let trimmed = line.trim();
+                starts_with_case_insensitive(trimmed, prefix)
+                    && values.iter().any(|value| contains_in_lower(trimmed, value))
+            }),
+        }
+    }
+
+    #[cfg(test)]
     fn matches(&self, text: &str) -> bool {
         match self {
             StrongSignal::Contains { value } => contains_case_insensitive(text, value),
@@ -872,7 +890,11 @@ impl ProfileStore {
             .enumerate()
             .filter(|(profile_index, (name, profile))| {
                 name.as_str() != "generic"
-                    && profile.matches_startup_detection(sample, hint_matches[*profile_index])
+                    && profile.matches_startup_detection(
+                        sample,
+                        lower,
+                        hint_matches[*profile_index],
+                    )
             })
             .map(|(_profile_index, (name, _profile))| name.clone())
             .collect();
@@ -1006,10 +1028,11 @@ impl ProfileStore {
             .map(String::as_str)
     }
 
+    /// `lower` is the ASCII-lowercased output window.
     pub(crate) fn strong_transition_profile(
         &self,
         detected: &[String],
-        text: &str,
+        lower: &str,
         active_profile: Option<&str>,
     ) -> Option<String> {
         self.ordered_specific_profiles(detected)
@@ -1018,7 +1041,7 @@ impl ProfileStore {
             .find(|profile| {
                 self.profiles
                     .get(profile.as_str())
-                    .is_some_and(|profile| profile.matches_strong_signal(text))
+                    .is_some_and(|profile| profile.matches_strong_signal(lower))
             })
             .cloned()
     }
@@ -1038,6 +1061,12 @@ impl ProfileStore {
                     .is_some_and(|profile| profile.matches_runtime_prompt(text))
             })
             .cloned()
+    }
+
+    pub(crate) fn matches_runtime_prompt(&self, profile_name: &str, text: &str) -> bool {
+        self.profiles
+            .get(profile_name)
+            .is_some_and(|profile| profile.matches_runtime_prompt(text))
     }
 
     pub(crate) fn prompt_switches_on_first_detection(
@@ -1097,28 +1126,33 @@ impl ProfileStore {
 }
 
 impl Profile {
-    fn matches_startup_detection(&self, sample: &str, detection_hint_matched: bool) -> bool {
+    fn matches_startup_detection(
+        &self,
+        sample: &str,
+        lower: &str,
+        detection_hint_matched: bool,
+    ) -> bool {
         detection_hint_matched
-            || self.matches_strong_signal(sample)
-            || self.matches_startup_prompt(sample)
+            || self.matches_strong_signal(lower)
+            || self.matches_startup_prompt(sample, lower)
     }
 
-    fn matches_strong_signal(&self, text: &str) -> bool {
+    fn matches_strong_signal(&self, lower: &str) -> bool {
         self.runtime
             .strong_signals
             .iter()
-            .any(|signal| signal.matches(text))
+            .any(|signal| signal.matches_lower(lower))
     }
 
-    fn matches_startup_prompt(&self, sample: &str) -> bool {
-        self.runtime.startup_prompt.matches_startup(sample) && !self.matches_negative_signal(sample)
+    fn matches_startup_prompt(&self, sample: &str, lower: &str) -> bool {
+        self.runtime.startup_prompt.matches_startup(sample) && !self.matches_negative_signal(lower)
     }
 
-    fn matches_negative_signal(&self, text: &str) -> bool {
+    fn matches_negative_signal(&self, lower: &str) -> bool {
         self.runtime
             .negative_signals
             .iter()
-            .any(|signal| signal.matches(text))
+            .any(|signal| signal.matches_lower(lower))
     }
 
     fn matches_runtime_prompt(&self, text: &str) -> bool {
@@ -1202,6 +1236,15 @@ fn contains_case_insensitive(haystack: &str, needle: &str) -> bool {
     })
 }
 
+/// Case-insensitive search of `needle` in an ASCII-lowercased haystack.
+fn contains_in_lower(lower: &str, needle: &str) -> bool {
+    if needle.bytes().any(|byte| byte.is_ascii_uppercase()) {
+        contains_case_insensitive(lower, needle)
+    } else {
+        lower.contains(needle)
+    }
+}
+
 fn starts_with_case_insensitive(haystack: &str, needle: &str) -> bool {
     haystack
         .as_bytes()
@@ -1226,7 +1269,9 @@ fn looks_like_cisco_prompt_line(line: &str) -> bool {
     let Some(marker) = marker else {
         return false;
     };
-    if marker == 0 {
+    // Hostnames start with a letter or digit; `-->` and `--->` are compiler
+    // and build-tool arrows.
+    if marker == 0 || !prompt.as_bytes()[0].is_ascii_alphanumeric() {
         return false;
     }
     let body = &prompt[..marker];
@@ -1862,6 +1907,35 @@ mod tests {
     }
 
     #[test]
+    fn cisco_prompt_matcher_requires_an_alphanumeric_hostname_start() {
+        let store = ProfileStore::builtin();
+        let cisco = "cisco".to_string();
+
+        for sample in [
+            "  --> src/main.rs:3:9\n",
+            " ---> Running in 1a2b3c\n",
+            "-> next step\n",
+            "(config)#\n",
+        ] {
+            assert!(
+                !store.detect_profiles(sample).contains(&cisco),
+                "{sample:?} is not a Cisco prompt"
+            );
+        }
+        for sample in [
+            "R1#\n",
+            "2960>\n",
+            "Router(config-if)#\n",
+            "N9K-CORE-01# show version\n",
+        ] {
+            assert!(
+                store.detect_profiles(sample).contains(&cisco),
+                "{sample:?} is a Cisco prompt"
+            );
+        }
+    }
+
+    #[test]
     fn bundled_negative_signals_block_only_startup_prompt_detection() {
         let store = ProfileStore::builtin();
 
@@ -1948,6 +2022,67 @@ mod tests {
             !helper_source.contains("to_ascii_lowercase"),
             "case-insensitive signal helpers should avoid lowercase String allocations"
         );
+    }
+
+    // Detection matches signals against the runtime's already-lowercased
+    // window; the result must equal the case-insensitive scan of the original.
+    #[test]
+    fn lowercase_signal_matching_agrees_with_case_insensitive_reference() {
+        let store = ProfileStore::builtin();
+        let custom = [
+            super::StrongSignal::Contains {
+                value: "Nexus".to_string(),
+            },
+            super::StrongSignal::ContainsAny {
+                values: vec!["ÉXE".to_string(), "pa-VM".to_string()],
+            },
+            super::StrongSignal::ContainsAny {
+                values: vec![String::new()],
+            },
+            super::StrongSignal::LinePrefixAndAny {
+                prefix: "Version:".to_string(),
+                values: vec!["FortiOS".to_string()],
+            },
+        ];
+        for sample in [
+            "",
+            "Cisco IOS Software, Version 15.2(4)M",
+            "Cisco Nexus Operating System (NX-OS) Software",
+            "--- JUNOS 22.4R3 Kernel 64-bit",
+            "Version: FortiGate-VM64 v7.4",
+            "  version: FORTIOS v7.2\r\nnext line",
+            "status\nVersion: fortinet\n",
+            "PAN-OS 11.1\nArubaOS-CX Version 10.13\nhpe-restd",
+            "Model: PA-VM\r\n",
+            "café JUNOS",
+            "ÄIOS XE",
+            "éxe nx-os ÉXE",
+            "cisco\nios split across lines",
+            "line protocol is up\r\nUBUNTU 24.04",
+            "Kernel: Linux 6.8.0\nTerminal: /dev/pts/1",
+            "Versa Director 22.1",
+            "Arista Networks EOS version 4.31",
+        ] {
+            let lower = sample.to_ascii_lowercase();
+            let signals = store
+                .profiles
+                .values()
+                .flat_map(|profile| {
+                    profile
+                        .runtime
+                        .strong_signals
+                        .iter()
+                        .chain(&profile.runtime.negative_signals)
+                })
+                .chain(&custom);
+            for signal in signals {
+                assert_eq!(
+                    signal.matches_lower(&lower),
+                    signal.matches(sample),
+                    "{signal:?} on {sample:?}"
+                );
+            }
+        }
     }
 
     #[test]

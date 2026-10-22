@@ -1,8 +1,11 @@
+use std::collections::VecDeque;
 use std::ffi::{OsStr, OsString};
 use std::fs::OpenOptions;
 use std::io::{self, Read, Write};
 use std::mem;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
+use std::os::unix::fs::OpenOptionsExt;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::{
     Arc, Mutex,
@@ -22,8 +25,8 @@ use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use super::CliError;
 use super::args::Options;
 use super::profile_selection::dynamic_profile_enabled;
-use super::runtime::{ReloadWatcher, RuntimeRegistration};
-use super::stream::{InputSource, highlight_stream};
+use super::runtime::{register_for_reload, unregister_before_exit};
+use super::stream::{InputSource, highlight_stream, prepare_session};
 use super::trace::IoTrace;
 
 const STRIPPED_ITERM_ENV: [&str; 6] = [
@@ -480,6 +483,13 @@ fn with_terminal_restored_for_job_control(
     reapply()
 }
 
+/// Prints a diagnostic to stderr. Unlike `eprintln!` it never panics, so an
+/// unwritable stderr (EIO once the controlling terminal hangs up) cannot
+/// abort cleanup or kill the signal watcher before it reaps the child.
+fn warn(args: std::fmt::Arguments<'_>) {
+    let _ = writeln!(io::stderr(), "{args}");
+}
+
 /// Runs `body`, catching a panic so it surfaces as a clear diagnostic instead
 /// of silently killing a detached worker thread (which could otherwise leave
 /// the session wedged with no error). Returns `false` if `body` panicked.
@@ -487,7 +497,9 @@ fn run_supervised(name: &str, body: impl FnOnce()) -> bool {
     if std::panic::catch_unwind(std::panic::AssertUnwindSafe(body)).is_ok() {
         return true;
     }
-    eprintln!("prismtty: the {name} thread stopped unexpectedly (panic)");
+    warn(format_args!(
+        "prismtty: the {name} thread stopped unexpectedly (panic)"
+    ));
     false
 }
 
@@ -507,8 +519,27 @@ pub(super) fn run_command(options: Options, command: Vec<OsString>) -> Result<Ex
     let pty_system = native_pty_system();
     let pair = pty_system.openpty(current_pty_size())?;
     let interactive = io::stdin().is_terminal();
+    // Output on a terminal is watched live even when stdin is redirected
+    // (`ptty cmd </dev/null`), so it gets the interactive highlighter and the
+    // holdback flush, as stdin mode does when stdout is a terminal. Raw mode,
+    // stdin forwarding and dynamic profiles stay keyed to `interactive`.
+    let live_output = interactive || io::stdout().is_terminal();
+    // Everything that can reject the invocation runs before the child exists,
+    // so a typo in a flag or a broken config never runs part of the command,
+    // and a reload warning prints before the terminal goes raw.
+    let prepared = prepare_session(&options, live_output)?;
+    let trace = IoTrace::open(options.trace_io.as_deref())?;
+    let (_registration, reload_watcher) = register_for_reload();
 
-    let mut builder = CommandBuilder::new(command_name);
+    let program = cwd_relative_program(command_name);
+    let mut builder = CommandBuilder::new(&program);
+    let cwd = child_working_directory();
+    if let Some(error) = unusable_script_interpreter(&program, cwd.as_deref()) {
+        return Err(error);
+    }
+    if let Some(cwd) = &cwd {
+        builder.cwd(cwd);
+    }
     for arg in command_args {
         builder.arg(arg);
     }
@@ -516,16 +547,26 @@ pub(super) fn run_command(options: Options, command: Vec<OsString>) -> Result<Ex
 
     if interactive {
         configure_child_pty(&*pair.master)?;
+    } else {
+        queue_end_of_input(&*pair.master)?;
     }
 
     let mut signal_mask = SessionSignalMask::block()?;
     let mut terminal_session = TerminalSession::start(interactive)?;
-    let mut child = pair.slave.spawn_command(builder)?;
+    let mut child = if interactive {
+        pair.slave
+            .spawn_command(builder)
+            .map_err(|source| CliError::Spawn {
+                code: spawn_failure_exit_code(&program, cwd.as_deref()),
+                source,
+            })?
+    } else {
+        spawn_with_caller_stdin(&builder, &*pair.master)?
+    };
     drop(pair.slave);
     set_forward_child_pid(child.process_id().map(|pid| pid as i32).unwrap_or(0));
     cleanup_child_on_err(signal_mask.restore(), &mut child)?;
 
-    let trace = cleanup_child_on_err(IoTrace::open(options.trace_io.as_deref()), &mut child)?;
     let (profile_input_tx, profile_input_rx) = if dynamic_profile_enabled(&options, interactive) {
         let (tx, rx) = mpsc::sync_channel(PROFILE_INPUT_QUEUE_CAPACITY);
         (Some(tx), Some(rx))
@@ -537,7 +578,7 @@ pub(super) fn run_command(options: Options, command: Vec<OsString>) -> Result<Ex
     // read loop polls it (idle detection). Duping keeps that use independent of
     // the resize watcher (which owns the master itself), so a resize-thread exit
     // cannot close the descriptor out from under the read loop.
-    let pty_fd_owned = if interactive {
+    let pty_fd_owned = if live_output {
         Some(cleanup_child_on_err(
             dup_master_fd(&*pair.master),
             &mut child,
@@ -545,7 +586,11 @@ pub(super) fn run_command(options: Options, command: Vec<OsString>) -> Result<Ex
     } else {
         None
     };
-    let pty_fd = pty_fd_owned.as_ref().map(AsRawFd::as_raw_fd);
+    let idle_fd = pty_fd_owned.as_ref().map(AsRawFd::as_raw_fd);
+    // Without a terminal on stdin nothing reaches the child through prismtty,
+    // so there is no echo to wait for, and the highlight color must close
+    // before each wait as in stdin mode (see `flush_before_wait`).
+    let pty_fd = idle_fd.filter(|_| interactive);
 
     // Records bytes forwarded to the child so the highlight loop can recognise
     // their echo: it surfaces a buffered trailing token on idle only when the
@@ -556,7 +601,7 @@ pub(super) fn run_command(options: Options, command: Vec<OsString>) -> Result<Ex
     let recent_input = Arc::new(Mutex::new(Vec::new()));
     let input_worker_failure = Arc::new(Mutex::new(None));
     if interactive {
-        let mut writer = cleanup_child_on_err(pair.master.take_writer(), &mut child)?;
+        let mut writer = cleanup_child_on_err(stdin_forward_writer(&*pair.master), &mut child)?;
         let trace = trace.clone();
         let local_echo = options.local_echo;
         let recent_input = Arc::clone(&recent_input);
@@ -566,7 +611,10 @@ pub(super) fn run_command(options: Options, command: Vec<OsString>) -> Result<Ex
                 &input_worker_failure,
                 || {
                     let stdin = io::stdin();
-                    let mut stdin = stdin.lock();
+                    let mut stdin = WaitWhenWouldBlock {
+                        inner: stdin.lock(),
+                        fd: libc::STDIN_FILENO,
+                    };
                     forward_stdin_to_pty(
                         &mut stdin,
                         &mut writer,
@@ -585,16 +633,18 @@ pub(super) fn run_command(options: Options, command: Vec<OsString>) -> Result<Ex
     let mut resize_watcher =
         cleanup_child_on_err(PtyResizeWatcher::start(pair.master), &mut child)?;
 
-    let mut stdout = io::stdout();
-    let _registration = cleanup_child_on_err(RuntimeRegistration::register(), &mut child)?;
-    let reload_watcher = Some(ReloadWatcher::new());
+    let mut stdout = WaitWhenWouldBlock {
+        inner: io::stdout(),
+        fd: libc::STDOUT_FILENO,
+    };
     let stream_result = highlight_stream(
         &mut reader,
         &mut stdout,
-        &options,
+        prepared,
         InputSource {
-            interactive,
+            interactive: live_output,
             pty_fd,
+            idle_fd,
             recent_input: Some(recent_input),
         },
         reload_watcher,
@@ -626,6 +676,437 @@ pub(super) fn run_command(options: Options, command: Vec<OsString>) -> Result<Ex
     }
     stream_result?;
     Ok(ExitCode::from(exit?))
+}
+
+/// The directory to start the wrapped command in: the caller's, whenever the
+/// child can enter it. portable-pty starts the child in $HOME when it is given
+/// no directory, or one it cannot stat. `.` still names the caller's directory
+/// when it was deleted (getcwd fails) or an ancestor cannot be searched; the
+/// child then stays there, as exec would leave it, and a relative path fails
+/// instead of acting on $HOME. Only a directory the user cannot search at all
+/// (`sudo -u postgres prismtty psql` from a private home, where getcwd still
+/// works on Linux but chdir fails) falls back to $HOME, with a warning, so the
+/// command still starts.
+fn child_working_directory() -> Option<PathBuf> {
+    let enterable = |dir: &Path| dir.is_dir() && is_executable(dir);
+    match std::env::current_dir() {
+        Ok(dir) if enterable(&dir) => Some(dir),
+        _ if enterable(Path::new(".")) => Some(PathBuf::from(".")),
+        _ => {
+            warn(format_args!(
+                "prismtty: cannot enter the current directory; running the command in $HOME"
+            ));
+            None
+        }
+    }
+}
+
+/// Prefixes a relative program path with a directory part (`bin/tool`) with
+/// `./`. Like execvp, a name containing `/` is resolved against the working
+/// directory, but portable-pty only does that for `./` and `../` paths and
+/// searches PATH for anything else.
+fn cwd_relative_program(program: OsString) -> OsString {
+    use std::os::unix::ffi::OsStrExt;
+    use std::path::{Component, Path};
+
+    let path = Path::new(&program);
+    let explicit = matches!(
+        path.components().next(),
+        Some(Component::CurDir | Component::ParentDir)
+    );
+    if path.is_relative() && !explicit && program.as_bytes().contains(&b'/') {
+        let mut prefixed = OsString::from("./");
+        prefixed.push(&program);
+        prefixed
+    } else {
+        program
+    }
+}
+
+/// Exit code for a wrapped command that could not be spawned, following the
+/// shell convention: 127 when nothing by that name exists, 126 when it exists
+/// but is a directory or is not executable. A name that resolves to an
+/// executable failed for some other reason and keeps the generic 1.
+fn spawn_failure_exit_code(program: &OsStr, cwd: Option<&Path>) -> u8 {
+    let mut exists = false;
+    for candidate in program_candidates(program, cwd) {
+        let Ok(metadata) = std::fs::metadata(&candidate) else {
+            continue;
+        };
+        if !metadata.is_dir() && is_executable(&candidate) {
+            return 1;
+        }
+        exists = true;
+    }
+    if exists { 126 } else { 127 }
+}
+
+/// The paths execvp would try for `program`, in order: the name itself
+/// against `cwd` when it contains `/`, otherwise each PATH entry.
+fn program_candidates(program: &OsStr, cwd: Option<&Path>) -> Vec<PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let cwd = cwd.unwrap_or(Path::new(""));
+    if program.is_empty() {
+        Vec::new()
+    } else if program.as_bytes().contains(&b'/') {
+        vec![cwd.join(program)]
+    } else {
+        std::env::var_os("PATH")
+            .map(|path| {
+                std::env::split_paths(&path)
+                    .map(|dir| cwd.join(dir).join(program))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+}
+
+/// How a kernel reads the `#!` line of a script. It reads the start of the
+/// file into a buffer, zero-filled past the end of a shorter file, skips
+/// blanks (space, tab) after `#!`, and ends the interpreter name at a blank,
+/// a NUL or the end of the line.
+struct ShebangSyntax {
+    /// How much of the file every version of the kernel reads.
+    buffer_bytes: usize,
+    /// The bytes that end the line.
+    line_ends: &'static [u8],
+    /// Whether a line with no end in the buffer still names an interpreter
+    /// when a blank follows the name, which only cuts off its arguments.
+    /// Otherwise the kernel reports ENOEXEC, and execvp runs the file with
+    /// /bin/sh.
+    names_in_unended_line: bool,
+}
+
+/// Linux, `load_script` in fs/binfmt_script.c: the newline search (strnchr)
+/// stops at a NUL, so the line of a short file with no newline ends where the
+/// file does. `#` is part of the name. The buffer is BINPRM_BUF_SIZE, 256
+/// bytes since Linux 5.1 but 128 before, where a name that does not end in
+/// it is ENOEXEC (5.0, 4.x stable) or cut off there (older kernels). Reading
+/// 128 bytes leaves such a name to the spawn on every version.
+const LINUX_SHEBANG: ShebangSyntax = ShebangSyntax {
+    buffer_bytes: 128,
+    line_ends: b"\n\0",
+    names_in_unended_line: true,
+};
+
+/// macOS, `exec_shell_imgact` in XNU's bsd/kern/kern_exec.c: the buffer is
+/// IMG_SHSIZE, and `#` ends the line as a newline does. A NUL ends neither,
+/// so a short file with no newline is ENOEXEC.
+const XNU_SHEBANG: ShebangSyntax = ShebangSyntax {
+    buffer_bytes: 512,
+    line_ends: b"\n#",
+    names_in_unended_line: false,
+};
+
+/// The `#!` syntax of the kernel prismtty runs on, where it is known.
+const KERNEL_SHEBANG: Option<ShebangSyntax> =
+    if cfg!(any(target_os = "linux", target_os = "android")) {
+        Some(LINUX_SHEBANG)
+    } else if cfg!(target_vendor = "apple") {
+        Some(XNU_SHEBANG)
+    } else {
+        None
+    };
+
+/// The interpreter a kernel with `syntax` runs for a file that starts with
+/// `start`, or None when it runs none: not a script, no name, or ENOEXEC.
+fn script_interpreter(start: &[u8], syntax: &ShebangSyntax) -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let mut buffer = start[..start.len().min(syntax.buffer_bytes)].to_vec();
+    buffer.resize(syntax.buffer_bytes, 0);
+    let line = buffer.strip_prefix(b"#!")?;
+    let (line, ended) = match line.iter().position(|byte| syntax.line_ends.contains(byte)) {
+        Some(end) => (&line[..end], true),
+        None if syntax.names_in_unended_line => (line, false),
+        None => return None,
+    };
+    let is_blank = |byte: &u8| matches!(byte, b' ' | b'\t');
+    let name = &line[line.iter().position(|byte| !is_blank(byte))?..];
+    let name = match name.iter().position(|byte| is_blank(byte) || *byte == 0) {
+        Some(end) => &name[..end],
+        // The buffer may have cut the name off: ENOEXEC.
+        None if !ended => return None,
+        None => name,
+    };
+    (!name.is_empty()).then(|| PathBuf::from(OsStr::from_bytes(name)))
+}
+
+/// Checks the `#!` interpreter of a script before it is spawned. A script
+/// whose interpreter cannot be executed only fails in execve, after the fork.
+/// portable-pty, which spawns the command from a terminal, closes every
+/// descriptor above 2 in the child, std's exec-error pipe included, so the
+/// child aborts with "fatal runtime error" instead of the spawn reporting the
+/// failure. The line is parsed as the kernel does, so a CRLF script names
+/// `/bin/sh\r`. Whatever the kernel would not reject for certain is left to
+/// the spawn: an empty name, a relative one when the child's directory is not
+/// known, and every script on a kernel whose syntax is not known here.
+fn unusable_script_interpreter(program: &OsStr, cwd: Option<&Path>) -> Option<CliError> {
+    let syntax = KERNEL_SHEBANG?;
+    let script = program_candidates(program, cwd)
+        .into_iter()
+        .find(|candidate| !candidate.is_dir() && is_executable(candidate))?;
+    // Opening an executable FIFO for reading would wait for a writer.
+    if !script.is_file() {
+        return None;
+    }
+    let mut start = Vec::new();
+    std::fs::File::open(&script)
+        .ok()?
+        .take(syntax.buffer_bytes as u64)
+        .read_to_end(&mut start)
+        .ok()?;
+    let interpreter = script_interpreter(&start, &syntax)?;
+    // A relative interpreter is found from the child's directory, which is
+    // $HOME, not known here, when the caller's cannot be entered.
+    let interpreter_path = match cwd {
+        Some(cwd) => cwd.join(&interpreter),
+        None if interpreter.is_absolute() => interpreter.clone(),
+        None => return None,
+    };
+    let code = match std::fs::metadata(&interpreter_path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => 127,
+        Err(_) => 126,
+        Ok(metadata) if metadata.is_dir() || !is_executable(&interpreter_path) => 126,
+        Ok(_) => return None,
+    };
+    Some(CliError::Spawn {
+        code,
+        source: anyhow::anyhow!(
+            "Unable to spawn {} because of a bad interpreter {:?}",
+            script.display(),
+            interpreter
+        ),
+    })
+}
+
+/// Spawns the wrapped command when stdin is not a terminal. The child reads
+/// the caller's stdin itself, so every read sees what `cmd < file` would: the
+/// data of a pipe or file, then end of input, however often it reads. The PTY
+/// slave is its stdout, stderr and controlling terminal. portable-pty always
+/// puts the slave on stdin, so this mirrors its spawn otherwise: the program
+/// is resolved against the same directory and PATH (`resolve_program` says
+/// where its messages differ), SHELL is set when unset (the builder's
+/// environment is the process's own on this path), and the child starts as a
+/// session leader with default signal dispositions and an empty signal mask.
+/// Inherited descriptors are marked close-on-exec rather than closed, which
+/// keeps std's exec-error pipe working, so an execve failure is reported
+/// instead of aborting the child.
+fn spawn_with_caller_stdin(
+    builder: &CommandBuilder,
+    master: &dyn portable_pty::MasterPty,
+) -> Result<Box<dyn portable_pty::Child + Send + Sync>, CliError> {
+    use std::os::unix::process::CommandExt;
+    use std::process::{Command, Stdio};
+
+    let argv = builder.get_argv();
+    let dir = builder
+        .get_cwd()
+        .map(Path::new)
+        .filter(|dir| dir.is_dir())
+        .map_or_else(|| home_dir(builder), Path::to_path_buf);
+    let program = resolve_program(&argv[0], &dir).map_err(|source| CliError::Spawn {
+        code: spawn_failure_exit_code(&argv[0], Some(&dir)),
+        source,
+    })?;
+    let tty_name = master
+        .tty_name()
+        .ok_or_else(|| io::Error::other("PTY slave name is unavailable"))?;
+    // O_NOCTTY: a session leader without a controlling terminal would
+    // otherwise take this one, and the child could no longer claim it.
+    let slave = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NOCTTY)
+        .open(tty_name)?;
+    let inherited = inherited_fds();
+    // SAFETY: sigset_t is a plain C type; sigemptyset below initializes it before it is used.
+    let mut empty_mask = unsafe { mem::zeroed::<libc::sigset_t>() };
+    // SAFETY: `empty_mask` is a valid, exclusively borrowed sigset_t.
+    unsafe {
+        libc::sigemptyset(&mut empty_mask);
+    }
+
+    let mut command = Command::new(&program);
+    command
+        .arg0(&argv[0])
+        .args(&argv[1..])
+        .current_dir(&dir)
+        .stdin(Stdio::inherit())
+        .stdout(slave.try_clone()?)
+        .stderr(slave);
+    if let Some(shell) = builder.get_env("SHELL") {
+        command.env("SHELL", shell);
+    }
+    // SAFETY: the closure runs in the forked child before exec. It only calls
+    // async-signal-safe functions (signal, sigprocmask, setsid, ioctl, fcntl)
+    // and allocates nothing: the mask and the descriptor list were prepared
+    // before the fork.
+    unsafe {
+        command.pre_exec(move || {
+            for signal in [
+                libc::SIGCHLD,
+                libc::SIGHUP,
+                libc::SIGINT,
+                libc::SIGQUIT,
+                libc::SIGTERM,
+                libc::SIGALRM,
+            ] {
+                libc::signal(signal, libc::SIG_DFL);
+            }
+            libc::sigprocmask(libc::SIG_SETMASK, &empty_mask, std::ptr::null_mut());
+            if libc::setsid() == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            // stdout is the PTY slave.
+            if libc::ioctl(libc::STDOUT_FILENO, libc::TIOCSCTTY as _, 0) == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            for &fd in &inherited {
+                // A descriptor closed since it was listed only reports EBADF.
+                libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
+            }
+            Ok(())
+        });
+    }
+    let child = command.spawn().map_err(|error| {
+        // std enters `dir` in the child before the exec and reports a failure
+        // there as the spawn's. Only the $HOME fallback can be a directory the
+        // child cannot enter, and then the program is not to blame.
+        if !(dir.is_dir() && is_executable(&dir)) {
+            return CliError::Spawn {
+                code: 1,
+                source: anyhow::anyhow!(
+                    "Unable to enter {} to spawn {}: {error}",
+                    dir.display(),
+                    program.display()
+                ),
+            };
+        }
+        CliError::Spawn {
+            code: exec_failure_exit_code(&error),
+            source: anyhow::anyhow!("Unable to spawn {}: {error}", program.display()),
+        }
+    })?;
+    Ok(Box::new(child))
+}
+
+/// Where portable-pty starts a child that has no usable directory: $HOME,
+/// else the user's home directory, else `/`.
+fn home_dir(builder: &CommandBuilder) -> PathBuf {
+    builder
+        .get_env("HOME")
+        .and_then(OsStr::to_str)
+        .map(PathBuf::from)
+        .or_else(|| directories::BaseDirs::new().map(|dirs| dirs.home_dir().to_path_buf()))
+        .unwrap_or_else(|| PathBuf::from("/"))
+}
+
+/// Resolves the program as portable-pty's spawn does: a name with a `/`
+/// against `dir`, any other name in each PATH entry. The messages are its
+/// own, except for an absolute path that is missing or not executable, which
+/// reads as a relative one does (portable-pty says "doesn't exist on the
+/// filesystem" and adds the errno), and an empty name, for which portable-pty
+/// also lists each PATH entry as a directory.
+fn resolve_program(program: &OsStr, dir: &Path) -> anyhow::Result<PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
+
+    if program.as_bytes().contains(&b'/') {
+        let path = dir.join(program);
+        if path.is_dir() {
+            anyhow::bail!(
+                "Unable to spawn {} because it is a directory",
+                path.display()
+            );
+        }
+        if is_executable(&path) {
+            return Ok(path);
+        }
+        if path.exists() {
+            anyhow::bail!(
+                "Unable to spawn {} because it is not executable",
+                path.display()
+            );
+        }
+        anyhow::bail!(
+            "Unable to spawn {} because it does not exist",
+            path.display()
+        );
+    }
+    let mut errors = Vec::new();
+    for candidate in program_candidates(program, Some(dir)) {
+        if candidate.is_dir() {
+            errors.push(format!("{} exists but is a directory", candidate.display()));
+        } else if is_executable(&candidate) {
+            return Ok(candidate);
+        } else if candidate.exists() {
+            errors.push(format!(
+                "{} exists but is not executable",
+                candidate.display()
+            ));
+        }
+    }
+    errors.push(match std::env::var_os("PATH") {
+        Some(path) => format!("No viable candidates found in PATH {path:?}"),
+        None => "Unable to resolve the PATH".to_owned(),
+    });
+    anyhow::bail!(
+        "Unable to spawn {} because:\n{}",
+        Path::new(program).display(),
+        errors.join(".\n")
+    )
+}
+
+/// Exit code for a resolved command whose execve failed, as a shell reports
+/// it: 127 when a file it needs does not exist (a script's interpreter, a
+/// program's loader), 126 when it cannot be executed. Anything else, such as
+/// the child failing to take the PTY, keeps the generic 1.
+fn exec_failure_exit_code(error: &io::Error) -> u8 {
+    match error.raw_os_error() {
+        Some(libc::ENOENT) => 127,
+        Some(
+            libc::EACCES
+            | libc::ENOEXEC
+            | libc::EISDIR
+            | libc::ENOTDIR
+            | libc::ELOOP
+            | libc::ENAMETOOLONG
+            | libc::ETXTBSY
+            | libc::E2BIG,
+        ) => 126,
+        _ => 1,
+    }
+}
+
+/// Descriptors above stderr that would survive an exec: ones prismtty
+/// inherited without close-on-exec, since all it opens itself is
+/// close-on-exec. Like portable-pty, this lists /dev/fd, and finds nothing
+/// where that cannot be read. Listing allocates, so it runs before the fork.
+fn inherited_fds() -> Vec<RawFd> {
+    let Ok(entries) = std::fs::read_dir("/dev/fd") else {
+        return Vec::new();
+    };
+    entries
+        .filter_map(|entry| entry.ok()?.file_name().to_str()?.parse::<RawFd>().ok())
+        .filter(|&fd| fd > 2)
+        .filter(|&fd| {
+            // SAFETY: F_GETFD takes no pointer argument; an invalid `fd` reports EBADF instead of
+            // touching memory.
+            let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+            flags >= 0 && flags & libc::FD_CLOEXEC == 0
+        })
+        .collect()
+}
+
+fn is_executable(path: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+
+    let Ok(path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+        return false;
+    };
+    // SAFETY: `path` is a valid NUL-terminated string that outlives the call.
+    unsafe { libc::access(path.as_ptr(), libc::X_OK) == 0 }
 }
 
 fn parent_terminal_is_iterm() -> bool {
@@ -669,11 +1150,39 @@ fn configure_child_pty(master: &dyn portable_pty::MasterPty) -> Result<(), CliEr
     let Some(tty_name) = master.tty_name() else {
         return Ok(());
     };
-    let slave_tty = OpenOptions::new().read(true).write(true).open(tty_name)?;
+    // O_NOCTTY: a session leader without a controlling terminal would
+    // otherwise take this one, and the child could no longer claim it.
+    let slave_tty = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NOCTTY)
+        .open(tty_name)?;
     let mut termios = source;
     normalize_child_pty_termios(&mut termios);
     tcsetattr(slave_tty.as_fd(), SetArg::TCSANOW, &termios)?;
     Ok(())
+}
+
+/// Queues an end of input on the child's PTY when there is no terminal to
+/// forward from. The child reads the caller's stdin itself then, but the PTY
+/// is still its controlling terminal, so a first reader of /dev/tty (a
+/// password prompt) sees EOF instead of blocking forever. Only VEOF is sent,
+/// before the child exists: a newline would read as an extra empty line, and
+/// echo is off for the write because macOS echoes VEOF as `^D`.
+fn queue_end_of_input(master: &dyn portable_pty::MasterPty) -> io::Result<()> {
+    let mut pty = stdin_forward_writer(master)?;
+    let fd = pty.as_raw_fd();
+    let attrs = terminal_attrs(fd)?;
+    let eof = attrs.c_cc[libc::VEOF];
+    if eof == 0 {
+        return Ok(());
+    }
+    let mut quiet = attrs;
+    quiet.c_lflag &= !libc::ECHO;
+    set_terminal_attrs_retrying_eintr(fd, &quiet)?;
+    let written = pty.write_all(&[eof]);
+    set_terminal_attrs_retrying_eintr(fd, &attrs)?;
+    written
 }
 
 fn normalize_child_pty_termios(termios: &mut Termios) {
@@ -703,6 +1212,73 @@ fn normalize_child_pty_flags(
     input.insert(InputFlags::ICRNL);
     output.insert(OutputFlags::OPOST);
     (local, input, output)
+}
+
+/// Reads from or writes to `inner`, waiting for `fd` to become ready whenever
+/// the call reports `WouldBlock`. A terminal's open file description is
+/// shared by every process on it, and usually by prismtty's stdin and stdout
+/// too, so another program can leave or set `O_NONBLOCK` on them; an empty
+/// non-blocking read, or an output queue the terminal has not drained yet, is
+/// not an I/O failure. Clearing the flag instead would change it for those
+/// programs too, and miss it being set again mid-session.
+pub(super) struct WaitWhenWouldBlock<T> {
+    pub(super) inner: T,
+    pub(super) fd: RawFd,
+}
+
+impl<R: Read> Read for WaitWhenWouldBlock<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        retry_when_would_block(self.fd, libc::POLLIN, || self.inner.read(buf))
+    }
+}
+
+// A write that fails took none of `buf`, as `Write` requires and std's
+// buffered stdout keeps, so it can be retried as it is.
+impl<W: Write> Write for WaitWhenWouldBlock<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        retry_when_would_block(self.fd, libc::POLLOUT, || self.inner.write(buf))
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        retry_when_would_block(self.fd, libc::POLLOUT, || self.inner.flush())
+    }
+}
+
+fn retry_when_would_block<T>(
+    fd: RawFd,
+    events: libc::c_short,
+    mut call: impl FnMut() -> io::Result<T>,
+) -> io::Result<T> {
+    loop {
+        match call() {
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                wait_until_ready(fd, events)?;
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            result => return result,
+        }
+    }
+}
+
+fn wait_until_ready(fd: RawFd, events: libc::c_short) -> io::Result<()> {
+    let mut poll_fd = libc::pollfd {
+        fd,
+        events,
+        revents: 0,
+    };
+    loop {
+        // SAFETY: `poll_fd` is a valid, exclusively borrowed pollfd and the count matches.
+        if unsafe { libc::poll(&mut poll_fd, 1, -1) } >= 0 {
+            // The requested event, POLLHUP and POLLERR all mean the next call
+            // does not report WouldBlock again: it transfers data, sees end of
+            // input or returns the error.
+            return Ok(());
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
 }
 
 fn forward_stdin_to_pty<R: Read, W: Write>(
@@ -745,7 +1321,10 @@ fn forward_stdin_to_pty<R: Read, W: Write>(
         if local_echo {
             let echo = echo_state.push(input);
             if !echo.is_empty() {
-                let mut stdout = io::stdout().lock();
+                let mut stdout = WaitWhenWouldBlock {
+                    inner: io::stdout().lock(),
+                    fd: libc::STDOUT_FILENO,
+                };
                 stdout.write_all(&echo)?;
                 stdout.flush()?;
             }
@@ -781,6 +1360,14 @@ fn record_recent_input(recent_input: &Mutex<Vec<u8>>, input: &[u8]) {
     }
 }
 
+/// The writer the stdin forwarder sends input through: a plain dup of the
+/// PTY master. portable-pty's own writer writes a newline and VEOF into the
+/// PTY when dropped, which would submit a partial line the user never entered
+/// (and can log out a remote shell) whenever forwarding ends.
+fn stdin_forward_writer(master: &dyn portable_pty::MasterPty) -> io::Result<std::fs::File> {
+    dup_master_fd(master).map(std::fs::File::from)
+}
+
 fn dup_master_fd(master: &dyn portable_pty::MasterPty) -> io::Result<OwnedFd> {
     let fd = master.as_raw_fd().ok_or_else(|| {
         io::Error::new(
@@ -788,9 +1375,10 @@ fn dup_master_fd(master: &dyn portable_pty::MasterPty) -> io::Result<OwnedFd> {
             "PTY master file descriptor is unavailable",
         )
     })?;
-    // SAFETY: `fd` is the live PTY master descriptor. `dup` returns a fresh
-    // descriptor that `OwnedFd` takes sole ownership of and closes on drop.
-    let duped = unsafe { libc::dup(fd) };
+    // SAFETY: `fd` is the live PTY master descriptor. F_DUPFD_CLOEXEC returns a
+    // fresh close-on-exec descriptor that `OwnedFd` takes sole ownership of and
+    // closes on drop.
+    let duped = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
     if duped < 0 {
         return Err(io::Error::last_os_error());
     }
@@ -938,6 +1526,10 @@ struct RawModeState {
     stdin_fd: RawFd,
     original: libc::termios,
     raw: libc::termios,
+    /// Set when the snapshot was taken while another job owned the terminal:
+    /// `original` is then that job's mode and is read again once this process
+    /// reaches the foreground.
+    snapshot_stale: bool,
 }
 
 enum RawModeLifecycle {
@@ -952,15 +1544,23 @@ impl RawModeLifecycle {
     /// holds the lifecycle mutex across both this transition and `apply`, so a
     /// terminating signal cannot restore cooked mode and then lose a race to
     /// a late raw-mode activation.
+    /// `apply` returns the state it applied, or `None` when the process is a
+    /// background job; raw mode then waits for the resume that brings it to
+    /// the foreground.
     fn activate_with(
         &mut self,
         terminal: RawModeState,
-        apply: impl FnOnce(&RawModeState) -> io::Result<()>,
+        apply: impl FnOnce(&RawModeState) -> io::Result<Option<RawModeState>>,
     ) -> io::Result<bool> {
         match self {
             Self::Inactive => {
-                apply(&terminal)?;
-                *self = Self::Active(terminal);
+                *self = match apply(&terminal)? {
+                    Some(active) => Self::Active(active),
+                    None => Self::Suspended(RawModeState {
+                        snapshot_stale: true,
+                        ..terminal
+                    }),
+                };
                 Ok(true)
             }
             Self::Terminating => Ok(false),
@@ -1002,13 +1602,35 @@ impl RawModeLifecycle {
         Ok(())
     }
 
+    /// Applies raw mode again once the process has been continued. A stop by
+    /// SIGSTOP cannot be caught and skips `suspend_with`, so the state can
+    /// still be active while the job-control shell has put its own mode back
+    /// on the terminal. A continued background job only gives up raw mode.
+    fn reassert_with(
+        &mut self,
+        apply: impl FnOnce(&RawModeState) -> io::Result<Option<RawModeState>>,
+    ) -> io::Result<()> {
+        match *self {
+            Self::Active(terminal) => {
+                if apply(&terminal)?.is_none() {
+                    *self = Self::Suspended(terminal);
+                }
+                Ok(())
+            }
+            Self::Suspended(_) => self.resume_with(apply),
+            Self::Inactive | Self::Terminating => Ok(()),
+        }
+    }
+
+    /// Stays suspended when `apply` returns `None`, as for `activate_with`.
     fn resume_with(
         &mut self,
-        apply: impl FnOnce(&RawModeState) -> io::Result<()>,
+        apply: impl FnOnce(&RawModeState) -> io::Result<Option<RawModeState>>,
     ) -> io::Result<()> {
         if let Self::Suspended(terminal) = *self {
-            apply(&terminal)?;
-            *self = Self::Active(terminal);
+            if let Some(active) = apply(&terminal)? {
+                *self = Self::Active(active);
+            }
         }
         Ok(())
     }
@@ -1023,25 +1645,11 @@ struct RawModeGuard {
 impl RawModeGuard {
     fn enable(state: SharedRawModeState) -> Result<Self, CliError> {
         let stdin = io::stdin();
-        let stdin_fd = stdin.as_fd().as_raw_fd();
-        let original = terminal_attrs(stdin_fd)?;
-        let mut raw = original;
-        // SAFETY: `raw` is a valid termios copied from tcgetattr; cfmakeraw only rewrites its
-        // fields.
-        unsafe {
-            libc::cfmakeraw(&mut raw);
-        }
-        let terminal = RawModeState {
-            stdin_fd,
-            original,
-            raw,
-        };
+        let terminal = raw_mode_state_for(stdin.as_fd().as_raw_fd())?;
         let activated = state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .activate_with(terminal, |terminal| {
-                set_terminal_attrs_retrying_eintr(terminal.stdin_fd, &terminal.raw)
-            })?;
+            .activate_with(terminal, apply_raw_mode_in_foreground)?;
         if !activated {
             return Err(io::Error::new(
                 io::ErrorKind::Interrupted,
@@ -1056,7 +1664,9 @@ impl RawModeGuard {
 impl Drop for RawModeGuard {
     fn drop(&mut self) {
         if let Err(error) = terminate_raw_mode_from_signal_state(&self.state) {
-            eprintln!("prismtty: could not restore terminal during cleanup: {error}");
+            warn(format_args!(
+                "prismtty: could not restore terminal during cleanup: {error}"
+            ));
         }
     }
 }
@@ -1071,7 +1681,7 @@ fn terminate_raw_mode_from_signal_state(state: &Mutex<RawModeLifecycle>) -> io::
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .begin_termination_with(|active| {
             if let Some(active) = active {
-                restore_terminal_attrs(active.stdin_fd, &active.original)?;
+                restore_cooked_mode_in_foreground(active)?;
             }
             Ok(())
         })
@@ -1081,16 +1691,65 @@ fn suspend_raw_mode_from_signal_state(state: &Mutex<RawModeLifecycle>) -> io::Re
     state
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .suspend_with(|active| restore_terminal_attrs(active.stdin_fd, &active.original))
+        .suspend_with(restore_cooked_mode_in_foreground)
+}
+
+/// Restores the mode saved before raw mode unless this process is a
+/// background job, which leaves the mode to the job that owns the terminal;
+/// restoring would overwrite that job's settings. An uncatchable SIGSTOP
+/// leaves the state active while the shell takes the terminal back, so this
+/// also guards a termination that arrives before the continue.
+fn restore_cooked_mode_in_foreground(active: &RawModeState) -> io::Result<()> {
+    if owns_terminal(active.stdin_fd) == Some(false) {
+        return Ok(());
+    }
+    restore_terminal_attrs(active.stdin_fd, &active.original)
 }
 
 fn reapply_raw_mode_from_signal_state(state: &Mutex<RawModeLifecycle>) -> io::Result<()> {
     state
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .resume_with(|suspended| {
-            set_terminal_attrs_retrying_eintr(suspended.stdin_fd, &suspended.raw)
-        })
+        .resume_with(apply_raw_mode_in_foreground)
+}
+
+fn reassert_raw_mode_from_signal_state(state: &Mutex<RawModeLifecycle>) -> io::Result<()> {
+    state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .reassert_with(apply_raw_mode_in_foreground)
+}
+
+fn raw_mode_state_for(stdin_fd: RawFd) -> io::Result<RawModeState> {
+    let original = terminal_attrs(stdin_fd)?;
+    let mut raw = original;
+    // SAFETY: `raw` is a valid termios copied from tcgetattr; cfmakeraw only rewrites its
+    // fields.
+    unsafe {
+        libc::cfmakeraw(&mut raw);
+    }
+    Ok(RawModeState {
+        stdin_fd,
+        original,
+        raw,
+        snapshot_stale: false,
+    })
+}
+
+/// Applies raw mode unless this process is a background job, which returns
+/// `None` and leaves the terminal to its foreground job. The signal masks in
+/// force here hold SIGTTOU, so the kernel would not refuse the write itself.
+fn apply_raw_mode_in_foreground(terminal: &RawModeState) -> io::Result<Option<RawModeState>> {
+    if owns_terminal(terminal.stdin_fd) == Some(false) {
+        return Ok(None);
+    }
+    let terminal = if terminal.snapshot_stale {
+        raw_mode_state_for(terminal.stdin_fd)?
+    } else {
+        *terminal
+    };
+    set_terminal_attrs_retrying_eintr(terminal.stdin_fd, &terminal.raw)?;
+    Ok(Some(terminal))
 }
 
 fn set_terminal_attrs_retrying_eintr(fd: RawFd, attrs: &libc::termios) -> io::Result<()> {
@@ -1156,6 +1815,7 @@ struct SessionSignalWatcher {
 
 impl SessionSignalWatcher {
     fn start(raw_mode_state: SharedRawModeState) -> io::Result<Self> {
+        ensure_child_is_reapable()?;
         let (read_fd, write_fd) = pipe_fds()?;
         if let Err(error) = set_fd_nonblocking(write_fd) {
             close_fd(read_fd);
@@ -1164,7 +1824,16 @@ impl SessionSignalWatcher {
         }
         RAW_MODE_SIGNAL_PIPE.arm(write_fd);
         let mut previous_signal_handlers = Vec::new();
-        for signal in TERMINATING_SIGNALS.into_iter().chain(JOB_CONTROL_SIGNALS) {
+        for signal in TERMINATING_SIGNALS
+            .into_iter()
+            .chain(JOB_CONTROL_SIGNALS)
+            .chain([libc::SIGCONT])
+        {
+            if signal_is_ignored(signal) {
+                // Keep a disposition the caller chose (`nohup`, or `cmd &` in a
+                // non-interactive shell) instead of acting on the signal.
+                continue;
+            }
             match install_signal_handler(signal, restore_raw_mode_for_signal, libc::SA_RESTART) {
                 Ok(previous) => previous_signal_handlers.push((signal, previous)),
                 Err(error) => {
@@ -1191,7 +1860,9 @@ impl SessionSignalWatcher {
 
     fn stop(&mut self) {
         if let Err(error) = terminate_raw_mode_from_signal_state(&self.raw_mode_state) {
-            eprintln!("prismtty: could not restore terminal during cleanup: {error}");
+            warn(format_args!(
+                "prismtty: could not restore terminal during cleanup: {error}"
+            ));
         }
         restore_signal_handlers(&self.previous_signal_handlers);
         self.previous_signal_handlers.clear();
@@ -1255,48 +1926,122 @@ impl Drop for TerminalSession {
 }
 
 fn handle_session_signals(read_fd: RawFd, raw_mode_state: SharedRawModeState) {
+    handle_session_signals_with(read_fd, &raw_mode_state, || {
+        with_terminal_restored_for_job_control(
+            || suspend_raw_mode_from_signal_state(&raw_mode_state),
+            || {
+                forward_signal_to_child(libc::SIGSTOP as u8);
+                // SAFETY: raise has no memory-safety preconditions; SIGSTOP cannot be
+                // caught and raw mode was restored just before.
+                unsafe {
+                    // Target the calling thread so Linux delivers the
+                    // stop before this worker can continue and reapply
+                    // raw mode. A process-directed kill may return
+                    // while SIGSTOP is still pending.
+                    libc::raise(libc::SIGSTOP);
+                }
+                forward_signal_to_child(libc::SIGCONT as u8);
+            },
+            || reapply_raw_mode_from_signal_state(&raw_mode_state),
+        )
+    });
+}
+
+/// Acts on the signal numbers the handlers queue in the self-pipe until the
+/// stop byte arrives. `stop_for_job_control` performs one supervised stop and
+/// returns once the wrapper has been continued.
+fn handle_session_signals_with(
+    read_fd: RawFd,
+    raw_mode_state: &Mutex<RawModeLifecycle>,
+    mut stop_for_job_control: impl FnMut() -> io::Result<()>,
+) {
+    let mut pending = VecDeque::new();
+    let mut resumed_at = None;
     while let Some(bytes) = read_signal_bytes(read_fd) {
-        for signal in bytes {
+        pending.extend(bytes);
+        while let Some(signal) = pending.pop_front() {
             if signal == RAW_SIGNAL_STOP_BYTE {
                 close_fd(read_fd);
                 return;
             }
             let signal = libc::c_int::from(signal);
             if TERMINATING_SIGNALS.contains(&signal) {
-                if let Err(error) = terminate_raw_mode_from_signal_state(&raw_mode_state) {
-                    eprintln!("prismtty: could not restore terminal before exit: {error}");
+                if let Err(error) = terminate_raw_mode_from_signal_state(raw_mode_state) {
+                    warn(format_args!(
+                        "prismtty: could not restore terminal before exit: {error}"
+                    ));
                 }
                 terminate_and_reap_forwarded_child(signal);
+                // This runs on the watcher thread, not in the signal handler.
+                unregister_before_exit();
                 // SAFETY: _exit never returns and skips destructors by design: the terminal was
-                // restored and the child reaped above.
+                // restored, the child reaped and the pid file removed above.
                 unsafe {
                     libc::_exit(128 + signal);
                 }
             }
-            if JOB_CONTROL_SIGNALS.contains(&signal) {
-                if let Err(error) = with_terminal_restored_for_job_control(
-                    || suspend_raw_mode_from_signal_state(&raw_mode_state),
-                    || {
-                        forward_signal_to_child(libc::SIGSTOP as u8);
-                        // SAFETY: raise has no memory-safety preconditions; SIGSTOP cannot be
-                        // caught and raw mode was restored just before.
-                        unsafe {
-                            // Target the calling thread so Linux delivers the
-                            // stop before this worker can continue and reapply
-                            // raw mode. A process-directed kill may return
-                            // while SIGSTOP is still pending.
-                            libc::raise(libc::SIGSTOP);
-                        }
-                        forward_signal_to_child(libc::SIGCONT as u8);
-                    },
-                    || reapply_raw_mode_from_signal_state(&raw_mode_state),
-                ) {
-                    eprintln!("prismtty: job-control terminal transition failed: {error}");
+            if signal == libc::SIGCONT {
+                if let Err(error) = reassert_raw_mode_from_signal_state(raw_mode_state) {
+                    warn(format_args!(
+                        "prismtty: could not reapply raw terminal mode: {error}"
+                    ));
                 }
+                RESIZE_SIGNAL_PIPE.notify(RESIZE_WAKE_BYTE);
+                continue;
+            }
+            if JOB_CONTROL_SIGNALS.contains(&signal) {
+                if is_stale_stop_request(signal, resumed_at, || {
+                    owns_terminal(libc::STDIN_FILENO) == Some(true)
+                }) {
+                    continue;
+                }
+                if let Err(error) = stop_for_job_control() {
+                    warn(format_args!(
+                        "prismtty: job-control terminal transition failed: {error}"
+                    ));
+                }
+                // A resize while stopped signalled the shell, which owned the
+                // terminal then, so check the size again.
+                RESIZE_SIGNAL_PIPE.notify(RESIZE_WAKE_BYTE);
+                // Stop requests queued before the resume were satisfied by
+                // this stop, just as SIGCONT discards pending stop signals.
+                // Replaying them would stop the wrapper again right after
+                // `fg`: a background read of the terminal raises SIGTTIN
+                // each time it restarts, queueing a burst of them.
+                pending.extend(ready_signal_bytes(read_fd));
+                pending.retain(|byte| !JOB_CONTROL_SIGNALS.contains(&libc::c_int::from(*byte)));
+                resumed_at = Some(Instant::now());
             }
         }
     }
     close_fd(read_fd);
+}
+
+/// How long after a job-control resume a SIGTTIN or SIGTTOU that reaches the
+/// watcher while the wrapper is in the foreground is still taken as stale.
+const STALE_STOP_WINDOW: Duration = Duration::from_secs(1);
+
+/// The kernel raises SIGTTIN and SIGTTOU only for terminal I/O from the
+/// background. One that reaches the watcher in the foreground shortly after a
+/// resume was queued by a handler the stop interrupted mid-way, which only
+/// finishes once the wrapper is continued; it is not a new request.
+fn is_stale_stop_request(
+    signal: libc::c_int,
+    resumed_at: Option<Instant>,
+    in_foreground: impl FnOnce() -> bool,
+) -> bool {
+    signal != libc::SIGTSTP
+        && resumed_at.is_some_and(|at| at.elapsed() < STALE_STOP_WINDOW)
+        && in_foreground()
+}
+
+/// Whether this process group is the foreground job of the terminal on `fd`,
+/// or `None` when that cannot be told: `fd` is not this process's controlling
+/// terminal, or the terminal has no foreground job.
+fn owns_terminal(fd: RawFd) -> Option<bool> {
+    // SAFETY: tcgetpgrp and getpgrp have no memory-safety preconditions.
+    let (foreground, own) = unsafe { (libc::tcgetpgrp(fd), libc::getpgrp()) };
+    (foreground > 0).then_some(foreground == own)
 }
 
 fn current_pty_size() -> PtySize {
@@ -1399,25 +2144,68 @@ extern "C" fn notify_resize_for_signal(_signal: libc::c_int) {
 }
 
 fn resize_pty_on_signals(master: Box<dyn portable_pty::MasterPty + Send>, read_fd: RawFd) {
-    let mut last_size = current_pty_size();
+    let mut last_size = start_pty_size_sync(&*master, current_pty_size());
     while let Some(bytes) = read_signal_bytes(read_fd) {
         if bytes.contains(&RESIZE_STOP_BYTE) {
             break;
         }
-        let next_size = current_pty_size();
-        if next_size != last_size {
-            let _ = master.resize(next_size);
-            last_size = next_size;
-        }
+        last_size = sync_pty_size(&*master, last_size, current_pty_size());
     }
     close_fd(read_fd);
 }
 
+/// Compares against the PTY's own size rather than the outer terminal's: a
+/// resize made after the PTY was opened, before the SIGWINCH handler was
+/// installed, would otherwise never reach it.
+fn start_pty_size_sync(master: &dyn portable_pty::MasterPty, outer_size: PtySize) -> PtySize {
+    let pty_size = master.get_size().unwrap_or_default();
+    sync_pty_size(master, pty_size, outer_size)
+}
+
+/// Gives the PTY the outer terminal's size when it differs from the size the
+/// PTY was last given, and returns the size it was given now.
+fn sync_pty_size(
+    master: &dyn portable_pty::MasterPty,
+    last_size: PtySize,
+    outer_size: PtySize,
+) -> PtySize {
+    if outer_size != last_size {
+        let _ = master.resize(outer_size);
+    }
+    outer_size
+}
+
+/// Creates a close-on-exec pipe. The signal self-pipe exists before the
+/// wrapped command is spawned, and portable-pty's /dev/fd scan, the only other
+/// thing that keeps it out of the child, does nothing when /proc is missing.
+/// macOS has no pipe2, so the flag is set afterwards; the only fork is the
+/// spawn on this same thread, so no child can inherit the ends in between.
 fn pipe_fds() -> io::Result<(RawFd, RawFd)> {
     let mut fds = [0; 2];
     // SAFETY: `fds` is a valid array of two c_int that pipe fills on success.
-    if unsafe { libc::pipe(fds.as_mut_ptr()) } == 0 {
-        Ok((fds[0], fds[1]))
+    if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    for fd in fds {
+        if let Err(error) = set_fd_cloexec(fd) {
+            close_fd(fds[0]);
+            close_fd(fds[1]);
+            return Err(error);
+        }
+    }
+    Ok((fds[0], fds[1]))
+}
+
+fn set_fd_cloexec(fd: RawFd) -> io::Result<()> {
+    // SAFETY: F_GETFD takes no pointer argument; an invalid `fd` reports EBADF instead of touching
+    // memory.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    if flags < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: F_SETFD takes an integer flags argument.
+    if unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) } == 0 {
+        Ok(())
     } else {
         Err(io::Error::last_os_error())
     }
@@ -1463,6 +2251,29 @@ fn read_signal_bytes(read_fd: RawFd) -> Option<Vec<u8>> {
     }
 }
 
+/// Reads whatever is already queued in the signal pipe without waiting. The
+/// pass limit keeps a burst that is still being written from pinning the
+/// thread.
+fn ready_signal_bytes(read_fd: RawFd) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    for _ in 0..1024 {
+        let mut poll_fd = libc::pollfd {
+            fd: read_fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: `poll_fd` is a valid, exclusively borrowed pollfd and the count matches.
+        if unsafe { libc::poll(&mut poll_fd, 1, 0) } <= 0 || poll_fd.revents & libc::POLLIN == 0 {
+            break;
+        }
+        match read_signal_bytes(read_fd) {
+            Some(read) => bytes.extend(read),
+            None => break,
+        }
+    }
+    bytes
+}
+
 fn write_signal_byte(write_fd: RawFd, byte: u8) {
     let bytes = [byte];
     // SAFETY: `bytes` is valid for reads of `bytes.len()`; write is async-signal-safe and
@@ -1480,6 +2291,49 @@ fn close_fd(fd: RawFd) {
             libc::close(fd);
         }
     }
+}
+
+/// Puts SIGCHLD back to its default disposition when it was inherited as
+/// ignored (or with SA_NOCLDWAIT). Either makes the kernel reap the wrapped
+/// child itself, so waiting for it fails with ECHILD and its exit status is
+/// lost. prismtty never handles SIGCHLD, and portable-pty already resets it
+/// for the child, so nothing else sees the change.
+fn ensure_child_is_reapable() -> io::Result<()> {
+    // SAFETY: sigaction is a plain C struct; the sigaction call fills it before it is read.
+    let mut current = unsafe { mem::zeroed::<libc::sigaction>() };
+    // SAFETY: a null new-action pointer only queries the disposition; `current` is valid for the
+    // call.
+    if unsafe { libc::sigaction(libc::SIGCHLD, std::ptr::null(), &mut current) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if current.sa_sigaction != libc::SIG_IGN && current.sa_flags & libc::SA_NOCLDWAIT == 0 {
+        return Ok(());
+    }
+    // SAFETY: sigaction is a plain C struct; all-zero is SIG_DFL with no flags, and the mask is
+    // initialized below.
+    let mut default = unsafe { mem::zeroed::<libc::sigaction>() };
+    default.sa_sigaction = libc::SIG_DFL;
+    // SAFETY: `default.sa_mask` is a valid, exclusively borrowed sigset_t.
+    unsafe {
+        libc::sigemptyset(&mut default.sa_mask);
+    }
+    // SAFETY: `default` is a valid action for the call; a null old-action pointer is permitted.
+    if unsafe { libc::sigaction(libc::SIGCHLD, &default, std::ptr::null_mut()) } == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+/// True when `signal` is currently ignored, for example inherited as ignored
+/// from `nohup`.
+fn signal_is_ignored(signal: libc::c_int) -> bool {
+    // SAFETY: sigaction is a plain C struct; the sigaction call fills it before it is read.
+    let mut current = unsafe { mem::zeroed::<libc::sigaction>() };
+    // SAFETY: a null new-action pointer only queries the disposition; `current` is valid for the
+    // call.
+    let queried = unsafe { libc::sigaction(signal, std::ptr::null(), &mut current) } == 0;
+    queried && current.sa_sigaction == libc::SIG_IGN
 }
 
 fn install_signal_handler(
@@ -1535,6 +2389,82 @@ mod tests {
     use nix::sys::termios::{InputFlags, LocalFlags, OutputFlags};
 
     #[test]
+    fn stdin_reader_waits_through_would_block_instead_of_failing() {
+        use std::io::{Read, Write};
+        use std::os::fd::FromRawFd;
+
+        let (read_fd, write_fd) = super::pipe_fds().expect("pipe");
+        super::set_fd_nonblocking(read_fd).expect("nonblocking read end");
+        // SAFETY: both descriptors were just created by pipe and are owned only here.
+        let (reader, mut writer) = unsafe {
+            (
+                std::fs::File::from_raw_fd(read_fd),
+                std::fs::File::from_raw_fd(write_fd),
+            )
+        };
+        let feeder = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            writer.write_all(b"hello").expect("write pipe");
+        });
+        let mut stdin = super::WaitWhenWouldBlock {
+            inner: reader,
+            fd: read_fd,
+        };
+        let mut buffer = [0_u8; 16];
+        let read = stdin.read(&mut buffer).expect("read waits for data");
+        assert_eq!(&buffer[..read], b"hello");
+        feeder.join().expect("feeder");
+        assert_eq!(
+            stdin
+                .read(&mut buffer)
+                .expect("end of input once the writer closes"),
+            0
+        );
+    }
+
+    // stdout shares the terminal's file description with stdin, so it can be
+    // non-blocking too, and a burst of output then fills the terminal's queue.
+    #[test]
+    fn stdout_writer_waits_through_would_block_instead_of_failing() {
+        use std::io::{Read, Write};
+        use std::os::fd::FromRawFd;
+
+        let (read_fd, write_fd) = super::pipe_fds().expect("pipe");
+        super::set_fd_nonblocking(write_fd).expect("nonblocking write end");
+        // SAFETY: both descriptors were just created by pipe and are owned only here.
+        let (mut reader, writer) = unsafe {
+            (
+                std::fs::File::from_raw_fd(read_fd),
+                std::fs::File::from_raw_fd(write_fd),
+            )
+        };
+        let mut stdout = super::WaitWhenWouldBlock {
+            inner: writer,
+            fd: write_fd,
+        };
+        let mut queued = 0;
+        loop {
+            match stdout.inner.write(&[b'x'; 4096]) {
+                Ok(written) => queued += written,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(error) => panic!("fill pipe: {error}"),
+            }
+        }
+        let drainer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            let mut drained = Vec::new();
+            reader.read_to_end(&mut drained).expect("drain pipe");
+            drained
+        });
+        stdout.write_all(b"hello").expect("write waits for room");
+        stdout.flush().expect("flush");
+        drop(stdout);
+        let drained = drainer.join().expect("drainer");
+        assert_eq!(drained.len(), queued + 5);
+        assert!(drained.ends_with(b"hello"));
+    }
+
+    #[test]
     fn supervised_run_catches_a_panicking_body() {
         assert!(super::run_supervised("test-thread", || {}));
         assert!(!super::run_supervised("test-thread", || panic!(
@@ -1572,6 +2502,234 @@ mod tests {
         assert_eq!(super::exit_code_byte(255), 255);
         assert_eq!(super::exit_code_byte(256), 255);
         assert_eq!(super::exit_code_byte(u32::MAX), 255);
+    }
+
+    #[test]
+    fn relative_program_paths_with_a_directory_resolve_against_the_cwd() {
+        use std::ffi::OsString;
+
+        assert_eq!(
+            super::cwd_relative_program(OsString::from("bin/tool")),
+            OsString::from("./bin/tool")
+        );
+        for unchanged in ["tool", "./tool", "../bin/tool", "/usr/bin/tool", ""] {
+            assert_eq!(
+                super::cwd_relative_program(OsString::from(unchanged)),
+                OsString::from(unchanged)
+            );
+        }
+    }
+
+    #[test]
+    fn spawn_failures_map_to_shell_exit_codes() {
+        use std::ffi::OsStr;
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("temp directory");
+        let script = dir.path().join("script.sh");
+        std::fs::write(&script, "#!/bin/sh\n").expect("write script");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o644))
+            .expect("script is not executable");
+        let cwd = Some(dir.path());
+
+        assert_eq!(super::spawn_failure_exit_code(OsStr::new(""), cwd), 127);
+        assert_eq!(
+            super::spawn_failure_exit_code(OsStr::new("./missing"), cwd),
+            127
+        );
+        assert_eq!(
+            super::spawn_failure_exit_code(OsStr::new("./script.sh"), cwd),
+            126
+        );
+        assert_eq!(super::spawn_failure_exit_code(OsStr::new("./"), cwd), 126);
+        // A program that resolves to an executable failed for another reason.
+        assert_eq!(
+            super::spawn_failure_exit_code(OsStr::new("/bin/sh"), cwd),
+            1
+        );
+    }
+
+    // The kernel ends a `#!` interpreter name only at a blank or the line end,
+    // so a CRLF script names `/bin/sh\r`, which does not exist.
+    #[test]
+    fn scripts_with_unusable_interpreters_map_to_shell_exit_codes() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStringExt;
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("temp directory");
+        let write = |name: &str, body: &str, mode: u32| {
+            let path = dir.path().join(name);
+            std::fs::write(&path, body).expect("write file");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode))
+                .expect("set mode");
+            path
+        };
+        write("crlf.sh", "#!/bin/sh\r\necho ran\r\n", 0o755);
+        write("missing.sh", "#!/nonexistent/interp -x\necho ran\n", 0o755);
+        let interp = write("interp", "#!/bin/sh\n", 0o644);
+        write(
+            "noexec.sh",
+            &format!("#!{}\necho ran\n", interp.display()),
+            0o755,
+        );
+        write("dir.sh", "#!/\necho ran\n", 0o755);
+        write("ok.sh", "#! \t/bin/sh -e\necho ran\n", 0o755);
+        write("plain.sh", "echo ran\n", 0o755);
+        write("unterminated.sh", &format!("#!/{}", "a".repeat(300)), 0o755);
+        write("short.sh", "#!/nonexistent/interp", 0o755);
+        write("hash.sh", "#!/bin/sh#x\necho ran\n", 0o755);
+        let long_name = format!("/nonexistent/{}", "a".repeat(150));
+        write("long.sh", &format!("#!{long_name}\necho ran\n"), 0o755);
+        let cwd = Some(dir.path());
+
+        let code =
+            |program: &str| match super::unusable_script_interpreter(OsStr::new(program), cwd) {
+                Some(super::CliError::Spawn { code, source }) => {
+                    assert!(
+                        source.to_string().contains("bad interpreter"),
+                        "{program}: {source}"
+                    );
+                    Some(code)
+                }
+                Some(other) => panic!("{program}: unexpected error {other}"),
+                None => None,
+            };
+        assert_eq!(code("./crlf.sh"), Some(127));
+        assert_eq!(code("./missing.sh"), Some(127));
+        assert_eq!(code("./noexec.sh"), Some(126));
+        assert_eq!(code("./dir.sh"), Some(126));
+        assert_eq!(code("./ok.sh"), None);
+        assert_eq!(code("./plain.sh"), None);
+        // A first line with no end in the bytes the kernel reads is left to
+        // execve, which reports ENOEXEC and lets execvp try /bin/sh.
+        assert_eq!(code("./unterminated.sh"), None);
+        // Linux ends the line of a short file with no newline at its end, and
+        // `#` is part of the name, but a name past 128 bytes runs differently
+        // by kernel version. macOS ends the line at `#`, reports ENOEXEC for a
+        // line with no end at all, and reads 512 bytes on every version.
+        #[cfg(target_os = "linux")]
+        {
+            assert_eq!(code("./short.sh"), Some(127));
+            assert_eq!(code("./hash.sh"), Some(127));
+            assert_eq!(code("./long.sh"), None);
+        }
+        #[cfg(target_vendor = "apple")]
+        {
+            assert_eq!(code("./short.sh"), None);
+            assert_eq!(code("./hash.sh"), None);
+            assert_eq!(code("./long.sh"), Some(127));
+        }
+        // Nothing to check: spawn reports these itself.
+        assert_eq!(code("./absent.sh"), None);
+        assert_eq!(code("./interp"), None);
+        let fifo = std::ffi::CString::new(dir.path().join("fifo").into_os_string().into_vec())
+            .expect("FIFO path");
+        // SAFETY: `fifo` is a valid NUL-terminated path that outlives the call.
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o700) }, 0, "mkfifo");
+        assert_eq!(code("./fifo"), None);
+    }
+
+    // When the child falls back to $HOME, a relative interpreter is found from
+    // there, so it cannot be checked from prismtty's directory.
+    #[test]
+    fn relative_interpreter_is_not_checked_when_the_child_directory_is_unknown() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("temp directory");
+        let write = |name: &str, body: &str| {
+            let path = dir.path().join(name);
+            std::fs::write(&path, body).expect("write script");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+                .expect("script is executable");
+            path
+        };
+        let relative = write("relative.sh", "#!prismtty-no-such-interp\necho ran\n");
+        let absolute = write("absolute.sh", "#!/nonexistent/interp\necho ran\n");
+        let check = super::unusable_script_interpreter;
+
+        assert!(check(relative.as_os_str(), Some(dir.path())).is_some());
+        assert!(check(relative.as_os_str(), None).is_none());
+        assert!(check(absolute.as_os_str(), None).is_some());
+    }
+
+    fn interpreter(start: &[u8], syntax: &super::ShebangSyntax) -> Option<String> {
+        super::script_interpreter(start, syntax).map(|path| path.display().to_string())
+    }
+
+    // fs/binfmt_script.c: a 128-byte buffer before Linux 5.1; the line ends at
+    // a newline or a NUL; only a blank or a NUL ends the name; with no line
+    // end in the buffer, a name followed by a blank still runs.
+    #[test]
+    fn linux_shebang_syntax_matches_binfmt_script() {
+        let linux = |start: &[u8]| interpreter(start, &super::LINUX_SHEBANG);
+        let long = |name_bytes: usize, rest: &str| {
+            format!("#!/{}{rest}", "a".repeat(name_bytes - 1)).into_bytes()
+        };
+
+        assert_eq!(linux(b"#!/bin/sh\necho ran\n").as_deref(), Some("/bin/sh"));
+        assert_eq!(linux(b"#! \t/bin/sh -e\n").as_deref(), Some("/bin/sh"));
+        assert_eq!(linux(b"#!/bin/sh\r\n").as_deref(), Some("/bin/sh\r"));
+        assert_eq!(linux(b"#!/bin/sh#x\n").as_deref(), Some("/bin/sh#x"));
+        assert_eq!(linux(b"#!/bin/sh\0x\n").as_deref(), Some("/bin/sh"));
+        // A short file with no newline ends its line at its end.
+        assert_eq!(linux(b"#!/missing").as_deref(), Some("/missing"));
+        assert_eq!(linux(b"#!/missing  ").as_deref(), Some("/missing"));
+        // No line end in the buffer: the blank after the name must be in it.
+        let name = format!("/{}", "a".repeat(124));
+        assert_eq!(linux(&long(125, "\n")).as_deref(), Some(name.as_str()));
+        assert_eq!(linux(&long(125, " -x\n")).as_deref(), Some(name.as_str()));
+        assert_eq!(linux(&long(126, " -x\n")), None);
+        // Linux 5.1 reads 256 bytes and runs this name, but earlier kernels
+        // report ENOEXEC or cut it off.
+        assert_eq!(linux(&long(126, "\n")), None);
+        assert_eq!(linux(&long(300, "\n")), None);
+        assert_eq!(
+            linux(format!("#!/missing {}", "a".repeat(300)).as_bytes()).as_deref(),
+            Some("/missing")
+        );
+        // No name, or not a script: nothing to check.
+        assert_eq!(linux(b"#!"), None);
+        assert_eq!(linux(b"#!\n/bin/sh\n"), None);
+        assert_eq!(linux(b"#! \t \n"), None);
+        assert_eq!(linux(format!("#!{}", " ".repeat(300)).as_bytes()), None);
+        assert_eq!(linux(b"echo ran\n"), None);
+        assert_eq!(linux(b"#"), None);
+        assert_eq!(linux(b""), None);
+    }
+
+    // XNU exec_shell_imgact: a 512-byte buffer; the line ends at a newline or
+    // `#`, and a line with no end in the buffer is ENOEXEC, so a short file
+    // with no newline runs with /bin/sh through execvp.
+    #[test]
+    fn xnu_shebang_syntax_matches_exec_shell_imgact() {
+        let xnu = |start: &[u8]| interpreter(start, &super::XNU_SHEBANG);
+
+        assert_eq!(xnu(b"#!/bin/sh\necho ran\n").as_deref(), Some("/bin/sh"));
+        assert_eq!(xnu(b"#! \t/bin/sh -e\n").as_deref(), Some("/bin/sh"));
+        assert_eq!(xnu(b"#!/bin/sh\r\n").as_deref(), Some("/bin/sh\r"));
+        assert_eq!(xnu(b"#!/bin/sh#x\n").as_deref(), Some("/bin/sh"));
+        assert_eq!(xnu(b"#!/bin/sh -x #y\n").as_deref(), Some("/bin/sh"));
+        assert_eq!(xnu(b"#!/bin/sh\0x\n").as_deref(), Some("/bin/sh"));
+        assert_eq!(xnu(b"#!/missing"), None);
+        assert_eq!(xnu(b"#!/missing\0\0\n").as_deref(), Some("/missing"));
+        // The line end must be in the buffer.
+        let name = format!("/{}", "a".repeat(508));
+        assert_eq!(
+            xnu(format!("#!{name}\n").as_bytes()).as_deref(),
+            Some(name.as_str())
+        );
+        assert_eq!(xnu(format!("#!{name}a\n").as_bytes()), None);
+        assert_eq!(
+            xnu(format!("#!/missing {}", "a".repeat(600)).as_bytes()),
+            None
+        );
+        // No name, or not a script: nothing to check.
+        assert_eq!(xnu(b"#!#\n"), None);
+        assert_eq!(xnu(b"#! \t#/bin/sh\n"), None);
+        assert_eq!(xnu(b"#!\n/bin/sh\n"), None);
+        assert_eq!(xnu(b"#!\0/bin/sh\n"), None);
+        assert_eq!(xnu(b"echo ran\n"), None);
     }
 
     #[test]
@@ -1705,6 +2863,47 @@ mod tests {
     }
 
     #[test]
+    fn dropping_the_stdin_forward_writer_injects_no_input() {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let pair = portable_pty::native_pty_system()
+            .openpty(portable_pty::PtySize::default())
+            .expect("openpty");
+        let slave = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_NOCTTY)
+            .open(pair.master.tty_name().expect("slave tty name"))
+            .expect("open slave tty");
+
+        let writer = super::stdin_forward_writer(&*pair.master).expect("stdin writer");
+        drop(writer);
+
+        let mut poll_fd = libc::pollfd {
+            fd: std::os::fd::AsRawFd::as_raw_fd(&slave),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: `poll_fd` is a valid, exclusively borrowed pollfd and the count matches.
+        let ready = unsafe { libc::poll(&mut poll_fd, 1, 200) };
+        assert_eq!(
+            ready, 0,
+            "ending stdin forwarding typed a line the user never entered"
+        );
+
+        let source = include_str!("pty.rs");
+        let run_command = source
+            .split("pub(super) fn run_command")
+            .nth(1)
+            .expect("run_command exists")
+            .split("fn cwd_relative_program")
+            .next()
+            .expect("run_command boundary exists");
+        assert!(run_command.contains("stdin_forward_writer("));
+        assert!(!run_command.contains("take_writer("));
+    }
+
+    #[test]
     fn record_recent_input_scopes_to_current_line() {
         // Recording no longer depends on ECHO state; instead the buffer is scoped
         // to the in-progress line, so a submitted or aborted line (and any secret
@@ -1801,6 +3000,9 @@ mod tests {
             .find("TerminalSession::start")
             .expect("signal watcher starts");
         let spawned = run_command.find("spawn_command").expect("child is spawned");
+        let spawned_with_caller_stdin = run_command
+            .find("spawn_with_caller_stdin(")
+            .expect("child is spawned without a terminal on stdin");
         let published = run_command
             .find("set_forward_child_pid")
             .expect("child pid is published");
@@ -1810,7 +3012,9 @@ mod tests {
 
         assert!(blocked < supervised);
         assert!(supervised < spawned);
+        assert!(supervised < spawned_with_caller_stdin);
         assert!(spawned < published);
+        assert!(spawned_with_caller_stdin < published);
         assert!(published < unblocked);
     }
 
@@ -1847,14 +3051,15 @@ mod tests {
                 // SAFETY: termios is a plain C struct; this state is never applied to a terminal
                 // (stdin_fd is -1).
                 raw: unsafe { std::mem::zeroed() },
+                snapshot_stale: false,
             };
             activation_ready_tx.send(()).unwrap();
             activation_state
                 .lock()
                 .unwrap()
-                .activate_with(terminal, |_| {
+                .activate_with(terminal, |terminal| {
                     activation_applied.store(true, Ordering::Release);
-                    Ok(())
+                    Ok(Some(*terminal))
                 })
                 .unwrap()
         });
@@ -1882,6 +3087,7 @@ mod tests {
             // SAFETY: termios is a plain C struct; this state is never applied to a terminal
             // (stdin_fd is -1).
             raw: unsafe { std::mem::zeroed() },
+            snapshot_stale: false,
         };
         let mut lifecycle = super::RawModeLifecycle::Active(terminal);
 
@@ -1898,6 +3104,136 @@ mod tests {
             })
             .expect("cleanup retry succeeds");
         assert!(matches!(lifecycle, super::RawModeLifecycle::Terminating));
+    }
+
+    #[test]
+    fn raw_mode_waits_for_the_foreground_when_started_in_the_background() {
+        let terminal = super::RawModeState {
+            stdin_fd: -1,
+            // SAFETY: termios is a plain C struct; this state is never applied to a terminal
+            // (stdin_fd is -1).
+            original: unsafe { std::mem::zeroed() },
+            // SAFETY: termios is a plain C struct; this state is never applied to a terminal
+            // (stdin_fd is -1).
+            raw: unsafe { std::mem::zeroed() },
+            snapshot_stale: false,
+        };
+        let mut lifecycle = super::RawModeLifecycle::Inactive;
+
+        assert!(
+            lifecycle
+                .activate_with(terminal, |_| Ok(None))
+                .expect("background activation succeeds")
+        );
+        assert!(
+            matches!(lifecycle, super::RawModeLifecycle::Suspended(suspended) if suspended.snapshot_stale),
+            "a background start must wait suspended and re-read the terminal later"
+        );
+
+        lifecycle
+            .resume_with(|_| Ok(None))
+            .expect("background resume succeeds");
+        assert!(
+            matches!(lifecycle, super::RawModeLifecycle::Suspended(_)),
+            "a resume in the background must not enter raw mode"
+        );
+
+        lifecycle
+            .resume_with(|_| Ok(Some(terminal)))
+            .expect("foreground resume succeeds");
+        assert!(
+            matches!(lifecycle, super::RawModeLifecycle::Active(active) if !active.snapshot_stale),
+            "the resume that brings the wrapper forward keeps the state it applied"
+        );
+    }
+
+    #[test]
+    fn continue_reapplies_raw_mode_only_in_the_foreground() {
+        let terminal = super::RawModeState {
+            stdin_fd: -1,
+            // SAFETY: termios is a plain C struct; this state is never applied to a terminal
+            // (stdin_fd is -1).
+            original: unsafe { std::mem::zeroed() },
+            // SAFETY: termios is a plain C struct; this state is never applied to a terminal
+            // (stdin_fd is -1).
+            raw: unsafe { std::mem::zeroed() },
+            snapshot_stale: false,
+        };
+        let mut lifecycle = super::RawModeLifecycle::Active(terminal);
+        let mut applied = 0;
+
+        lifecycle
+            .reassert_with(|terminal| {
+                applied += 1;
+                Ok(Some(*terminal))
+            })
+            .expect("foreground continue succeeds");
+        assert_eq!(
+            applied, 1,
+            "a continued foreground session re-enters raw mode"
+        );
+        assert!(matches!(lifecycle, super::RawModeLifecycle::Active(_)));
+
+        lifecycle
+            .reassert_with(|_| Ok(None))
+            .expect("background continue succeeds");
+        assert!(
+            matches!(lifecycle, super::RawModeLifecycle::Suspended(_)),
+            "a continued background job gives the terminal up"
+        );
+
+        lifecycle
+            .reassert_with(|terminal| Ok(Some(*terminal)))
+            .expect("continue into the foreground succeeds");
+        assert!(matches!(lifecycle, super::RawModeLifecycle::Active(_)));
+
+        for mut lifecycle in [
+            super::RawModeLifecycle::Inactive,
+            super::RawModeLifecycle::Terminating,
+        ] {
+            lifecycle
+                .reassert_with(|_| panic!("raw mode applied outside a session"))
+                .expect("continue outside a session is a no-op");
+        }
+    }
+
+    // The outer terminal can be resized after the PTY is opened and before the
+    // resize watcher's SIGWINCH handler is installed.
+    #[test]
+    fn resize_watcher_starts_from_the_ptys_own_size() {
+        let opened = portable_pty::PtySize {
+            rows: 24,
+            cols: 80,
+            ..portable_pty::PtySize::default()
+        };
+        let resized = portable_pty::PtySize {
+            rows: 30,
+            cols: 100,
+            ..portable_pty::PtySize::default()
+        };
+        let pair = portable_pty::native_pty_system()
+            .openpty(opened)
+            .expect("openpty");
+
+        let synced = super::start_pty_size_sync(&*pair.master, resized);
+
+        assert_eq!(synced, resized);
+        assert_eq!(
+            pair.master.get_size().expect("PTY size"),
+            resized,
+            "a resize made during startup never reached the PTY"
+        );
+    }
+
+    #[test]
+    fn session_diagnostics_do_not_panic_on_an_unwritable_stderr() {
+        let source = include_str!("pty.rs");
+        let runtime_source = source.split("mod tests").next().unwrap_or(source);
+
+        assert!(
+            !runtime_source.contains("eprintln!(") && !runtime_source.contains("println!("),
+            "print macros panic on EIO after a terminal hangup; use warn()"
+        );
     }
 
     #[test]
@@ -1961,6 +3297,65 @@ mod tests {
         assert_eq!(error.kind(), std::io::ErrorKind::Other);
         assert!(!suspended.load(Ordering::Acquire));
         assert!(!reapplied.load(Ordering::Acquire));
+    }
+
+    // A background read of the terminal raises SIGTTIN again every time it
+    // restarts, so a burst of stop requests is queued before the wrapper
+    // stops. One stop satisfies them all, as SIGCONT discards pending stops.
+    #[test]
+    fn stop_requests_queued_before_a_resume_are_coalesced() {
+        let (read_fd, write_fd) = super::pipe_fds().expect("signal pipe");
+        for _ in 0..200 {
+            super::write_signal_byte(write_fd, libc::SIGTTIN as u8);
+        }
+        super::write_signal_byte(write_fd, super::RAW_SIGNAL_STOP_BYTE);
+        let state = Mutex::new(super::RawModeLifecycle::Inactive);
+        let mut stops = 0;
+
+        super::handle_session_signals_with(read_fd, &state, || {
+            stops += 1;
+            Ok(())
+        });
+
+        assert_eq!(stops, 1, "stale stop requests stopped the wrapper again");
+        super::close_fd(write_fd);
+    }
+
+    #[test]
+    fn only_background_io_stops_shortly_after_a_resume_in_the_foreground_are_stale() {
+        let just_resumed = Some(Instant::now());
+        let long_resumed = Instant::now().checked_sub(super::STALE_STOP_WINDOW * 2);
+
+        assert!(super::is_stale_stop_request(
+            libc::SIGTTIN,
+            just_resumed,
+            || true
+        ));
+        assert!(super::is_stale_stop_request(
+            libc::SIGTTOU,
+            just_resumed,
+            || true
+        ));
+        // An explicit stop from the user is honored, and so is any request
+        // while in the background or long after the last resume.
+        assert!(!super::is_stale_stop_request(
+            libc::SIGTSTP,
+            just_resumed,
+            || true
+        ));
+        assert!(!super::is_stale_stop_request(
+            libc::SIGTTIN,
+            just_resumed,
+            || false
+        ));
+        assert!(!super::is_stale_stop_request(libc::SIGTTIN, None, || true));
+        if long_resumed.is_some() {
+            assert!(!super::is_stale_stop_request(
+                libc::SIGTTIN,
+                long_resumed,
+                || true
+            ));
+        }
     }
 
     #[test]
@@ -2091,6 +3486,43 @@ mod tests {
         );
         assert!(started.elapsed() >= Duration::from_millis(50));
         assert_eq!(slot.write_fd.load(Ordering::SeqCst), -1);
+    }
+
+    fn fd_is_close_on_exec(fd: RawFd) -> bool {
+        // SAFETY: F_GETFD takes no pointer argument; an invalid `fd` reports EBADF.
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        assert!(
+            flags >= 0,
+            "fcntl(F_GETFD) on {fd}: {}",
+            std::io::Error::last_os_error()
+        );
+        flags & libc::FD_CLOEXEC != 0
+    }
+
+    // The signal self-pipe exists before the wrapped command is spawned, and
+    // portable-pty's /dev/fd scan, the only other thing that keeps it out of
+    // the child, does nothing when /proc is not mounted.
+    #[test]
+    fn self_pipe_ends_are_close_on_exec() {
+        let (read_fd, write_fd) = super::pipe_fds().expect("pipe");
+        let read_cloexec = fd_is_close_on_exec(read_fd);
+        let write_cloexec = fd_is_close_on_exec(write_fd);
+        super::close_fd(read_fd);
+        super::close_fd(write_fd);
+        assert!(read_cloexec, "self-pipe read end lacks FD_CLOEXEC");
+        assert!(write_cloexec, "self-pipe write end lacks FD_CLOEXEC");
+    }
+
+    #[test]
+    fn master_dup_is_close_on_exec() {
+        let pair = portable_pty::native_pty_system()
+            .openpty(portable_pty::PtySize::default())
+            .expect("openpty");
+        let duped = super::dup_master_fd(&*pair.master).expect("dup master");
+        assert!(
+            fd_is_close_on_exec(std::os::fd::AsRawFd::as_raw_fd(&duped)),
+            "PTY master dup lacks FD_CLOEXEC"
+        );
     }
 
     #[test]

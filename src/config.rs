@@ -7,7 +7,7 @@ use crate::profiles::{ProfileRuntimeMeta, ProfileStore};
 use crate::style::{Style, parse_palette};
 use crate::terminal_text::escape_untrusted;
 use serde::Deserialize;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::OpenOptions;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
@@ -167,7 +167,7 @@ pub struct LoadedProfileFile {
 impl PrismConfig {
     /// Parses a ChromaTerm-style YAML document into highlighting rules.
     pub fn from_chromaterm_yaml(input: &str) -> Result<Self, ConfigError> {
-        let doc: RulesDoc = serde_norway::from_str(input)?;
+        let doc = parse_rules_doc(input)?;
         Self::from_rules_doc(doc)
     }
 
@@ -186,11 +186,10 @@ impl PrismConfig {
             path: path.to_path_buf(),
             source,
         })?;
-        let doc: RulesDoc =
-            serde_norway::from_str(&input).map_err(|source| ConfigError::YamlFile {
-                path: path.to_path_buf(),
-                source,
-            })?;
+        let doc = parse_rules_doc(&input).map_err(|source| ConfigError::YamlFile {
+            path: path.to_path_buf(),
+            source,
+        })?;
         Self::from_rules_doc(doc)
     }
 
@@ -231,6 +230,28 @@ const MAX_CONFIG_FILE_BYTES: u64 = 1024 * 1024;
 
 /// Largest fixture accepted by the profiles test command.
 pub(crate) const MAX_PROFILE_TEST_FILE_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Deepest collection nesting a config or profile document may use. This is
+/// serde_norway's own recursion limit, so checking it up front rejects no
+/// document that could load.
+const MAX_YAML_NESTING: usize = 128;
+
+/// Most that YAML aliases may add to a config or profile document once they
+/// are expanded, counted as the scalar bytes plus [`YAML_NODE_OVERHEAD`] per
+/// node of everything they copy. Every alias copies its anchored node again,
+/// so without this bound a file within [`MAX_CONFIG_FILE_BYTES`] could expand
+/// to many gigabytes.
+const MAX_EXPANDED_YAML_BYTES: usize = 4 * MAX_CONFIG_FILE_BYTES as usize;
+
+/// Charge for each YAML node on top of its scalar bytes, so that an alias of a
+/// large sequence of tiny scalars is bounded too.
+const YAML_NODE_OVERHEAD: usize = 16;
+
+/// Most bytes the tags of a config or profile document may add up to. libyaml
+/// resolves each tag against its `%TAG` directive into a fresh string, so
+/// without this bound one long directive prefix used by many short tags could
+/// expand a file within [`MAX_CONFIG_FILE_BYTES`] to many gigabytes.
+const MAX_YAML_TAG_BYTES: usize = 4 * MAX_CONFIG_FILE_BYTES as usize;
 
 /// Reads one bounded regular file without allowing a FIFO open to block.
 pub(crate) fn read_bounded_regular_file(
@@ -277,6 +298,227 @@ fn read_config_file(path: &Path) -> std::io::Result<String> {
         .map_err(|source| std::io::Error::new(std::io::ErrorKind::InvalidData, source))
 }
 
+/// Parses a config or profile YAML document. Every YAML entry point goes
+/// through here, so a document within [`MAX_CONFIG_FILE_BYTES`] also stays
+/// bounded in parse time and memory.
+fn parse_rules_doc(input: &str) -> Result<RulesDoc, serde_norway::Error> {
+    check_yaml_limits(input)?;
+    serde_norway::from_str(input)
+}
+
+/// Rejects a document whose collections nest deeper than [`MAX_YAML_NESTING`],
+/// whose aliases add more than [`MAX_EXPANDED_YAML_BYTES`] to it, or whose
+/// tags add up to more than [`MAX_YAML_TAG_BYTES`].
+///
+/// serde_norway applies its recursion limit only after libyaml has produced
+/// every event, and libyaml's scanner does work proportional to the flow depth
+/// for each token, so a deeply nested file could take minutes to hours to
+/// reject. serde_norway also copies an anchored node again for every alias and
+/// only limits how many alias jumps a document makes relative to its own size,
+/// so a large anchored scalar or sequence referenced many times could exhaust
+/// memory before any PrismTTY limit applies. Likewise libyaml spells out each
+/// tag in full, and serde_norway keeps every one.
+///
+/// This walks the same events and stops as soon as any limit is passed,
+/// reporting too deep a document in serde_norway's own words. Each alias is
+/// charged the expanded size of the node it names, from the scalar lengths
+/// libyaml reports, so it does not matter whether serde_norway later reads a
+/// scalar as a string or a number. Syntax errors and unknown anchors are left
+/// for serde_norway to report.
+fn check_yaml_limits(input: &str) -> Result<(), serde_norway::Error> {
+    use std::mem::MaybeUninit;
+    use unsafe_libyaml_norway::{
+        YAML_ALIAS_EVENT, YAML_DOCUMENT_START_EVENT, YAML_MAPPING_END_EVENT,
+        YAML_MAPPING_START_EVENT, YAML_SCALAR_EVENT, YAML_SEQUENCE_END_EVENT,
+        YAML_SEQUENCE_START_EVENT, YAML_STREAM_END_EVENT, YAML_UTF8_ENCODING, yaml_event_delete,
+        yaml_event_t, yaml_parser_delete, yaml_parser_initialize, yaml_parser_parse,
+        yaml_parser_set_encoding, yaml_parser_set_input_string, yaml_parser_t,
+    };
+
+    let rejected = |message: String| <serde_norway::Error as serde::de::Error>::custom(message);
+    let mut storage = MaybeUninit::<yaml_parser_t>::uninit();
+    let parser = storage.as_mut_ptr();
+    // SAFETY: `parser` points to writable, aligned storage for a
+    // yaml_parser_t, which initialize fills in before anything reads it.
+    if unsafe { yaml_parser_initialize(parser) }.fail {
+        return Err(rejected("failed to initialize the YAML parser".to_string()));
+    }
+    // SAFETY: the parser is initialized and has no encoding or input yet.
+    // `input` outlives the parser, which is deleted below, and `storage` is
+    // never moved, which matters because the parser now points to itself.
+    unsafe {
+        yaml_parser_set_encoding(parser, YAML_UTF8_ENCODING);
+        yaml_parser_set_input_string(parser, input.as_ptr(), input.len() as u64);
+    }
+
+    let mut rejection = None;
+    // Expanded size of the document so far, how much of it aliases added, and
+    // how much its tags take.
+    let mut expanded = 0usize;
+    let mut alias_bytes = 0usize;
+    let mut tag_bytes = 0usize;
+    // Each anchor name maps to a slot holding the expanded size of the node it
+    // names, or `None` while that collection is still open: an alias inside
+    // it would repeat it without end. Like serde_norway, the latest definition
+    // of a name wins and names do not carry over into the next document.
+    let mut anchors: HashMap<Vec<u8>, usize> = HashMap::new();
+    let mut anchor_sizes: Vec<Option<usize>> = Vec::new();
+    // `expanded` where each open collection started, and its anchor slot.
+    let mut open: Vec<(usize, Option<usize>)> = Vec::new();
+    loop {
+        let mut event = MaybeUninit::<yaml_event_t>::uninit();
+        // SAFETY: the parser is initialized with its input set, and `event` is
+        // writable storage that parse fills in.
+        if unsafe { yaml_parser_parse(parser, event.as_mut_ptr()) }.fail {
+            // serde_norway stops at the same error, so it never expands an
+            // alias that comes after it.
+            break;
+        }
+        // SAFETY: a successful parse initialized the event.
+        let mut event = unsafe { event.assume_init() };
+        // SAFETY: the event came from a successful parse and is not deleted
+        // until the anchor borrowed from it is no longer used.
+        let (anchor, tag_len) = unsafe { yaml_event_anchor_and_tag(&event) };
+        tag_bytes = tag_bytes.saturating_add(tag_len);
+        if tag_bytes > MAX_YAML_TAG_BYTES {
+            let mark = event.start_mark;
+            rejection = Some(format!(
+                "YAML tags expand the document by more than {MAX_YAML_TAG_BYTES} bytes \
+                 at line {} column {}",
+                mark.line + 1,
+                mark.column + 1
+            ));
+        }
+        // A copy of a node made for an alias copies its tag as well.
+        let node_size = YAML_NODE_OVERHEAD.saturating_add(tag_len);
+        let mut stop = event.type_ == YAML_STREAM_END_EVENT;
+        match event.type_ {
+            YAML_DOCUMENT_START_EVENT => {
+                anchors.clear();
+                anchor_sizes.clear();
+            }
+            YAML_SCALAR_EVENT => {
+                // SAFETY: a scalar event carries the scalar variant.
+                let length = unsafe { event.data.scalar.length } as usize;
+                let size = node_size.saturating_add(length);
+                expanded = expanded.saturating_add(size);
+                if let Some(name) = anchor {
+                    anchors.insert(name.to_vec(), anchor_sizes.len());
+                    anchor_sizes.push(Some(size));
+                }
+            }
+            YAML_SEQUENCE_START_EVENT | YAML_MAPPING_START_EVENT => {
+                let slot = anchor.map(|name| {
+                    anchors.insert(name.to_vec(), anchor_sizes.len());
+                    anchor_sizes.push(None);
+                    anchor_sizes.len() - 1
+                });
+                open.push((expanded, slot));
+                expanded = expanded.saturating_add(node_size);
+                if open.len() > MAX_YAML_NESTING {
+                    let mark = event.start_mark;
+                    rejection = Some(format!(
+                        "recursion limit exceeded at line {} column {}",
+                        mark.line + 1,
+                        mark.column + 1
+                    ));
+                }
+            }
+            YAML_SEQUENCE_END_EVENT | YAML_MAPPING_END_EVENT => {
+                if let Some((start, Some(slot))) = open.pop() {
+                    if let Some(size) = anchor_sizes.get_mut(slot) {
+                        *size = Some(expanded.saturating_sub(start));
+                    }
+                }
+            }
+            YAML_ALIAS_EVENT => {
+                let anchored = anchor
+                    .and_then(|name| anchors.get(name))
+                    .and_then(|&slot| anchor_sizes.get(slot).copied());
+                match anchored {
+                    Some(anchored) => {
+                        // An alias inside the collection it names never ends.
+                        let size = anchored.unwrap_or(usize::MAX);
+                        expanded = expanded.saturating_add(size);
+                        alias_bytes = alias_bytes.saturating_add(size);
+                        if alias_bytes > MAX_EXPANDED_YAML_BYTES {
+                            let mark = event.start_mark;
+                            rejection = Some(format!(
+                                "YAML aliases expand the document by more than \
+                                 {MAX_EXPANDED_YAML_BYTES} bytes at line {} column {}",
+                                mark.line + 1,
+                                mark.column + 1
+                            ));
+                        }
+                    }
+                    // serde_norway reports an unknown anchor and loads nothing
+                    // after it.
+                    None => stop = true,
+                }
+            }
+            _ => {}
+        }
+        // SAFETY: the event came from a successful parse and is deleted once.
+        unsafe { yaml_event_delete(&mut event) };
+        if stop || rejection.is_some() {
+            break;
+        }
+    }
+    // SAFETY: the parser was initialized above and is deleted exactly once.
+    unsafe { yaml_parser_delete(parser) };
+
+    match rejection {
+        Some(message) => Err(rejected(message)),
+        None => Ok(()),
+    }
+}
+
+/// The anchor that an alias, scalar, sequence or mapping event names, if any,
+/// and the length of the tag a scalar, sequence or mapping event carries.
+///
+/// # Safety
+///
+/// `event` must come from a successful `yaml_parser_parse` and not have been
+/// deleted yet.
+unsafe fn yaml_event_anchor_and_tag(
+    event: &unsafe_libyaml_norway::yaml_event_t,
+) -> (Option<&[u8]>, usize) {
+    use std::ffi::CStr;
+    use unsafe_libyaml_norway::{
+        YAML_ALIAS_EVENT, YAML_MAPPING_START_EVENT, YAML_SCALAR_EVENT, YAML_SEQUENCE_START_EVENT,
+    };
+
+    // SAFETY: each arm reads the variant of the event data that its event type
+    // carries.
+    let (anchor, tag) = unsafe {
+        match event.type_ {
+            YAML_ALIAS_EVENT => (event.data.alias.anchor, std::ptr::null_mut()),
+            YAML_SCALAR_EVENT => (event.data.scalar.anchor, event.data.scalar.tag),
+            YAML_SEQUENCE_START_EVENT => (
+                event.data.sequence_start.anchor,
+                event.data.sequence_start.tag,
+            ),
+            YAML_MAPPING_START_EVENT => (
+                event.data.mapping_start.anchor,
+                event.data.mapping_start.tag,
+            ),
+            _ => return (None, 0),
+        }
+    };
+    // SAFETY: libyaml stores a non-null anchor as a NUL-terminated string that
+    // the event owns until it is deleted, which the returned slice's borrow of
+    // `event` rules out.
+    let anchor = (!anchor.is_null()).then(|| unsafe { CStr::from_ptr(anchor.cast()) }.to_bytes());
+    let tag_len = if tag.is_null() {
+        0
+    } else {
+        // SAFETY: libyaml stores a non-null tag as a NUL-terminated string
+        // that the event owns until it is deleted.
+        unsafe { CStr::from_ptr(tag.cast()) }.to_bytes().len()
+    };
+    (anchor, tag_len)
+}
+
 /// Loads and validates a native PrismTTY profile YAML file from disk.
 pub fn load_profile_file(path: impl AsRef<Path>) -> Result<LoadedProfileFile, ConfigError> {
     let path = path.as_ref();
@@ -301,7 +543,7 @@ pub(crate) fn parse_profile_file_contents(
     path: &Path,
     input: &str,
 ) -> Result<LoadedProfileFile, ConfigError> {
-    let doc: RulesDoc = serde_norway::from_str(input).map_err(|source| ConfigError::YamlFile {
+    let doc = parse_rules_doc(input).map_err(|source| ConfigError::YamlFile {
         path: path.to_path_buf(),
         source,
     })?;
@@ -356,7 +598,7 @@ fn parse_profile_yaml_with_mode(
     input: &str,
     mode: ProfileYamlMode,
 ) -> Result<LoadedProfileFile, ConfigError> {
-    let doc: RulesDoc = serde_norway::from_str(input)?;
+    let doc = parse_rules_doc(input)?;
     profile_file_from_doc(doc, mode)
 }
 
@@ -716,5 +958,285 @@ rules:
         assert!(!message.contains('\u{7}'), "{message:?}");
         assert!(message.contains("\\x1b"), "{message:?}");
         assert!(message.contains("\\x07"), "{message:?}");
+    }
+
+    /// Runs `parse` on a worker thread so that a parser regression on a
+    /// pathological document fails the test instead of hanging it.
+    fn parse_within_time_limit<T: Send + 'static>(parse: impl FnOnce() -> T + Send + 'static) -> T {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = sender.send(parse());
+        });
+        receiver
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("YAML parsing should finish within the time limit")
+    }
+
+    const DEEP_COLOR_HEADER: &str = "rules:\n  - regex: x\n    color: ";
+
+    fn deep_flow_payloads() -> [String; 4] {
+        [
+            "[".repeat(200_000),
+            "{a: ".repeat(100_000),
+            "[\n".repeat(200_000),
+            format!("{}{}", "[".repeat(16_000), "a,".repeat(400_000)),
+        ]
+    }
+
+    #[test]
+    fn deeply_nested_flow_yaml_is_rejected_quickly() {
+        for payload in deep_flow_payloads() {
+            let config = format!("{DEEP_COLOR_HEADER}{payload}");
+            let message = parse_within_time_limit(move || {
+                PrismConfig::from_chromaterm_yaml(&config).map(|_| ())
+            })
+            .expect_err("deep config nesting must be rejected")
+            .to_string();
+            assert!(message.contains("recursion limit exceeded"), "{message}");
+
+            let profile = format!("profile:\n  name: deep\n{DEEP_COLOR_HEADER}{payload}");
+            let message = parse_within_time_limit(move || parse_profile_yaml(&profile).map(|_| ()))
+                .expect_err("deep profile nesting must be rejected")
+                .to_string();
+            assert!(message.contains("recursion limit exceeded"), "{message}");
+        }
+    }
+
+    #[test]
+    fn deeply_nested_config_and_profile_files_are_rejected_quickly() {
+        let file = tempfile::NamedTempFile::new().expect("temp file creates");
+        std::fs::write(file.path(), format!("rules: {}\n", "{".repeat(200_000)))
+            .expect("deep yaml writes");
+
+        let loaders: [fn(std::path::PathBuf) -> Result<(), super::ConfigError>; 2] = [
+            |path| PrismConfig::from_chromaterm_file(path).map(|_| ()),
+            |path| load_profile_file(path).map(|_| ()),
+        ];
+        for load in loaders {
+            let path = file.path().to_path_buf();
+            let error = parse_within_time_limit(move || load(path))
+                .expect_err("deep file nesting must be rejected");
+            let message = error.to_string();
+            assert!(
+                matches!(error, super::ConfigError::YamlFile { .. }),
+                "{message}"
+            );
+            assert!(
+                message.contains(&file.path().display().to_string()),
+                "{message}"
+            );
+            assert!(message.contains("recursion limit exceeded"), "{message}");
+        }
+    }
+
+    #[test]
+    fn yaml_nesting_limit_matches_serde_norway_recursion_limit() {
+        // The header puts the color value at depth 4, so 125 flow levels end
+        // exactly at serde_norway's limit of 128.
+        let at_limit = format!(
+            "{DEEP_COLOR_HEADER}{}{}\n",
+            "[".repeat(125),
+            "]".repeat(125)
+        );
+        let error = PrismConfig::from_chromaterm_yaml(&at_limit)
+            .expect_err("a sequence is not a valid color");
+        assert!(
+            matches!(error, super::ConfigError::InvalidStyle { .. }),
+            "{error}"
+        );
+
+        let over_limit = format!(
+            "{DEEP_COLOR_HEADER}{}{}\n",
+            "[".repeat(126),
+            "]".repeat(126)
+        );
+        let serde_error = serde_norway::from_str::<serde_norway::Value>(&over_limit)
+            .expect_err("serde_norway rejects nesting past its recursion limit");
+        assert_eq!(
+            PrismConfig::from_chromaterm_yaml(&over_limit)
+                .expect_err("nesting past the limit must be rejected")
+                .to_string(),
+            format!("failed to parse YAML: {serde_error}")
+        );
+        assert_eq!(
+            serde_error.to_string(),
+            "recursion limit exceeded at line 3 column 137"
+        );
+    }
+
+    /// A 200 KB anchored regex reused by 40 more rules, about 8 MB once its
+    /// aliases are expanded.
+    fn aliased_regex_config() -> String {
+        let mut yaml = format!(
+            "rules:\n  - {{regex: &s \"{}\", color: bold}}\n",
+            "a".repeat(200_000)
+        );
+        yaml.push_str(&"  - {regex: *s, color: bold}\n".repeat(40));
+        yaml
+    }
+
+    /// The same 200 KB anchored scalar as 41 profile detection hints.
+    fn aliased_detection_profile() -> String {
+        format!(
+            "profile:\n  name: p\n  detection: [&s \"{}\"{}]\nrules: []\n",
+            "a".repeat(200_000),
+            ", *s".repeat(40)
+        )
+    }
+
+    #[test]
+    fn yaml_alias_expansion_is_bounded() {
+        // 500 aliases of a 1,000-item sequence inside the free-form color
+        // value: tiny scalars, but half a million nodes once expanded.
+        let aliased_color = format!(
+            "rules:\n  - regex: x\n    color: [&a [{}], {}]\n",
+            ["''"; 1_000].join(", "),
+            ["*a"; 500].join(", ")
+        );
+        // serde_norway reads these plain scalars as numbers, but a string
+        // field such as regex still copies all of their text for every alias.
+        let zeros = "0".repeat(200_000);
+        let aliased_numbers = [format!("0x{zeros}1"), format!("1.{zeros}")].map(|scalar| {
+            let mut yaml = format!("rules:\n  - {{regex: &s {scalar}, color: bold}}\n");
+            yaml.push_str(&"  - {regex: *s, color: bold}\n".repeat(40));
+            yaml
+        });
+        // Aliases inside anchored sequences multiply: six levels of ten make
+        // a million scalars from a few hundred bytes.
+        let mut nested = String::from(
+            "rules:\n  - regex: x\n    color:\n      - &l0 [a, a, a, a, a, a, a, a, a, a]\n",
+        );
+        for level in 1..6 {
+            let items = vec![format!("*l{}", level - 1); 10].join(", ");
+            nested.push_str(&format!("      - &l{level} [{items}]\n"));
+        }
+        // An alias inside the sequence it names repeats it without end.
+        let recursive = format!(
+            "rules:\n  - regex: x\n    color: &r [\"{}\", *r]\n",
+            "a".repeat(200_000)
+        );
+        let configs = [aliased_regex_config(), aliased_color, nested, recursive];
+        for config in configs.into_iter().chain(aliased_numbers) {
+            let message = parse_within_time_limit(move || {
+                PrismConfig::from_chromaterm_yaml(&config).map(|_| ())
+            })
+            .expect_err("alias expansion past the budget must be rejected")
+            .to_string();
+            assert!(message.contains("YAML aliases expand"), "{message}");
+        }
+
+        let profile = aliased_detection_profile();
+        let message = parse_within_time_limit(move || parse_profile_yaml(&profile).map(|_| ()))
+            .expect_err("alias expansion past the budget must be rejected")
+            .to_string();
+        assert!(message.contains("YAML aliases expand"), "{message}");
+    }
+
+    #[test]
+    fn yaml_alias_expansion_in_config_and_profile_files_is_bounded() {
+        let config = tempfile::NamedTempFile::new().expect("temp file creates");
+        std::fs::write(config.path(), aliased_regex_config()).expect("config writes");
+        let profile = tempfile::NamedTempFile::new().expect("temp file creates");
+        std::fs::write(profile.path(), aliased_detection_profile()).expect("profile writes");
+
+        let loaders: [fn(std::path::PathBuf) -> Result<(), super::ConfigError>; 2] = [
+            |path| PrismConfig::from_chromaterm_file(path).map(|_| ()),
+            |path| load_profile_file(path).map(|_| ()),
+        ];
+        for (file, load) in [&config, &profile].into_iter().zip(loaders) {
+            let path = file.path().to_path_buf();
+            let error = parse_within_time_limit(move || load(path))
+                .expect_err("alias expansion past the budget must be rejected");
+            let message = error.to_string();
+            assert!(
+                matches!(error, super::ConfigError::YamlFile { .. }),
+                "{message}"
+            );
+            assert!(
+                message.contains(&file.path().display().to_string()),
+                "{message}"
+            );
+            assert!(message.contains("YAML aliases expand"), "{message}");
+        }
+    }
+
+    #[test]
+    fn yaml_tag_expansion_is_bounded() {
+        let config = PrismConfig::from_chromaterm_yaml(
+            "%TAG !e! tag:example.com,2000:\n---\nrules:\n  - {regex: !e!x y, color: bold}\n",
+        )
+        .expect("an ordinary tag directive parses");
+        assert_eq!(config.rules[0].regex, "y");
+
+        // libyaml spells out the 200 KB directive prefix again for each tag.
+        let mut yaml = format!("%TAG !e! tag:{}\n---\nrules:\n", "a".repeat(200_000));
+        yaml.push_str(&"  - {regex: !e!x y, color: bold}\n".repeat(40));
+        let message =
+            parse_within_time_limit(move || PrismConfig::from_chromaterm_yaml(&yaml).map(|_| ()))
+                .expect_err("tag expansion past the budget must be rejected")
+                .to_string();
+        assert!(message.contains("YAML tags expand"), "{message}");
+    }
+
+    #[test]
+    fn ordinary_yaml_anchors_still_work() {
+        let config = PrismConfig::from_chromaterm_yaml(
+            r#"
+rules:
+  - {regex: a, color: &red f#ff0000}
+  - {regex: b, color: *red}
+  - {regex: '(c)', color: &captures {1: b#000000}}
+  - {regex: '(d)', color: *captures}
+  - {regex: !custom &tagged e, color: bold}
+  - {regex: *tagged, color: bold}
+"#,
+        )
+        .expect("anchored styles parse");
+        assert_eq!(config.rules.len(), 6);
+        assert_eq!(config.rules[0].style, config.rules[1].style);
+        assert_eq!(config.rules[2].style, config.rules[3].style);
+        assert_eq!(config.rules[5].regex, "e");
+
+        let profile = parse_profile_yaml(
+            "profile:\n  name: p\n  inherits: [&base generic]\n  detection: [*base, Foo]\nrules: []\n",
+        )
+        .expect("anchored metadata parses");
+        assert_eq!(profile.meta.detection, ["generic", "Foo"]);
+
+        // A 1 KB anchored regex reused 1,000 times stays within the budget.
+        let mut yaml = format!(
+            "rules:\n  - {{regex: &s \"{}\", color: bold}}\n",
+            "b".repeat(1_000)
+        );
+        yaml.push_str(&"  - {regex: *s, color: bold}\n".repeat(1_000));
+        let config = PrismConfig::from_chromaterm_yaml(&yaml).expect("modest aliasing parses");
+        assert_eq!(config.rules.len(), 1_001);
+
+        // An alias names the latest anchor of its name, as serde_norway
+        // resolves it, so these aliases copy one byte, not a megabyte.
+        let mut yaml = format!(
+            "rules:\n  - {{regex: &r \"{}\", color: bold}}\n  - {{regex: &r b, color: bold}}\n",
+            "a".repeat(1_000_000)
+        );
+        yaml.push_str(&"  - {regex: *r, color: bold}\n".repeat(10));
+        let config = PrismConfig::from_chromaterm_yaml(&yaml).expect("redefined anchor parses");
+        assert_eq!(config.rules[11].regex, "b");
+
+        let message =
+            PrismConfig::from_chromaterm_yaml("rules:\n  - {regex: *missing, color: bold}\n")
+                .expect_err("an unknown anchor must be rejected")
+                .to_string();
+        assert!(message.contains("unknown anchor"), "{message}");
+    }
+
+    #[test]
+    fn only_what_aliases_add_is_charged_for_expansion() {
+        let description = "d".repeat(super::MAX_EXPANDED_YAML_BYTES + 1);
+        let config = PrismConfig::from_chromaterm_yaml(&format!(
+            "rules:\n  - {{description: {description}, regex: x, color: &c bold}}\n  - {{regex: y, color: *c}}\n"
+        ))
+        .expect("a large document with a small alias parses");
+        assert_eq!(config.rules[0].description, description);
+        assert_eq!(config.rules[0].style, config.rules[1].style);
     }
 }

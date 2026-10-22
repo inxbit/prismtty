@@ -17,11 +17,37 @@ use thiserror::Error;
 const UNICODE_PROMPT_MARKERS: &[&str] = &["○", "●", "❯", "❮", "❱", "›", "»", "➜", "➤", "λ"];
 pub(crate) const MAX_INCOMPLETE_ESCAPE_BYTES: usize = 16 * 1024;
 const MAX_INCOMPLETE_NON_STRING_ESCAPE_BYTES: usize = 1024;
+/// How many times the sanitize split may scan the read. A clean split takes
+/// two scans, one to find it and one to check the prefix before it; each
+/// further scan steps back over one control that ends in a character the
+/// previous split cut off. Scans after the first resume from a stop before
+/// their split instead of the start of the read, so stepping back over a run
+/// of controls costs about one scan of the run. Only crafted output steps
+/// back this often, and past the cap the read is carried whole.
+const MAX_SANITIZE_SPLIT_PASSES: usize = 8;
+/// How far past a stop the top-level escape scan may have read to reach it:
+/// whether a character after an ESC is cut off depends on the three bytes
+/// from the stop and on whether a fourth follows. The scan of a prefix makes
+/// every stop that the scan of a longer buffer made at least this far before
+/// the prefix ends.
+const TOP_LEVEL_SCAN_LOOKAHEAD: usize = 4;
+/// The least distance between the stops that the first scan of a sanitize
+/// split keeps to resume from, so a read of many controls keeps a stop per
+/// this many bytes instead of one per control. A later scan resuming from one
+/// reads at most this much more than it would from the nearest stop.
+const SANITIZE_SPLIT_STOP_SPACING: usize = 64;
+/// How many CSI parameters xterm keeps. Past them it ignores `;` and `:` and
+/// reads every further digit into the last parameter.
+const XTERM_MAX_CSI_PARAMETERS: usize = 30;
 const MAX_TENTATIVE_UTF8_SUFFIX_BYTES: usize = 2;
 const PCRE2_JIT_STACK_LIMIT_BYTES: usize = 32 * 1024;
 const PCRE2_MATCH_LIMIT: usize = 100_000;
 const PCRE2_DEPTH_LIMIT: usize = 1_000;
 const MAX_COMPILED_RULES: usize = 512;
+/// Longest visible prompt (ASCII whitespace trimmed) that `looks_like_prompt_tail`
+/// accepts. A prompt candidate end is never ASCII whitespace, so no candidate end
+/// past this offset can begin a prompt echo; scans stop there.
+const MAX_PROMPT_TAIL_BYTES: usize = 180;
 /// How many runtime match errors a rule may hit on one chunk before the scan
 /// gives up. Each error means PCRE2 spent its whole match budget at that
 /// starting position, so recovery has to stay bounded; a handful is enough to
@@ -167,9 +193,10 @@ pub struct StreamingHighlighter {
 
 /// Incrementally tracks an incomplete terminal string control. Once the
 /// control exceeds the bounded carry budget, its payload is discarded until a
-/// BEL/ST terminator or CAN/SUB cancellation arrives. This prevents bytes
-/// inside a hostile oversized OSC/DCS/SOS/PM/APC payload from being
-/// reinterpreted as top-level terminal controls on a later read.
+/// BEL/ST terminator, a CAN/SUB cancellation, or an ESC that starts another
+/// control arrives. This prevents bytes inside a hostile oversized
+/// OSC/DCS/SOS/PM/APC payload from being reinterpreted as top-level terminal
+/// controls on a later read.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct OversizedStringControlFilter {
     mode: OversizedStringControlMode,
@@ -183,7 +210,7 @@ enum OversizedStringControlMode {
     Discarding(DiscardedStringControl),
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum StringControlKind {
     EscOsc,
     EscString(u8),
@@ -194,11 +221,16 @@ enum StringControlKind {
 impl StringControlKind {
     fn at(bytes: &[u8], start: usize) -> Option<(Self, usize)> {
         match *bytes.get(start)? {
-            0x1b => match *bytes.get(start + 1)? {
-                b']' => Some((Self::EscOsc, start + 2)),
-                byte @ (b'P' | b'X' | b'^' | b'_') => Some((Self::EscString(byte), start + 2)),
-                _ => None,
-            },
+            0x1b => {
+                let introducer = skip_escape_state_controls(bytes, start + 1);
+                match *bytes.get(introducer)? {
+                    b']' => Some((Self::EscOsc, introducer + 1)),
+                    byte @ (b'P' | b'X' | b'^' | b'_') => {
+                        Some((Self::EscString(byte), introducer + 1))
+                    }
+                    _ => None,
+                }
+            }
             _ => match c1_control_at(bytes, start)? {
                 (0x9d, width) => Some((Self::C1Osc(width), start + width)),
                 (byte @ (0x90 | 0x98 | 0x9e | 0x9f), width) => {
@@ -214,14 +246,7 @@ impl StringControlKind {
     }
 
     fn matches_at(self, bytes: &[u8], start: usize) -> bool {
-        match self {
-            Self::EscOsc => bytes.get(start..start + 2) == Some(b"\x1b]"),
-            Self::EscString(byte) => {
-                bytes.get(start) == Some(&0x1b) && bytes.get(start + 1) == Some(&byte)
-            }
-            Self::C1Osc(width) => c1_control_at(bytes, start) == Some((0x9d, width)),
-            Self::C1String(byte, width) => c1_control_at(bytes, start) == Some((byte, width)),
-        }
+        Self::at(bytes, start).is_some_and(|(kind, _payload_start)| kind == self)
     }
 
     fn sequence_end(self, bytes: &[u8], start: usize) -> usize {
@@ -278,7 +303,10 @@ impl TrackedStringControl {
 
     fn scan_more(&mut self, bytes: &[u8]) -> TrackedStringScan {
         while self.scanned < bytes.len() {
-            if self.total_bytes >= MAX_INCOMPLETE_ESCAPE_BYTES {
+            // The budget covers the cancelled controls and ESC-ended strings
+            // carried in front of this string too, so such a chain cannot grow
+            // the carry without bound.
+            if self.carry_offset + self.total_bytes >= MAX_INCOMPLETE_ESCAPE_BYTES {
                 return TrackedStringScan::Oversized(self.scanned);
             }
             let byte = bytes[self.scanned];
@@ -296,6 +324,9 @@ impl TrackedStringControl {
                             .expect("tentative UTF-8 suffix is part of the scanned buffer"),
                     );
                 }
+                StringPayloadScan::RestartAtEscape => {
+                    return TrackedStringScan::Restart(self.scanned - 2);
+                }
             }
         }
         TrackedStringScan::Incomplete
@@ -310,6 +341,8 @@ impl TrackedStringControl {
 
 enum TrackedStringScan {
     Complete(usize),
+    /// The string ended at this ESC, which starts the next control.
+    Restart(usize),
     Incomplete,
     Oversized(usize),
 }
@@ -321,6 +354,9 @@ enum StringPayloadScan {
         replay: [u8; MAX_TENTATIVE_UTF8_SUFFIX_BYTES],
         replay_len: usize,
     },
+    /// The previous byte was an ESC that does not start ST: the string ended
+    /// before it, and that ESC and the current byte begin a new control.
+    RestartAtEscape,
 }
 
 struct DiscardedTerminator {
@@ -351,6 +387,27 @@ impl DiscardedStringControl {
                         end: start + offset,
                         replay,
                         replay_len,
+                    });
+                }
+                StringPayloadScan::RestartAtEscape => {
+                    // Bytes are fed contiguously, so the ESC is the byte before
+                    // the current one. Resume there; if it closed the previous
+                    // chunk it is no longer in `bytes`, so replay it.
+                    let mut replay = [0; MAX_TENTATIVE_UTF8_SUFFIX_BYTES];
+                    return Some(match (start + offset).checked_sub(1) {
+                        Some(escape) => DiscardedTerminator {
+                            end: escape,
+                            replay,
+                            replay_len: 0,
+                        },
+                        None => {
+                            replay[0] = 0x1b;
+                            DiscardedTerminator {
+                                end: 0,
+                                replay,
+                                replay_len: 1,
+                            }
+                        }
                     });
                 }
             }
@@ -387,7 +444,8 @@ impl StringPayloadScanner {
         }
     }
 
-    /// Reports a BEL/ST terminator or CAN/SUB cancellation. A raw ST that was
+    /// Reports a BEL/ST terminator, a CAN/SUB cancellation, or an ESC that
+    /// ends the string by starting another control. A raw ST that was
     /// tentatively consumed as UTF-8 is retained until the full codepoint is
     /// valid, so malformed input can terminate before the byte that disproves
     /// the candidate without dropping that visible suffix byte.
@@ -433,6 +491,9 @@ impl StringPayloadScanner {
             if byte == b'\\' {
                 return StringPayloadScan::CompleteAfterCurrent;
             }
+            // Like a terminal's parser, any other byte after ESC ends the
+            // string before that ESC, which then starts a new control.
+            return StringPayloadScan::RestartAtEscape;
         }
 
         if matches!(byte, 0x18 | 0x1a) || (self.allows_bel && byte == 0x07) || byte == 0x9c {
@@ -520,6 +581,10 @@ impl OversizedStringControlFilter {
             if tracked.align_with_reassembled_carry(bytes) {
                 match tracked.scan_more(bytes) {
                     TrackedStringScan::Complete(end) => scan_from = end,
+                    TrackedStringScan::Restart(escape) => {
+                        cancellation_root = Some(tracked.drop_start);
+                        scan_from = escape;
+                    }
                     TrackedStringScan::Incomplete => {
                         self.mode = OversizedStringControlMode::Tracking(tracked);
                         return bytes.to_vec();
@@ -570,6 +635,12 @@ impl OversizedStringControlFilter {
                     cancellation_root = None;
                     scan_from = end;
                 }
+                TrackedStringScan::Restart(escape) => {
+                    // Like a cancelled control, the ended string is carried and
+                    // dropped together with whatever its ESC starts.
+                    cancellation_root = Some(drop_start);
+                    scan_from = escape;
+                }
                 TrackedStringScan::Incomplete => {
                     tracked.drop_start =
                         output.len() + tracked.drop_start.saturating_sub(copy_from);
@@ -588,6 +659,9 @@ impl OversizedStringControlFilter {
                         return output;
                     };
                     output.extend_from_slice(&terminator.replay[..terminator.replay_len]);
+                    // The discarded string took its cancelled prefix with it, so
+                    // a control right after the terminator starts a new chain.
+                    cancellation_root = None;
                     copy_from = terminator.end;
                     scan_from = terminator.end;
                 }
@@ -1239,12 +1313,12 @@ impl StreamingHighlighter {
             };
 
             let prompt = combined.prefix(prefix_len);
-            let mut remainder = AnsiChunk::new(combined.bytes[prefix_len..].to_vec());
+            let remainder = AnsiChunk::new(combined.bytes[prefix_len..].to_vec());
             let mut output = self.emit_prompt_echo_passthrough(prompt.bytes());
             self.observe_interactive_visible_chunk(&AnsiChunk::new(output.clone()));
 
             let split_at = interactive_split_at_chunk(&remainder, false, self.alternate_screen);
-            let processed = split_prepared_pending(&mut remainder, split_at, &mut self.pending);
+            let processed = split_prepared_pending(remainder, split_at, &mut self.pending);
             self.pending_from_prompt_echo_remainder = !self.pending.is_empty();
             self.pending_from_interactive_split = false;
 
@@ -1264,12 +1338,12 @@ impl StreamingHighlighter {
             };
 
             let prompt = combined.prefix(prefix_len);
-            let mut remainder = AnsiChunk::new(combined.bytes[prefix_len..].to_vec());
+            let remainder = AnsiChunk::new(combined.bytes[prefix_len..].to_vec());
             let mut output = self.emit_prompt_echo_passthrough(prompt.bytes());
             self.observe_interactive_visible_chunk(&AnsiChunk::new(output.clone()));
 
             let split_at = interactive_split_at_chunk(&remainder, false, self.alternate_screen);
-            let processed = split_prepared_pending(&mut remainder, split_at, &mut self.pending);
+            let processed = split_prepared_pending(remainder, split_at, &mut self.pending);
             self.pending_from_prompt_echo_remainder = !self.pending.is_empty();
             self.pending_from_interactive_split = false;
 
@@ -1286,9 +1360,9 @@ impl StreamingHighlighter {
                 self.alternate_screen,
             )
         } else {
-            streaming_split_at(combined.bytes())
+            streaming_split_at(&combined)
         };
-        let processed = split_prepared_pending(&mut combined, split_at, &mut self.pending);
+        let processed = split_prepared_pending(combined, split_at, &mut self.pending);
         self.pending_from_prompt_echo_remainder = false;
         self.pending_from_interactive_split = !self.pending.is_empty();
 
@@ -1332,6 +1406,17 @@ impl StreamingHighlighter {
         if self.passthrough_single_byte_chunks {
             self.reset_interactive_overlay(&mut output);
         }
+        output
+    }
+
+    /// Returns the reset for an interactive highlight style that is still
+    /// active, or nothing when none is (always the case for noninteractive
+    /// streams). A caller about to wait for more input uses it so the terminal
+    /// is not left in a highlight color meanwhile; the next highlighted byte
+    /// opens its style again.
+    pub(crate) fn close_interactive_overlay(&mut self) -> Vec<u8> {
+        let mut output = Vec::new();
+        self.reset_interactive_overlay(&mut output);
         output
     }
 
@@ -1461,6 +1546,16 @@ impl StreamingHighlighter {
             let line_end = segment_start + relative_line_end;
             let boundary_end = segment_start + relative_boundary_end;
             self.emit_interactive_line_segment(&bytes[segment_start..line_end], &mut output);
+            // At the bottom of the screen a line feed scrolls in a blank line
+            // drawn in the current rendition, so a style that shows on blank
+            // cells ends before the terminator. No highlight spans one.
+            if self
+                .interactive_overlay
+                .as_ref()
+                .is_some_and(style_paints_blank_cells)
+            {
+                self.reset_interactive_overlay(&mut output);
+            }
             output.extend_from_slice(&bytes[line_end..boundary_end]);
             segment_start = boundary_end;
         }
@@ -1486,12 +1581,29 @@ impl StreamingHighlighter {
         }
 
         let mut output = Vec::new();
+        // Outside the alternate screen and without a screen switch, every token
+        // below lands in `highlightable` and rebuilds `input` byte for byte, so
+        // highlight the already tokenized chunk instead.
+        if !self.alternate_screen
+            && !input.tokens.iter().any(|token| {
+                matches!(token, Token::Ansi(bytes) if alternate_screen_command(bytes).is_some())
+            })
+        {
+            if !input.bytes.is_empty() {
+                self.highlight_prepared(input, &mut output);
+            }
+            return output;
+        }
+
         let mut highlightable = Vec::new();
 
         for token in &input.tokens {
             match &token {
                 Token::Ansi(bytes) if is_alternate_screen_enable(bytes) => {
                     self.flush_highlightable(&mut highlightable, &mut output);
+                    if saves_rendition(bytes) {
+                        self.reset_interactive_overlay(&mut output);
+                    }
                     self.native_sgr.apply_sequence(bytes);
                     self.alternate_screen = true;
                     self.prompt_echo_passthrough = false;
@@ -1546,10 +1658,14 @@ impl StreamingHighlighter {
         }
 
         let chunk = AnsiChunk::new(std::mem::take(input));
+        self.highlight_prepared(&chunk, output);
+    }
+
+    fn highlight_prepared(&mut self, chunk: &AnsiChunk, output: &mut Vec<u8>) {
         if self.passthrough_single_byte_chunks {
             let reset_mode = self.interactive_reset_mode();
             output.extend(self.highlighter.highlight_chunk_with_interactive_overlay(
-                &chunk,
+                chunk,
                 Some(&mut self.benchmark),
                 reset_mode,
                 &mut self.native_sgr,
@@ -1558,10 +1674,10 @@ impl StreamingHighlighter {
             ));
         } else {
             output.extend(self.highlighter.highlight_chunk_with_native_sgr(
-                &chunk,
+                chunk,
                 Some(&mut self.benchmark),
                 ResetMode::Full,
-                &mut NativeSgrState::default(),
+                &mut self.native_sgr,
                 &mut self.disabled_rule_identities,
             ));
         }
@@ -1722,6 +1838,10 @@ struct AnsiRange {
     start: usize,
     end: usize,
     is_sgr: bool,
+    /// The ESC or C1 control that starts this range is what ends the control
+    /// before it: a string control with no terminator, or a sequence cut
+    /// short. Removing the range would leave the terminal inside that control.
+    ends_open_control: bool,
 }
 
 fn neutralize_prompt_echo_source_sgr(
@@ -1787,6 +1907,15 @@ fn prompt_echo_source_sgr_plan(
     input: &[u8],
     previous_visible_tail: &[u8],
 ) -> (Vec<(usize, usize)>, Vec<usize>) {
+    // Most chunks carry no escape at all; skip building the visible-byte map
+    // for them. Any ESC, raw C1 or UTF-8 C1 (`C2 xx`) form contains one of
+    // these bytes.
+    if !input
+        .iter()
+        .any(|byte| *byte == 0x1b || is_c1_control(*byte))
+    {
+        return (Vec::new(), Vec::new());
+    }
     let (visible, ansi_ranges) = visible_byte_map_and_ansi_ranges(input);
     if visible.is_empty() || ansi_ranges.iter().all(|range| !range.is_sgr) {
         return (Vec::new(), Vec::new());
@@ -1832,7 +1961,7 @@ fn prompt_echo_source_sgr_plan(
                 let ranges_for_line = ansi_ranges
                     .iter()
                     .copied()
-                    .filter(|range| range.is_sgr)
+                    .filter(|range| range.is_sgr && !range.ends_open_control)
                     .filter(|range| range.start >= sgr_start_raw && range.start < line_raw_end)
                     .map(|range| (range.start, range.end))
                     .collect::<Vec<_>>();
@@ -1868,11 +1997,21 @@ fn visible_byte_map_and_ansi_ranges(input: &[u8]) -> (Vec<VisibleByte>, Vec<Ansi
             } else {
                 ansi_sequence_end(input, idx)
             };
+            let is_sgr = is_csi_sequence(&input[idx..end])
+                && input.get(end.saturating_sub(1)) == Some(&b'm');
+            let ends_open_control = is_sgr
+                && ansi_ranges.last().is_some_and(|previous: &AnsiRange| {
+                    previous.end == idx
+                        && !matches!(
+                            scan_escape_for_neutralization(input, previous.start),
+                            EscapeScan::Complete(_)
+                        )
+                });
             ansi_ranges.push(AnsiRange {
                 start: idx,
                 end,
-                is_sgr: is_csi_sequence(&input[idx..end])
-                    && input.get(end.saturating_sub(1)) == Some(&b'm'),
+                is_sgr,
+                ends_open_control,
             });
             idx = end;
         } else if let Some(width) = valid_utf8_char_width_at(input, idx) {
@@ -1916,7 +2055,7 @@ fn prompt_echo_sgr_bounds(
         return Some((0, command_start));
     }
 
-    for prompt_end in 1..line.len() {
+    for prompt_end in 1..line.len().min(MAX_PROMPT_TAIL_BYTES + 1) {
         if !is_prompt_tail_candidate_end(&line[..prompt_end]) {
             continue;
         }
@@ -1937,7 +2076,7 @@ fn prompt_echo_sgr_bounds(
 
 fn looks_like_prompt_tail(line: &[u8]) -> bool {
     let trimmed = trim_ascii_whitespace_end(line);
-    if trimmed.is_empty() || trimmed.len() > 180 {
+    if trimmed.is_empty() || trimmed.len() > MAX_PROMPT_TAIL_BYTES {
         return false;
     }
     let Some(last) = trimmed.last() else {
@@ -1966,7 +2105,12 @@ fn looks_like_prompt_tail(line: &[u8]) -> bool {
 fn looks_like_unicode_prompt_tail(trimmed: &[u8]) -> bool {
     // Cheap marker check first: this runs for every candidate prompt end of a
     // visible line, so the UTF-8 decode and control scan below must only run
-    // for the rare tail that actually ends in a Unicode prompt marker.
+    // for the rare tail that actually ends in a Unicode prompt marker. Every
+    // marker is multibyte UTF-8 and so ends in a non-ASCII byte; an ASCII last
+    // byte, the common case, needs no marker compares at all.
+    if trimmed.last().is_none_or(u8::is_ascii) {
+        return false;
+    }
     let Some(marker) = UNICODE_PROMPT_MARKERS
         .iter()
         .copied()
@@ -2041,46 +2185,61 @@ fn leading_prompt_terminator_len(bytes: &[u8], previous_visible_tail: &[u8]) -> 
 }
 
 fn prompt_echo_cr_prefix_len(bytes: &[u8], previous_visible_tail: &[u8]) -> Option<usize> {
-    for (idx, byte) in bytes.iter().enumerate() {
-        if *byte != b'\r' {
-            continue;
+    // One pass over the visible bytes: a CR inside an escape (an OSC payload,
+    // say) is not a line break, and the line before each CR is built up as the
+    // pass goes instead of re-stripping the whole prefix for every CR.
+    if !bytes.contains(&b'\r') {
+        return None;
+    }
+    let (visible, _) = visible_byte_map_and_ansi_ranges(bytes);
+    let previous_continues_prompt = contains_prompt_echo_in_visible_line(previous_visible_tail)
+        || looks_like_prompt_tail(previous_visible_tail);
+    let mut before_cr_line = Vec::new();
+    let mut after_cr_line = Vec::new();
+
+    for (visible_idx, mapped) in visible.iter().enumerate() {
+        match mapped.byte {
+            b'\r' => {}
+            b'\n' => {
+                before_cr_line.clear();
+                continue;
+            }
+            byte => {
+                before_cr_line.push(byte);
+                continue;
+            }
         }
 
-        let before_cr_visible = strip_ansi(&bytes[..idx]);
-        let line_start = before_cr_visible
-            .iter()
-            .rposition(|byte| matches!(*byte, b'\r' | b'\n'))
-            .map(|idx| idx + 1)
-            .unwrap_or(0);
-        let before_cr_line = &before_cr_visible[line_start..];
-
+        let idx = mapped.raw;
         if bytes.get(idx + 1) == Some(&b'\n') {
-            if contains_prompt_echo_in_visible_line(before_cr_line) {
+            if contains_prompt_echo_in_visible_line(&before_cr_line) {
                 return Some(idx + 2);
             }
+            before_cr_line.clear();
             continue;
         }
 
-        let after_cr = &bytes[idx + 1..];
-        if after_cr.is_empty() {
+        if idx + 1 == bytes.len() {
             return None;
         }
 
         let has_echo_before_cr = before_cr_line
             .iter()
             .any(|byte| !byte.is_ascii_whitespace())
-            && (contains_prompt_echo_in_visible_line(before_cr_line)
-                || contains_prompt_echo_in_visible_line(previous_visible_tail)
-                || looks_like_prompt_tail(previous_visible_tail));
-        if !has_echo_before_cr {
-            continue;
+            && (contains_prompt_echo_in_visible_line(&before_cr_line) || previous_continues_prompt);
+        if has_echo_before_cr {
+            after_cr_line.clear();
+            after_cr_line.extend(
+                visible[visible_idx + 1..]
+                    .iter()
+                    .map(|mapped| mapped.byte)
+                    .take_while(|byte| !matches!(*byte, b'\r' | b'\n')),
+            );
+            if !redraws_interactive_prompt_line(&after_cr_line) {
+                return Some(idx + 1);
+            }
         }
-
-        if redraws_interactive_prompt_line(after_cr) {
-            continue;
-        }
-
-        return Some(idx + 1);
+        before_cr_line.clear();
     }
 
     None
@@ -2140,17 +2299,18 @@ fn prompt_echo_lf_prefix_len(bytes: &[u8], previous_visible_tail: &[u8]) -> Opti
 }
 
 fn contains_prompt_echo_before_lf_visible(visible: &[u8]) -> bool {
-    let line_end = visible
-        .iter()
-        .position(|byte| *byte == b'\n')
-        .unwrap_or(visible.len());
-    let sub = &visible[..line_end];
-    let start = sub
+    // A line this chunk already ended with LF is finished output, not a command
+    // line still being echoed. A CRLF line already has nothing after its CR to
+    // match below; a bare LF or LF-CR ending must not match either.
+    if visible.contains(&b'\n') {
+        return false;
+    }
+    let start = visible
         .iter()
         .rposition(|byte| *byte == b'\r')
         .map(|idx| idx + 1)
         .unwrap_or(0);
-    contains_prompt_echo_in_visible_line(&sub[start..])
+    contains_prompt_echo_in_visible_line(&visible[start..])
 }
 
 /// Reports whether an escape sequence moves back over, or deletes within, text
@@ -2167,7 +2327,7 @@ fn is_in_place_line_edit_sequence(bytes: &[u8]) -> bool {
 }
 
 fn contains_prompt_echo_in_visible_line(line: &[u8]) -> bool {
-    for prompt_end in 1..line.len() {
+    for prompt_end in 1..line.len().min(MAX_PROMPT_TAIL_BYTES + 1) {
         if !is_prompt_tail_candidate_end(&line[..prompt_end]) {
             continue;
         }
@@ -2198,13 +2358,7 @@ fn looks_like_prompt_echo_prefix(line: &[u8]) -> bool {
     true
 }
 
-fn redraws_interactive_prompt_line(bytes: &[u8]) -> bool {
-    let visible = strip_ansi(bytes);
-    let line_end = visible
-        .iter()
-        .position(|byte| matches!(*byte, b'\r' | b'\n'))
-        .unwrap_or(visible.len());
-    let line = &visible[..line_end];
+fn redraws_interactive_prompt_line(line: &[u8]) -> bool {
     looks_like_prompt_tail(line) || contains_prompt_echo_in_visible_line(line)
 }
 
@@ -2459,16 +2613,10 @@ fn match_rule(
             }
         };
 
-        // Same stepping as pcre2's own iterator: an empty match advances one
-        // byte so the search makes progress, and an empty match directly after
-        // the previous match is skipped.
-        if start == end {
-            last_end = end + 1;
-            if Some(end) == last_match {
-                continue;
-            }
-        } else {
-            last_end = end;
+        let (next_search, skip) = next_match_search(start, end, last_match);
+        last_end = next_search;
+        if skip {
+            continue;
         }
         last_match = Some(end);
         match_count += 1;
@@ -2487,6 +2635,20 @@ fn match_rule(
     }
 
     (ranges, match_count, match_error)
+}
+
+/// Returns where the search resumes after a match at `start..end`, and whether
+/// to skip that match. Same stepping as pcre2's own iterator: an empty match
+/// advances one byte so the search makes progress, and an empty match directly
+/// after the previous match is skipped. A match that starts after its end
+/// (`\K` inside a lookaround, which PCRE2 before 10.38 allows by default) steps
+/// the same way: resuming at its end would find it again forever.
+fn next_match_search(start: usize, end: usize, last_match: Option<usize>) -> (usize, bool) {
+    if start >= end {
+        (end + 1, Some(end) == last_match)
+    } else {
+        (end, false)
+    }
 }
 
 fn capture_group_index(regex: &Regex, name: &str) -> Option<usize> {
@@ -2541,28 +2703,44 @@ fn c1_sequence_end(input: &[u8], start: usize) -> usize {
 }
 
 fn ansi_sequence_end(input: &[u8], start: usize) -> usize {
-    if start + 1 >= input.len() {
+    let introducer = skip_escape_state_controls(input, start + 1);
+    if introducer >= input.len() {
         return input.len();
     }
-    if c1_control_at(input, start + 1).is_some() {
-        return start + 1;
+    if c1_control_at(input, introducer).is_some() {
+        return introducer;
     }
 
-    match input[start + 1] {
-        b'[' => csi_sequence_end(input, start + 2),
-        b']' => osc_sequence_end(input, start + 2),
-        b'P' | b'X' | b'^' | b'_' => string_sequence_end(input, start + 2),
+    match input[introducer] {
+        b'[' => csi_sequence_end(input, introducer + 1),
+        b']' => osc_sequence_end(input, introducer + 1),
+        b'P' | b'X' | b'^' | b'_' => string_sequence_end(input, introducer + 1),
         0x20..=0x2f => esc_intermediate_sequence_end(input, start),
-        0x1b | 0x80..=0x9f => start + 1,
-        _ => (start + 2).min(input.len()),
+        // A non-ASCII byte is never part of the escape, so a UTF-8 character
+        // after ESC stays whole visible text.
+        0x1b | 0x80..=0xff => introducer,
+        _ => introducer + 1,
     }
+}
+
+/// VT parsers execute C0 controls other than CAN, SUB and ESC, and ignore
+/// DEL, without leaving the escape state, so the first byte after such a run
+/// still selects the sequence: `ESC NUL ]` opens an OSC.
+fn skip_escape_state_controls(bytes: &[u8], mut idx: usize) -> usize {
+    while matches!(
+        bytes.get(idx),
+        Some(0x00..=0x17 | 0x19 | 0x1c..=0x1f | 0x7f)
+    ) {
+        idx += 1;
+    }
+    idx
 }
 
 fn esc_intermediate_sequence_end(input: &[u8], start: usize) -> usize {
     let mut idx = start + 1;
     while idx < input.len() {
         let byte = input[idx];
-        if byte == 0x1b || is_c1_control(byte) {
+        if byte == 0x1b || byte >= 0x80 {
             return idx;
         }
         idx += 1;
@@ -2628,8 +2806,14 @@ fn string_terminator_end(input: &[u8], idx: &mut usize, allows_bel: bool) -> Opt
         if input[*idx] == 0x9c && !byte_is_inside_utf8_codepoint_or_prefix(input, *idx) {
             return Some(*idx + 1);
         }
-        if input[*idx] == 0x1b && *idx + 1 < input.len() && input[*idx + 1] == b'\\' {
-            return Some(*idx + 2);
+        if input[*idx] == 0x1b && *idx + 1 < input.len() {
+            // ESC \ is ST; any other ESC ends the string and starts a new
+            // control, as it does in a terminal's parser.
+            return Some(if input[*idx + 1] == b'\\' {
+                *idx + 2
+            } else {
+                *idx
+            });
         }
         *idx += 1;
     }
@@ -2717,15 +2901,30 @@ fn is_interactive_layout_boundary_sequence(bytes: &[u8]) -> bool {
 
 /// Length of the CSI introducer at the start of `bytes`: `ESC [`, the raw C1
 /// `9B`, or its UTF-8 encoding `C2 9B` (the tokenizer accepts both C1 forms,
-/// so every classifier must too). `None` when `bytes` is not a CSI sequence.
+/// so every classifier must too). Like the tokenizer, it counts the C0
+/// controls a terminal runs between ESC and `[`. `None` when `bytes` is not a
+/// CSI sequence.
 fn csi_introducer_len(bytes: &[u8]) -> Option<usize> {
-    if bytes.starts_with(b"\x1b[") || bytes.starts_with(b"\xc2\x9b") {
+    if bytes.starts_with(b"\xc2\x9b") {
         Some(2)
     } else if bytes.starts_with(b"\x9b") {
         Some(1)
+    } else if bytes.first() == Some(&0x1b) {
+        let introducer = skip_escape_state_controls(bytes, 1);
+        (bytes.get(introducer) == Some(&b'[')).then_some(introducer + 1)
     } else {
         None
     }
+}
+
+/// The final byte of an escape sequence with no intermediates, such as the
+/// `7` of DECSC (`ESC 7`), past the C0 controls a terminal runs after ESC.
+fn escape_final_byte(bytes: &[u8]) -> Option<u8> {
+    if bytes.first() != Some(&0x1b) {
+        return None;
+    }
+    let final_byte = skip_escape_state_controls(bytes, 1);
+    (final_byte + 1 == bytes.len()).then(|| bytes[final_byte])
 }
 
 fn is_csi_sequence(bytes: &[u8]) -> bool {
@@ -2752,14 +2951,21 @@ fn emit_highlighted(
     let mut output = Vec::new();
     let mut visible_pos = 0;
     let mut active_style: Option<Style> = None;
+    let mut starts = SgrStartCache::default();
 
     for token in tokens {
         match token {
             Token::Ansi(bytes) => {
+                if let Some(style) = active_style
+                    .as_ref()
+                    .filter(|style| saves_rendition(bytes) || fills_blank_cells_with(bytes, style))
+                {
+                    output.extend(style_reset_bytes(style, native_sgr, reset_mode));
+                }
                 native_sgr.apply_sequence(bytes);
                 output.extend_from_slice(bytes);
                 if let Some(style) = &active_style {
-                    output.extend_from_slice(style.ansi_start_with_mode(color_mode).as_bytes());
+                    output.extend_from_slice(starts.start(style, color_mode));
                 }
             }
             Token::Text(bytes) => {
@@ -2774,9 +2980,7 @@ fn emit_highlighted(
                             output.extend(style_reset_bytes(style, native_sgr, reset_mode));
                         }
                         if let Some(style) = &wanted {
-                            output.extend_from_slice(
-                                style.ansi_start_with_mode(color_mode).as_bytes(),
-                            );
+                            output.extend_from_slice(starts.start(style, color_mode));
                         }
                         active_style = wanted;
                     }
@@ -2804,14 +3008,21 @@ fn emit_interactive_highlighted(
 ) -> Vec<u8> {
     let mut output = Vec::new();
     let mut visible_pos = 0;
+    let mut starts = SgrStartCache::default();
 
     for token in tokens {
         match token {
             Token::Ansi(bytes) => {
+                if let Some(style) = active_style
+                    .as_ref()
+                    .filter(|style| saves_rendition(bytes) || fills_blank_cells_with(bytes, style))
+                {
+                    output.extend(style_reset_bytes(style, native_sgr, reset_mode));
+                }
                 native_sgr.apply_sequence(bytes);
                 output.extend_from_slice(bytes);
                 if let Some(style) = active_style {
-                    output.extend_from_slice(style.ansi_start_with_mode(color_mode).as_bytes());
+                    output.extend_from_slice(starts.start(style, color_mode));
                 }
             }
             Token::Text(bytes) => {
@@ -2825,15 +3036,28 @@ fn emit_interactive_highlighted(
                     match wanted {
                         Some(style) => {
                             if active_style.as_ref() != Some(&style) {
-                                output.extend_from_slice(
-                                    style.ansi_start_with_mode(color_mode).as_bytes(),
-                                );
+                                // A start only adds to what is drawn, so end
+                                // what the previous style set and this lacks.
+                                if let Some(previous) = active_style
+                                    .as_ref()
+                                    .filter(|previous| style_outlasts_start_of(previous, &style))
+                                {
+                                    output.extend(style_reset_bytes(
+                                        previous, native_sgr, reset_mode,
+                                    ));
+                                }
+                                output.extend_from_slice(starts.start(&style, color_mode));
                                 *active_style = Some(style);
                             }
                             output.push(*byte);
                         }
                         None => {
-                            if active_style.is_some() && !is_interactive_spacing(*byte) {
+                            // A foreground-only overlay stays open across the
+                            // spacing between highlighted columns; a style
+                            // that shows on blank cells must not paint it.
+                            if active_style.as_ref().is_some_and(|style| {
+                                !is_interactive_spacing(*byte) || style_paints_blank_cells(style)
+                            }) {
                                 let style = active_style
                                     .take()
                                     .expect("active style checked as present");
@@ -2852,8 +3076,96 @@ fn emit_interactive_highlighted(
     output
 }
 
+/// Rendered SGR start sequences of the styles one emit call has used. A
+/// style's start is emitted at every transition into it and again after every
+/// escape inside its span, so render each one once per call instead. Bounded:
+/// past the limit the last entry is replaced.
+#[derive(Default)]
+struct SgrStartCache {
+    entries: Vec<(Style, Vec<u8>)>,
+}
+
+impl SgrStartCache {
+    const MAX_ENTRIES: usize = 16;
+
+    fn start(&mut self, style: &Style, color_mode: ColorMode) -> &[u8] {
+        let index = match self.entries.iter().position(|(cached, _)| cached == style) {
+            Some(index) => index,
+            None => {
+                if self.entries.len() == Self::MAX_ENTRIES {
+                    self.entries.pop();
+                }
+                let start = style.ansi_start_with_mode(color_mode).into_bytes();
+                self.entries.push((style.clone(), start));
+                self.entries.len() - 1
+            }
+        };
+        &self.entries[index].1
+    }
+}
+
 fn is_interactive_spacing(byte: u8) -> bool {
     matches!(byte, b' ' | b'\t')
+}
+
+/// Reports whether `previous` sets a color or attribute that starting `next`
+/// on top of it would leave in place, because an SGR start only adds.
+fn style_outlasts_start_of(previous: &Style, next: &Style) -> bool {
+    (previous.foreground.is_some() && next.foreground.is_none())
+        || (previous.background.is_some() && next.background.is_none())
+        || (previous.bold && !next.bold)
+        || (previous.italic && !next.italic)
+        || (previous.underline && !next.underline)
+        || (previous.blink && !next.blink)
+        || (previous.invert && !next.invert)
+        || (previous.strike && !next.strike)
+}
+
+/// Reports whether a style shows on blank cells: a background, underline,
+/// inverse or strike is drawn on spaces and on the cells a terminal fills when
+/// it erases, inserts or scrolls, while a foreground color alone is not.
+fn style_paints_blank_cells(style: &Style) -> bool {
+    style.background.is_some() || style.underline || style.invert || style.strike
+}
+
+/// Reports whether `bytes` is a control that fills cells with blanks in the
+/// current rendition (CSI erase in display or line `J`/`K`, erase, insert or
+/// delete characters `X`/`@`/`P`, insert or delete lines `L`/`M`, scroll
+/// `S`/`T`, and index, next line and reverse index) while `style`, if left
+/// active, would show on them.
+fn fills_blank_cells_with(bytes: &[u8], style: &Style) -> bool {
+    style_paints_blank_cells(style)
+        && (is_index_control(bytes)
+            || (is_csi_sequence(bytes)
+                && matches!(
+                    bytes.last(),
+                    Some(b'J' | b'K' | b'X' | b'@' | b'P' | b'L' | b'M' | b'S' | b'T')
+                )))
+}
+
+/// Reports whether `bytes` makes the terminal save the current rendition:
+/// DECSC or CSI s, or setting mode 1048 or 1049. A highlight left active there
+/// would be saved with it and come back with the restore, on text it never
+/// matched.
+fn saves_rendition(bytes: &[u8]) -> bool {
+    saves_cursor(bytes)
+        || private_mode_sequence(bytes).is_some_and(|(modes, set)| {
+            set && modes
+                .split(|byte| *byte == b';')
+                .any(|mode| matches!(mode, b"1048" | b"1049"))
+        })
+}
+
+/// Reports whether `bytes` is index (`ESC D`), next line (`ESC E`) or reverse
+/// index (`ESC M`), in the 7-bit form (with any C0 controls a terminal runs
+/// after the ESC) or either C1 form. Like a line feed, each scrolls a blank
+/// line in when the cursor is on a scroll margin.
+fn is_index_control(bytes: &[u8]) -> bool {
+    matches!(escape_final_byte(bytes), Some(b'D' | b'E' | b'M'))
+        || matches!(
+            bytes,
+            b"\x84" | b"\x85" | b"\x8d" | b"\xc2\x84" | b"\xc2\x85" | b"\xc2\x8d"
+        )
 }
 
 fn style_for_reset_mode(style: Style, reset_mode: ResetMode) -> Style {
@@ -2915,15 +3227,125 @@ fn collect_styled_spans(visible: &[u8], styles: &[Option<Style>]) -> Vec<StyledS
     spans
 }
 
+/// The program's own rendition, tracked the way an xterm-compatible terminal
+/// keeps it: SGR changes it, RIS and DECSTR reset it, and DECSC saves it and
+/// DECRC restores it. Mode 1048 saves and restores like DECSC and DECRC, and
+/// mode 1049 saves before it switches to the alternate screen and restores
+/// after it switches back; modes 47 and 1047 switch screens without saving.
+/// CSI s and CSI u with no parameters save and restore like DECSC and DECRC,
+/// as they do while left and right margin mode is off, its default; that
+/// mode is not tracked.
 #[derive(Clone, Debug, Default)]
 struct NativeSgrState {
+    rendition: SgrRendition,
+    /// The copies saved on the normal and on the alternate screen, which a
+    /// terminal keeps apart.
+    saved: [SgrRendition; 2],
+    alternate_screen: bool,
+}
+
+impl NativeSgrState {
+    fn apply_sequence(&mut self, bytes: &[u8]) {
+        match bytes {
+            _ if escape_final_byte(bytes) == Some(b'c') => *self = Self::default(),
+            _ if saves_cursor(bytes) => self.save(),
+            _ if restores_cursor(bytes) => self.restore(),
+            _ if is_soft_terminal_reset(bytes) => {
+                self.rendition = SgrRendition::default();
+                self.saved[usize::from(self.alternate_screen)] = SgrRendition::default();
+            }
+            _ => match private_mode_sequence(bytes) {
+                Some((modes, set)) => {
+                    for mode in modes.split(|byte| *byte == b';') {
+                        match (mode, set) {
+                            (b"1048", true) => self.save(),
+                            (b"1048", false) => self.restore(),
+                            (b"1049", true) => {
+                                self.save();
+                                self.alternate_screen = true;
+                            }
+                            (b"1049", false) => {
+                                self.alternate_screen = false;
+                                self.restore();
+                            }
+                            (b"47" | b"1047", _) => self.alternate_screen = set,
+                            _ => {}
+                        }
+                    }
+                }
+                None => self.rendition.apply_sequence(bytes),
+            },
+        }
+    }
+
+    fn save(&mut self) {
+        self.saved[usize::from(self.alternate_screen)] = self.rendition.clone();
+    }
+
+    fn restore(&mut self) {
+        self.rendition = self.saved[usize::from(self.alternate_screen)].clone();
+    }
+
+    fn ansi_start(&self) -> Option<String> {
+        self.rendition.ansi_start()
+    }
+
+    fn restore_after_interactive_style(&self, style: &Style) -> Vec<u8> {
+        self.rendition.restore_after_interactive_style(style)
+    }
+}
+
+/// Reports whether `bytes` saves the cursor and its rendition: DECSC
+/// (`ESC 7`), or `CSI s` with no parameters (SCOSC).
+fn saves_cursor(bytes: &[u8]) -> bool {
+    escape_final_byte(bytes) == Some(b'7')
+        || csi_introducer_len(bytes).is_some_and(|introducer| &bytes[introducer..] == b"s")
+}
+
+/// Reports whether `bytes` restores the cursor and its rendition: DECRC
+/// (`ESC 8`), or `CSI u` with no parameters (SCORC).
+fn restores_cursor(bytes: &[u8]) -> bool {
+    escape_final_byte(bytes) == Some(b'8')
+        || csi_introducer_len(bytes).is_some_and(|introducer| &bytes[introducer..] == b"u")
+}
+
+/// Reports whether `bytes` is DECSTR (`CSI ! p`), which xterm runs whatever
+/// parameters come before the `!`.
+fn is_soft_terminal_reset(bytes: &[u8]) -> bool {
+    csi_introducer_len(bytes).is_some_and(|introducer| {
+        bytes[introducer..]
+            .strip_suffix(b"!p")
+            .is_some_and(|parameters| {
+                parameters
+                    .iter()
+                    .all(|byte| byte.is_ascii_digit() || *byte == b';')
+            })
+    })
+}
+
+/// The modes of a DEC private mode set (`CSI ? Pm h`) or reset (`CSI ? Pm l`)
+/// and whether it sets them.
+fn private_mode_sequence(bytes: &[u8]) -> Option<(&[u8], bool)> {
+    let introducer = csi_introducer_len(bytes)?;
+    let (final_byte, body) = bytes[introducer..].split_last()?;
+    let set = match final_byte {
+        b'h' => true,
+        b'l' => false,
+        _ => return None,
+    };
+    Some((body.strip_prefix(b"?")?, set))
+}
+
+/// The colors and attributes that SGR sequences have set.
+#[derive(Clone, Debug, Default)]
+struct SgrRendition {
     foreground: Option<String>,
     background: Option<String>,
     underline_color: Option<String>,
     attributes: BTreeMap<u16, String>,
 }
 
-impl NativeSgrState {
+impl SgrRendition {
     fn apply_sequence(&mut self, bytes: &[u8]) {
         let Some(body_start) = csi_introducer_len(bytes) else {
             return;
@@ -3292,7 +3714,8 @@ fn chunk_contains_prompt_echo_anywhere(visible: &[u8]) -> bool {
     false
 }
 
-fn streaming_split_at(bytes: &[u8]) -> usize {
+fn streaming_split_at(chunk: &AnsiChunk) -> usize {
+    let bytes = chunk.bytes();
     if bytes.is_empty() {
         return 0;
     }
@@ -3313,7 +3736,7 @@ fn streaming_split_at(bytes: &[u8]) -> usize {
     while start > 0 && is_token_continuation(bytes[start - 1]) {
         start -= 1;
     }
-    if let Some(ansi_end) = ansi_sequence_end_containing(bytes, start) {
+    if let Some(ansi_end) = ansi_token_end_containing(&chunk.tokens, start) {
         start = ansi_end;
     }
 
@@ -3328,6 +3751,8 @@ fn streaming_split_at(bytes: &[u8]) -> usize {
 /// If `bytes` ends partway through a multibyte UTF-8 sequence, returns the
 /// index of that sequence's lead byte so the partial codepoint can be carried
 /// to the next chunk instead of being emitted and split by an SGR escape.
+/// Bytes that no later byte can make a character, such as `F0 8E`, are not a
+/// partial codepoint: their C1-valued bytes are controls.
 fn incomplete_utf8_start(bytes: &[u8]) -> Option<usize> {
     let mut idx = bytes.len();
     let mut continuations = 0usize;
@@ -3337,16 +3762,24 @@ fn incomplete_utf8_start(bytes: &[u8]) -> Option<usize> {
     }
     let lead = *bytes.get(idx.checked_sub(1)?)?;
     let expected = match lead {
-        0xc0..=0xdf => 2,
+        0xc2..=0xdf => 2,
         0xe0..=0xef => 3,
-        0xf0..=0xf7 => 4,
+        0xf0..=0xf4 => 4,
         _ => return None,
     };
-    (continuations + 1 < expected).then_some(idx - 1)
+    (continuations + 1 < expected
+        && (continuations == 0 || utf8_prefix_can_be_completed(&bytes[idx - 1..], expected)))
+    .then_some(idx - 1)
 }
 
 pub(crate) fn is_incomplete_utf8_prefix(bytes: &[u8]) -> bool {
     incomplete_utf8_start(bytes) == Some(0)
+}
+
+/// True when a UTF-8 character starting at `idx` is cut off by the end of
+/// `bytes`.
+fn is_partial_utf8_char_at_end(bytes: &[u8], idx: usize) -> bool {
+    bytes.len() - idx < 4 && is_incomplete_utf8_prefix(&bytes[idx..])
 }
 
 /// The leading length of `pending` that is safe to surface now: up to a trailing
@@ -3365,15 +3798,19 @@ fn neutralize_incomplete_escape_at_eof(bytes: &mut Vec<u8>) {
     };
 
     let mut current = root;
+    let mut chain_has_string_control = false;
     loop {
-        let is_string_control = StringControlKind::at(bytes, current).is_some();
+        chain_has_string_control |= StringControlKind::at(bytes, current).is_some();
         match scan_escape_for_neutralization(bytes, current) {
             EscapeScan::Restart(restart) => {
                 neutralize_control_start(bytes, current);
                 current = restart;
             }
             EscapeScan::IncompleteWithinLimit | EscapeScan::IncompleteOversized => {
-                if is_string_control {
+                // A string ended by the ESC of a later control in the chain is
+                // dropped with it, like an unfinished one: emitting the string
+                // without that ESC would leave the terminal inside it.
+                if chain_has_string_control {
                     bytes.truncate(root);
                 } else {
                     neutralize_control_start(bytes, current);
@@ -3385,37 +3822,29 @@ fn neutralize_incomplete_escape_at_eof(bytes: &mut Vec<u8>) {
     }
 }
 
-fn ansi_sequence_end_containing(bytes: &[u8], index: usize) -> Option<usize> {
-    let mut end = index.min(bytes.len());
-    while end > 0 {
-        let start = bytes[..end]
-            .iter()
-            .rposition(|byte| *byte == 0x1b || is_c1_control(*byte))?;
-        if byte_is_inside_utf8_codepoint_or_prefix(bytes, start) {
-            end = start;
-            continue;
+/// The end of the control token that `index` falls inside, if any. Walking
+/// the chunk's tokens takes one pass and agrees with how the chunk is
+/// highlighted, where scanning back from `index` would rescan every earlier
+/// string introducer up to a terminator they share.
+fn ansi_token_end_containing(tokens: &[Token], index: usize) -> Option<usize> {
+    let mut offset = 0usize;
+    for token in tokens {
+        if offset >= index {
+            return None;
         }
-        let control_end = if bytes[start] == 0x1b {
-            ansi_sequence_end(bytes, start)
-        } else {
-            c1_sequence_end(bytes, start)
-        };
-        if start < index && index < control_end {
-            return Some(control_end);
+        let end = offset + token.as_bytes().len();
+        if matches!(token, Token::Ansi(_)) && index < end {
+            return Some(end);
         }
-        end = start;
+        offset = end;
     }
     None
 }
 
-fn split_prepared_pending(
-    chunk: &mut AnsiChunk,
-    split_at: usize,
-    pending: &mut Vec<u8>,
-) -> AnsiChunk {
+fn split_prepared_pending(chunk: AnsiChunk, split_at: usize, pending: &mut Vec<u8>) -> AnsiChunk {
     if split_at >= chunk.bytes.len() {
         pending.clear();
-        return chunk.clone();
+        return chunk;
     }
 
     *pending = chunk.bytes[split_at..].to_vec();
@@ -3434,7 +3863,7 @@ fn interactive_split_at_chunk(
     {
         incomplete_top_level_escape_start(chunk.bytes()).unwrap_or(chunk.bytes.len())
     } else {
-        streaming_split_at(chunk.bytes())
+        streaming_split_at(chunk)
     }
 }
 
@@ -3451,12 +3880,47 @@ pub(crate) fn incomplete_escape_start(bytes: &[u8]) -> Option<usize> {
 
 /// Returns the start of the first top-level terminal sequence that is still
 /// open at the end of `bytes`. String-control payload bytes are skipped as one
-/// sequence, so an ESC or C1 byte inside an unfinished OSC/DCS/SOS/PM/APC
-/// cannot be mistaken for a newer top-level control and cause the outer
-/// introducer to be emitted prematurely.
+/// sequence, so a C1 byte inside an unfinished OSC/DCS/SOS/PM/APC cannot be
+/// mistaken for a newer top-level control and cause the outer introducer to be
+/// emitted prematurely. An ESC that does not start ST ends the string, as it
+/// does in a terminal, and the string is carried with the control it starts.
 fn incomplete_top_level_escape_start(bytes: &[u8]) -> Option<usize> {
-    let mut idx = 0usize;
-    let mut cancellation_root = None;
+    resume_top_level_escape_scan(bytes, TopLevelScanStop::default(), &mut |_| {})
+}
+
+/// Where the top-level escape scan stops between two controls: the offset it
+/// reads on from and the first control of the cancellation chain it is in.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct TopLevelScanStop {
+    idx: usize,
+    cancellation_root: Option<usize>,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Bytes the top-level escape scans on this thread set out to read, from
+    /// where each one starts to the end of its buffer. A sanitize split that
+    /// rescans its prefix adds the prefix again, so stream tests sum them to
+    /// see how often a split rescans a read.
+    pub(crate) static TOP_LEVEL_SCAN_BYTES: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// Runs the scan of `incomplete_top_level_escape_start` on from `from`,
+/// passing each stop it makes after `from` to `stop`. Taking `stop` as a
+/// trait object keeps one copy of the scan for every caller.
+fn resume_top_level_escape_scan(
+    bytes: &[u8],
+    from: TopLevelScanStop,
+    stop: &mut dyn FnMut(TopLevelScanStop),
+) -> Option<usize> {
+    #[cfg(test)]
+    TOP_LEVEL_SCAN_BYTES
+        .with(|scanned| scanned.set(scanned.get() + bytes.len().saturating_sub(from.idx)));
+    let TopLevelScanStop {
+        mut idx,
+        mut cancellation_root,
+    } = from;
     while idx < bytes.len() {
         let start = next_stateful_control_start(bytes, idx)?;
         let relative_start = start - idx;
@@ -3477,6 +3941,10 @@ fn incomplete_top_level_escape_start(bytes: &[u8]) -> Option<usize> {
             }
             EscapeScan::IncompleteOversized => return None,
         }
+        stop(TopLevelScanStop {
+            idx,
+            cancellation_root,
+        });
     }
     None
 }
@@ -3486,35 +3954,76 @@ fn escape_is_incomplete_at(bytes: &[u8], start: usize) -> bool {
     incomplete_top_level_escape_start(&bytes[start..]) == Some(0)
 }
 
+/// Where a sanitize read must be split so the incomplete tail is carried.
+/// Raw and UTF-8 C1 strings are top-level controls like their ESC forms, so
+/// the top-level scan finds them; a C1 byte inside another string's payload
+/// is not a control and must not split that string.
+///
+/// The prefix before the split is sanitized on its own, and there a character
+/// the split cut off looks unfinished: a CSI or ESC that ends in it would be
+/// emitted whole, though the rest of the read shows its C1-valued bytes are
+/// controls. So split again until that prefix ends with no control open. Only
+/// the end of the read can cut off a character that later bytes complete.
+/// Before a split, one in text never completes, and the sanitizer already
+/// reads its C1-valued bytes as controls, so text that looks like lead bytes,
+/// as a legacy encoding does, is not carried with the split.
+///
+/// The scan of a prefix makes every stop that the scan of the read made at
+/// least `TOP_LEVEL_SCAN_LOOKAHEAD` bytes before the prefix ends, in the same
+/// state. So each split after the first resumes from the last such stop
+/// instead of rescanning the prefix from its start, and keeps every stop it
+/// makes for the next split to resume from.
 pub(crate) fn incomplete_sanitize_start(bytes: &[u8]) -> Option<usize> {
-    let escape = incomplete_top_level_escape_start(bytes).unwrap_or(bytes.len());
+    let mut stops: Vec<TopLevelScanStop> = Vec::new();
+    let escape = resume_top_level_escape_scan(bytes, TopLevelScanStop::default(), &mut |stop| {
+        if stop.idx >= stops.last().map_or(0, |last| last.idx) + SANITIZE_SPLIT_STOP_SPACING {
+            stops.push(stop);
+        }
+    })
+    .unwrap_or(bytes.len());
     let utf8 = incomplete_utf8_start(bytes).unwrap_or(bytes.len());
-    let c1 = incomplete_c1_string_escape_start(bytes).unwrap_or(bytes.len());
-    let split = escape.min(utf8).min(c1);
-    (split < bytes.len()).then_some(split)
+    let mut split = escape.min(utf8);
+    if split == bytes.len() {
+        return None;
+    }
+    for _ in 1..MAX_SANITIZE_SPLIT_PASSES {
+        while stops
+            .last()
+            .is_some_and(|stop| stop.idx + TOP_LEVEL_SCAN_LOOKAHEAD > split)
+        {
+            stops.pop();
+        }
+        let from = stops.last().copied().unwrap_or_default();
+        match resume_top_level_escape_scan(&bytes[..split], from, &mut |stop| stops.push(stop)) {
+            Some(start) => split = start,
+            None => return Some(split),
+        }
+    }
+    // Only crafted output keeps cutting off one more control. Carrying all of
+    // it leaves nothing open, and the carry limit drops it once oversized.
+    Some(0)
 }
 
-fn incomplete_c1_string_escape_start(bytes: &[u8]) -> Option<usize> {
-    for start in (0..bytes.len()).rev() {
-        let Some((kind, _payload_start)) = StringControlKind::at(bytes, start) else {
-            continue;
+/// `incomplete_sanitize_start` with each split rescanning its prefix from the
+/// start, which it must match.
+#[cfg(test)]
+fn incomplete_sanitize_start_by_rescans(bytes: &[u8]) -> Option<usize> {
+    let mut split = bytes.len();
+    for pass in 0..MAX_SANITIZE_SPLIT_PASSES {
+        let prefix = &bytes[..split];
+        let escape = incomplete_top_level_escape_start(prefix).unwrap_or(split);
+        let utf8 = if pass == 0 {
+            incomplete_utf8_start(prefix).unwrap_or(split)
+        } else {
+            split
         };
-        if !matches!(
-            kind,
-            StringControlKind::C1Osc(_) | StringControlKind::C1String(_, _)
-        ) {
-            continue;
+        let next = escape.min(utf8);
+        if next == split {
+            return (split < bytes.len()).then_some(split);
         }
-        if matches!(
-            kind,
-            StringControlKind::C1Osc(1) | StringControlKind::C1String(_, 1)
-        ) && byte_is_inside_utf8_codepoint_or_prefix(bytes, start)
-        {
-            continue;
-        }
-        return c1_string_escape_is_incomplete_at(bytes, start).then_some(start);
+        split = next;
     }
-    None
+    Some(0)
 }
 
 fn byte_is_inside_utf8_codepoint_or_prefix(bytes: &[u8], index: usize) -> bool {
@@ -3541,7 +4050,9 @@ fn byte_is_inside_utf8_codepoint_or_prefix(bytes: &[u8], index: usize) -> bool {
             continue;
         }
 
-        let prefix = &bytes[start..=index];
+        // Every byte to the end belongs to this cut-off character, and a later
+        // one that cannot continue it shows the character never completes.
+        let prefix = &bytes[start..];
         if std::str::from_utf8(prefix).is_err() && utf8_prefix_can_be_completed(prefix, width) {
             return true;
         }
@@ -3565,27 +4076,12 @@ fn utf8_prefix_can_be_completed(prefix: &[u8], expected_width: usize) -> bool {
     first_is_valid && prefix[2..].iter().all(|byte| (0x80..=0xbf).contains(byte))
 }
 
-fn c1_string_escape_is_incomplete_at(bytes: &[u8], start: usize) -> bool {
-    if bytes.len().saturating_sub(start) > MAX_INCOMPLETE_ESCAPE_BYTES {
-        return false;
-    }
-    let Some((kind, mut payload)) = StringControlKind::at(bytes, start) else {
-        return false;
-    };
-    let complete = match kind {
-        StringControlKind::C1Osc(_) => string_terminator_end(bytes, &mut payload, true).is_some(),
-        StringControlKind::C1String(_, _) => {
-            string_terminator_end(bytes, &mut payload, false).is_some()
-        }
-        StringControlKind::EscOsc | StringControlKind::EscString(_) => true,
-    };
-    !complete
-}
-
 enum EscapeScan {
     Complete(usize),
-    /// The current control was cancelled and parsing restarts at this nested
-    /// ESC/C1 introducer, which must not be swallowed as parameter/final data.
+    /// The current control was cancelled, or a string control was ended, by
+    /// this nested ESC/C1 introducer. Parsing restarts there, so it must not be
+    /// swallowed as parameter/final data, and the ended control is carried
+    /// with whatever the introducer starts.
     Restart(usize),
     IncompleteWithinLimit,
     IncompleteOversized,
@@ -3595,6 +4091,7 @@ fn neutralize_oversized_incomplete_escape(bytes: &mut [u8]) -> bool {
     let mut changed = false;
     let mut idx = 0usize;
     let mut cancellation_root = None;
+    let mut chain_has_string_control = false;
     while idx < bytes.len() {
         let Some(start) = next_stateful_control_start(bytes, idx) else {
             break;
@@ -3609,10 +4106,30 @@ fn neutralize_oversized_incomplete_escape(bytes: &mut [u8]) -> bool {
                 idx = end.max(start + 1);
             }
             EscapeScan::Restart(restart) => {
+                if cancellation_root.is_none() {
+                    chain_has_string_control = false;
+                }
                 cancellation_root.get_or_insert(start);
+                chain_has_string_control |= StringControlKind::at(bytes, start).is_some();
                 idx = restart;
             }
-            EscapeScan::IncompleteWithinLimit => break,
+            EscapeScan::IncompleteWithinLimit => {
+                // The chain is carried from its root, so cap all of it, not
+                // just its last control. A string tail is left to the string
+                // filter, whose budget also counts from the root.
+                if let Some(root) = cancellation_root {
+                    let limit = if chain_has_string_control {
+                        MAX_INCOMPLETE_ESCAPE_BYTES
+                    } else {
+                        MAX_INCOMPLETE_NON_STRING_ESCAPE_BYTES
+                    };
+                    if StringControlKind::at(bytes, start).is_none() && bytes.len() - root > limit {
+                        neutralize_restart_chain(bytes, root, start);
+                        changed = true;
+                    }
+                }
+                break;
+            }
             EscapeScan::IncompleteOversized => {
                 if let Some(root) = cancellation_root {
                     neutralize_restart_chain(bytes, root, start);
@@ -3670,22 +4187,25 @@ fn scan_escape_for_neutralization(bytes: &[u8], start: usize) -> EscapeScan {
             _ => EscapeScan::Complete(start + width),
         };
     }
-    if start + 1 >= bytes.len() {
+    let introducer = skip_escape_state_controls(bytes, start + 1);
+    if introducer >= bytes.len() {
         return incomplete_escape_scan_result(bytes, start, MAX_INCOMPLETE_NON_STRING_ESCAPE_BYTES);
     }
-    if c1_control_at(bytes, start + 1).is_some() {
-        return EscapeScan::Restart(start + 1);
+    if c1_control_at(bytes, introducer).is_some() {
+        return EscapeScan::Restart(introducer);
     }
 
-    match bytes[start + 1] {
-        b'[' => scan_csi_for_neutralization(bytes, start),
-        b']' => scan_st_terminated_for_neutralization(bytes, start, true),
-        b'P' | b'X' | b'^' | b'_' => scan_st_terminated_for_neutralization(bytes, start, false),
-        b'N' | b'O' => scan_single_shift_for_neutralization(bytes, start, start + 2),
+    match bytes[introducer] {
+        b'[' => scan_csi_for_neutralization(bytes, start, introducer + 1),
+        b']' => scan_st_terminated_for_neutralization(bytes, start, introducer + 1, true),
+        b'P' | b'X' | b'^' | b'_' => {
+            scan_st_terminated_for_neutralization(bytes, start, introducer + 1, false)
+        }
+        b'N' | b'O' => scan_single_shift_for_neutralization(bytes, start, introducer + 1),
         0x20..=0x2f => scan_esc_intermediate_for_neutralization(bytes, start),
-        0x1b | 0x80..=0x9f => EscapeScan::Restart(start + 1),
-        0x18 | 0x1a => EscapeScan::Complete(start + 2),
-        _ => EscapeScan::Complete((start + 2).min(bytes.len())),
+        0x1b | 0x80..=0x9f => EscapeScan::Restart(introducer),
+        0xa0..=0xff => non_ascii_after_escape_scan(bytes, start, introducer),
+        _ => EscapeScan::Complete(introducer + 1),
     }
 }
 
@@ -3695,6 +4215,9 @@ fn scan_esc_intermediate_for_neutralization(bytes: &[u8], start: usize) -> Escap
         let byte = bytes[idx];
         if byte == 0x1b || c1_control_at(bytes, idx).is_some() {
             return EscapeScan::Restart(idx);
+        }
+        if byte >= 0x80 {
+            return non_ascii_after_escape_scan(bytes, start, idx);
         }
         idx += 1;
         if matches!(byte, 0x18 | 0x1a) || (0x30..=0x7e).contains(&byte) {
@@ -3707,10 +4230,27 @@ fn scan_esc_intermediate_for_neutralization(bytes: &[u8], start: usize) -> Escap
     incomplete_escape_scan_result(bytes, start, MAX_INCOMPLETE_NON_STRING_ESCAPE_BYTES)
 }
 
+/// Matches the tokenizer: a non-ASCII byte ends the escape before it, so the
+/// character stays visible text. A character cut off by the end of the buffer
+/// waits with the escape: a trailing `C2` may still become a UTF-8 C1 control
+/// that cancels it, and an ESC split from the character would be read at the
+/// end of a buffer, where it is still open.
+fn non_ascii_after_escape_scan(bytes: &[u8], start: usize, idx: usize) -> EscapeScan {
+    if is_partial_utf8_char_at_end(bytes, idx) {
+        return incomplete_escape_scan_result(bytes, start, MAX_INCOMPLETE_NON_STRING_ESCAPE_BYTES);
+    }
+    EscapeScan::Complete(idx)
+}
+
 fn scan_single_shift_for_neutralization(bytes: &[u8], start: usize, mut idx: usize) -> EscapeScan {
     while idx < bytes.len() {
         if bytes[idx] == 0x1b || c1_control_at(bytes, idx).is_some() {
             return EscapeScan::Restart(idx);
+        }
+        if matches!(bytes[idx], b'\r' | b'\n') {
+            // Like the tokenizer, end the shift before a line ending rather
+            // than carry the line ending while waiting for a character.
+            return EscapeScan::Complete(idx);
         }
         if let Some(width) = valid_utf8_char_width_at(bytes, idx) {
             return EscapeScan::Complete(idx + width);
@@ -3743,6 +4283,11 @@ fn scan_c1_csi_for_neutralization(bytes: &[u8], start: usize, mut idx: usize) ->
         if let Some(width) = valid_utf8_char_width_at(bytes, idx) {
             idx += width;
             continue;
+        }
+        if is_partial_utf8_char_at_end(bytes, idx) {
+            // A C1-valued byte that completes this character is text, not a
+            // control that cancels the sequence, so wait for the rest of it.
+            break;
         }
         let byte = bytes[idx];
         idx += 1;
@@ -3779,16 +4324,18 @@ fn scan_c1_string_for_neutralization(
         {
             return EscapeScan::Complete(idx + 1);
         }
-        if bytes[idx] == 0x1b && idx + 1 < bytes.len() && bytes[idx + 1] == b'\\' {
-            return EscapeScan::Complete(idx + 2);
+        if bytes[idx] == 0x1b && idx + 1 < bytes.len() {
+            if bytes[idx + 1] == b'\\' {
+                return EscapeScan::Complete(idx + 2);
+            }
+            return EscapeScan::Restart(idx);
         }
         idx += 1;
     }
     incomplete_escape_scan_result(bytes, start, MAX_INCOMPLETE_ESCAPE_BYTES)
 }
 
-fn scan_csi_for_neutralization(bytes: &[u8], start: usize) -> EscapeScan {
-    let mut idx = start + 2;
+fn scan_csi_for_neutralization(bytes: &[u8], start: usize, mut idx: usize) -> EscapeScan {
     while idx < bytes.len() {
         if bytes[idx] == 0x1b || c1_control_at(bytes, idx).is_some() {
             return EscapeScan::Restart(idx);
@@ -3796,6 +4343,11 @@ fn scan_csi_for_neutralization(bytes: &[u8], start: usize) -> EscapeScan {
         if let Some(width) = valid_utf8_char_width_at(bytes, idx) {
             idx += width;
             continue;
+        }
+        if is_partial_utf8_char_at_end(bytes, idx) {
+            // A C1-valued byte that completes this character is text, not a
+            // control that cancels the sequence, so wait for the rest of it.
+            break;
         }
         let byte = bytes[idx];
         idx += 1;
@@ -3812,9 +4364,9 @@ fn scan_csi_for_neutralization(bytes: &[u8], start: usize) -> EscapeScan {
 fn scan_st_terminated_for_neutralization(
     bytes: &[u8],
     start: usize,
+    mut idx: usize,
     allows_bel: bool,
 ) -> EscapeScan {
-    let mut idx = start + 2;
     while idx < bytes.len() {
         if idx.saturating_sub(start) > MAX_INCOMPLETE_ESCAPE_BYTES {
             return EscapeScan::IncompleteOversized;
@@ -3835,8 +4387,11 @@ fn scan_st_terminated_for_neutralization(
         if bytes[idx] == 0x9c && !byte_is_inside_utf8_codepoint_or_prefix(bytes, idx) {
             return EscapeScan::Complete(idx + 1);
         }
-        if bytes[idx] == 0x1b && idx + 1 < bytes.len() && bytes[idx + 1] == b'\\' {
-            return EscapeScan::Complete(idx + 2);
+        if bytes[idx] == 0x1b && idx + 1 < bytes.len() {
+            if bytes[idx + 1] == b'\\' {
+                return EscapeScan::Complete(idx + 2);
+            }
+            return EscapeScan::Restart(idx);
         }
         idx += 1;
     }
@@ -3872,27 +4427,139 @@ pub fn strip_ansi(input: &[u8]) -> Vec<u8> {
 /// (window-title spoofing, OSC 52 clipboard injection, DCS payload smuggling);
 /// everything a normal TUI needs to render survives. An unterminated string
 /// sequence at the end of the input is dropped rather than passed through.
+/// So are controls that a terminal could read as a string introducer or that
+/// could switch it out of UTF-8: an ESC that a non-ASCII byte follows (the
+/// byte is kept) with any control that the ESC cancelled, every DOCS sequence
+/// (`ESC %`), a CSI that holds a byte from 80 up or that a C1 control cancels,
+/// and a CSI that sets, resets or restores DEC private mode 42.
 pub fn strip_string_escapes(input: &[u8]) -> Vec<u8> {
     let mut sanitized = Vec::with_capacity(input.len());
     let mut idx = 0;
     while idx < input.len() {
         if input[idx] == 0x1b || c1_control_at(input, idx).is_some() {
-            let root = idx;
+            // The chain is emitted up to `copied` as it goes, so a string
+            // control, DOCS or CSI that it reaches can still drop all of it.
+            let chain_start = sanitized.len();
+            let mut copied = idx;
             let mut current = idx;
             loop {
                 if let Some((kind, _payload_start)) = StringControlKind::at(input, current) {
+                    sanitized.truncate(chain_start);
                     idx = kind.sequence_end(input, current);
                     break;
                 }
+                // xterm reads a character of U+00FF or below after ESC from
+                // the Latin-1 half of its escape table, which mirrors ASCII:
+                // U+00DD opens an OSC and U+00D0 a DCS, as the raw bytes do in
+                // a Latin-1 xterm. In UTF-8 mode it ignores a C1 control there,
+                // UTF-8 encoded or raw, and Alacritty ignores every byte from
+                // 80 up, so in `ESC 80 ]` the `]` opens an OSC. Other
+                // terminals show the character or run the control, so the ESC
+                // run is dropped and its C0 controls are kept. A control that
+                // its first ESC cancelled would be completed by the bytes
+                // after the run, so it is dropped with the chain that reached
+                // it, apart from the C0 controls of the ESC runs in that
+                // chain. A C1 control goes on with the chain, as it would after
+                // the ESC, so a string control that it reaches still drops the
+                // chain from its first control; a C1 string control is left to
+                // the chain. A character is read on its own, and one cut off
+                // by the end of the input stays whole, as it did while the ESC
+                // waited for it, so its C1-valued bytes are not read as
+                // controls that drop it.
+                if escape_precedes_non_ascii(input, current) {
+                    let next = skip_escape_state_controls(input, current + 1);
+                    if c1_control_at(input, next).is_some() {
+                        push_escape_run_controls(&mut sanitized, input, copied, current, next);
+                        copied = next;
+                        current = next;
+                        continue;
+                    }
+                    let end = if is_partial_utf8_char_at_end(input, next) {
+                        input.len()
+                    } else {
+                        next
+                    };
+                    push_escape_run_controls(&mut sanitized, input, copied, current, end);
+                    idx = end;
+                    break;
+                }
+                let docs = is_docs_escape(input, current);
+                let csi_parameters = csi_parameters_start(input, current);
                 match scan_escape_for_neutralization(input, current) {
-                    EscapeScan::Restart(restart) => current = restart,
-                    EscapeScan::Complete(end) => {
-                        sanitized.extend_from_slice(&input[root..end]);
+                    // DOCS selects how xterm decodes its input: `ESC % @`
+                    // leaves UTF-8 unless its utf8 resource is "always", and
+                    // then the 9D in U+201D opens an OSC. xterm also ignores a
+                    // C1 control inside DOCS and reads U+00C0 and U+00C7 as
+                    // `@` and `G`, so DOCS is dropped however it ends, with
+                    // the chain that reached it. The C0 controls and DEL
+                    // inside it and a CAN or SUB that ends it go with it; an
+                    // ESC, C1 control or other non-ASCII byte that ends it is
+                    // read on its own. A terminal already set to another
+                    // encoding is beyond what --sanitize can protect, since
+                    // prismtty reads output as UTF-8.
+                    EscapeScan::Complete(end) | EscapeScan::Restart(end) if docs => {
+                        sanitized.truncate(chain_start);
                         idx = end;
                         break;
                     }
+                    // In UTF-8 mode xterm ignores a C1 control inside a CSI
+                    // and reads a character from U+00A0 to U+00FF there, which
+                    // a lone raw A0-BF byte before a byte from 21 to 7F decodes
+                    // to, as the ASCII byte it mirrors. So it reads
+                    // `CSI ? 4 C2 B2 h` and `CSI ? 4 C2 80 2 h` as
+                    // `CSI ? 42 h`, and Alacritty ignores every byte from 80
+                    // up there. A CSI that holds a byte from 80 up, however it
+                    // ends, or that a C1 control cancels is dropped with the
+                    // chain that reached it, and the C1 control is read as
+                    // before.
+                    EscapeScan::Restart(restart)
+                        if csi_parameters.is_some_and(|parameters| {
+                            input[parameters..=restart].iter().any(|byte| *byte >= 0x80)
+                        }) =>
+                    {
+                        sanitized.truncate(chain_start);
+                        copied = restart;
+                        current = restart;
+                    }
+                    EscapeScan::Restart(restart) => current = restart,
+                    // So is one that sets, resets or restores mode 42
+                    // (DECNRCM), which can take xterm out of UTF-8 even when
+                    // its utf8 resource is "always", and then the 9D in U+201D
+                    // opens an OSC.
+                    EscapeScan::Complete(end)
+                        if csi_parameters.is_some_and(|parameters| {
+                            input[parameters..end].iter().any(|byte| *byte >= 0x80)
+                                || changes_decnrcm(&input[parameters..end])
+                        }) =>
+                    {
+                        sanitized.truncate(chain_start);
+                        idx = end;
+                        break;
+                    }
+                    EscapeScan::Complete(end) => {
+                        sanitized.extend_from_slice(&input[copied..end]);
+                        idx = end;
+                        break;
+                    }
+                    EscapeScan::IncompleteOversized
+                        if input[current] == 0x1b
+                            && skip_escape_state_controls(input, current + 1) == input.len() =>
+                    {
+                        // The terminal is still in the escape state after these
+                        // controls, so emitting the ESC would let a `]` in the
+                        // next read open a string control.
+                        push_escape_run_controls(
+                            &mut sanitized,
+                            input,
+                            copied,
+                            current,
+                            input.len(),
+                        );
+                        idx = input.len();
+                        break;
+                    }
                     EscapeScan::IncompleteWithinLimit | EscapeScan::IncompleteOversized => {
-                        sanitized.extend_from_slice(&input[root..]);
+                        sanitized.extend_from_slice(&input[copied..]);
                         idx = input.len();
                         break;
                     }
@@ -3909,6 +4576,109 @@ pub fn strip_string_escapes(input: &[u8]) -> Vec<u8> {
         idx += 1;
     }
     sanitized
+}
+
+/// True when the ESC at `start`, past its escape-state controls, is followed
+/// by a byte from 80 up that does not start a C1 string control: a UTF-8 lead
+/// byte, a raw Latin-1 byte, an invalid byte or a C1 control, raw or UTF-8
+/// encoded. A C1 string control is left to the chain, which drops it with the
+/// ESC.
+fn escape_precedes_non_ascii(bytes: &[u8], start: usize) -> bool {
+    if bytes[start] != 0x1b {
+        return false;
+    }
+    let next = skip_escape_state_controls(bytes, start + 1);
+    match c1_control_at(bytes, next) {
+        Some((control, _width)) => !is_c1_string_escape_start(control),
+        None => bytes.get(next).is_some_and(|byte| *byte >= 0x80),
+    }
+}
+
+/// True when the ESC at `start`, past its escape-state controls, starts a
+/// DOCS sequence, whose first intermediate is `%`.
+fn is_docs_escape(bytes: &[u8], start: usize) -> bool {
+    bytes[start] == 0x1b && bytes.get(skip_escape_state_controls(bytes, start + 1)) == Some(&b'%')
+}
+
+/// Appends the controls of the bare ESC run in `input[from..=current]` that
+/// ends with the ESC at `current`, each ESC followed only by escape-state
+/// controls up to the next: `input[open..end]` without its ESCs, where `open`
+/// starts the run. A bare ESC that the next one cancels leaves the terminal in
+/// the escape state too, so the byte at `end` would still select a sequence.
+/// A real control before the run, which its first ESC cancelled, is not
+/// appended.
+fn push_escape_run_controls(
+    sanitized: &mut Vec<u8>,
+    input: &[u8],
+    from: usize,
+    current: usize,
+    end: usize,
+) {
+    let mut open = current;
+    while let Some(previous) = input[from..open].iter().rposition(|byte| *byte == 0x1b) {
+        if skip_escape_state_controls(input, from + previous + 1) != open {
+            break;
+        }
+        open = from + previous;
+    }
+    sanitized.extend(input[open..end].iter().filter(|byte| **byte != 0x1b));
+}
+
+/// Where the parameters of a CSI that starts at `start` begin: after `ESC [`,
+/// past the escape-state controls between them, or after a C1 CSI, raw or
+/// UTF-8 encoded.
+fn csi_parameters_start(bytes: &[u8], start: usize) -> Option<usize> {
+    if bytes[start] == 0x1b {
+        let introducer = skip_escape_state_controls(bytes, start + 1);
+        return (bytes.get(introducer) == Some(&b'[')).then_some(introducer + 1);
+    }
+    match c1_control_at(bytes, start) {
+        Some((0x9b, width)) => Some(start + width),
+        _ => None,
+    }
+}
+
+/// True when `csi`, the bytes of an ASCII CSI after its introducer, sets,
+/// resets or restores DEC private mode 42: `?`, parameters split on `;` and
+/// `:` of which one is 42, and the final `h`, `l` or `r`, with no
+/// intermediate. The terminal runs or ignores C0 controls and DEL inside a
+/// CSI without ending it, so they are skipped. xterm reads the digits after
+/// its last parameter into it, so after 29 others `4;2` is 42 too.
+fn changes_decnrcm(csi: &[u8]) -> bool {
+    let Some((final_byte, parameters)) = csi.split_last() else {
+        return false;
+    };
+    if !matches!(final_byte, b'h' | b'l' | b'r') {
+        return false;
+    }
+    let mut parameters = parameters
+        .iter()
+        .filter(|byte| !matches!(byte, 0x00..=0x1f | 0x7f));
+    if parameters.next() != Some(&b'?') {
+        return false;
+    }
+    // The parameter being read, capped at 65535 as xterm caps it, or `None`
+    // once a byte other than a digit means it cannot be 42. Past the last
+    // parameter that xterm keeps, `;` and `:` are skipped and digits run on.
+    let mut value = Some(0u32);
+    let mut separators = 0;
+    let mut sets_42 = false;
+    for byte in parameters {
+        match byte {
+            b'0'..=b'9' => {
+                value = value.map(|value| (value * 10 + u32::from(byte - b'0')).min(65_535));
+            }
+            b';' | b':' if separators < XTERM_MAX_CSI_PARAMETERS - 1 => {
+                sets_42 |= value == Some(42);
+                separators += 1;
+                value = Some(0);
+            }
+            b';' | b':' => {}
+            b'<'..=b'?' => value = None,
+            _ => return false,
+        }
+    }
+    sets_42 || value == Some(42)
 }
 
 fn valid_utf8_char_width_at(input: &[u8], idx: usize) -> Option<usize> {
@@ -4178,6 +4948,19 @@ rules:
         assert!(Highlighter::from_config(maximum_pattern).is_ok());
     }
 
+    // PCRE2 before 10.38 allows `\K` in a lookaround by default, so a rule like
+    // `(?=ab\K)` reports a match on "xx ab" that starts at 5 and ends at 3.
+    // Resuming the search at 3 would find the same match forever.
+    #[test]
+    fn match_stepping_moves_past_a_match_that_starts_after_its_end() {
+        assert_eq!(super::next_match_search(5, 3, None), (4, false));
+        assert_eq!(super::next_match_search(5, 3, Some(3)), (4, true));
+
+        assert_eq!(super::next_match_search(0, 0, None), (1, false));
+        assert_eq!(super::next_match_search(4, 4, Some(4)), (5, true));
+        assert_eq!(super::next_match_search(1, 3, Some(0)), (3, false));
+    }
+
     #[test]
     fn match_limit_errors_are_recorded_in_rule_telemetry() {
         let config = PrismConfig::from_chromaterm_yaml(
@@ -4415,6 +5198,667 @@ rules:
         }
     }
 
+    // A VT parser executes C0 controls (except CAN, SUB and ESC) and ignores
+    // DEL without leaving the escape state, so `ESC NUL ]` still opens an OSC.
+    #[test]
+    fn sanitize_strips_string_escapes_after_escape_state_controls() {
+        for control in [0x00u8, 0x01, b'\r', b'\n', 0x19, 0x1c, 0x1f, 0x7f] {
+            for (introducer, terminator) in [
+                (b"]52;c;U0VDUkVU".as_slice(), b"\x07".as_slice()),
+                (b"]2;TITLE".as_slice(), b"\x1b\\".as_slice()),
+                (b"P1$qm".as_slice(), b"\x1b\\".as_slice()),
+                (b"_apc".as_slice(), b"\x1b\\".as_slice()),
+            ] {
+                let input = [
+                    b"a\x1b".as_slice(),
+                    &[control],
+                    introducer,
+                    terminator,
+                    b"b",
+                ]
+                .concat();
+                assert_eq!(
+                    super::strip_string_escapes(&input),
+                    b"ab",
+                    "string survived after {control:#04x}: {input:02x?}"
+                );
+                let unterminated = [b"a\x1b".as_slice(), &[control, control], introducer].concat();
+                assert_eq!(super::strip_string_escapes(&unterminated), b"a");
+                assert_eq!(super::incomplete_sanitize_start(&unterminated), Some(1));
+            }
+            let split = [b"ok\x1b".as_slice(), &[control]].concat();
+            assert_eq!(super::incomplete_sanitize_start(&split), Some(2));
+        }
+
+        // CAN and SUB still cancel the escape, so the bracket is plain text.
+        assert_eq!(super::strip_string_escapes(b"\x1b\x18]x"), b"\x1b\x18]x");
+        assert_eq!(super::strip_string_escapes(b"\x1b\x1a]x"), b"\x1b\x1a]x");
+
+        // An escape left open by a long run of controls is not emitted, since
+        // the terminal would still be waiting to read a string introducer.
+        // Neither is a bare escape that it cancelled, which would leave the
+        // terminal in the same state, nor a control that the run cancelled,
+        // which the next read could complete.
+        let controls = vec![0; super::MAX_INCOMPLETE_NON_STRING_ESCAPE_BYTES + 1];
+        for (prefix, expected) in [
+            (b"ok\x1b".as_slice(), b"ok".as_slice()),
+            (b"ok\x1b\x1b".as_slice(), b"ok".as_slice()),
+            (b"ok\x1b\x00\x1b".as_slice(), b"ok\x00".as_slice()),
+            (b"ok\x1b[1\x1b\x1b".as_slice(), b"ok".as_slice()),
+            (b"ok\x1b[?4\x1b\r\x1b".as_slice(), b"ok\r".as_slice()),
+            (b"ok\x9b1\x1b".as_slice(), b"ok".as_slice()),
+            (b"ok\x1b(\x1b".as_slice(), b"ok".as_slice()),
+        ] {
+            let oversized = [prefix, &controls].concat();
+            assert_eq!(
+                super::strip_string_escapes(&oversized),
+                [expected, &controls].concat(),
+                "open ESC was emitted for {prefix:02x?}"
+            );
+        }
+    }
+
+    // xterm reads a character of U+00FF or below after ESC from the upper half
+    // of its escape table, which mirrors ASCII: ESC U+00DD opens an OSC, U+00D0
+    // a DCS, U+00D8 an SOS, U+00DE a PM, U+00DF an APC, U+00DB a CSI and
+    // U+00DC is ST, and a Latin-1 xterm reads the raw bytes the same way.
+    // Escape-state controls and a bare ESC that the next one cancels leave the
+    // terminal in the escape state, so none of those ESCs may reach it. Other
+    // terminals show the character, so it and the controls stay visible.
+    #[test]
+    fn sanitize_drops_escapes_that_a_latin1_character_would_complete() {
+        for code in [0xd0u8, 0xd8, 0xdb, 0xdc, 0xdd, 0xde, 0xdf, 0xa0, 0xc0, 0xff] {
+            let encoded = char::from(code).to_string().into_bytes();
+            for character in [encoded.as_slice(), &[code]] {
+                for (escapes, kept) in [
+                    (b"\x1b".as_slice(), b"".as_slice()),
+                    (b"\x1b\x00", b"\x00"),
+                    (b"\x1b\x7f\r\n", b"\x7f\r\n"),
+                    (b"\x1b\x1b", b""),
+                    (b"\x1b\x00\x1b\x01", b"\x00\x01"),
+                    // A real control that a bare ESC cancels is dropped too,
+                    // or the character would complete it, and the controls
+                    // of the run stay.
+                    (b"\x1b[1\x1b", b""),
+                    (b"\x1b(\x1b\x1b\x00", b"\x00"),
+                    (b"\x9b1\x1b", b""),
+                    (b"\x1b[?4\x1b\r", b"\r"),
+                    // A string control that the bare ESC ends is dropped.
+                    (b"\x1b]0;x\x1b", b""),
+                ] {
+                    let input = [b"a", escapes, character, b"0;title\x07b"].concat();
+                    let expected = [b"a", kept, character, b"0;title\x07b"].concat();
+                    assert_eq!(
+                        super::strip_string_escapes(&input),
+                        expected,
+                        "ESC was emitted before {character:02x?} in {input:02x?}"
+                    );
+                }
+            }
+        }
+
+        // The character may be cut off by the end of the input, or follow a
+        // run of controls past the limit for an open escape. A cut-off
+        // character stays whole, though its continuation bytes look like C1
+        // controls.
+        for (input, expected) in [
+            (b"a\x1b\xc3".as_slice(), b"a\xc3".as_slice()),
+            (b"a\x1b\x00\xc2", b"a\x00\xc2"),
+            (b"a\x1b\xe2\x9d", b"a\xe2\x9d"),
+            (b"a\x1b\x07\xf0\x9f\x8e", b"a\x07\xf0\x9f\x8e"),
+            (b"a\x1b\x1b\xf0\x9f\x98", b"a\xf0\x9f\x98"),
+            (b"a\x1b[1\x1b\xe2\x90", b"a\xe2\x90"),
+        ] {
+            assert_eq!(super::strip_string_escapes(input), expected, "{input:02x?}");
+        }
+        let controls = vec![0; super::MAX_INCOMPLETE_NON_STRING_ESCAPE_BYTES + 1];
+        for character in [b"\xc3\x9d".as_slice(), b"\xdd", b"\xc3", b"\xe2\x9d"] {
+            let input = [b"ok\x1b\x1b".as_slice(), &controls, character].concat();
+            assert_eq!(
+                super::strip_string_escapes(&input),
+                [b"ok".as_slice(), &controls, character].concat()
+            );
+        }
+
+        // A C1 string control is dropped with the ESC, raw or UTF-8 encoded,
+        // and ESC followed by an ASCII byte is unchanged.
+        for input in [
+            b"a\x1b\x9d0;t\x07b".as_slice(),
+            b"a\x1b\xc2\x9d0;t\x07b",
+            b"a\x1b\x00\xc2\x90q\x1b\\b",
+            b"a\x1b\x1b\x980;t\x1b\\b",
+        ] {
+            assert_eq!(super::strip_string_escapes(input), b"ab", "{input:02x?}");
+        }
+        for input in [
+            b"a\x1b7b\x1b\x008\x1b(Bc".as_slice(),
+            b"a\x1b",
+            b"a\x1b\x00",
+        ] {
+            assert_eq!(super::strip_string_escapes(input), input, "{input:02x?}");
+        }
+    }
+
+    // In UTF-8 mode xterm ignores a C1 control in the escape state, decoded
+    // from UTF-8 or from a lone raw byte that an ASCII byte follows, and
+    // Alacritty ignores every byte from 80 up there, so the escape goes on
+    // past it: ESC C2 80 ] and ESC 80 ] open an OSC, as does ESC C2 80 U+00DD.
+    // VTE-style parsers read the control as cancelling the ESC instead. The
+    // ESC run is dropped as before a Latin-1 character and the control is
+    // read on its own: one that starts a string is dropped with its string,
+    // as before, and any other one is kept.
+    #[test]
+    fn sanitize_drops_escapes_that_a_c1_control_follows() {
+        for control in 0x80u8..=0x9f {
+            for encoded in [[0xc2, control].as_slice(), &[control]] {
+                for (escapes, kept) in [
+                    (b"\x1b".as_slice(), b"".as_slice()),
+                    (b"\x1b\x00", b"\x00"),
+                    (b"\x1b\x7f\r\n", b"\x7f\r\n"),
+                    (b"\x1b\x1b", b""),
+                    (b"\x1b\x00\x1b\x01", b"\x00\x01"),
+                ] {
+                    let input = [b"a", escapes, encoded, b"]0;title\x1b\\b"].concat();
+                    let expected = if super::is_c1_string_escape_start(control) {
+                        b"ab".to_vec()
+                    } else {
+                        [b"a", kept, encoded, b"]0;title\x1b\\b"].concat()
+                    };
+                    assert_eq!(
+                        super::strip_string_escapes(&input),
+                        expected,
+                        "{input:02x?}"
+                    );
+                }
+            }
+        }
+
+        for (input, expected) in [
+            (
+                b"a\x1b\xc2\x80]0;title\x07b".as_slice(),
+                b"a\xc2\x80]0;title\x07b".as_slice(),
+            ),
+            (b"a\x1b\x80]0;title\x07b", b"a\x80]0;title\x07b"),
+            (b"a\x1b\xc2\x9b]0;t\x07b", b"a\xc2\x9b]0;t\x07b"),
+            (b"a\x1b\x9b]0;t\x07b", b"a\x9b]0;t\x07b"),
+            (b"a\x1b\xc2\x9c]0;t\x07b", b"a\xc2\x9c]0;t\x07b"),
+            (b"a\x1b\xc2\x8e]0;t\x07b", b"a\xc2\x8e]0;t\x07b"),
+            (b"a\x1b\x00\xc2\x80]0;t\x07b", b"a\x00\xc2\x80]0;t\x07b"),
+            (b"a\x1b\x00\x8e]0;t\x07b", b"a\x00\x8e]0;t\x07b"),
+            (b"a\x1b\x9b31mb", b"a\x9b31mb"),
+            (b"a\x1b\x80\x81]0;t\x07b", b"a\x80\x81]0;t\x07b"),
+            (
+                b"a\x1b\xc2\x80\xc2\x81]0;t\x07b",
+                b"a\xc2\x80\xc2\x81]0;t\x07b",
+            ),
+            (
+                b"a\x1b\xc2\x80\xc3\x9d0;t\x07b",
+                b"a\xc2\x80\xc3\x9d0;t\x07b",
+            ),
+            (b"a\x1b\xc2\x9b31mb", b"a\xc2\x9b31mb"),
+            // A real control that a bare ESC cancels is dropped too, or the
+            // bytes after the control would complete it, and so is a string
+            // control that the bare ESC ends.
+            (b"a\x1b[1\x1b\xc2\x80]0;t\x07b", b"a\xc2\x80]0;t\x07b"),
+            (b"a\x1b(\x1b\x1b\x00\xc2\x8e]b", b"a\x00\xc2\x8e]b"),
+            (b"a\x9b1\x1b\xc2\x80]0;t\x07b", b"a\xc2\x80]0;t\x07b"),
+            (b"a\x1b[?4\x1b\x802hb", b"a\x802hb"),
+            (b"a\x1b]0;x\x1b\xc2\x80]0;t\x07b", b"a\xc2\x80]0;t\x07b"),
+            // A string control is still dropped with the whole chain.
+            (b"a\x1b[1\x1b\xc2\x9d0;t\x07b", b"ab"),
+            (b"a\x1b\xc2\x80\xc2\x9d0;t\x07b", b"a\xc2\x80b"),
+            (b"a\x1b\x80\x9d0;t\x07b", b"a\x80b"),
+            // Cut off by the end of the input, the character stays whole.
+            (b"a\x1b\xc2", b"a\xc2"),
+            (b"a\x1b\x1b\x00\xc2", b"a\x00\xc2"),
+        ] {
+            assert_eq!(super::strip_string_escapes(input), expected, "{input:02x?}");
+        }
+
+        let controls = vec![0; super::MAX_INCOMPLETE_NON_STRING_ESCAPE_BYTES + 1];
+        for control in [
+            b"\xc2\x80".as_slice(),
+            b"\xc2\x9b",
+            b"\xc2\x8e",
+            b"\x80",
+            b"\x9b",
+            b"\x8e",
+        ] {
+            let input = [b"ok\x1b\x1b".as_slice(), &controls, control, b"]0;t\x07"].concat();
+            assert_eq!(
+                super::strip_string_escapes(&input),
+                [b"ok".as_slice(), &controls, control, b"]0;t\x07"].concat()
+            );
+        }
+    }
+
+    // A C1 control after a dropped ESC run goes on with the chain whose
+    // control the run's first ESC cancelled, as it would after the ESC. That
+    // control is dropped, or the bytes after the run would complete it, and a
+    // string control that a CSI or single shift there reaches drops the chain
+    // from its first control. A chain that ends without one keeps the
+    // controls of the run and the C1 control's sequence.
+    #[test]
+    fn sanitize_keeps_the_chain_of_a_c1_control_after_a_dropped_escape() {
+        for root in [
+            b"\x1b[1".as_slice(),
+            b"\x1b(",
+            b"\x9b1",
+            b"\xc2\x9b1",
+            b"\x8e",
+            b"\x8f",
+        ] {
+            for (escapes, kept) in [
+                (b"\x1b".as_slice(), b"".as_slice()),
+                (b"\x1b\x00", b"\x00"),
+                (b"\x1b\x1b\r", b"\r"),
+            ] {
+                for (control, end) in [
+                    (b"\xc2\x9b1".as_slice(), b"m".as_slice()),
+                    (b"\x9b1", b"m"),
+                    (b"\xc2\x8e", b"x"),
+                    (b"\x8e", b"x"),
+                    (b"\xc2\x8f\x00", b"x"),
+                    (b"\x8f", b"x"),
+                ] {
+                    let chain = [root, escapes, control].concat();
+                    for (string, after) in [
+                        (b"\x1b]0;t\x07".as_slice(), b"b".as_slice()),
+                        (b"\x9d0;t\x07", b"b"),
+                        (b"\xc2\x90q\x1b\\", b"b"),
+                        (b"\x1b\x00\x1b_x\x1b\\", b"b"),
+                        // An unterminated string at the end of the input.
+                        (b"\x1b]0;t", b""),
+                    ] {
+                        let input = [b"a".as_slice(), &chain, string, after].concat();
+                        assert_eq!(
+                            super::strip_string_escapes(&input),
+                            [b"a", after].concat(),
+                            "{input:02x?}"
+                        );
+                    }
+                    let input = [b"a".as_slice(), &chain, end, b"b"].concat();
+                    assert_eq!(
+                        super::strip_string_escapes(&input),
+                        [b"a", kept, control, end, b"b"].concat(),
+                        "{input:02x?}"
+                    );
+                }
+            }
+        }
+
+        // The chain may pass more than one dropped ESC run, and a C1 control
+        // that starts no sequence ends it.
+        for (input, expected) in [
+            (
+                b"a\x1b[1\x1b\x9b1\x1b\xc2\x8e\x1b]0;t\x07b".as_slice(),
+                b"ab".as_slice(),
+            ),
+            (b"a\x1b[1\x1b\x9b1\x1b\xc2\x8exb", b"a\xc2\x8exb"),
+            (b"a\x1b(\x1b\x80\x1b]0;t\x07b", b"a\x80b"),
+        ] {
+            assert_eq!(super::strip_string_escapes(input), expected, "{input:02x?}");
+        }
+
+        // A later dropped ESC run keeps the C0 controls that an earlier one
+        // in the chain kept, since the terminal runs them either way.
+        for (input, expected) in [
+            (
+                b"a\x1b\r\xc2\x8e\x1b\xc3\x9eb".as_slice(),
+                b"a\r\xc3\x9eb".as_slice(),
+            ),
+            (b"a\x1b\n\x9b1\x1b\x80b", b"a\n\x80b"),
+            (b"a\x1b\r\x8e\x1b\x00\x1b\xc2\x9b1mb", b"a\r\x00\xc2\x9b1mb"),
+        ] {
+            assert_eq!(super::strip_string_escapes(input), expected, "{input:02x?}");
+        }
+        let controls = vec![0; super::MAX_INCOMPLETE_ESCAPE_BYTES + 1];
+        let input = [b"a\x1b\r\xc2\x8e\x1b".as_slice(), &controls].concat();
+        assert_eq!(
+            super::strip_string_escapes(&input),
+            [b"a\r".as_slice(), &controls].concat()
+        );
+    }
+
+    // DOCS selects how xterm decodes its input: after `ESC % @` it reads
+    // U+201D (E2 80 9D) byte by byte, and the 9D opens an OSC. xterm ignores
+    // a C1 control inside DOCS and reads U+00C0 and U+00C7 as its `@` and `G`,
+    // so --sanitize drops every DOCS however it ends, with the chain that
+    // reached it. The C0 controls and DEL inside it and a CAN or SUB that
+    // ends it go with it; an ESC, C1 control or other non-ASCII byte that
+    // ends it is read on its own.
+    #[test]
+    fn sanitize_drops_docs_sequences() {
+        let rest = "\u{201d}0;title\x07b".as_bytes();
+        for docs in [
+            b"\x1b%@".as_slice(),
+            b"\x1b%G",
+            b"\x1b%8",
+            b"\x1b%/G",
+            b"\x1b%/@",
+            b"\x1b% @",
+            b"\x1b\x00%\r@",
+            b"\x1b\x7f%\x00/\x00G",
+            b"\x1b\x1b%G",
+            b"\x1b[1\x1b%@",
+            b"\x1b(\x1b\x00%@",
+            b"\x9b1\x1b%@",
+            b"\xc2\x8e\x1b%G",
+            b"\x1b%\x18",
+            b"\x1b%\x1a",
+            b"\x1b%\r/\n\x18",
+        ] {
+            let input = [b"a", docs, rest].concat();
+            assert_eq!(
+                super::strip_string_escapes(&input),
+                [b"a", rest].concat(),
+                "{input:02x?}"
+            );
+        }
+
+        for (input, expected) in [
+            (b"a\x1b%\xc3\x80b".as_slice(), b"a\xc3\x80b".as_slice()),
+            (b"a\x1b%\xc3\x87b", b"a\xc3\x87b"),
+            (b"a\x1b%/\xc3\x87b", b"a\xc3\x87b"),
+            (b"a\x1b%\xc0b", b"a\xc0b"),
+            (b"a\x1b%\xc2\x80@b", b"a\xc2\x80@b"),
+            (b"a\x1b%\x80@b", b"a\x80@b"),
+            (b"a\x1b%\x9b1mb", b"a\x9b1mb"),
+            (b"a\x1b%\xc2\x9d0;t\x07b", b"ab"),
+            (b"a\x1b%\x1b[1mb", b"a\x1b[1mb"),
+            (b"a\x1b%\x1b]0;t\x07b", b"ab"),
+            (b"a\x1b%\x1b%Gb", b"ab"),
+        ] {
+            assert_eq!(super::strip_string_escapes(input), expected, "{input:02x?}");
+        }
+
+        // Cut off by the end of a read, it is carried like any other
+        // incomplete escape, so the final in the next read drops it.
+        for input in [b"a\x1b%".as_slice(), b"a\x1b%/", b"a\x1b\x00%\x00"] {
+            assert_eq!(super::incomplete_sanitize_start(input), Some(1));
+        }
+
+        // Another first intermediate starts no DOCS, and the other filters
+        // handle DOCS as before.
+        for input in [b"a\x1b(%5b".as_slice(), b"a\x1b %Gb", b"a\x1b#8b"] {
+            assert_eq!(super::strip_string_escapes(input), input, "{input:02x?}");
+        }
+        let docs = b"a\x1b%@b\x1b%Gc";
+        assert_eq!(super::strip_ansi(docs), b"abc");
+        let mut streaming = StreamingHighlighter::new(
+            Highlighter::from_config(PrismConfig::default()).expect("empty config"),
+        );
+        let mut highlighted = streaming.push(docs);
+        highlighted.extend(streaming.finish());
+        assert_eq!(highlighted, docs);
+    }
+
+    // In UTF-8 mode xterm ignores a C1 control inside a CSI, UTF-8 encoded or
+    // a lone raw byte that an ASCII byte follows, reads a character from
+    // U+00A0 to U+00FF there, or a lone raw A0-BF byte, as the ASCII byte it
+    // mirrors, and adds a combining character to the cell before without
+    // reading it. So it reads `CSI ? 4 C2 B2 h`, `CSI ? 4 B2 h` and
+    // `CSI ? 4 C2 80 2 h` as `CSI ? 42 h`. Alacritty ignores every byte from
+    // 80 up inside a CSI. --sanitize drops a CSI that holds such a byte or
+    // that a C1 control cancels, with the chain that reached it, and reads
+    // the C1 control on its own as before.
+    #[test]
+    fn sanitize_drops_csis_that_hold_bytes_from_80_up() {
+        for introducer in [
+            b"\x1b[".as_slice(),
+            b"\x1b\x00[",
+            b"\x1b\x7f\r[",
+            b"\x9b",
+            b"\xc2\x9b",
+        ] {
+            for inside in [
+                "\u{b2}".as_bytes(),
+                b"\xb2",
+                "\u{e8}".as_bytes(),
+                b"\xe8",
+                "\u{a0}".as_bytes(),
+                b"\xff",
+                b"\xc3",
+                "\u{301}".as_bytes(),
+                "\u{201d}".as_bytes(),
+            ] {
+                let input = [b"a", introducer, b"?4", inside, b"2h\x1b[mb"].concat();
+                assert_eq!(
+                    super::strip_string_escapes(&input),
+                    b"a\x1b[mb",
+                    "{input:02x?}"
+                );
+            }
+            for control in 0x80u8..=0x9f {
+                for encoded in [[0xc2, control].as_slice(), &[control]] {
+                    let input = [b"a", introducer, b"?4", encoded, b"2h\x1b\\b"].concat();
+                    let expected = if super::is_c1_string_escape_start(control) {
+                        b"ab".to_vec()
+                    } else {
+                        [b"a", encoded, b"2h\x1b\\b"].concat()
+                    };
+                    assert_eq!(
+                        super::strip_string_escapes(&input),
+                        expected,
+                        "{input:02x?}"
+                    );
+                }
+            }
+        }
+
+        for (input, expected) in [
+            // A Latin-1 character can be the final byte to xterm.
+            (b"a\x1b[1\xc3\x9e0;t\x07b".as_slice(), b"a\x07b".as_slice()),
+            // An ESC that ends the CSI is read as before, a CAN or SUB that
+            // ends it goes with it, and so do the controls that the chain
+            // cancelled on the way.
+            (b"a\x1b[?4\xc2\xb2\x1b[mb", b"a\x1b[mb"),
+            (b"a\x1b[1\xc3\xa9\x1b]0;t\x07b", b"ab"),
+            (b"a\x1b[1\xc3\xa9\x18b", b"ab"),
+            (b"a\x9b1\xb2\x1ab", b"ab"),
+            (b"a\x1b(\x1b[1\xc3\xa9mb", b"ab"),
+            (b"a\x1b[1\x1b[?4\xc2\xb2hb", b"ab"),
+            (b"a\x8e\x1b\x00[\xb2mb", b"ab"),
+            (b"a\x1b[31\x9b1mb", b"a\x9b1mb"),
+            (b"a\x1b[1\xc2\x9d0;t\x07b", b"ab"),
+            // ASCII CSIs, with controls inside them, are kept.
+            (
+                b"a\x1b[1;31m\x9b0m\xc2\x9b2J\x1b[\r1mb",
+                b"a\x1b[1;31m\x9b0m\xc2\x9b2J\x1b[\r1mb",
+            ),
+        ] {
+            assert_eq!(super::strip_string_escapes(input), expected, "{input:02x?}");
+        }
+
+        // Cut off by the end of a read, it is carried like any other
+        // incomplete CSI, so the next read decides.
+        for input in [
+            b"a\x1b[1\xc3\xa9".as_slice(),
+            b"a\x9b?4\xc2",
+            b"a\x1b[1\xb2",
+        ] {
+            assert_eq!(super::incomplete_sanitize_start(input), Some(1));
+        }
+    }
+
+    // An ESC run dropped because a Latin-1 character or a C1 control follows
+    // it would leave the control that its first ESC cancelled open for the
+    // bytes after the run: `ESC [ ? 4 ESC C2 B2 h` would reach xterm as
+    // `CSI ? 4 C2 B2 h`, DECSET 42, and `ESC [ 1 ESC C3 9E` as `CSI 1 ^`.
+    // --sanitize drops that control with the run and keeps the run's
+    // controls.
+    #[test]
+    fn sanitize_drops_controls_that_a_dropped_escape_cancelled() {
+        let rest = "h\u{201d}0;t\x07b".as_bytes();
+        for root in [
+            b"\x1b[?4".as_slice(),
+            b"\x1b[1",
+            b"\x1b\x00[1",
+            b"\x9b?4",
+            b"\xc2\x9b1",
+            b"\x1b(",
+            b"\x1b#",
+            b"\x1b ",
+            b"\x1bN",
+            b"\x1bO",
+            b"\x8e",
+            b"\xc2\x8f",
+        ] {
+            for (escapes, kept) in [
+                (b"\x1b".as_slice(), b"".as_slice()),
+                (b"\x1b\x00", b"\x00"),
+                (b"\x1b\x1b\r", b"\r"),
+            ] {
+                for follower in [
+                    "\u{b2}".as_bytes(),
+                    b"\xb2",
+                    "\u{de}".as_bytes(),
+                    "\u{e8}".as_bytes(),
+                    b"\xc2\x80",
+                    b"\x80",
+                    b"\xc2\x8e",
+                    b"\x9b",
+                ] {
+                    let input = [b"a", root, escapes, follower, rest].concat();
+                    assert_eq!(
+                        super::strip_string_escapes(&input),
+                        [b"a", kept, follower, rest].concat(),
+                        "{input:02x?}"
+                    );
+                }
+            }
+        }
+    }
+
+    // DECSET, DECRST and XTRESTORE of DEC private mode 42 (DECNRCM) make
+    // xterm swap its UTF-8 mode out, even when its utf8 resource is "always",
+    // and then the 9D in U+201D opens an OSC. --sanitize drops them in every
+    // CSI form, wherever 42 stands among the parameters.
+    #[test]
+    fn sanitize_drops_decnrcm_changes() {
+        let rest = "\u{201d}0;t\x07b".as_bytes();
+        for introducer in [b"\x1b[".as_slice(), b"\x1b\x00[", b"\x9b", b"\xc2\x9b"] {
+            for parameters in [
+                b"?42".as_slice(),
+                b"?042",
+                b"?0042",
+                b"?1;42",
+                b"?42;1049",
+                b"?25;0042;7",
+                b"?;42",
+                b"?42;",
+                b"?1:42",
+                b"?42:1",
+                b"?4\r2",
+                b"?\x0042\x7f",
+            ] {
+                for final_byte in [b"h", b"l", b"r"] {
+                    let input = [b"a", introducer, parameters, final_byte, rest].concat();
+                    assert_eq!(
+                        super::strip_string_escapes(&input),
+                        [b"a", rest].concat(),
+                        "{input:02x?}"
+                    );
+                }
+            }
+        }
+
+        // Reached through a chain, it goes with the chain.
+        for chain in [
+            b"a\x1b(\x1b[?42h".as_slice(),
+            b"a\x1b\x9b?42l",
+            b"a\x1b[1\x1b\xc2\x9b?42r",
+        ] {
+            let input = [chain, rest].concat();
+            assert_eq!(
+                super::strip_string_escapes(&input),
+                [b"a", rest].concat(),
+                "{input:02x?}"
+            );
+        }
+
+        // xterm keeps 30 parameters and reads the digits after the 30th into
+        // it, so after 29 others `4;2` is 42, and `42;0` is 420.
+        for (others, last, dropped) in [
+            (29, b"42".as_slice(), true),
+            (29, b"4;2", true),
+            (29, b"4:2", true),
+            (29, b"0;04;;2", true),
+            (29, b"1;42", false),
+            (29, b"42;0", false),
+            (28, b"4;2", false),
+        ] {
+            for final_byte in [b"h", b"l", b"r"] {
+                let csi = [
+                    b"\x1b[?".as_slice(),
+                    &b"1;".repeat(others),
+                    last,
+                    final_byte,
+                ]
+                .concat();
+                let input = [b"a", csi.as_slice(), rest].concat();
+                let expected = if dropped {
+                    [b"a", rest].concat()
+                } else {
+                    input.clone()
+                };
+                assert_eq!(
+                    super::strip_string_escapes(&input),
+                    expected,
+                    "{input:02x?}"
+                );
+            }
+        }
+
+        // Other modes, ANSI mode 42, saving mode 42, and a sequence with an
+        // intermediate or another final byte are kept.
+        for csi in [
+            b"\x1b[?25h".as_slice(),
+            b"\x1b[?1049l",
+            b"\x1b[?4h",
+            b"\x1b[?2;4r",
+            b"\x1b[?420h",
+            b"\x1b[?4200000000000000000042h",
+            b"\x1b[?4?2h",
+            b"\x1b[42h",
+            b"\x1b[>42h",
+            b"\x1b[?42s",
+            b"\x1b[?42m",
+            b"\x1b[?42$p",
+            b"\x1b[?42 h",
+            b"\x9b?1049h",
+            b"\xc2\x9b?25l",
+        ] {
+            let input = [b"a", csi, rest].concat();
+            assert_eq!(super::strip_string_escapes(&input), input, "{input:02x?}");
+        }
+    }
+
+    // Preserve mode keeps such a string as one opaque control, so highlighting
+    // cannot insert SGR bytes inside what the terminal reads as a title.
+    #[test]
+    fn escape_state_controls_before_a_string_introducer_stay_in_one_token() {
+        let input = b"x\x1b\x00]2;192.0.2.1\x07y";
+        assert_eq!(super::ansi_sequence_end(input, 1), input.len() - 1);
+        assert_eq!(super::ansi_sequence_end(b"\x1b\r[31m", 0), 6);
+        assert_eq!(super::strip_ansi(input), b"xy");
+
+        let config = PrismConfig::from_chromaterm_yaml(
+            "rules:\n  - regex: '192\\.0\\.2\\.1'\n    color: f#00ff00\n",
+        )
+        .expect("config parses");
+        let highlighter = Highlighter::from_config(config).expect("rule compiles");
+        assert_eq!(highlighter.highlight_bytes(input), input);
+
+        let mut streaming = StreamingHighlighter::new(highlighter);
+        let mut output = Vec::new();
+        for byte in input {
+            output.extend(streaming.push(&[*byte]));
+        }
+        output.extend(streaming.finish());
+        assert_eq!(output, input);
+    }
+
     #[test]
     fn sanitize_drops_unterminated_strings_reached_through_cancellation() {
         for input in [
@@ -4424,6 +5868,271 @@ rules:
         ] {
             assert_eq!(super::strip_string_escapes(input), b"safe");
             assert_eq!(super::incomplete_sanitize_start(input), Some(4));
+        }
+    }
+
+    // Each sanitize split after the first resumes the scan from a stop near it
+    // instead of rescanning its prefix, which must not move any split. That
+    // relies on the scan of a prefix making every stop the scan of the whole
+    // read made far enough before the prefix ends, so check that too.
+    #[test]
+    fn sanitize_split_resuming_its_scan_matches_rescanning_each_prefix() {
+        const FRAGMENTS: &[&[u8]] = &[
+            b"\x1b",
+            b"\x1b\x00",
+            b"\x1b\r",
+            b"\x1b\x1b",
+            b"\x1b\x18",
+            b"\x00",
+            b"\x07",
+            b"\x18",
+            b"\x1a",
+            b"\x1c",
+            b"\x7f",
+            b"\r\n",
+            b"\x9b",
+            b"\x9d",
+            b"\x90",
+            b"\x98",
+            b"\x9e",
+            b"\x9f",
+            b"\x9c",
+            b"\x8e",
+            b"\x8f",
+            b"\x84",
+            b"\xc2\x9b",
+            b"\xc2\x9d",
+            b"\xc2\x90",
+            b"\xc2\x98",
+            b"\xc2\x9e",
+            b"\xc2\x9f",
+            b"\xc2\x9c",
+            b"\xc2\x8e",
+            b"\xc2\x8f",
+            b"\x1b]0;title\x07",
+            b"\x1b]52;c;",
+            b"\x1bPq",
+            b"\x1b\\",
+            b"\x1b_",
+            b"\x1bX",
+            b"\x1b^",
+            b"\x9d0;t\x9c",
+            b"\x1b[",
+            b"\x1b[1",
+            b";1",
+            b"\x1b[1;2H",
+            b"\x1b[?25h",
+            b"\x1b[31m",
+            b"\x1b[0m",
+            b"\x1b[38;5;196m",
+            b"\x9b2J",
+            b"\x9b1",
+            b"\x1b(",
+            b"\x1b(B",
+            b"\x1b ",
+            b"\x1b%G",
+            b"\x1bN",
+            b"\x1bO",
+            b"\x1bc",
+            "\u{e9}".as_bytes(),
+            "\u{4e2d}".as_bytes(),
+            "\u{275c}".as_bytes(),
+            "\u{1f600}".as_bytes(),
+            b"\xc2",
+            b"\xe2",
+            b"\xe2\x9d",
+            b"\xe0",
+            b"\xed",
+            b"\xf0",
+            b"\xf0\x9f",
+            b"\xf0\x9f\x9c",
+            b"\xf4\x90",
+            b"\x80",
+            b"\xa9",
+            b"\xbf",
+            b"\xff",
+            // KOI8-R and CP1251 words: legacy text full of UTF-8 lead bytes.
+            b"\xd3\xcf\xcf\xc2\xdd\xc5\xce\xc9\xc5",
+            b"\xef\xf0\xe8\xe2\xe5\xf2",
+            b"\xce\xf8\xe8\xe1\xea\xe0",
+            // Controls that each end in a character the next one cuts off.
+            b"\x1b\xf0\x9f\x9c",
+            b"\x1b[\xf0\x9f\x9c",
+            b"\x1b\xe2\x9d",
+            b"\x1b\xc2",
+            b"\x9b\xf0\x9f\xc2",
+            b"a",
+            b" ",
+            b"router# show ip\n",
+        ];
+        // The reads of the other sanitize split and filtered read tests, joined.
+        const CASES: &[&[u8]] = &[
+            b"\x1b[\xe2\x9d\\",
+            b"\x90\x1b\xe2\x90\x9d",
+            b"\x1b]0;\x90t\x07visible\x1b\\after",
+            b"\x1b]0;\x90t\x07vis",
+            b"\x9b\xf0\x9f\xc2\x9c",
+            b"\x9b\xf0\x9f\xc2Gpayload\x9c",
+            b"\x9b\xf0\x9f\xc2",
+            b"\x9b\xf0\x9d\xc2\xa052;c;aGk=\x07",
+            b"\x9b\xf0\x90\xc2q\x9c",
+            b"\x9b\xe2\x9f\xc2\x9c",
+            b"\x9b\xf0\x9f\x1b\\",
+            b"\x1b[\xf0\x9f\xc2\x9c",
+            b"\x1b[\xe2\x9d\xc2x\x07",
+            b"\x1b\xf0\x9f\x9c\xc2\x1b[\x9c",
+            b"\x1b\xf0\x9f\xa0\xc2G\x9c",
+            b"\x9b\xe0\x9d",
+            b"\x1b[\xf4\x90",
+            b"\xf0\x9f\x72\xe0",
+            b"\xf0\x9f\x01",
+            b"\xf0\x9d\x9c\x1b[31m",
+            b"\x9b\xf0\x9f\xc2hidden-payload\x9c",
+            b"ok \xd3\xcf\xcf\xc2\xdd\xc5\xce\xc9\xc5\x1b[",
+            b"safe\x1b[1\x1b]52;c;unterminated",
+            b"safe\x1b(\x1b]52;c;unterminated",
+            b"safe\x9b1\x9d52;c;unterminated",
+            b"safe\x1b[1\x1b]52;c;SGVsbG8=\x07Jafter",
+            b"safe\x1b(\x1b]52;c;SGVsbG8=\x07Jafter",
+            b"safe\x9b1\x9d52;c;SGVsbG8=\x07Jafter",
+            b"safe\x1b[1\x9d52;c;SGVsbG8=\x07Jafter",
+            b"safe\x1b[1\x18\x1b]52;c;SGVsbG8=\x07Jafter",
+            b"a\x1b\xc2",
+            b"a\x1b\xe2\x90",
+            b"a\x1b(\xc2",
+            b"a\x1b\xc2\x9d0;t\x07b",
+            b"ok\x9dtitle",
+            b"ok\x9b31",
+            b"hello\x1b[31m world",
+            b"safe\x1b]52;c;aGVsbG8=\x07 after",
+            b"safe\x9d52;c;aGVsbG8=\x07 after",
+            b"safe\xc2\x9d52;c;aGVsbG8=\x07 after",
+            b"safe\xc2\x90dcs\xc2\x9c after",
+            b"ok\x1b\x00]52;c;U0VDUkVU\x07done",
+            b"x\x1b\x00]2;192.0.2.1\x07y",
+            b"last\x1bN\r\n",
+            b"last\x8e\n",
+            b"last\x1bO\r\n",
+            b"x\x1b]0;t\x1b[0m hello",
+            b"before\x1b]52;abc\x18after\n",
+            b"before\x1bPabc\x1aafter\n",
+            b"before\x9d52;abc\x18after\n",
+            b"before\x90abc\x1aafter\n",
+            b"safe\x1b]ab\x1b]\x07after",
+            b"prompt \xe2\x9d\xaf ready",
+            b"\xc2\xa9\xe2\x9d\x9c\x9b2J\x1b\\after",
+        ];
+
+        let check = |input: &[u8], lens: &mut dyn Iterator<Item = usize>| {
+            let mut stops = Vec::new();
+            super::resume_top_level_escape_scan(input, Default::default(), &mut |stop| {
+                stops.push(stop)
+            });
+            for len in lens {
+                let prefix = &input[..len];
+                assert_eq!(
+                    super::incomplete_sanitize_start(prefix),
+                    super::incomplete_sanitize_start_by_rescans(prefix),
+                    "split of {prefix:02x?}"
+                );
+                let mut prefix_stops = Vec::new();
+                super::resume_top_level_escape_scan(prefix, Default::default(), &mut |stop| {
+                    prefix_stops.push(stop)
+                });
+                let settled = |stop: &&super::TopLevelScanStop| {
+                    stop.idx + super::TOP_LEVEL_SCAN_LOOKAHEAD <= len
+                };
+                assert!(
+                    prefix_stops
+                        .iter()
+                        .filter(settled)
+                        .eq(stops.iter().filter(settled)),
+                    "stops of {prefix:02x?}: {prefix_stops:?}, whole input: {stops:?}"
+                );
+            }
+        };
+
+        // A read starts wherever the previous one left its carry, so check
+        // every part of each case.
+        for case in CASES {
+            for start in 0..case.len() {
+                let input = &case[start..];
+                check(input, &mut (0..=input.len()));
+            }
+        }
+        for control in [0x00u8, 0x01, b'\r', b'\n', 0x19, 0x1c, 0x1f, 0x7f] {
+            for introducer in [b"]52;c;U0VDUkVU".as_slice(), b"]2;TITLE", b"P1$qm", b"_apc"] {
+                let input = [b"a\x1b".as_slice(), &[control, control], introducer].concat();
+                check(&input, &mut (0..=input.len()));
+            }
+            let input = [b"ok\x1b".as_slice(), &[control]].concat();
+            check(&input, &mut (0..=input.len()));
+        }
+        for group in [
+            b"\x1b\xf0\x9f\x9c".as_slice(),
+            b"\x1b[\xf0\x9f\x9c",
+            b"\x1b\xe2\x9d",
+            b"\x1b\xc2",
+        ] {
+            let input = group.repeat(8192 / group.len());
+            check(&input, &mut (input.len() - 16..=input.len()));
+        }
+        let mut legacy = b"0m ".to_vec();
+        legacy.extend_from_slice(&b"x".repeat(4000));
+        legacy.extend_from_slice(b" \xd3\xcf\xcf\xc2\xdd\xc5\xce\xc9\xc5\x1b[");
+        check(&legacy, &mut (legacy.len() - 16..=legacy.len()));
+        // Controls at and past the size beyond which they are no longer
+        // carried, followed by a run that the split steps back over.
+        let (control_limit, string_limit) = (
+            super::MAX_INCOMPLETE_NON_STRING_ESCAPE_BYTES,
+            super::MAX_INCOMPLETE_ESCAPE_BYTES,
+        );
+        for (introducer, filler, limit) in [
+            (b"\x1b[".as_slice(), b'1', control_limit),
+            (b"\x9b", b'1', control_limit),
+            (b"ok\x1b", 0x00, control_limit),
+            (b"safe\x1b]52;c;", b'x', string_limit),
+            (b"safe\x1bP", b'x', string_limit),
+            (b"safe\xc2\x90", b'x', string_limit),
+            (b"safe\x1b[1\x1b]52;c;", b'x', string_limit),
+        ] {
+            for extra in [0, 1, 2] {
+                let mut input = introducer.to_vec();
+                input.resize(limit + extra, filler);
+                input.extend_from_slice(&b"\x1b\xc2".repeat(5));
+                let len = input.len();
+                check(&input, &mut (len - 32..=len));
+            }
+        }
+
+        let mut seed = 0x5eed_5b11_7a11_0c4e_u64;
+        let mut below = |bound: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % bound as u64) as usize
+        };
+        for case in 0..1000 {
+            let large = case % 100 == 99;
+            let fragments = if large { 1000 } else { 1 + below(24) };
+            let mut input = Vec::new();
+            for _ in 0..fragments {
+                let fragment = FRAGMENTS[below(FRAGMENTS.len())];
+                // Repeats make runs that cross the pass cap and the spacing
+                // of the stops the split keeps.
+                let repeats = if below(8) == 0 { 1 + below(40) } else { 1 };
+                for _ in 0..repeats {
+                    input.extend_from_slice(fragment);
+                }
+            }
+            // Start anywhere, as a carry can, even inside a character.
+            let input = &input[below(input.len().min(8) + 1)..];
+            if input.len() <= 128 {
+                check(input, &mut (0..=input.len()));
+            } else {
+                let lens: Vec<usize> = (0..32).map(|_| below(input.len() + 1)).collect();
+                check(input, &mut lens.into_iter().chain([input.len()]));
+            }
         }
     }
 
@@ -4513,6 +6222,128 @@ rules:
         }
     }
 
+    // A VT parser ends a string control at any ESC that does not start ST and
+    // parses that ESC as a new control, so an ESC-ended or stray OSC must not
+    // hold back or discard the output after it.
+    #[test]
+    fn escape_ends_string_controls_like_a_vt_parser() {
+        let highlighter =
+            Highlighter::from_config(PrismConfig::default()).expect("empty config compiles");
+
+        for input in [
+            b"x\x1b]0;t\x1b[0m hello world\n".as_slice(),
+            b"a\x1bPq\x1b[0m\nback\n".as_slice(),
+            b"a\x9d0;t\x1b[0m\nback\n".as_slice(),
+            b"a\x1b]0;t\x1b\x18back\n".as_slice(),
+        ] {
+            let mut whole = StreamingHighlighter::new(highlighter.clone());
+            let mut output = whole.push(input);
+            output.extend(whole.finish());
+            assert_eq!(output, input);
+
+            let mut bytewise = StreamingHighlighter::new(highlighter.clone());
+            let mut output = Vec::new();
+            for byte in input {
+                output.extend(bytewise.push(&[*byte]));
+            }
+            output.extend(bytewise.finish());
+            assert_eq!(output, input);
+        }
+
+        assert_eq!(super::strip_ansi(b"x\x1b]0;t\x1b[0m hi"), b"x hi");
+        assert_eq!(
+            super::strip_string_escapes(b"x\x1b]0;t\x1b[0m hi"),
+            b"x\x1b[0m hi"
+        );
+        assert_eq!(
+            super::strip_string_escapes(b"x\x9d0;t\x1b[0m hi"),
+            b"x\x1b[0m hi"
+        );
+        // A nested introducer starts a string of its own, which is stripped too.
+        assert_eq!(
+            super::strip_string_escapes(b"x\x1b]0;t\x1b]52;c;eA==\x07y"),
+            b"xy"
+        );
+
+        let mut input = b"start\x1b]".to_vec();
+        let mut visible = b"start".to_vec();
+        for line in 0..2000 {
+            input.extend_from_slice(format!("\x1b[32mline {line}\x1b[0m\n").as_bytes());
+            visible.extend_from_slice(format!("line {line}\n").as_bytes());
+        }
+        let mut streaming = StreamingHighlighter::new(highlighter);
+        let mut output = Vec::new();
+        for chunk in input.chunks(8192) {
+            output.extend(streaming.push(chunk));
+        }
+        output.extend(streaming.finish());
+        assert_eq!(output, input);
+        assert_eq!(super::strip_ansi(&output), visible);
+    }
+
+    #[test]
+    fn oversized_string_discard_ends_at_an_escape_that_starts_a_new_control() {
+        let highlighter =
+            Highlighter::from_config(PrismConfig::default()).expect("empty config compiles");
+
+        for introducer in [
+            b"\x1b]0;".as_slice(),
+            b"\x1bP".as_slice(),
+            b"\x9d0;".as_slice(),
+        ] {
+            for reads in [
+                [b"".as_slice(), b"\x1b[1mafter\x1b[0m\n".as_slice()],
+                [b"\x1b".as_slice(), b"[1mafter\x1b[0m\n".as_slice()],
+                [b"\x1b[".as_slice(), b"1mafter\x1b[0m\n".as_slice()],
+            ] {
+                let mut first = b"safe".to_vec();
+                first.extend_from_slice(introducer);
+                first.extend(std::iter::repeat_n(
+                    b'x',
+                    super::MAX_INCOMPLETE_ESCAPE_BYTES + 1,
+                ));
+
+                let mut streaming = StreamingHighlighter::new(highlighter.clone());
+                let mut output = streaming.push(&first);
+                for read in reads {
+                    output.extend(streaming.push(read));
+                }
+                output.extend(streaming.finish());
+                assert_eq!(output, b"safe\x1b[1mafter\x1b[0m\n");
+
+                // The same bytes in one push end the discard at the same ESC.
+                let mut whole = StreamingHighlighter::new(highlighter.clone());
+                let mut input = first.clone();
+                input.extend(reads.concat());
+                let mut output = whole.push(&input);
+                output.extend(whole.finish());
+                assert_eq!(output, b"safe\x1b[1mafter\x1b[0m\n");
+            }
+        }
+    }
+
+    #[test]
+    fn chain_of_escape_ended_strings_stays_within_the_carry_budget() {
+        let highlighter =
+            Highlighter::from_config(PrismConfig::default()).expect("empty config compiles");
+        let mut streaming = StreamingHighlighter::new(highlighter);
+        let mut string = b"\x1b]".to_vec();
+        string.resize(64, b'a');
+
+        let mut output = Vec::new();
+        for _ in 0..512 {
+            output.extend(streaming.push(&string));
+            assert!(
+                streaming.pending.len() <= super::MAX_INCOMPLETE_ESCAPE_BYTES + string.len(),
+                "pending grew to {} bytes",
+                streaming.pending.len()
+            );
+        }
+        output.extend(streaming.push(b"\x07after\n"));
+        output.extend(streaming.finish());
+        assert!(super::strip_ansi(&output).ends_with(b"after\n"));
+    }
+
     #[test]
     fn streaming_finish_drops_cancelled_prefix_with_unterminated_nested_string() {
         let highlighter =
@@ -4591,6 +6422,7 @@ rules:
             b"\x1b!".as_slice(),
             b"\x1b&".as_slice(),
             b"\x1b$(".as_slice(),
+            b"\x1b\x00".as_slice(),
             b"\x1bN".as_slice(),
             b"\x1bO".as_slice(),
             b"\x8e".as_slice(),
@@ -4618,6 +6450,7 @@ rules:
             (b"\x1b ".as_slice(), b"safeafter".as_slice()),
             (b"\x1b$".as_slice(), b"safeafter".as_slice()),
             (b"\x1b$(".as_slice(), b"safeafter".as_slice()),
+            (b"\x1b\x00".as_slice(), b"safeafter".as_slice()),
             (b"\x1bN".as_slice(), b"safeBafter".as_slice()),
             (b"\x1bO".as_slice(), b"safeBafter".as_slice()),
             (b"\x8e".as_slice(), b"safeBafter".as_slice()),
@@ -4635,6 +6468,142 @@ rules:
             assert_eq!(output, expected);
             assert_eq!(super::strip_ansi(&output), visible);
         }
+    }
+
+    // A line ending is not the character a single shift selects, so like the
+    // tokenizer the scanner ends the shift there instead of carrying the line
+    // ending with it.
+    #[test]
+    fn single_shift_before_a_line_ending_keeps_the_line_ending() {
+        for input in [
+            b"last line\x1bN\r\n".as_slice(),
+            b"last line\x1bO\n".as_slice(),
+            b"last line\x8e\r\n".as_slice(),
+            b"x\x8f\r".as_slice(),
+        ] {
+            assert_eq!(
+                super::incomplete_top_level_escape_start(input),
+                None,
+                "{input:02x?}"
+            );
+        }
+
+        let highlighter =
+            Highlighter::from_config(PrismConfig::default()).expect("empty config compiles");
+        for shift in [b"\x1bN".as_slice(), b"\x8e".as_slice()] {
+            let mut input = b"R1# show clock\r\nlast line".to_vec();
+            input.extend_from_slice(shift);
+            input.extend_from_slice(b"\r\nR1# show ver\r\nCisco\r\n");
+
+            let mut streaming = StreamingHighlighter::new_interactive(highlighter.clone());
+            let mut output = streaming.push(&input);
+            output.extend(streaming.finish());
+
+            let mut line_end = shift.to_vec();
+            line_end.extend_from_slice(b"\r\nR1# ");
+            assert!(
+                output
+                    .windows(line_end.len())
+                    .any(|window| window == line_end),
+                "line ending lost after {shift:02x?}: {output:02x?}"
+            );
+            assert_eq!(super::strip_ansi(&output), super::strip_ansi(&input));
+        }
+
+        // The line is released without waiting for more output, and EOF does
+        // not neutralize the shift.
+        let mut streaming = StreamingHighlighter::new(highlighter);
+        assert_eq!(streaming.push(b"abc\x1bN\n"), b"abc\x1bN\n");
+        assert!(streaming.finish().is_empty());
+    }
+
+    // Many string introducers that share one far terminator must not make the
+    // split point search rescan to that terminator from each of them.
+    #[test]
+    fn split_point_search_stays_linear_for_shared_string_terminators() {
+        for (introducer, terminator) in [
+            (b"\x90x".as_slice(), b"\x9c".as_slice()),
+            (b"\x9dx".as_slice(), b"\x07".as_slice()),
+        ] {
+            let mut chunk = introducer.repeat(4094);
+            chunk.extend_from_slice(terminator);
+            chunk.extend_from_slice(b"tok");
+            assert_eq!(
+                super::streaming_split_at(&super::AnsiChunk::from_slice(&chunk)),
+                chunk.len() - 3
+            );
+
+            let highlighter =
+                Highlighter::from_config(PrismConfig::default()).expect("empty config compiles");
+            let mut streaming = StreamingHighlighter::new(highlighter);
+            let started = std::time::Instant::now();
+            let mut output = Vec::new();
+            for _ in 0..32 {
+                output.extend(streaming.push(&chunk));
+            }
+            output.extend(streaming.finish());
+            let elapsed = started.elapsed();
+
+            assert_eq!(output, chunk.repeat(32));
+            assert!(
+                elapsed < std::time::Duration::from_secs(2),
+                "32 reads of {introducer:02x?} chains took {elapsed:?}"
+            );
+        }
+    }
+
+    // A run of cancelled controls is carried from its first control, so the
+    // carry cap must hold for the whole run, not just its incomplete tail.
+    #[test]
+    fn incomplete_cancellation_chain_is_capped_across_pushes() {
+        let highlighter =
+            Highlighter::from_config(PrismConfig::default()).expect("empty config compiles");
+
+        for unit in [b"\x1b".as_slice(), b"\x1b[".as_slice(), b"\x9b".as_slice()] {
+            let run = unit.repeat(16);
+            let mut streaming = StreamingHighlighter::new(highlighter.clone());
+            let mut output = Vec::new();
+            for _ in 0..256 {
+                output.extend(streaming.push(&run));
+                assert!(
+                    streaming.pending.len()
+                        <= super::MAX_INCOMPLETE_NON_STRING_ESCAPE_BYTES + run.len(),
+                    "pending grew to {} for {unit:02x?}",
+                    streaming.pending.len()
+                );
+            }
+            output.extend(streaming.finish());
+
+            assert_eq!(output.len(), 256 * run.len());
+            assert!(
+                !output.contains(&0x1b) && !output.contains(&0x9b),
+                "live control survived for {unit:02x?}"
+            );
+        }
+
+        // A run that holds an ESC-ended string gets the string budget.
+        let mut input = b"\x1b]0;".to_vec();
+        input.extend(std::iter::repeat_n(b't', 2000));
+        input.extend_from_slice(b"\x1b[");
+        let mut streaming = StreamingHighlighter::new(highlighter.clone());
+        let mut output = streaming.push(&input);
+        output.extend(streaming.push(b"31mtext\n"));
+        output.extend(streaming.finish());
+        input.extend_from_slice(b"31mtext\n");
+        assert_eq!(output, input);
+
+        let mut streaming = StreamingHighlighter::new(highlighter);
+        let mut output = streaming.push(b"\x1b]0;title");
+        for _ in 0..80 {
+            output.extend(streaming.push(&[0x1b; 256]));
+            assert!(
+                streaming.pending.len() <= super::MAX_INCOMPLETE_ESCAPE_BYTES + 256,
+                "pending grew to {} after a string",
+                streaming.pending.len()
+            );
+        }
+        output.extend(streaming.finish());
+        assert!(!output.contains(&0x1b), "live ESC survived after a string");
     }
 
     // AUDIT (1.0.8): an unterminated escape longer than the cap must be treated
@@ -5167,7 +7136,7 @@ rules:
         let highlighter = Highlighter::from_config(PrismConfig::default()).expect("empty config");
 
         for input in [
-            b"\x1b]0;hidden\n\x1b[2J\x07user@host$ cmd\n".as_slice(),
+            b"\x1b]0;hidden\n\x9b2J\x07user@host$ cmd\n".as_slice(),
             b"\x1bPignored\r\n\x1b[31m\x1b\\user@host$ cmd\n".as_slice(),
             b"\x9d0;hidden\n\x9b2J\x9cuser@host$ cmd\n".as_slice(),
         ] {
@@ -5313,6 +7282,217 @@ rules:
         assert_eq!(super::strip_ansi(&streaming.flush_buffered_echo()), b"log");
     }
 
+    // Every position of a line full of Unicode prompt markers is a candidate
+    // prompt end. Candidates past the prompt length limit can never match, so
+    // scanning them made each line quadratic.
+    #[test]
+    fn interactive_marker_flood_line_is_linear() {
+        let highlighter =
+            Highlighter::from_config(PrismConfig::default()).expect("empty config compiles");
+        let mut streaming = StreamingHighlighter::new_interactive(highlighter);
+        let mut line = b"!".to_vec();
+        for _ in 0..4095 {
+            line.extend_from_slice("»".as_bytes());
+        }
+        line.push(b'\n');
+
+        let started = std::time::Instant::now();
+        let mut output = Vec::new();
+        for _ in 0..8 {
+            output.extend(streaming.push(&line));
+        }
+        output.extend(streaming.finish());
+
+        assert_eq!(output.len(), line.len() * 8);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(3),
+            "marker flood took {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn prompt_echo_scan_bound_matches_prompt_length_limit() {
+        let limit = super::MAX_PROMPT_TAIL_BYTES;
+        let at_limit = format!("{}# show run", "a".repeat(limit - 1));
+        assert!(super::contains_prompt_echo_in_visible_line(
+            at_limit.as_bytes()
+        ));
+        assert!(super::prompt_echo_sgr_bounds(at_limit.as_bytes(), false).is_some());
+
+        let past_limit = format!("{}# show run", "a".repeat(limit));
+        assert!(!super::contains_prompt_echo_in_visible_line(
+            past_limit.as_bytes()
+        ));
+        assert!(super::prompt_echo_sgr_bounds(past_limit.as_bytes(), false).is_none());
+
+        // `»` is two bytes, so these prompts are exactly at and one byte past
+        // the limit.
+        let unicode_at_limit = format!("{}» ls", "a".repeat(limit - 2));
+        assert!(super::contains_prompt_echo_in_visible_line(
+            unicode_at_limit.as_bytes()
+        ));
+        let unicode_past_limit = format!("{}» ls", "a".repeat(limit - 1));
+        assert!(!super::contains_prompt_echo_in_visible_line(
+            unicode_past_limit.as_bytes()
+        ));
+    }
+
+    // The Unicode prompt check skips every tail with an ASCII last byte, which
+    // is only sound while no marker ends in one.
+    #[test]
+    fn unicode_prompt_markers_end_in_non_ascii_bytes() {
+        for marker in super::UNICODE_PROMPT_MARKERS {
+            assert!(
+                marker
+                    .as_bytes()
+                    .last()
+                    .is_some_and(|last| !last.is_ascii()),
+                "{marker:?} must end in a non-ASCII byte"
+            );
+        }
+    }
+
+    #[test]
+    fn every_unicode_prompt_marker_still_starts_a_prompt_echo() {
+        for marker in super::UNICODE_PROMPT_MARKERS {
+            for line in [
+                format!("{marker} make"),
+                format!("~/src {marker} git status"),
+            ] {
+                assert!(
+                    super::contains_prompt_echo_in_visible_line(line.as_bytes()),
+                    "{line:?} is a prompt echo"
+                );
+            }
+        }
+        assert!(super::contains_prompt_echo_in_visible_line(
+            "──○ cmd".as_bytes()
+        ));
+        assert!(!super::contains_prompt_echo_in_visible_line(
+            b"plain ascii line with no prompt"
+        ));
+    }
+
+    #[test]
+    fn prompt_source_sgr_plan_is_empty_without_escapes() {
+        for input in [b"router# show version".as_slice(), "~/src ❯ ls".as_bytes()] {
+            assert_eq!(
+                super::prompt_echo_source_sgr_plan(input, b""),
+                (Vec::new(), Vec::new())
+            );
+            assert_eq!(
+                super::neutralize_prompt_echo_source_sgr(input, b"", super::ResetMode::Minimal),
+                input
+            );
+        }
+    }
+
+    #[test]
+    fn utf8_c1_prompt_source_sgr_is_neutralized_before_command_echo() {
+        let input = b"router# \xc2\x9b31mshow up";
+        let output =
+            super::neutralize_prompt_echo_source_sgr(input, b"", super::ResetMode::Minimal);
+
+        assert!(
+            !output.windows(2).any(|window| window == b"\xc2\x9b"),
+            "source C1 SGR survived: {output:02x?}"
+        );
+        assert!(
+            output
+                .windows(b"\x1b[39m".len())
+                .any(|window| window == b"\x1b[39m"),
+            "command boundary reset missing: {output:02x?}"
+        );
+        assert_eq!(super::strip_ansi(&output), b"router# show up");
+    }
+
+    // A CR inside an OSC payload is not a line break: splitting the prompt
+    // echo there would highlight the rest of the payload and inject SGR into it.
+    #[test]
+    fn prompt_echo_split_ignores_carriage_returns_inside_string_controls() {
+        let input = b"R#show\x1b]0;a\r\n192.0.2.1\x07 more\r\n";
+        assert_eq!(
+            super::prompt_echo_line_prefix_len(input, b"R#"),
+            Some(input.len())
+        );
+
+        let config = PrismConfig::from_chromaterm_yaml(
+            "rules:\n  - description: ipv4\n    regex: '\\b192\\.0\\.2\\.\\d+\\b'\n    color: f#00ffff\n",
+        )
+        .expect("config parses");
+        let highlighter = Highlighter::from_config(config).expect("rules compile");
+        let mut streaming = StreamingHighlighter::new_interactive(highlighter);
+        let mut output = streaming.push(b"R#");
+        output.extend(streaming.push(input));
+        output.extend(streaming.finish());
+
+        let osc = b"\x1b]0;a\r\n192.0.2.1\x07";
+        assert!(
+            output.windows(osc.len()).any(|window| window == osc),
+            "OSC payload must pass through intact: {:?}",
+            String::from_utf8_lossy(&output)
+        );
+    }
+
+    // A string control with no terminator ends at the ESC of the next control,
+    // and a CSI or escape sequence cut short ends there too. When that next
+    // control is a source SGR on a prompt echo, removing it would leave the
+    // terminal inside the earlier control, hiding the text after it.
+    #[test]
+    fn prompt_echo_keeps_source_sgr_that_ends_an_open_control() {
+        let highlighter =
+            Highlighter::from_config(PrismConfig::default()).expect("empty config compiles");
+
+        for opener in [
+            b"\x90".as_slice(),
+            b"\xc2\x90",
+            b"\x9d0;t",
+            b"\x1bPq",
+            b"\x1b]0;t",
+            b"\x1bX",
+            b"\x1b^",
+            b"\x1b_",
+            b"\x1b[3",
+            b"\x9b3",
+            b"\x1b(",
+            b"\x1b",
+        ] {
+            let mut input = b">0] \x1b[31m # \x18".to_vec();
+            input.extend_from_slice(opener);
+            input.extend_from_slice(b"\x1b[31m \r\n end");
+
+            let mut streaming = StreamingHighlighter::new_interactive(highlighter.clone());
+            let mut output = streaming.push(&input);
+            output.extend(streaming.finish());
+
+            assert!(
+                super::strip_ansi(&output).ends_with(b" \r\n end"),
+                "text after {opener:02x?} was hidden: {output:02x?}"
+            );
+        }
+
+        // An SGR after a control that ended on its own is still removed.
+        let input = b"R# \x1bP\x18\x1b[31mshow";
+        let output =
+            super::neutralize_prompt_echo_source_sgr(input, b"", super::ResetMode::Minimal);
+        assert_eq!(output, b"R# \x1bP\x18\x1b[39mshow");
+    }
+
+    #[test]
+    fn prompt_echo_carriage_return_scan_is_linear() {
+        let mut input = b"\x1b[1C".to_vec();
+        input.extend(std::iter::repeat_n(b'\r', 32 * 1024));
+
+        let started = std::time::Instant::now();
+        assert_eq!(super::prompt_echo_line_prefix_len(&input, b"R#"), None);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "carriage return scan took {:?}",
+            started.elapsed()
+        );
+    }
+
     #[test]
     fn streaming_does_not_buffer_unterminated_escape_without_bound() {
         let highlighter =
@@ -5364,7 +7544,10 @@ rules:
                 ));
 
                 let mut output = streaming.push(&first);
-                output.extend(streaming.push(b"\x1b[2J\x9b2J"));
+                // A nested 7-bit ESC would end the string as it does in a
+                // terminal, so the nested control is the C1 form, which a
+                // terminal keeps as payload.
+                output.extend(streaming.push(b"\x9b2J"));
                 if terminator == b"\x1b\\" {
                     output.extend(streaming.push(b"\x1b"));
                     output.extend(streaming.push(b"\\after"));
@@ -5380,7 +7563,7 @@ rules:
                     "payload escaped from {introducer:02x?}: {output:02x?}"
                 );
                 assert!(
-                    !output.windows(4).any(|window| window == b"\x1b[2J"),
+                    !output.windows(3).any(|window| window == b"\x9b2J"),
                     "nested CSI became active for {introducer:02x?}: {output:02x?}"
                 );
             }
@@ -5403,13 +7586,13 @@ rules:
         output.extend(streaming.push(b"\xa9"));
         output.extend(streaming.push(b"\xe2"));
         output.extend(streaming.push(b"\x9d"));
-        output.extend(streaming.push(b"\x9c\x1b[2J"));
+        output.extend(streaming.push(b"\x9c\x9b2J"));
         output.extend(streaming.push(b"\x1b"));
         output.extend(streaming.push(b"\\after"));
         output.extend(streaming.finish());
 
         assert_eq!(output, b"safeafter");
-        assert!(!output.windows(4).any(|window| window == b"\x1b[2J"));
+        assert!(!output.windows(3).any(|window| window == b"\x9b2J"));
     }
 
     #[test]
@@ -5456,6 +7639,41 @@ rules:
         output.extend(streaming.finish());
 
         assert_eq!(output, b"safe\x80after");
+    }
+
+    #[test]
+    fn oversized_string_after_cancelled_control_does_not_reuse_a_stale_drop_root() {
+        let highlighter =
+            Highlighter::from_config(PrismConfig::default()).expect("empty config compiles");
+
+        for second in [b"\x1b]0;".as_slice(), b"\x1bP".as_slice()] {
+            let mut input = b"pre\x1b[1\x1b]0;".to_vec();
+            input.extend(std::iter::repeat_n(
+                b'a',
+                super::MAX_INCOMPLETE_ESCAPE_BYTES + 1,
+            ));
+            input.push(0x07);
+            input.extend_from_slice(second);
+            input.extend(std::iter::repeat_n(
+                b'b',
+                super::MAX_INCOMPLETE_ESCAPE_BYTES + 1,
+            ));
+            input.extend_from_slice(b"\x1b\\visible\n");
+
+            let mut whole = StreamingHighlighter::new(highlighter.clone());
+            let mut output = whole.push(&input);
+            output.extend(whole.finish());
+
+            let mut chunked = StreamingHighlighter::new(highlighter.clone());
+            let mut reference = Vec::new();
+            for chunk in input.chunks(8192) {
+                reference.extend(chunked.push(chunk));
+            }
+            reference.extend(chunked.finish());
+
+            assert_eq!(output, b"previsible\n");
+            assert_eq!(output, reference);
+        }
     }
 
     #[test]
@@ -5508,6 +7726,142 @@ rules:
 
         assert!(output.contains("\x1b[4;38;2;0;255;0;48;2;0;0;255mup"));
         assert!(output.contains("\x1b[24;39;49m"));
+    }
+
+    fn background_rule_highlighter() -> Highlighter {
+        let config = PrismConfig::from_chromaterm_yaml(
+            "rules:\n  - description: bad status\n    regex: '\\berror\\b'\n    color: f#ffffff b#ff0000\n",
+        )
+        .expect("config parses");
+        Highlighter::from_config(config).expect("highlighter builds")
+    }
+
+    // A line terminator at the bottom of the screen scrolls in a blank line
+    // filled with the current background, so a background highlight must end
+    // before it, not at the first text of the next line.
+    #[test]
+    fn interactive_background_highlight_ends_before_the_line_terminator() {
+        for chunks in [
+            vec!["disk error\r\n    retrying\r\n"],
+            vec!["disk error", "\r\n    retrying\r\n"],
+        ] {
+            let mut streaming =
+                StreamingHighlighter::new_interactive(background_rule_highlighter());
+            streaming.set_no_minimal_resets(false);
+            let mut output = String::new();
+            for chunk in &chunks {
+                output.push_str(&streaming.push_str(chunk));
+                // Surface the held-back token, so a split read leaves the
+                // highlight open until the next read brings the terminator.
+                output.push_str(
+                    &String::from_utf8(streaming.flush_buffered_echo()).expect("output is utf8"),
+                );
+            }
+            output.push_str(&String::from_utf8(streaming.finish()).expect("output is utf8"));
+
+            assert!(
+                output.contains("error\x1b[39;49m\r\n    retrying"),
+                "{chunks:?}: {output:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn interactive_background_highlight_does_not_cover_trailing_spaces() {
+        let config = PrismConfig::from_chromaterm_yaml(
+            r##"
+rules:
+  - description: rich state
+    regex: '\bup\b'
+    color: f#00ff00 b#0000ff bold underline
+"##,
+        )
+        .expect("config parses");
+        let highlighter = Highlighter::from_config(config).expect("highlighter builds");
+        let mut streaming = StreamingHighlighter::new_interactive(highlighter);
+        streaming.set_no_minimal_resets(false);
+
+        let output = String::from_utf8(streaming.push(b"up down\n")).expect("output is utf8");
+
+        assert!(output.contains("up\x1b[24;39;49m down"), "{output:?}");
+    }
+
+    // An erase fills cells with the current background; a highlight still
+    // active at a program's `ESC [ K` must not paint the rest of the line.
+    #[test]
+    fn background_highlight_is_reset_before_an_erase_sequence() {
+        let input = b"\x1b[01;31m\x1b[Kerror\x1b[m\x1b[K on sda\n";
+        for interactive in [false, true] {
+            let mut streaming = if interactive {
+                StreamingHighlighter::new_interactive(background_rule_highlighter())
+            } else {
+                StreamingHighlighter::new(background_rule_highlighter())
+            };
+            let mut output = streaming.push(input);
+            output.extend(streaming.finish());
+            let output = String::from_utf8(output).expect("output is utf8");
+
+            let erase = output
+                .match_indices("\x1b[K")
+                .nth(1)
+                .map(|(idx, _)| idx)
+                .expect("second erase is present");
+            let last_sgr = output[..erase]
+                .rsplit("\x1b[")
+                .next()
+                .expect("an SGR precedes the erase");
+            assert!(
+                last_sgr == "0m" || last_sgr.ends_with("49m"),
+                "interactive={interactive}: {output:?}"
+            );
+            assert_eq!(super::strip_ansi(output.as_bytes()), b"error on sda\n");
+        }
+    }
+
+    // Index, next line and reverse index scroll in a blank line at a margin,
+    // which the terminal fills with the current background as for a line feed.
+    #[test]
+    fn background_highlight_is_reset_before_an_index_control() {
+        for control in [
+            b"\x1bD".as_slice(),
+            b"\x1bE",
+            b"\x1bM",
+            b"\x84",
+            b"\x85",
+            b"\x8d",
+            b"\xc2\x84",
+            b"\xc2\x85",
+            b"\xc2\x8d",
+        ] {
+            let mut input = b"disk error".to_vec();
+            input.extend_from_slice(control);
+            input.extend_from_slice(b" retrying\n");
+            for interactive in [false, true] {
+                let mut streaming = if interactive {
+                    StreamingHighlighter::new_interactive(background_rule_highlighter())
+                } else {
+                    StreamingHighlighter::new(background_rule_highlighter())
+                };
+                let mut output = streaming.push(&input);
+                output.extend(streaming.finish());
+
+                let control_at = output
+                    .windows(control.len())
+                    .position(|window| window == control)
+                    .expect("control is passed through");
+                let before = String::from_utf8_lossy(&output[..control_at]);
+                let last_sgr = before
+                    .rsplit("\x1b[")
+                    .next()
+                    .expect("an SGR precedes the control");
+                assert!(
+                    before.contains("48;2;255;0;0merror")
+                        && (last_sgr == "0m" || last_sgr.ends_with("49m")),
+                    "interactive={interactive} control={control:02x?}: {:?}",
+                    String::from_utf8_lossy(&output)
+                );
+            }
+        }
     }
 
     #[test]
@@ -5595,7 +7949,7 @@ rules:
         for suffix in [
             b"\x1b]0;unfinished title".as_slice(),
             b"\x1b]0;payload with nested csi \x1b[".as_slice(),
-            b"\x1b]0;payload with complete nested csi \x1b[31m".as_slice(),
+            b"\x1b[1\x1b]0;ended title\x1b[".as_slice(),
             b"\x1bPunfinished dcs".as_slice(),
             b"\x1bXunfinished sos".as_slice(),
             b"\x1b^unfinished pm".as_slice(),
@@ -5617,6 +7971,14 @@ rules:
 
             assert_eq!(output, b"safe prefix", "unsafe EOF output: {output:02x?}");
         }
+
+        // A complete 7-bit control ends the string as it would in a terminal,
+        // so neither is unfinished at EOF.
+        let input = b"safe prefix\x1b]0;title ended by a complete csi \x1b[31m";
+        let mut streaming = StreamingHighlighter::new_interactive(highlighter);
+        let mut output = streaming.push(input);
+        output.extend(streaming.finish());
+        assert_eq!(output, input);
     }
 
     #[test]
@@ -5693,6 +8055,35 @@ rules:
             output.extend(streaming.finish());
             assert_eq!(output, input, "partial UTF-8 changed: {output:02x?}");
         }
+    }
+
+    // `F0 8E` can never become a character, so its `8E` is a single shift and
+    // the `9B` after it a CSI that end of input must neutralize, not bytes of
+    // a character still waiting for its end. E0 and F4 take narrower first
+    // continuations too, so `E0 9D` and `F4 90` start an OSC and a DCS.
+    #[test]
+    fn finish_neutralizes_controls_after_bytes_that_cannot_be_a_character() {
+        let highlighter =
+            Highlighter::from_config(PrismConfig::default()).expect("empty config compiles");
+
+        for input in [
+            b"\x8e\xf0\x8e\x9b".as_slice(),
+            b"\x1b\xf0\x8e\x9b".as_slice(),
+            b"\x1b[\xe0\x9d".as_slice(),
+            b"\x9b\xf4\x90".as_slice(),
+        ] {
+            let mut streaming = StreamingHighlighter::new(highlighter.clone());
+            let mut output = streaming.push(input);
+            output.extend(streaming.finish());
+
+            assert_eq!(
+                super::incomplete_top_level_escape_start(&output),
+                None,
+                "{input:02x?} left a control open: {output:02x?}"
+            );
+        }
+        assert_eq!(super::incomplete_utf8_start(b"x\xf0\x8e"), None);
+        assert_eq!(super::incomplete_utf8_start(b"x\xf0\x9f"), Some(1));
     }
 
     #[test]
@@ -5838,6 +8229,456 @@ rules:
         );
     }
 
+    // What xterm draws after each control sequence: RIS and DECSTR reset the
+    // rendition, DECSTR also the copy saved for the current screen, DECSC and
+    // setting mode 1048 or 1049 save it and DECRC and resetting them restore
+    // it, any number of times. The normal and the alternate screen keep
+    // separate saved copies, and leaving mode 1049 restores the normal one.
+    #[test]
+    fn native_state_follows_terminal_resets_saves_and_restores() {
+        for (input, expected) in [
+            (b"\x1b[33m\x1bc".as_slice(), None),
+            (b"\x1b[33m\x1b[!p", None),
+            (b"\x1b[33m\x1b[1!p", None),
+            (b"\x1b[33m\x9b!p", None),
+            (b"\x1b[33m\x1b7\x1b[31m\x1b8", Some("\x1b[33m")),
+            (b"\x1b[33m\x1b7\x1b[31m\x1b8\x1b[32m\x1b8", Some("\x1b[33m")),
+            (b"\x1b[33m\x1b8", None),
+            (b"\x1b[33m\x1b7\x1b[31m\x1b[!p\x1b8", None),
+            (b"\x1b[33m\x1b7\x1b[31m\x1bc\x1b8", None),
+            (b"\x1b[33m\x1b7\x1b[31m\x1b 8", Some("\x1b[31m")),
+            // SGR 0 resets the rendition but not the saved copy.
+            (b"\x1b[33m\x1b7\x1b[0m\x1b8", Some("\x1b[33m")),
+            (b"\x1b[?1049h\x1b[33m\x1b[?1049l", None),
+            (b"\x1b[33m\x1b[?1049h\x1b[31m\x1b[?1049l", Some("\x1b[33m")),
+            (
+                b"\x1b[33m\xc2\x9b?1049h\x1b[31m\x9b?1049l",
+                Some("\x1b[33m"),
+            ),
+            (
+                b"\x1b[33m\x1b[?25;1049h\x1b[31m\x1b[?1049;25l",
+                Some("\x1b[33m"),
+            ),
+            (b"\x1b[33m\x1b7\x1b[31m\x1b[?1049l", Some("\x1b[33m")),
+            (b"\x1b[33m\x1b[?1048h\x1b[31m\x1b[?1048l", Some("\x1b[33m")),
+            (b"\x1b[33m\x1b[?1047h\x1b[31m\x1b[?1047l", Some("\x1b[31m")),
+            (b"\x1b[33m\x1b[?47h\x1b[31m\x1b[?47l", Some("\x1b[31m")),
+            (
+                b"\x1b[33m\x1b[?1049h\x1b[32m\x1b7\x1b[31m\x1b[?1049l",
+                Some("\x1b[33m"),
+            ),
+            (
+                b"\x1b[33m\x1b7\x1b[?1049h\x1b[32m\x1b7\x1b[34m\x1b8",
+                Some("\x1b[32m"),
+            ),
+            (
+                b"\x1b[35m\x1b7\x1b[?1047h\x1b[32m\x1b7\x1b[?1047l\x1b8",
+                Some("\x1b[35m"),
+            ),
+            (
+                b"\x1b[35m\x1b7\x1b[31m\x1b[?1049h\x1b[?1049l\x1b[33m\x1b8",
+                Some("\x1b[31m"),
+            ),
+            (
+                b"\x1b[33m\x1b[?1049h\x1b[31m\x1b[!p\x1b[?1049l",
+                Some("\x1b[33m"),
+            ),
+            (b"\x1b[33m\x1b[?1049h\x1b[32m\x1b7\x1b[!p\x1b8", None),
+            // CSI s and CSI u with no parameters save and restore like DECSC
+            // and DECRC; with parameters or a prefix they are other controls.
+            (b"\x1b[33m\x1b[s\x1b[31m\x1b[u", Some("\x1b[33m")),
+            (b"\x1b[33m\x9bs\x1b[31m\xc2\x9bu", Some("\x1b[33m")),
+            (b"\x1b[33m\x1b7\x1b[31m\x1b[u", Some("\x1b[33m")),
+            (b"\x1b[33m\x1b[s\x1b[31m\x1b8", Some("\x1b[33m")),
+            (b"\x1b[33m\x1b[s\x1b[31m\x1b[>1u\x1b[<u", Some("\x1b[31m")),
+            (b"\x1b[33m\x1b[s\x1b[31m\x1b[?u", Some("\x1b[31m")),
+            // A terminal runs C0 controls after ESC and then the control.
+            (b"\x1b\x00[33m", Some("\x1b[33m")),
+            (b"\x1b[33m\x1b\x00c", None),
+            (b"\x1b[33m\x1b\x00[!p", None),
+            (b"\x1b[33m\x1b\x007\x1b[31m\x1b\r\n8", Some("\x1b[33m")),
+            (b"\x1b[33m\x1b\x7f[s\x1b[31m\x1b\x00[u", Some("\x1b[33m")),
+            (
+                b"\x1b[33m\x1b\x00[?1049h\x1b[31m\x1b\x00[?1049l",
+                Some("\x1b[33m"),
+            ),
+        ] {
+            let mut state = NativeSgrState::default();
+            for token in super::tokenize_ansi(input) {
+                if let super::Token::Ansi(sequence) = token {
+                    state.apply_sequence(&sequence);
+                }
+            }
+            assert_eq!(
+                state.ansi_start().as_deref(),
+                expected,
+                "after {input:02x?}"
+            );
+        }
+    }
+
+    /// The foreground xterm draws each visible byte of `bytes` in, modeled
+    /// apart from `NativeSgrState`: SGR sets it, RIS and DECSTR reset it, and
+    /// DECSC, CSI s and modes 1048 and 1049 save it and DECRC, CSI u and those
+    /// modes restore it, with a saved copy per screen.
+    fn drawn_foregrounds(bytes: &[u8]) -> Vec<(u8, Option<String>)> {
+        let mut foreground: Option<String> = None;
+        let mut saved: [Option<String>; 2] = [None, None];
+        let mut screen = 0;
+        let mut drawn = Vec::new();
+        for token in super::tokenize_ansi(bytes) {
+            let control = match token {
+                super::Token::Text(text) => {
+                    drawn.extend(text.iter().map(|byte| (*byte, foreground.clone())));
+                    continue;
+                }
+                super::Token::Ansi(control) => control,
+            };
+            // A terminal runs C0 controls between ESC and the next byte.
+            let mut control = control;
+            while control.len() > 1
+                && control[0] == 0x1b
+                && matches!(control[1], 0x00..=0x17 | 0x19 | 0x1c..=0x1f | 0x7f)
+            {
+                control.remove(1);
+            }
+            match control.as_slice() {
+                b"\x1bc" => {
+                    foreground = None;
+                    saved = [None, None];
+                    screen = 0;
+                }
+                b"\x1b[!p" => {
+                    foreground = None;
+                    saved[screen] = None;
+                }
+                b"\x1b7" | b"\x1b[s" | b"\x1b[?1048h" => saved[screen] = foreground.clone(),
+                b"\x1b8" | b"\x1b[u" | b"\x1b[?1048l" => foreground = saved[screen].clone(),
+                b"\x1b[?1049h" => {
+                    saved[screen] = foreground.clone();
+                    screen = 1;
+                }
+                b"\x1b[?1049l" => {
+                    screen = 0;
+                    foreground = saved[0].clone();
+                }
+                b"\x1b[?47h" | b"\x1b[?1047h" => screen = 1,
+                b"\x1b[?47l" | b"\x1b[?1047l" => screen = 0,
+                sgr if sgr.starts_with(b"\x1b[") && sgr.ends_with(b"m") => {
+                    let parameters =
+                        std::str::from_utf8(&sgr[2..sgr.len() - 1]).expect("test SGR is ASCII");
+                    let codes = parameters.split(';').collect::<Vec<_>>();
+                    let mut idx = 0;
+                    while idx < codes.len() {
+                        match codes[idx] {
+                            "" | "0" | "39" => foreground = None,
+                            "38" => {
+                                let len = if codes[idx + 1] == "5" { 3 } else { 5 };
+                                foreground = Some(codes[idx..idx + len].join(";"));
+                                idx += len - 1;
+                            }
+                            code if code.len() == 2 && code.starts_with('3') => {
+                                foreground = Some(code.to_string());
+                            }
+                            _ => {}
+                        }
+                        idx += 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+        drawn
+    }
+
+    // However reads split the output, highlighting must leave every byte it
+    // does not highlight in the color the program drew it in, through the
+    // terminal's resets, saves and restores of that color.
+    #[test]
+    fn highlighting_keeps_program_colors_through_terminal_resets_and_saves() {
+        const FRAGMENTS: &[&[u8]] = &[
+            b"\x1b[31m",
+            b"\x1b[32m",
+            b"\x1b[33m",
+            b"\x1b[39m",
+            b"\x1b[0m",
+            b"\x1b[1m",
+            b"\x1b7",
+            b"\x1b8",
+            b"\x1b[s",
+            b"\x1b[u",
+            b"\x1b[>1u",
+            b"\x1b\x007",
+            b"\x1b\x008",
+            b"\x1b\r8",
+            b"\x1b\x00c",
+            b"\x1b\x00[32m",
+            b"\x1b\x00[s",
+            b"\x1b\x7f[u",
+            b"\x1b\x00[!p",
+            b"\x1b\x00[?1049h",
+            b"\x1b\x00[?1049l",
+            b"\x1bc",
+            b"\x1b[!p",
+            b"\x1b[?1048h",
+            b"\x1b[?1048l",
+            b"\x1b[?1049h",
+            b"\x1b[?1049l",
+            b"\x1b[?1047h",
+            b"\x1b[?1047l",
+            b"\x1b[?47h",
+            b"\x1b[?47l",
+            b"error",
+            b" ",
+            b"x",
+            b"\n",
+        ];
+        let config = PrismConfig::from_chromaterm_yaml(
+            "rules:\n  - description: bad status\n    regex: '\\berror\\b'\n    color: f#ff0000\n",
+        )
+        .expect("config parses");
+        let highlighter = Highlighter::from_config(config).expect("rule compiles");
+
+        let mut seed = 0x5eed_c010_4ba5_e5e1_u64;
+        let mut below = |bound: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % bound as u64) as usize
+        };
+        for _ in 0..1000 {
+            let mut input = Vec::new();
+            for _ in 0..1 + below(40) {
+                input.extend_from_slice(FRAGMENTS[below(FRAGMENTS.len())]);
+            }
+            let program = drawn_foregrounds(&input);
+            let visible = program.iter().map(|(byte, _)| *byte).collect::<Vec<_>>();
+            let mut highlightable = vec![false; visible.len()];
+            for (start, _) in visible
+                .windows(b"error".len())
+                .enumerate()
+                .filter(|(_, window)| *window == b"error")
+            {
+                highlightable[start..start + b"error".len()].fill(true);
+            }
+
+            let mut random = Vec::new();
+            let mut start = 0;
+            while start < input.len() {
+                let end = input.len().min(start + 1 + below(16));
+                random.push(&input[start..end]);
+                start = end;
+            }
+            for chunks in [vec![input.as_slice()], random, input.chunks(1).collect()] {
+                for interactive in [false, true] {
+                    let mut streaming = if interactive {
+                        StreamingHighlighter::new_interactive(highlighter.clone())
+                    } else {
+                        StreamingHighlighter::new(highlighter.clone())
+                    };
+                    let mut output = Vec::new();
+                    for chunk in &chunks {
+                        output.extend(streaming.push(chunk));
+                    }
+                    output.extend(streaming.finish());
+
+                    let drawn = drawn_foregrounds(&output);
+                    assert_eq!(
+                        drawn.iter().map(|(byte, _)| *byte).collect::<Vec<_>>(),
+                        visible,
+                        "visible text changed for {input:02x?}"
+                    );
+                    for (idx, ((byte, color), (_, program_color))) in
+                        drawn.iter().zip(&program).enumerate()
+                    {
+                        if highlightable[idx] || matches!(byte, b' ' | b'\n') {
+                            continue;
+                        }
+                        assert_eq!(
+                            color,
+                            program_color,
+                            "byte {idx} of {input:02x?} in {} reads (interactive: {interactive}): {output:02x?}",
+                            chunks.len()
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    // Pins the style starts emitted at transitions and re-emitted after an
+    // escape inside a highlight, in both emit paths and color modes.
+    #[test]
+    fn style_starts_are_emitted_at_transitions_and_after_escapes() {
+        let yaml = "rules:\n  - description: state\n    regex: '\\bup\\b'\n    color: f#00ff00\n  - description: wan\n    regex: '\\bwan\\b'\n    color: f#ff0000 b#0000ff underline\n";
+        let input = b"is \x1b[32mup\x1b[0m, is \x1b[32mup\x1b[0m, u\x1b[1mp w\x1b]0;t\x07an,up\n";
+        let render = |color_mode, interactive: bool| {
+            let config = PrismConfig::from_chromaterm_yaml(yaml).expect("config parses");
+            let highlighter = Highlighter::from_config_with_color_mode(config, color_mode)
+                .expect("rules compile");
+            let mut streaming = if interactive {
+                StreamingHighlighter::new_interactive(highlighter)
+            } else {
+                StreamingHighlighter::new(highlighter)
+            };
+            let mut output = streaming.push(input);
+            output.extend(streaming.finish());
+            String::from_utf8(output).expect("utf8")
+        };
+
+        assert_eq!(
+            render(crate::style::ColorMode::TrueColor, false),
+            concat!(
+                "is \x1b[32m\x1b[38;2;0;255;0mup\x1b[0m\x1b[38;2;0;255;0m\x1b[0m, ",
+                "is \x1b[32m\x1b[38;2;0;255;0mup\x1b[0m\x1b[38;2;0;255;0m\x1b[0m, ",
+                "\x1b[38;2;0;255;0mu\x1b[1m\x1b[38;2;0;255;0mp\x1b[0m\x1b[1m ",
+                "\x1b[4;38;2;255;0;0;48;2;0;0;255mw\x1b]0;t\x07\x1b[4;38;2;255;0;0;48;2;0;0;255man",
+                "\x1b[0m\x1b[1m,\x1b[38;2;0;255;0mup\x1b[0m\x1b[1m\n",
+            )
+        );
+        assert_eq!(
+            render(crate::style::ColorMode::Xterm256, false),
+            concat!(
+                "is \x1b[32m\x1b[38;5;46mup\x1b[0m\x1b[38;5;46m\x1b[0m, ",
+                "is \x1b[32m\x1b[38;5;46mup\x1b[0m\x1b[38;5;46m\x1b[0m, ",
+                "\x1b[38;5;46mu\x1b[1m\x1b[38;5;46mp\x1b[0m\x1b[1m ",
+                "\x1b[4;38;5;196;48;5;21mw\x1b]0;t\x07\x1b[4;38;5;196;48;5;21man",
+                "\x1b[0m\x1b[1m,\x1b[38;5;46mup\x1b[0m\x1b[1m\n",
+            )
+        );
+        assert_eq!(
+            render(crate::style::ColorMode::TrueColor, true),
+            concat!(
+                "is \x1b[32m\x1b[38;2;0;255;0mup\x1b[0m\x1b[38;2;0;255;0m\x1b[39m, ",
+                "is \x1b[32m\x1b[38;2;0;255;0mup\x1b[0m\x1b[38;2;0;255;0m\x1b[39m, ",
+                "\x1b[38;2;0;255;0mu\x1b[1m\x1b[38;2;0;255;0mp ",
+                "\x1b[4;38;2;255;0;0;48;2;0;0;255mw\x1b]0;t\x07\x1b[4;38;2;255;0;0;48;2;0;0;255man",
+                "\x1b[24;39;49m,\x1b[38;2;0;255;0mup\n\x1b[39m",
+            )
+        );
+        assert_eq!(
+            render(crate::style::ColorMode::Ansi16, true),
+            concat!(
+                "is \x1b[32m\x1b[92mup\x1b[0m\x1b[92m\x1b[39m, ",
+                "is \x1b[32m\x1b[92mup\x1b[0m\x1b[92m\x1b[39m, ",
+                "\x1b[92mu\x1b[1m\x1b[92mp ",
+                "\x1b[4;91;104mw\x1b]0;t\x07\x1b[4;91;104man",
+                "\x1b[24;39;49m,\x1b[92mup\n\x1b[39m",
+            )
+        );
+    }
+
+    // An SGR start only adds to what is drawn, so switching the interactive
+    // overlay to another style must first end what the previous style set and
+    // the next one does not, or it stays on the text after it.
+    #[test]
+    fn interactive_overlay_ends_the_previous_style_before_starting_another() {
+        let render = |yaml: &str, input: &[u8], no_minimal_resets: bool| {
+            let config = PrismConfig::from_chromaterm_yaml(yaml).expect("config parses");
+            let highlighter =
+                Highlighter::from_config_with_color_mode(config, crate::style::ColorMode::Xterm256)
+                    .expect("rules compile");
+            let mut streaming = StreamingHighlighter::new_interactive(highlighter);
+            streaming.set_no_minimal_resets(no_minimal_resets);
+            let mut output = streaming.push(input);
+            output.extend(streaming.finish());
+            String::from_utf8(output).expect("utf8")
+        };
+
+        let background_then_foreground = "rules:\n  - description: host\n    regex: '\\bhost\\d+'\n    color: f#ffffff b#003366\n  - description: port\n    regex: ':\\d+\\b'\n    color: f#00ff00\n";
+        assert_eq!(
+            render(background_then_foreground, b"host1:22 open\nnext\n", false),
+            "\x1b[38;5;231;48;5;23mhost1\x1b[39;49m\x1b[38;5;46m:22 \x1b[39mopen\nnext\n",
+        );
+
+        let bold_then_plain = "rules:\n  - description: down\n    regex: '\\bdown\\b'\n    color: f#ff0000 bold\n  - description: port\n    regex: '\\bGi\\S+'\n    color: f#0087ff\n";
+        let output = render(bold_then_plain, b"down Gi0/1\n", true);
+        let gi = output.find("Gi0/1").expect("token is emitted");
+        let before_gi = &output[..gi];
+        assert!(
+            before_gi.rfind("\x1b[0m") > before_gi.rfind("\x1b[1;"),
+            "bold from `down` is not ended before `Gi0/1`: {output:?}"
+        );
+
+        // A switch between foreground-only styles needs no reset.
+        let foreground_only = "rules:\n  - description: host\n    regex: '\\bhost\\d+'\n    color: f#ffffff\n  - description: port\n    regex: ':\\d+\\b'\n    color: f#00ff00\n";
+        assert_eq!(
+            render(foreground_only, b"host1:22 open\n", false),
+            "\x1b[38;5;231mhost1\x1b[38;5;46m:22 \x1b[39mopen\n",
+        );
+    }
+
+    #[test]
+    fn emit_paths_render_style_starts_through_the_cache() {
+        let source = include_str!("highlight.rs");
+        for name in ["fn emit_highlighted(", "fn emit_interactive_highlighted("] {
+            let function_source = source
+                .split(name)
+                .nth(1)
+                .expect("function exists")
+                .split("\n}\n")
+                .next()
+                .expect("function ends");
+
+            assert!(
+                !function_source.contains("ansi_start_with_mode"),
+                "{name} renders style starts outside SgrStartCache"
+            );
+        }
+    }
+
+    #[test]
+    fn primary_screen_streaming_reuses_the_tokenized_chunk() {
+        let source = include_str!("highlight.rs");
+        let fast_path_source = source
+            .split("fn highlight_streaming_chunk")
+            .nth(1)
+            .expect("function exists")
+            .split("let mut highlightable")
+            .next()
+            .expect("fast path precedes the token loop");
+        assert!(fast_path_source.contains("self.highlight_prepared(input"));
+
+        let split_source = source
+            .split("fn split_prepared_pending")
+            .nth(1)
+            .expect("function exists")
+            .split("\n}\n")
+            .next()
+            .expect("function ends");
+        assert!(!split_source.contains(".clone()"));
+    }
+
+    #[test]
+    fn sgr_start_cache_matches_direct_rendering_past_its_bound() {
+        let styles = (0..40u8)
+            .map(|step| crate::style::Style {
+                foreground: Some(crate::style::Rgb {
+                    r: step,
+                    g: 255 - step,
+                    b: 7,
+                }),
+                underline: step % 3 == 0,
+                ..crate::style::Style::default()
+            })
+            .collect::<Vec<_>>();
+        for color_mode in [
+            crate::style::ColorMode::TrueColor,
+            crate::style::ColorMode::Xterm256,
+        ] {
+            let mut cache = super::SgrStartCache::default();
+            // In order, strided (so evicted entries come back), and repeated.
+            for idx in (0..styles.len()).chain((0..styles.len()).map(|idx| (idx * 7) % 40)) {
+                for _ in 0..2 {
+                    assert_eq!(
+                        cache.start(&styles[idx], color_mode),
+                        styles[idx].ansi_start_with_mode(color_mode).as_bytes()
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn regex_compile_diagnostics_escape_untrusted_rule_descriptions() {
         let config = PrismConfig::from_chromaterm_yaml(
@@ -5858,6 +8699,59 @@ rules:
         assert!(!message.contains('\u{7}'), "{message:?}");
         assert!(message.contains("\\x1b"), "{message:?}");
         assert!(message.contains("\\x07"), "{message:?}");
+    }
+
+    #[test]
+    fn escape_before_a_multibyte_character_keeps_highlighted_output_utf8() {
+        for rules in [
+            "rules:\n  - regex: '\\b(up)\\b'\n    color: f#00ff00\n",
+            "rules:\n  - regex: 'link.*now'\n    color: f#00ff00\n",
+        ] {
+            let config = PrismConfig::from_chromaterm_yaml(rules).expect("config parses");
+            let highlighter = Highlighter::from_config(config).expect("rule compiles");
+            for input in [
+                "link up\u{1b}\u{e9} now\n",
+                "link up\u{1b}(\u{e9} now\n",
+                "link up\u{1b}\u{4e2d} now\n",
+            ] {
+                let output = highlighter.highlight_bytes(input.as_bytes());
+                assert!(
+                    std::str::from_utf8(&output).is_ok(),
+                    "invalid UTF-8 for {input:?}: {output:02x?}"
+                );
+                assert!(std::str::from_utf8(&super::strip_ansi(&output)).is_ok());
+                let _ = highlighter.highlight_str(input);
+                let _ = StreamingHighlighter::new(highlighter.clone()).push_str(input);
+            }
+        }
+
+        // The character stays visible text and the escape scanner agrees with
+        // the tokenizer that the bare ESC is already complete.
+        assert_eq!(
+            super::strip_ansi("a\u{1b}\u{e9}".as_bytes()),
+            "a\u{e9}".as_bytes()
+        );
+        assert_eq!(
+            super::strip_ansi("a\u{1b}(\u{e9}".as_bytes()),
+            "a\u{e9}".as_bytes()
+        );
+        assert_eq!(
+            super::incomplete_top_level_escape_start("a\u{1b}\u{e9}".as_bytes()),
+            None
+        );
+        assert_eq!(
+            super::incomplete_top_level_escape_start("a\u{1b}(\u{e9}".as_bytes()),
+            None
+        );
+        // A trailing C2 can still become a UTF-8 C1 control that cancels the
+        // ESC, so the ESC is carried with it instead of being emitted alone.
+        assert_eq!(super::incomplete_sanitize_start(b"a\x1b\xc2"), Some(1));
+        assert_eq!(super::incomplete_sanitize_start(b"a\x1b\xe2\x90"), Some(1));
+        assert_eq!(super::incomplete_sanitize_start(b"a\x1b(\xc2"), Some(1));
+        assert_eq!(
+            super::strip_string_escapes(b"a\x1b\xc2\x9d0;t\x07b"),
+            b"ab".to_vec()
+        );
     }
 
     #[test]
@@ -5995,6 +8889,35 @@ rules:
             b"ab"
         );
         assert_eq!(ranges.len(), 1);
+        assert!(ranges[0].is_sgr);
+    }
+
+    // A terminal runs C0 controls between ESC and the byte that selects the
+    // sequence, and the tokenizer keeps them in the control's token, so the
+    // classifiers must read `ESC NUL [` as a CSI and `ESC NUL 7` as DECSC.
+    #[test]
+    fn escapes_with_c0_controls_after_esc_match_their_plain_forms() {
+        assert_eq!(
+            super::tokenize_ansi(b"\x1b\x00[?1049hx").len(),
+            2,
+            "the C0 control stays in the CSI token"
+        );
+        assert_eq!(
+            super::alternate_screen_command(b"\x1b\x00[?1049h"),
+            Some(true)
+        );
+        assert!(super::is_cursor_positioning_sequence(b"\x1b\x7f[2H"));
+        assert!(super::saves_rendition(b"\x1b\x007"));
+        assert!(super::saves_rendition(b"\x1b\r\n[s"));
+        assert!(super::saves_rendition(b"\x1b\x00[?1049h"));
+        assert!(super::is_index_control(b"\x1b\x00D"));
+        assert!(!super::saves_rendition(b"\x1b\x00#7"));
+
+        let (visible, ranges) = super::visible_byte_map_and_ansi_ranges(b"a\x1b\x00[31mb");
+        assert_eq!(
+            visible.iter().map(|byte| byte.byte).collect::<Vec<_>>(),
+            b"ab"
+        );
         assert!(ranges[0].is_sgr);
     }
 

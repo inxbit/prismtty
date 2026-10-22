@@ -243,6 +243,21 @@ test('README files keep their public contract', () => {
   assert.doesNotMatch(cratesReadme, /show-tech\.txt \| prismtty/);
 });
 
+test('documented cargo install builds from the audited Cargo.lock', () => {
+  // Without --locked, cargo install re-resolves every dependency to its newest
+  // compatible version instead of the lockfile that CI and release audit.
+  for (const file of ['README.md', 'README.crates.md', 'PRODUCT.md', INDEX]) {
+    const text = read(file);
+    assert.match(text, /cargo install --locked prismtty/, `${file}: document cargo install --locked`);
+    assert.doesNotMatch(text, /cargo install prismtty\b/, `${file}: cargo install without --locked`);
+  }
+  const index = read(INDEX);
+  assert.match(index, /data-copy="cargo install --locked prismtty"/);
+  for (const [, value] of index.matchAll(/data-copy="([^"]*cargo install[^"]*)"/g)) {
+    assert.match(value, /--locked/, `${INDEX}: copy button value ${value}`);
+  }
+});
+
 test('site pages ship the approved CSP', () => {
   const index = read(INDEX);
   assert.equal(

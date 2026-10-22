@@ -1,4 +1,5 @@
 use std::fs;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use directories::BaseDirs;
@@ -58,6 +59,15 @@ fn terminal_supports_truecolor() -> bool {
         .unwrap_or(false)
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Detection passes run on this thread. Each strips and scans the whole
+    /// sample, so stream tests count them to see how often a read loop
+    /// rescans.
+    pub(super) static DETECTION_PASSES: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
 pub(super) fn select_profile_names_with_store(
     options: &Options,
     store: &ProfileStore,
@@ -68,6 +78,8 @@ pub(super) fn select_profile_names_with_store(
     } else if options.no_auto_detect {
         vec!["generic".to_string()]
     } else {
+        #[cfg(test)]
+        DETECTION_PASSES.with(|passes| passes.set(passes.get() + 1));
         let visible_sample = strip_ansi(sample);
         let sample_text = String::from_utf8_lossy(&visible_sample);
         store.detect_profiles(&sample_text)
@@ -127,7 +139,9 @@ impl ProfileReporter {
 
     pub(super) fn report(&mut self, profile_names: &[String]) {
         if let Some(message) = self.message_for(profile_names) {
-            eprintln!("{message}");
+            // Diagnostics are best effort: a closed stderr must not cost the
+            // highlighted output.
+            let _ = writeln!(io::stderr(), "{message}");
         }
     }
 
@@ -170,7 +184,8 @@ pub(super) fn profile_store() -> Result<ProfileStore, CliError> {
             .map_err(|error| CliError::Usage(error.to_string()))?;
         if shadowed {
             let name = escape_untrusted(&name);
-            eprintln!(
+            let _ = writeln!(
+                io::stderr(),
                 "prismtty: user profile '{name}' from profiles.d overrides the built-in profile of the same name"
             );
         }
@@ -276,9 +291,11 @@ fn enforce_profiles_d_entry_budget(entry_count: usize) -> Result<(), CliError> {
 }
 
 fn config_base_dir() -> Option<PathBuf> {
-    if let Some(path) = std::env::var_os("XDG_CONFIG_HOME") {
-        if !path.is_empty() {
-            return Some(PathBuf::from(path));
+    // The XDG Base Directory spec treats a relative value (or an empty one)
+    // as invalid: honouring it would load config from the current directory.
+    if let Some(path) = std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from) {
+        if path.is_absolute() {
+            return Some(path);
         }
     }
     BaseDirs::new().map(|base_dirs| base_dirs.home_dir().join(".config"))

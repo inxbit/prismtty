@@ -14,6 +14,7 @@ mod trace;
 
 use std::ffi::OsString;
 use std::io::{self, Write};
+use std::os::fd::AsRawFd;
 use std::process::ExitCode;
 
 use is_terminal::IsTerminal;
@@ -27,9 +28,9 @@ use crate::terminal_text::escape_untrusted;
 
 use args::{Action, Options, parse_args, print_help};
 use profile_selection::profile_store;
-use pty::run_command;
-use runtime::{ReloadWatcher, RuntimeRegistration, request_reload};
-use stream::{InputSource, highlight_stream};
+use pty::{WaitWhenWouldBlock, run_command};
+use runtime::{register_for_reload, request_reload};
+use stream::{InputSource, highlight_stream, prepare_session};
 use trace::IoTrace;
 
 #[cfg(feature = "completion-generation")]
@@ -54,15 +55,43 @@ pub enum CliError {
     /// PTY creation or command execution failed.
     #[error("PTY error: {0}")]
     Pty(#[from] anyhow::Error),
+    /// The wrapped command could not be started.
+    #[error("PTY error: {source}")]
+    Spawn {
+        /// Why spawning failed.
+        source: anyhow::Error,
+        /// The exit code to report: 127 not found, 126 not executable, else 1.
+        code: u8,
+    },
     /// Switching terminal modes failed.
     #[error("terminal mode error: {0}")]
     Terminal(#[from] nix::errno::Errno),
 }
 
+impl CliError {
+    /// The process exit code: what a shell reports for a wrapped command that
+    /// could not be started (127 not found, 126 not executable), otherwise 1.
+    fn exit_code(&self) -> u8 {
+        match self {
+            Self::Spawn { code, .. } => *code,
+            _ => 1,
+        }
+    }
+}
+
+/// Exit status for output whose reader went away: 128 + SIGPIPE, what a
+/// filter killed by SIGPIPE reports, so `set -o pipefail` sees the same code.
+const BROKEN_PIPE_EXIT_STATUS: u8 = 141;
+
 /// Runs the CLI using process arguments and returns the desired exit code.
 pub fn run() -> ExitCode {
     match run_inner(std::env::args_os().skip(1).collect()) {
         Ok(code) => code,
+        // `| head` or quitting `less` ends a pipeline; it is not an error worth
+        // a message. PTY mode has already reaped the child by this point.
+        Err(CliError::Io(error)) if error.kind() == io::ErrorKind::BrokenPipe => {
+            ExitCode::from(BROKEN_PIPE_EXIT_STATUS)
+        }
         Err(error) => {
             let message = error.to_string();
             let mut stderr = io::stderr().lock();
@@ -73,31 +102,34 @@ pub fn run() -> ExitCode {
                     let _ = writeln!(stderr, "prismtty: {}", escape_untrusted(line));
                 }
             }
-            ExitCode::from(1)
+            ExitCode::from(error.exit_code())
         }
     }
 }
 
 fn run_inner(args: Vec<OsString>) -> Result<ExitCode, CliError> {
     let (options, action) = parse_args(args)?;
+    // Reports are written with `writeln!` rather than `println!`, which panics
+    // when the reader has gone away instead of returning the error.
     match action {
         Action::Help => {
-            print_help();
+            print_help()?;
             Ok(ExitCode::SUCCESS)
         }
         Action::Version => {
-            println!("prismtty {}", env!("CARGO_PKG_VERSION"));
+            writeln!(io::stdout(), "prismtty {}", env!("CARGO_PKG_VERSION"))?;
             Ok(ExitCode::SUCCESS)
         }
         Action::Reload => {
             let count = request_reload()?;
-            println!("Processes reloaded: {count}");
+            writeln!(io::stdout(), "Processes reloaded: {count}")?;
             Ok(ExitCode::SUCCESS)
         }
         Action::ProfilesList => {
             let store = profile_store()?;
+            let mut out = io::stdout().lock();
             for name in store.names() {
-                println!("{}", escape_untrusted(name));
+                writeln!(out, "{}", escape_untrusted(name))?;
             }
             Ok(ExitCode::SUCCESS)
         }
@@ -109,11 +141,13 @@ fn run_inner(args: Vec<OsString>) -> Result<ExitCode, CliError> {
                     escape_untrusted(&profile_name)
                 ))
             })?;
-            println!("profile: {}", escape_untrusted(&profile.name));
+            let mut out = io::stdout().lock();
+            writeln!(out, "profile: {}", escape_untrusted(&profile.name))?;
             if profile.inherits.is_empty() {
-                println!("inherits: none");
+                writeln!(out, "inherits: none")?;
             } else {
-                println!(
+                writeln!(
+                    out,
                     "inherits: {}",
                     profile
                         .inherits
@@ -121,12 +155,13 @@ fn run_inner(args: Vec<OsString>) -> Result<ExitCode, CliError> {
                         .map(|name| escape_untrusted(name))
                         .collect::<Vec<_>>()
                         .join(", ")
-                );
+                )?;
             }
             if profile.detection.is_empty() {
-                println!("detection: none");
+                writeln!(out, "detection: none")?;
             } else {
-                println!(
+                writeln!(
+                    out,
                     "detection: {}",
                     profile
                         .detection
@@ -134,11 +169,11 @@ fn run_inner(args: Vec<OsString>) -> Result<ExitCode, CliError> {
                         .map(|hint| escape_untrusted(hint))
                         .collect::<Vec<_>>()
                         .join(", ")
-                );
+                )?;
             }
-            println!("rules:");
+            writeln!(out, "rules:")?;
             for rule in &profile.rules {
-                println!("  - {}", escape_untrusted(&rule.description));
+                writeln!(out, "  - {}", escape_untrusted(&rule.description))?;
             }
             Ok(ExitCode::SUCCESS)
         }
@@ -158,7 +193,11 @@ fn run_inner(args: Vec<OsString>) -> Result<ExitCode, CliError> {
                 enabled_profiles: vec![loaded.meta.name.clone()],
             };
             let _ = Highlighter::from_config(config)?;
-            println!("profile {} valid", escape_untrusted(&loaded.meta.name));
+            writeln!(
+                io::stdout(),
+                "profile {} valid",
+                escape_untrusted(&loaded.meta.name)
+            )?;
             Ok(ExitCode::SUCCESS)
         }
         Action::ProfilesTest { profile, fixture } => {
@@ -194,6 +233,9 @@ fn run_inner(args: Vec<OsString>) -> Result<ExitCode, CliError> {
                 ));
             }
             stdout.write_all(&rendered)?;
+            // Output with no final line end is still buffered, and the flush
+            // at exit would drop its error.
+            stdout.flush()?;
             Ok(ExitCode::SUCCESS)
         }
         Action::Stdin => run_stdin(options),
@@ -202,19 +244,31 @@ fn run_inner(args: Vec<OsString>) -> Result<ExitCode, CliError> {
 }
 
 fn run_stdin(options: Options) -> Result<ExitCode, CliError> {
-    let _registration = RuntimeRegistration::register()?;
-    let reload_watcher = Some(ReloadWatcher::new());
-    let trace = IoTrace::open(options.trace_io.as_deref())?;
-    let stdin = io::stdin();
-    let mut stdout = io::stdout();
+    let stdout = io::stdout();
     let interactive = stdin_mode_interactive_highlighting(stdout.is_terminal());
+    // Reject a bad config before reading: with empty input it would otherwise
+    // never be loaded, and with input it would cost the first chunk.
+    let prepared = prepare_session(&options, interactive)?;
+    let trace = IoTrace::open(options.trace_io.as_deref())?;
+    let (_registration, reload_watcher) = register_for_reload();
+    let stdin = io::stdin();
+    // As in PTY mode, another program on the terminal can leave stdout
+    // non-blocking.
+    let mut stdout = WaitWhenWouldBlock {
+        fd: stdout.as_raw_fd(),
+        inner: stdout,
+    };
     highlight_stream(
         stdin.lock(),
         &mut stdout,
-        &options,
+        prepared,
         InputSource {
             interactive,
             pty_fd: None,
+            // The stream reads 8 KiB at a time, no less than the stdin lock's
+            // buffer, so each read goes straight to the descriptor and a poll
+            // of it sees everything not yet read.
+            idle_fd: interactive.then(|| stdin.as_raw_fd()),
             recent_input: None,
         },
         reload_watcher,

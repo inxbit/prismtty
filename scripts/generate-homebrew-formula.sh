@@ -81,6 +81,9 @@ class Prismtty < Formula
     bin.install "prismtty", "ptty", "ct"
     bash_completion.install "completions/prismtty.bash" => "prismtty"
     fish_completion.install "completions/prismtty.fish"
+    # fish loads completions by command name; ptty and ct share prismtty.fish.
+    fish_completion.install_symlink fish_completion/"prismtty.fish" => "ptty.fish"
+    fish_completion.install_symlink fish_completion/"prismtty.fish" => "ct.fish"
     zsh_completion.install "completions/_prismtty"
     pkgshare.install "profiles"
   end

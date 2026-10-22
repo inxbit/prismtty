@@ -353,6 +353,87 @@ fn trace_output_bytes(path: &Path) -> Vec<u8> {
         .collect()
 }
 
+/// The reason traced for each flush of a held-back tail, decoded from the
+/// `FLUSH` lines of a `--trace-io` file.
+fn trace_flush_reasons(path: &Path) -> Vec<String> {
+    let Ok(trace) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    trace
+        .lines()
+        .filter_map(|line| line.split_once(" FLUSH ").map(|(_, bytes)| bytes))
+        .map(|bytes| {
+            let bytes: Vec<u8> = bytes
+                .split_whitespace()
+                .filter_map(|byte| u8::from_str_radix(byte, 16).ok())
+                .collect();
+            String::from_utf8_lossy(&bytes).into_owned()
+        })
+        .collect()
+}
+
+/// Asserts that an echo trigger, not the program-output holdback, drew the
+/// tail. The holdback also makes the tail visible, only 250 ms late, so
+/// visibility alone cannot tell a broken echo trigger apart. The trace line is
+/// written before the tail is drawn, so a visible tail's reason is on file.
+fn assert_drawn_by_echo_trigger(path: &Path, reason: &str) {
+    let reasons = trace_flush_reasons(path);
+    assert!(
+        reasons.iter().any(|traced| traced == reason),
+        "tail was not drawn by the {reason:?} trigger; traced flushes: {reasons:?}"
+    );
+    assert!(
+        !reasons.iter().any(|traced| traced == "holdback"),
+        "echo waited out the program-output holdback; traced flushes: {reasons:?}"
+    );
+}
+
+/// Makes a FIFO for a child to wait on with `read -r _ < "$gate"`. Unlike a
+/// file the child polls with `sleep`, the child resumes the moment
+/// [`release_fifo_gate`] writes to it, so the pause it ends is the test's own
+/// reaction time, however slowly the machine starts processes.
+fn make_fifo_gate(path: &Path) {
+    use std::os::unix::ffi::OsStrExt;
+
+    let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).expect("gate path");
+    // SAFETY: `c_path` is a valid NUL-terminated path that outlives the call.
+    let made = unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) };
+    assert_eq!(
+        made,
+        0,
+        "mkfifo {}: {}",
+        path.display(),
+        std::io::Error::last_os_error()
+    );
+}
+
+/// Ends one `read -r _ < "$gate"` of the child, waiting for it to open its
+/// end of the FIFO if it has not yet.
+fn release_fifo_gate(path: &Path) {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(path)
+        {
+            Ok(mut gate) => {
+                gate.write_all(b"\n").expect("write the FIFO gate");
+                return;
+            }
+            // ENXIO: no reader has the FIFO open yet.
+            Err(error)
+                if error.raw_os_error() == Some(libc::ENXIO) && Instant::now() < deadline =>
+            {
+                thread::sleep(Duration::from_millis(1));
+            }
+            Err(error) => panic!("open the FIFO gate: {error}"),
+        }
+    }
+}
+
 fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
     !needle.is_empty()
         && haystack
@@ -479,7 +560,11 @@ fn pasted_line_is_fully_visible_without_extra_input() {
         })
         .expect("openpty");
 
+    let trace_dir = tempfile::tempdir().expect("trace tempdir");
+    let trace_path = trace_dir.path().join("echo.trace");
     let mut builder = CommandBuilder::new(env!("CARGO_BIN_EXE_ptty"));
+    builder.arg("--trace-io");
+    builder.arg(&trace_path);
     builder.arg("sh");
     builder.arg("-c");
     builder.arg("printf 'READY\\n'; exec cat");
@@ -519,6 +604,7 @@ fn pasted_line_is_fully_visible_without_extra_input() {
         visible.contains(target),
         "pasted line never fully surfaced without extra input; saw: {visible:?}"
     );
+    assert_drawn_by_echo_trigger(&trace_path, "echo-suffix");
 }
 
 fn count_subslice(haystack: &[u8], needle: &[u8]) -> usize {
@@ -551,12 +637,14 @@ fn contains_sgr_span(haystack: &[u8], token: &[u8]) -> bool {
 /// input echo, so it must NOT fire for buffered program-output tokens — there is
 /// no pending input echo. Regression guard for the bulk-output highlighting that
 /// an unconditional idle flush would break (cisco "Vlan1191" split as
-/// "...Vlan11" + "91" across two reads with an inter-write gap).
+/// "...Vlan11" + "91" across two reads with an inter-write gap). The gap here is
+/// the test's reaction time, far inside the program-output holdback.
 #[test]
 fn split_program_output_token_keeps_single_highlight_span() {
     let trace_dir = tempfile::tempdir().expect("trace tempdir");
     let trace_path = trace_dir.path().join("split.trace");
     let continue_path = trace_dir.path().join("continue");
+    make_fifo_gate(&continue_path);
     let pair = native_pty_system()
         .openpty(PtySize {
             rows: 24,
@@ -576,16 +664,19 @@ fn split_program_output_token_keeps_single_highlight_span() {
     builder.arg("-c");
     // The child cannot emit the suffix until the test has observed the prefix in
     // prismtty's raw I/O trace. This proves the token crossed two downstream read
-    // boundaries without relying on a scheduler-dependent sleep.
+    // boundaries without relying on a scheduler-dependent sleep. It waits on a
+    // FIFO rather than polling a file, so it resumes as soon as the test
+    // releases it and the holdback does not draw the prefix on its own.
     builder.arg(
-        "printf 'show: Vlan11'; while [ ! -f \"$PRISMTTY_TEST_CONTINUE\" ]; do sleep 0.01; done; printf '91 New TZ GW to Internal\\n'",
+        "printf 'show: Vlan11'; read -r _ < \"$PRISMTTY_TEST_CONTINUE\"; printf '91 New TZ GW to Internal\\n'",
     );
 
     let child = pair.slave.spawn_command(builder).expect("spawn ptty");
     drop(pair.slave);
 
     // Pure program output: we never write to the master, so no input echo is
-    // pending and the idle flush must leave the buffered token alone.
+    // pending and, within the holdback window, the idle flush must leave the
+    // buffered token alone.
     let session = PtySession::new(child, &*pair.master);
     let prefix_crossed_boundary = wait_for_condition(Duration::from_secs(5), || {
         contains_bytes(&trace_output_bytes(&trace_path), b"show: Vlan11")
@@ -594,7 +685,7 @@ fn split_program_output_token_keeps_single_highlight_span() {
         prefix_crossed_boundary,
         "raw trace never recorded the token prefix before the continuation gate"
     );
-    std::fs::write(&continue_path, b"continue").expect("release continuation gate");
+    release_fifo_gate(&continue_path);
 
     let out = session.capture().wait_until(Duration::from_secs(5), |out| {
         contains_sgr_span(out, b"Vlan1191")
@@ -612,7 +703,17 @@ fn split_program_output_token_keeps_single_highlight_span() {
 /// returns the captured output. With echo off the typed bytes never echo back,
 /// so the buffered token is always program output and its span must stay intact
 /// regardless of what is typed.
+///
+/// Each second half waits on a FIFO that the test releases as soon as prismtty
+/// draws the `aaaaaaaa ` before the first half, which it does only once it has
+/// read it. So every token crosses a read boundary, and its halves arrive far
+/// closer together than the program-output holdback, which would draw the
+/// first half on its own.
 fn echo_off_split_stream_while_typing(typed: &'static [u8]) -> Vec<u8> {
+    const SPLITS: usize = 12;
+    let gate_dir = tempfile::tempdir().expect("gate tempdir");
+    let continue_path = gate_dir.path().join("continue");
+    make_fifo_gate(&continue_path);
     let pair = native_pty_system()
         .openpty(PtySize {
             rows: 24,
@@ -625,12 +726,14 @@ fn echo_off_split_stream_while_typing(typed: &'static [u8]) -> Vec<u8> {
     let mut builder = CommandBuilder::new(env!("CARGO_BIN_EXE_ptty"));
     builder.arg("-p");
     builder.arg("cisco");
+    builder.env("PRISMTTY_TEST_CONTINUE", &continue_path);
     builder.arg("sh");
     builder.arg("-c");
-    builder.arg(
-        "stty -echo; i=0; while [ $i -lt 12 ]; do printf 'aaaaaaaa Vlan11'; \
-         sleep 0.12; printf '91 bbbb\\n'; sleep 0.12; i=$((i+1)); done; printf 'STREAM_DONE\\n'",
-    );
+    builder.arg(format!(
+        "stty -echo; i=0; while [ $i -lt {SPLITS} ]; do printf 'aaaaaaaa Vlan11'; \
+         read -r _ < \"$PRISMTTY_TEST_CONTINUE\"; printf '91 bbbb\\n'; sleep 0.12; \
+         i=$((i+1)); done; printf 'STREAM_DONE\\n'"
+    ));
 
     let child = pair.slave.spawn_command(builder).expect("spawn ptty");
     drop(pair.slave);
@@ -642,6 +745,17 @@ fn echo_off_split_stream_while_typing(typed: &'static [u8]) -> Vec<u8> {
     // master writes briefly after the child exits, so do not rely on write
     // failure as the only thread-exit signal.
     let typer = TypingTask::start(writer, typed);
+    for split in 1..=SPLITS {
+        let drawn = session.capture().wait_until(Duration::from_secs(5), |out| {
+            visible_output(out).matches("aaaaaaaa ").count() >= split
+        });
+        assert!(
+            visible_output(&drawn).matches("aaaaaaaa ").count() >= split,
+            "prismtty never drew the first half of split {split}; saw: {:?}",
+            visible_output(&drawn)
+        );
+        release_fifo_gate(&continue_path);
+    }
     let out = session.capture().wait_until(Duration::from_secs(8), |out| {
         visible_output(out).contains("STREAM_DONE")
     });
@@ -696,7 +810,11 @@ fn raw_mode_paste_line_is_visible_without_extra_input() {
         })
         .expect("openpty");
 
+    let trace_dir = tempfile::tempdir().expect("trace tempdir");
+    let trace_path = trace_dir.path().join("echo.trace");
     let mut builder = CommandBuilder::new(env!("CARGO_BIN_EXE_ptty"));
+    builder.arg("--trace-io");
+    builder.arg(&trace_path);
     builder.arg("sh");
     builder.arg("-c");
     builder.arg("stty raw -echo 2>/dev/null; printf 'READY\\n'; exec cat");
@@ -734,6 +852,7 @@ fn raw_mode_paste_line_is_visible_without_extra_input() {
         visible.contains(target),
         "raw-mode pasted line never fully surfaced without extra input; saw: {visible:?}"
     );
+    assert_drawn_by_echo_trigger(&trace_path, "echo-suffix");
 }
 
 /// The char-by-char mirror of the nsupdate report: in a raw/ECHO-off session the
@@ -751,7 +870,11 @@ fn raw_mode_typed_chars_are_visible_without_extra_input() {
         })
         .expect("openpty");
 
+    let trace_dir = tempfile::tempdir().expect("trace tempdir");
+    let trace_path = trace_dir.path().join("echo.trace");
     let mut builder = CommandBuilder::new(env!("CARGO_BIN_EXE_ptty"));
+    builder.arg("--trace-io");
+    builder.arg(&trace_path);
     builder.arg("sh");
     builder.arg("-c");
     builder.arg("stty raw -echo 2>/dev/null; printf 'READY\\n'; exec cat");
@@ -795,6 +918,7 @@ fn raw_mode_typed_chars_are_visible_without_extra_input() {
         visible.contains("showversion"),
         "raw-mode typed token never surfaced without a delimiter; saw: {visible:?}"
     );
+    assert_drawn_by_echo_trigger(&trace_path, "echo-suffix");
 }
 
 /// History recall: a shell rewrites the current input line by backspacing over
@@ -819,7 +943,11 @@ fn history_recall_redraw_tail_is_visible_without_extra_input() {
         })
         .expect("openpty");
 
+    let trace_dir = tempfile::tempdir().expect("trace tempdir");
+    let trace_path = trace_dir.path().join("echo.trace");
     let mut builder = CommandBuilder::new(env!("CARGO_BIN_EXE_ptty"));
+    builder.arg("--trace-io");
+    builder.arg(&trace_path);
     builder.env("PRISMTTY_TEST_CONTINUE", &continue_path);
     builder.arg("sh");
     builder.arg("-c");
@@ -862,6 +990,7 @@ fn history_recall_redraw_tail_is_visible_without_extra_input() {
         visible.contains(target),
         "recalled history line lost its tail until the next keypress; saw: {visible:?}"
     );
+    assert_drawn_by_echo_trigger(&trace_path, "line-edit-redraw");
 }
 
 /// The same recall, delivered in two reads. Over ssh the transport splits a
@@ -882,7 +1011,11 @@ fn split_history_recall_redraw_tail_is_visible_without_extra_input() {
         })
         .expect("openpty");
 
+    let trace_dir = tempfile::tempdir().expect("trace tempdir");
+    let trace_path = trace_dir.path().join("echo.trace");
     let mut builder = CommandBuilder::new(env!("CARGO_BIN_EXE_ptty"));
+    builder.arg("--trace-io");
+    builder.arg(&trace_path);
     builder.env("PRISMTTY_TEST_CONTINUE", &continue_path);
     builder.arg("sh");
     builder.arg("-c");
@@ -926,6 +1059,7 @@ fn split_history_recall_redraw_tail_is_visible_without_extra_input() {
         visible.contains(target),
         "split recall lost its tail until the next keypress; saw: {visible:?}"
     );
+    assert_drawn_by_echo_trigger(&trace_path, "line-edit-redraw");
 }
 
 /// A line editor that redraws with cursor movement rather than backspaces
@@ -945,7 +1079,11 @@ fn csi_history_recall_redraw_tail_is_visible_without_extra_input() {
         })
         .expect("openpty");
 
+    let trace_dir = tempfile::tempdir().expect("trace tempdir");
+    let trace_path = trace_dir.path().join("echo.trace");
     let mut builder = CommandBuilder::new(env!("CARGO_BIN_EXE_ptty"));
+    builder.arg("--trace-io");
+    builder.arg(&trace_path);
     builder.env("PRISMTTY_TEST_CONTINUE", &continue_path);
     builder.arg("sh");
     builder.arg("-c");
@@ -986,5 +1124,111 @@ fn csi_history_recall_redraw_tail_is_visible_without_extra_input() {
     assert!(
         visible.contains(target),
         "cursor-movement recall lost its tail until the next keypress; saw: {visible:?}"
+    );
+    assert_drawn_by_echo_trigger(&trace_path, "line-edit-redraw");
+}
+
+/// Runs `program args` on a terminal while the child holds its last write open
+/// on a file gate, and returns what the terminal showed once `shown` held or
+/// three seconds passed, before the gate was released. Nothing is ever typed,
+/// so no echo trigger can surface the held output.
+fn shown_while_program_output_is_quiet(
+    program: &str,
+    args: &[&str],
+    shown: impl Fn(&str) -> bool,
+) -> String {
+    let gate_dir = tempfile::tempdir().expect("gate tempdir");
+    let continue_path = gate_dir.path().join("continue");
+    let pair = native_pty_system()
+        .openpty(PtySize {
+            rows: 24,
+            cols: 200,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("openpty");
+
+    let mut builder = CommandBuilder::new(program);
+    builder.env("PRISMTTY_TEST_CONTINUE", &continue_path);
+    builder.args(args);
+    let child = pair.slave.spawn_command(builder).expect("spawn child");
+    drop(pair.slave);
+
+    let session = PtySession::new(child, &*pair.master);
+    let output = session
+        .capture()
+        .wait_until(Duration::from_secs(3), |out| shown(&visible_output(out)));
+    std::fs::write(&continue_path, b"continue").expect("release the gate");
+    visible_output(&output)
+}
+
+fn ends_with_visible(screen: &str, tail: &str) -> bool {
+    screen.trim_end_matches(['\r', '\n']).ends_with(tail)
+}
+
+/// Program output that ends mid-token is held back so a token split across
+/// reads still highlights as one span. When the program then goes quiet, as
+/// Cisco `ping` does for two seconds per unanswered probe, that hold must end:
+/// the dots used to stay invisible until the summary line arrived.
+#[test]
+fn quiet_program_output_tail_is_visible_after_holdback() {
+    let visible = shown_while_program_output_is_quiet(
+        env!("CARGO_BIN_EXE_ptty"),
+        &[
+            "-p",
+            "cisco",
+            "sh",
+            "-c",
+            "printf 'Sending 5, 100-byte ICMP Echos:\\r\\n..'; \
+             while [ ! -f \"$PRISMTTY_TEST_CONTINUE\" ]; do sleep 0.05; done; \
+             printf '\\r\\nSuccess rate is 0 percent\\r\\n'",
+        ],
+        |screen| ends_with_visible(screen, ".."),
+    );
+
+    assert!(
+        ends_with_visible(&visible, ".."),
+        "quiet program output stayed hidden; saw: {visible:?}"
+    );
+}
+
+/// The same hold for a wrapped command whose stdin is not a terminal
+/// (`ptty cmd </dev/null` run from a terminal): its output is still watched
+/// live, so the held tail must be drawn once the program goes quiet.
+#[test]
+fn quiet_program_output_tail_is_visible_after_holdback_with_stdin_redirected() {
+    let script = format!(
+        "exec '{}' -p cisco sh -c \"printf 'Building configuration...'; \
+         while [ ! -f \\\"\\$PRISMTTY_TEST_CONTINUE\\\" ]; do sleep 0.05; done; \
+         printf '\\\\r\\\\n[OK]\\\\r\\\\n'\" </dev/null",
+        env!("CARGO_BIN_EXE_ptty")
+    );
+    let visible = shown_while_program_output_is_quiet("sh", &["-c", &script], |screen| {
+        ends_with_visible(screen, "configuration...")
+    });
+
+    assert!(
+        ends_with_visible(&visible, "Building configuration..."),
+        "quiet output of a wrapped command with stdin redirected stayed hidden; saw: {visible:?}"
+    );
+}
+
+/// The same hold in pipe mode with stdout on a terminal, where no PTY master
+/// carries the output: `tail -f` of a log that stops mid-token.
+#[test]
+fn quiet_piped_output_tail_is_visible_after_holdback() {
+    let script = format!(
+        "{{ printf 'Building configuration...'; \
+         while [ ! -f \"$PRISMTTY_TEST_CONTINUE\" ]; do sleep 0.05; done; \
+         printf '\\n[OK]\\n'; }} | '{}' -p cisco",
+        env!("CARGO_BIN_EXE_prismtty")
+    );
+    let visible = shown_while_program_output_is_quiet("sh", &["-c", &script], |screen| {
+        ends_with_visible(screen, "configuration...")
+    });
+
+    assert!(
+        ends_with_visible(&visible, "Building configuration..."),
+        "quiet piped output stayed hidden; saw: {visible:?}"
     );
 }

@@ -5,6 +5,9 @@ const INPUT_LINE_LIMIT: usize = 4096;
 const CLOSE_MARKER_WINDOW_LIMIT: usize = 256;
 const DETECTION_BYTE_INTERVAL: usize = 4096;
 const PROFILE_STACK_LIMIT: usize = 8;
+/// Lines typed after a remote command before its attempt expires: a user
+/// name, a password, a one-time code, and the Enter that redraws a prompt.
+const REMOTE_ATTEMPT_LINE_GRACE: u8 = 4;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ClosePolicy {
@@ -56,11 +59,29 @@ struct ProfileFrame {
     close_policy: ClosePolicy,
     target: Option<String>,
     unresolved_detection: bool,
+    /// A remote command was typed inside this connection, so a close message
+    /// that names no known target may belong to that nested attempt.
+    nested_attempt_seen: bool,
+}
+
+/// How firmly output identified the active profile's device.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum ActiveEvidence {
+    /// Prompt-only detection, which cannot tell apart vendors that share a
+    /// prompt shape, or a profile restored by a close.
+    #[default]
+    Weak,
+    /// A strong banner selected the profile; its prompt has not appeared.
+    Banner,
+    /// The device's prompt followed its banner, so later strong signals of
+    /// other vendors are command output such as neighbor descriptions.
+    BannerAndPrompt,
 }
 
 #[derive(Clone, Debug)]
 struct ProfileTransitionState {
     active_profiles: Vec<String>,
+    active_evidence: ActiveEvidence,
     baseline_profiles: Vec<String>,
     stack: Vec<ProfileFrame>,
     pending_remote: Option<RemoteAttempt>,
@@ -84,6 +105,7 @@ enum InputEscapeState {
 #[derive(Clone, Debug)]
 pub(crate) struct ProfileRuntime {
     active_profiles: Vec<String>,
+    active_evidence: ActiveEvidence,
     baseline_profiles: Vec<String>,
     stack: Vec<ProfileFrame>,
     output_window: String,
@@ -94,6 +116,7 @@ pub(crate) struct ProfileRuntime {
     unreliable_remote_attempt: Option<RemoteAttempt>,
     input_escape_state: InputEscapeState,
     pending_remote: Option<RemoteAttempt>,
+    pending_remote_lines: u8,
     baseline_locked: bool,
     pending_prompt_profiles: Option<Vec<String>>,
     pending_prompt_hits: usize,
@@ -105,6 +128,7 @@ impl ProfileRuntime {
         let baseline_locked = !is_generic_profile_set(&initial_profiles);
         Self {
             active_profiles: initial_profiles.clone(),
+            active_evidence: ActiveEvidence::Weak,
             baseline_profiles: initial_profiles,
             stack: Vec::new(),
             output_window: String::new(),
@@ -115,6 +139,7 @@ impl ProfileRuntime {
             unreliable_remote_attempt: None,
             input_escape_state: InputEscapeState::None,
             pending_remote: None,
+            pending_remote_lines: 0,
             baseline_locked,
             pending_prompt_profiles: None,
             pending_prompt_hits: 0,
@@ -196,7 +221,9 @@ impl ProfileRuntime {
                     if self.input_line_reliable {
                         self.submit_input_line();
                     } else if let Some(attempt) = self.unreliable_remote_attempt.take() {
-                        self.arm_remote_attempt(Some(attempt));
+                        self.arm_remote_attempt(attempt);
+                    } else {
+                        self.age_pending_remote();
                     }
                     self.input_line.clear();
                     self.input_line_reliable = true;
@@ -207,15 +234,17 @@ impl ProfileRuntime {
                         self.input_line.pop();
                     }
                 }
-                byte if (byte.is_ascii_graphic() || *byte == b' ' || *byte == b'\t')
+                byte if (byte.is_ascii_graphic() || *byte == b' ')
                     && self.input_line_reliable
                     && self.input_line.len() < INPUT_LINE_LIMIT =>
                 {
                     self.input_line.push(*byte as char);
                 }
-                byte if byte.is_ascii_graphic() || *byte == b' ' || *byte == b'\t' => {
+                byte if byte.is_ascii_graphic() || *byte == b' ' => {
                     self.invalidate_input_line();
                 }
+                // TAB asks the shell to complete the word, so like the other
+                // editing keys it leaves the typed text unreliable.
                 _ => self.invalidate_input_line(),
             }
         }
@@ -223,10 +252,12 @@ impl ProfileRuntime {
 
     fn invalidate_input_line(&mut self) {
         if self.input_line_reliable {
-            self.unreliable_remote_attempt = remote_attempt(&self.input_line).map(|mut attempt| {
-                attempt.target = None;
-                attempt
-            });
+            self.unreliable_remote_attempt =
+                self.typed_remote_attempt(&self.input_line)
+                    .map(|mut attempt| {
+                        attempt.target = None;
+                        attempt
+                    });
         }
         self.input_line.clear();
         self.input_line_reliable = false;
@@ -312,6 +343,37 @@ impl ProfileRuntime {
                 self.clear_pending_prompt();
                 return self.pop_profile();
             }
+            // OpenSSH names the HostName an ssh_config alias resolves to, not
+            // the typed alias. With no remote command typed inside this
+            // connection, a targeted ssh close naming no other connection
+            // can only be its own.
+            if self.pending_remote.is_none()
+                && self.stack.last().is_some_and(|frame| {
+                    !frame.nested_attempt_seen
+                        && close_markers.iter().any(|marker| {
+                            frame.close_policy.accepts(marker.kind)
+                                && is_untracked_ssh_close(marker, &self.stack)
+                        })
+                })
+            {
+                self.clear_output_window();
+                self.clear_pending_prompt();
+                return self.pop_profile();
+            }
+            // Likewise an alias attempt that no output resolved ends on the
+            // close naming its HostName; left pending, the next prompt would
+            // record a connection that never closes.
+            if self.pending_remote.as_ref().is_some_and(|pending| {
+                close_markers.iter().any(|marker| {
+                    pending.policy.accepts(marker.kind)
+                        && is_untracked_ssh_close(marker, &self.stack)
+                })
+            }) {
+                self.pending_remote = None;
+                self.clear_output_window();
+                self.clear_pending_prompt();
+                return None;
+            }
         }
 
         if self.pending_remote.as_ref().is_some_and(|pending| {
@@ -328,9 +390,21 @@ impl ProfileRuntime {
         }
         self.output_bytes_since_detection = 0;
 
+        // Gate on the evidence from before this read, so a read carrying a
+        // banner and a prompt can never block that banner's own switch.
+        let banner_and_prompt = self.active_evidence == ActiveEvidence::BannerAndPrompt;
+        if self.active_evidence == ActiveEvidence::Banner
+            && store
+                .active_specific_profile(&self.active_profiles)
+                .is_some_and(|profile| store.matches_runtime_prompt(profile, &self.output_window))
+        {
+            self.active_evidence = ActiveEvidence::BannerAndPrompt;
+        }
+
         let detected =
             store.detect_profiles_with_lowercase(&self.output_window, &self.output_window_lower);
         if is_generic_profile_set(&detected) {
+            self.retain_unterminated_tail();
             self.clear_pending_prompt();
             return None;
         }
@@ -341,6 +415,7 @@ impl ProfileRuntime {
                 self.clear_pending_prompt();
                 let _ = self.switch_to(profiles, Some(remote_attempt), false);
             }
+            self.retain_unterminated_tail();
             self.clear_pending_prompt();
             return None;
         }
@@ -348,6 +423,7 @@ impl ProfileRuntime {
         if self.should_learn_baseline(&detected, store) {
             self.baseline_profiles = detected.clone();
             self.active_profiles = detected.clone();
+            self.active_evidence = ActiveEvidence::Weak;
             self.baseline_locked = true;
             self.clear_output_window();
             self.clear_pending_prompt();
@@ -356,29 +432,50 @@ impl ProfileRuntime {
 
         let active_profile = store.active_specific_profile(&self.active_profiles);
         let at_local_baseline = self.at_local_baseline(store);
-        if let Some(profile) =
-            store.strong_transition_profile(&detected, &self.output_window, active_profile)
-        {
-            let remote_attempt = self.pending_remote.take();
-            self.clear_output_window();
-            self.clear_pending_prompt();
-            return self.switch_to(profile_set(&profile), remote_attempt, at_local_baseline);
-        }
-
         let unresolved_remote = self
             .stack
             .last()
             .is_some_and(|frame| frame.unresolved_detection);
         let has_remote_hint = self.pending_remote.is_some() || unresolved_remote;
+        // Once a banner-identified device shows its prompt, another vendor's
+        // strong signal is command output, such as an LLDP or CDP neighbor's
+        // system description, unless a remote command was typed.
+        let identified_remote = banner_and_prompt
+            && !has_remote_hint
+            && active_profile.is_some_and(|profile| !store.is_local_baseline_profile(profile));
+        let strong_profile = if identified_remote {
+            None
+        } else {
+            store.strong_transition_profile(&detected, &self.output_window_lower, active_profile)
+        };
+        if let Some(profile) = strong_profile {
+            let remote_attempt = self.pending_remote.take();
+            let evidence = if self.waiting_at_prompt(store, &profile) {
+                ActiveEvidence::BannerAndPrompt
+            } else {
+                ActiveEvidence::Banner
+            };
+            self.clear_output_window();
+            self.clear_pending_prompt();
+            let transition =
+                self.switch_to(profile_set(&profile), remote_attempt, at_local_baseline);
+            self.active_evidence = evidence;
+            return transition;
+        }
+
         if has_remote_hint || active_profile.is_none() || at_local_baseline {
             if let Some(profile) =
                 store.prompt_transition_profile(&detected, &self.output_window, active_profile)
             {
+                // Without a remote hint, only a prompt waiting for input (the
+                // unterminated last line) is trusted on first sight; a
+                // prompt-shaped line in local output must repeat.
                 if store.prompt_switches_on_first_detection(
                     &profile,
                     has_remote_hint,
                     at_local_baseline,
-                ) {
+                ) && (has_remote_hint || self.waiting_at_prompt(store, &profile))
+                {
                     let remote_attempt = self.pending_remote.take();
                     self.clear_output_window();
                     self.clear_pending_prompt();
@@ -394,6 +491,8 @@ impl ProfileRuntime {
 
         if active_profile.is_some() {
             self.clear_output_window();
+        } else {
+            self.retain_unterminated_tail();
         }
         self.clear_pending_prompt();
         None
@@ -409,6 +508,7 @@ impl ProfileRuntime {
         };
         let rejected_remote = rollback.pending_remote;
         self.active_profiles = rollback.active_profiles;
+        self.active_evidence = rollback.active_evidence;
         self.baseline_profiles = rollback.baseline_profiles;
         self.stack = rollback.stack;
         self.pending_remote = None;
@@ -451,6 +551,7 @@ impl ProfileRuntime {
     fn transition_state(&self) -> ProfileTransitionState {
         ProfileTransitionState {
             active_profiles: self.active_profiles.clone(),
+            active_evidence: self.active_evidence,
             baseline_profiles: self.baseline_profiles.clone(),
             stack: self.stack.clone(),
             pending_remote: self.pending_remote.clone(),
@@ -461,17 +562,42 @@ impl ProfileRuntime {
     }
 
     fn submit_input_line(&mut self) {
-        let trimmed = self.input_line.trim_start();
-        self.arm_remote_attempt(remote_attempt(trimmed));
+        match self.typed_remote_attempt(self.input_line.trim_start()) {
+            Some(attempt) => self.arm_remote_attempt(attempt),
+            None => self.age_pending_remote(),
+        }
     }
 
-    fn arm_remote_attempt(&mut self, attempt: Option<RemoteAttempt>) {
-        self.pending_remote = attempt;
-        if self.pending_remote.is_some() {
-            self.baseline_locked = true;
-            self.clear_output_window();
-            self.clear_pending_prompt();
+    /// Where the local baseline's profiles are active (the local shell or a
+    /// host like it), `ssh` is OpenSSH. A network device's own `ssh` takes
+    /// keywords after the host (`vrf management`, `routing-instance mgmt`),
+    /// so OpenSSH's rules for commands that open no session do not apply.
+    fn typed_remote_attempt(&self, line: &str) -> Option<RemoteAttempt> {
+        remote_attempt(line, self.active_profiles == self.baseline_profiles)
+    }
+
+    /// A login can take a few typed lines (user name, password, the Enter
+    /// that redraws a prompt-only device's prompt) before output resolves
+    /// the attempt, so ordinary lines expire it only after a grace period.
+    fn age_pending_remote(&mut self) {
+        if self.pending_remote.is_none() {
+            return;
         }
+        self.pending_remote_lines = self.pending_remote_lines.saturating_add(1);
+        if self.pending_remote_lines > REMOTE_ATTEMPT_LINE_GRACE {
+            self.pending_remote = None;
+        }
+    }
+
+    fn arm_remote_attempt(&mut self, attempt: RemoteAttempt) {
+        self.pending_remote = Some(attempt);
+        self.pending_remote_lines = 0;
+        if let Some(frame) = self.stack.last_mut() {
+            frame.nested_attempt_seen = true;
+        }
+        self.baseline_locked = true;
+        self.clear_output_window();
+        self.clear_pending_prompt();
     }
 
     fn should_detect_profiles(&self, text: &str) -> bool {
@@ -479,6 +605,11 @@ impl ProfileRuntime {
             || self.output_bytes_since_detection >= DETECTION_BYTE_INTERVAL
             || text.bytes().any(|byte| matches!(byte, b'\r' | b'\n'))
             || looks_like_prompt_detection_boundary(text)
+    }
+
+    fn waiting_at_prompt(&self, store: &ProfileStore, profile: &str) -> bool {
+        let tail = unterminated_tail(&self.output_window);
+        looks_like_prompt_detection_boundary(tail) && store.matches_runtime_prompt(profile, tail)
     }
 
     fn at_local_baseline(&self, store: &ProfileStore) -> bool {
@@ -517,6 +648,10 @@ impl ProfileRuntime {
             self.clear_pending_prompt();
             self.switch_to(detected, remote_attempt, at_local_baseline)
         } else {
+            // The repeat must come from new output, not from the next pass
+            // finding the same complete line again. A prompt waiting for
+            // input is the unterminated tail and stays.
+            self.retain_unterminated_tail();
             None
         }
     }
@@ -539,11 +674,13 @@ impl ProfileRuntime {
             self.push_frame(remote_attempt);
             let changed = profiles != self.active_profiles;
             self.active_profiles = profiles;
+            self.active_evidence = ActiveEvidence::Weak;
             return changed.then(|| self.active_profiles.clone());
         }
         if profiles == self.active_profiles {
             return None;
         }
+        self.active_evidence = ActiveEvidence::Weak;
         if let Some(stack_index) = self
             .stack
             .iter()
@@ -573,6 +710,7 @@ impl ProfileRuntime {
     }
 
     fn pop_profile(&mut self) -> Option<Vec<String>> {
+        self.active_evidence = ActiveEvidence::Weak;
         let next = self
             .stack
             .pop()
@@ -605,6 +743,7 @@ impl ProfileRuntime {
             close_policy: remote_attempt.policy,
             target: remote_attempt.target,
             unresolved_detection,
+            nested_attempt_seen: false,
         });
     }
 
@@ -618,13 +757,29 @@ impl ProfileRuntime {
         self.output_window_lower.clear();
         self.output_bytes_since_detection = 0;
     }
+
+    /// Drops the complete lines a detection pass already examined. Signals
+    /// and prompts are matched per line, so only an unterminated trailing
+    /// line, such as a banner or prompt split across reads, needs another
+    /// look once the rest of it arrives.
+    fn retain_unterminated_tail(&mut self) {
+        if let Some(end) = self.output_window.rfind(is_line_terminator) {
+            // ASCII lowercasing keeps byte offsets, so both windows share them.
+            self.output_window.drain(..=end);
+            self.output_window_lower.drain(..=end);
+        }
+        // Output without line terminators is not a prompt line; keep only
+        // enough of it for a signal split across the next read.
+        trim_to_recent_chars(&mut self.output_window, DETECTION_BYTE_INTERVAL);
+        trim_to_recent_chars(&mut self.output_window_lower, DETECTION_BYTE_INTERVAL);
+    }
 }
 
 fn profile_set(profile: &str) -> Vec<String> {
     vec!["generic".to_string(), profile.to_string()]
 }
 
-fn remote_attempt(line: &str) -> Option<RemoteAttempt> {
+fn remote_attempt(line: &str, openssh_client: bool) -> Option<RemoteAttempt> {
     let words = split_shell_words(line);
     let command = words
         .as_ref()
@@ -648,6 +803,10 @@ fn remote_attempt(line: &str) -> Option<RemoteAttempt> {
     let mut skip_option_value = false;
     let mut options_ended = false;
     let mut target = None;
+    let mut target_seen = false;
+    let mut remote_command = false;
+    let mut force_tty = false;
+    let mut no_session = false;
     for word in words.iter().skip(1) {
         if skip_option_value {
             skip_option_value = false;
@@ -659,14 +818,63 @@ fn remote_attempt(line: &str) -> Option<RemoteAttempt> {
         }
         if !options_ended && word.starts_with('-') {
             skip_option_value = remote_option_takes_value(&command, word);
+            no_session |= remote_option_opens_no_session(&command, word);
+            force_tty |= command == "ssh" && ssh_option_flags(word).contains(&'t');
             continue;
         }
+        if target_seen {
+            // OpenSSH parses options again after the host, so the first
+            // other word after it starts a remote command.
+            remote_command = true;
+            break;
+        }
+        target_seen = true;
         if is_literal_remote_target(word) {
             target = Some(normalize_remote_target(word));
         }
-        break;
+        if command != "ssh" {
+            break;
+        }
+    }
+    // A remote command without a forced tty, a session without a tty, or a
+    // query or background invocation never opens an interactive session
+    // to close again.
+    if openssh_client && (no_session || (remote_command && !force_tty)) {
+        return None;
     }
     Some(RemoteAttempt { policy, target })
+}
+
+fn remote_option_opens_no_session(command: &str, option: &str) -> bool {
+    match command {
+        "ssh" => ssh_option_flags(option)
+            .iter()
+            .any(|flag| matches!(flag, 'V' | 'G' | 'N' | 'f' | 'Q' | 'O' | 'T')),
+        "screen" => matches!(
+            option,
+            "-ls" | "-list" | "-wipe" | "-v" | "-version" | "-Q" | "-X"
+        ),
+        _ => false,
+    }
+}
+
+/// The getopt flags of one ssh option word, up to the first flag that takes
+/// a value (the rest of the word or the next word).
+fn ssh_option_flags(option: &str) -> Vec<char> {
+    let mut flags = Vec::new();
+    let Some(cluster) = option.strip_prefix('-') else {
+        return flags;
+    };
+    if cluster.starts_with('-') {
+        return flags;
+    }
+    for flag in cluster.chars() {
+        flags.push(flag);
+        if remote_option_word_takes_value("ssh", &format!("-{flag}")) {
+            break;
+        }
+    }
+    flags
 }
 
 fn split_shell_words(line: &str) -> Option<Vec<String>> {
@@ -887,6 +1095,16 @@ fn ssh_close_target(line: &str) -> Option<&str> {
     None
 }
 
+/// A targeted ssh close naming no tracked connection's target.
+fn is_untracked_ssh_close(marker: &ObservedCloseMarker, stack: &[ProfileFrame]) -> bool {
+    marker.kind == CloseMarkerKind::SshLike
+        && marker.target.as_ref().is_some_and(|target| {
+            !stack
+                .iter()
+                .any(|frame| frame.target.as_ref() == Some(target))
+        })
+}
+
 fn close_marker_matches(
     marker: &ObservedCloseMarker,
     policy: ClosePolicy,
@@ -951,6 +1169,12 @@ fn contains_remote_open_failure(text: &str, policy: ClosePolicy) -> bool {
             ClosePolicy::Generic => false,
         }
     })
+}
+
+/// The trailing line of `text` that no line terminator has ended yet.
+fn unterminated_tail(text: &str) -> &str {
+    text.rfind(is_line_terminator)
+        .map_or(text, |end| &text[end + 1..])
 }
 
 fn looks_like_prompt_detection_boundary(text: &str) -> bool {
@@ -1144,6 +1368,63 @@ mod tests {
         assert_eq!(runtime.active_profiles(), names(&["generic", "cisco"]));
     }
 
+    // A detection pass that changes nothing must not leave its examined lines
+    // in the window, or every later read rescans up to 64 KiB of old output.
+    #[test]
+    fn no_change_detection_does_not_rescan_examined_lines() {
+        let store = ProfileStore::builtin();
+        let filler = "plain log line without vendor words 0123456789\n".repeat(2048);
+
+        // Generic-only detection.
+        let mut runtime = ProfileRuntime::new(names(&["generic"]));
+        assert_eq!(runtime.observe_output(filler.as_bytes(), &store), None);
+        assert!(runtime.output_window.is_empty());
+        assert!(runtime.output_window_lower.is_empty());
+
+        // Weak hints with no specific profile active.
+        let mut runtime = ProfileRuntime::new(names(&["generic"]));
+        assert_eq!(
+            runtime.observe_output(b"Gi1/0/1 is up, line protocol is up\n", &store),
+            None
+        );
+        assert!(runtime.output_window.is_empty());
+
+        // Detection that only confirms the active profile.
+        let mut runtime = ProfileRuntime::new(names(&["generic", "juniper"]));
+        assert_eq!(runtime.observe_output(b"--- JUNOS 22.4R3\n", &store), None);
+        assert!(runtime.output_window.is_empty());
+
+        // An unterminated tail survives so a split banner still completes.
+        let mut runtime = ProfileRuntime::new(names(&["generic", "linux-unix"]));
+        assert_eq!(runtime.observe_output(filler.as_bytes(), &store), None);
+        assert_eq!(runtime.observe_output(b"x\nCisco I", &store), None);
+        assert_eq!(runtime.output_window, "Cisco I");
+        assert_eq!(runtime.output_window_lower, "cisco i");
+        assert_eq!(
+            runtime.observe_output(b"OS Software\n", &store),
+            Some(names(&["generic", "cisco"]))
+        );
+
+        // Output without line terminators keeps only a bounded tail.
+        let mut runtime = ProfileRuntime::new(names(&["generic", "linux-unix"]));
+        assert_eq!(runtime.observe_output(&[b'a'; 70_000], &store), None);
+        assert!(runtime.output_window.len() <= super::DETECTION_BYTE_INTERVAL);
+        assert_eq!(
+            runtime.output_window.len(),
+            runtime.output_window_lower.len()
+        );
+
+        // An armed remote attempt at an unrecognised prompt stays bounded too,
+        // although every echoed keystroke runs a detection pass.
+        let mut runtime = ProfileRuntime::new(names(&["generic", "linux-unix"]));
+        runtime.observe_input(b"ssh web01\r");
+        assert_eq!(runtime.observe_output(filler.as_bytes(), &store), None);
+        assert_eq!(runtime.observe_output(b"[admin@web01 ~]$ ", &store), None);
+        assert_eq!(runtime.observe_output(b"l", &store), None);
+        assert!(runtime.pending_remote.is_some());
+        assert_eq!(runtime.output_window, "[admin@web01 ~]$ l");
+    }
+
     #[test]
     fn oversized_input_line_is_invalidated_until_newline() {
         let mut runtime = ProfileRuntime::new(names(&["generic", "linux-unix"]));
@@ -1185,6 +1466,127 @@ mod tests {
                 "{line:?}"
             );
         }
+    }
+
+    // These commands never open an interactive session, so nothing would ever
+    // close a frame pushed for them.
+    #[test]
+    fn non_interactive_remote_commands_do_not_leave_profile_frames() {
+        let store = ProfileStore::builtin();
+        for command in [
+            "ssh backup01 uptime\r",
+            "ssh backup01 -p 2222 uptime\r",
+            "ssh -V\r",
+            "ssh -G router-a\r",
+            "ssh -fN -L 8080:localhost:80 jump\r",
+            "ssh -O check router-a\r",
+            "ssh -Q cipher\r",
+            "ssh -T git@git.example.com\r",
+            "screen -ls\r",
+        ] {
+            let mut runtime = ProfileRuntime::new(names(&["generic", "linux-unix"]));
+            runtime.observe_input(command.as_bytes());
+            assert_eq!(runtime.pending_remote, None, "{command:?}");
+            runtime.observe_output(b"some output\r\nuser@laptop:~$ ", &store);
+            assert_eq!(runtime.stack_len(), 0, "{command:?} left a profile frame");
+            runtime.observe_input(b"fw\r");
+            assert_eq!(
+                runtime.observe_output(b"fw\r\nFW-EDGE # ", &store),
+                Some(names(&["generic", "fortinet"])),
+                "{command:?}"
+            );
+            assert_eq!(
+                runtime.observe_output(b"Connection to fw closed.\n", &store),
+                Some(names(&["generic", "linux-unix"])),
+                "{command:?}"
+            );
+        }
+    }
+
+    // A network device's own ssh takes keywords after the host, so a nested
+    // jump typed there still opens a session that closes again.
+    #[test]
+    fn device_ssh_keywords_after_the_host_still_track_the_nested_session() {
+        let store = ProfileStore::builtin();
+        for (login, outer, jump, banner, nested, close) in [
+            (
+                &b"--- JUNOS 22.4R3 Kernel 64-bit\r\nlab@mx1> "[..],
+                "juniper",
+                &b"ssh 192.0.2.1 routing-instance mgmt_junos\r"[..],
+                &b"Cisco IOS Software, C3750E Software\r\ncore-sw#"[..],
+                "cisco",
+                &b"Connection to 192.0.2.1 closed.\r\nlab@mx1> "[..],
+            ),
+            (
+                b"Cisco Nexus Operating System (NX-OS) Software\r\ncore-sw# ",
+                "cisco",
+                b"ssh admin@192.0.2.5 vrf management\r",
+                b"--- JUNOS 22.4R3 Kernel 64-bit\r\nlab@mx1> ",
+                "juniper",
+                b"Connection to 192.0.2.5 closed.\r\ncore-sw# ",
+            ),
+        ] {
+            let mut runtime = ProfileRuntime::new(names(&["generic", "linux-unix"]));
+            runtime.observe_input(b"ssh outer\r");
+            assert_eq!(
+                runtime.observe_output(login, &store),
+                Some(names(&["generic", outer]))
+            );
+            runtime.accept_transition();
+            runtime.observe_input(jump);
+            assert!(
+                runtime.pending_remote.is_some(),
+                "{:?}",
+                String::from_utf8_lossy(jump)
+            );
+            assert_eq!(
+                runtime.observe_output(banner, &store),
+                Some(names(&["generic", nested]))
+            );
+            runtime.accept_transition();
+            assert_eq!(runtime.stack_len(), 2);
+            assert_eq!(
+                runtime.observe_output(close, &store),
+                Some(names(&["generic", outer]))
+            );
+            assert_eq!(runtime.stack_len(), 1);
+        }
+    }
+
+    // OpenSSH parses options again after the host, and a forced tty keeps a
+    // remote command interactive.
+    #[test]
+    fn interactive_ssh_commands_keep_their_close_target() {
+        for line in [
+            "ssh router-a -p 2222\r",
+            "ssh router-a -l admin -o ServerAliveInterval=30\r",
+            "ssh -t router-a ssh core-sw\r",
+            "ssh router-a -tt ssh core-sw\r",
+            "ssh -vt router-a show version\r",
+        ] {
+            let mut runtime = ProfileRuntime::new(names(&["generic", "linux-unix"]));
+            runtime.observe_input(line.as_bytes());
+            assert_eq!(
+                runtime
+                    .pending_remote
+                    .as_ref()
+                    .and_then(|attempt| attempt.target.as_deref()),
+                Some("router-a"),
+                "{line:?}"
+            );
+        }
+
+        let store = ProfileStore::builtin();
+        let mut runtime = ProfileRuntime::new(names(&["generic", "linux-unix"]));
+        runtime.observe_input(b"ssh -t jump ssh router-a\r");
+        assert_eq!(
+            runtime.observe_output(b"Cisco IOS Software\n", &store),
+            Some(names(&["generic", "cisco"]))
+        );
+        assert_eq!(
+            runtime.observe_output(b"Connection to jump closed.\n", &store),
+            Some(names(&["generic", "linux-unix"]))
+        );
     }
 
     #[test]
@@ -1439,6 +1841,216 @@ mod tests {
             runtime.observe_output(b"CoreSW#\n", &store),
             Some(names(&["generic", "cisco"]))
         );
+    }
+
+    // A prompt-only device prints its second prompt only after Enter, so
+    // that keystroke must not drop the typed remote hint.
+    #[test]
+    fn nested_prompt_only_device_survives_the_enter_that_redraws_its_prompt() {
+        let store = ProfileStore::builtin();
+        let mut runtime = ProfileRuntime::new(names(&["generic", "linux-unix"]));
+
+        runtime.observe_input(b"ssh mx1\r");
+        assert_eq!(
+            runtime.observe_output(b"--- JUNOS 21.4R3.15 Kernel 64-bit\r\nlab@mx1> ", &store),
+            Some(names(&["generic", "juniper"]))
+        );
+        runtime.accept_transition();
+        runtime.observe_input(b"ssh core-sw\r");
+        assert_eq!(runtime.observe_output(b"\r\ncore-sw#", &store), None);
+        runtime.observe_input(b"\r");
+        assert_eq!(
+            runtime.observe_output(b"\r\ncore-sw#", &store),
+            Some(names(&["generic", "cisco"]))
+        );
+        runtime.accept_transition();
+        assert_eq!(
+            runtime.observe_output(b"Connection to core-sw closed.\r\n", &store),
+            Some(names(&["generic", "juniper"]))
+        );
+    }
+
+    #[test]
+    fn password_line_keeps_the_ssh_close_target() {
+        let store = ProfileStore::builtin();
+        let mut runtime = ProfileRuntime::new(names(&["generic", "linux-unix"]));
+
+        runtime.observe_input(b"ssh mx1\r");
+        assert_eq!(
+            runtime.observe_output(b"lab@mx1's password: ", &store),
+            None
+        );
+        runtime.observe_input(b"hunter2\r");
+        assert_eq!(
+            runtime.observe_output(
+                b"\r\n--- JUNOS 21.4R3.15 Kernel 64-bit\r\nlab@mx1> ",
+                &store
+            ),
+            Some(names(&["generic", "juniper"]))
+        );
+        runtime.accept_transition();
+        assert_eq!(
+            runtime
+                .stack
+                .last()
+                .and_then(|frame| frame.target.as_deref()),
+            Some("mx1")
+        );
+
+        // An attempt that no output resolves expires after a few lines.
+        runtime.observe_input(b"ssh core-sw\r");
+        for line in [
+            &b"show clock\r"[..],
+            b"exit\r",
+            b"show version\r",
+            b"show route\r",
+        ] {
+            runtime.observe_input(line);
+            assert!(runtime.pending_remote.is_some());
+        }
+        runtime.observe_input(b"show arp\r");
+        assert_eq!(runtime.pending_remote, None, "a stale attempt must expire");
+
+        assert_eq!(
+            runtime.observe_output(b"Connection to core-sw closed.\r\nlab@mx1> ", &store),
+            None
+        );
+        assert_eq!(runtime.active_profiles(), names(&["generic", "juniper"]));
+        assert_eq!(
+            runtime.observe_output(b"exit\r\n\r\nConnection to mx1 closed.\r\n", &store),
+            Some(names(&["generic", "linux-unix"]))
+        );
+    }
+
+    // Compiler arrows, `C#` and `word # comment` lines look like vendor
+    // prompts, but one such line of local output must not switch the shell.
+    #[test]
+    fn single_prompt_shaped_local_lines_do_not_switch_local_baseline() {
+        let store = ProfileStore::builtin();
+        let mut runtime = ProfileRuntime::new(names(&["generic", "linux-unix"]));
+
+        for chunk in [
+            &b"user@host:~$ "[..],
+            b"cargo build\r\nwarning: unused variable: `x`\r\n  --> src/main.rs:3:9\r\n",
+            b"user@host:~$ ",
+            b"echo 'C# rocks'\r\nC# rocks\r\n",
+            b"user@host:~$ ",
+            b"printf 'C# rocks\\ndone\\n'\r\nC# rocks\r\n",
+            b"done\r\n",
+            b"user@host:~$ ",
+            b"cat build.sh\r\nfor target in a b; do\r\n  make \"$target\"\r\ndone # build every target\r\n",
+            b"user@host:~$ ",
+        ] {
+            assert_eq!(
+                runtime.observe_output(chunk, &store),
+                None,
+                "{:?}",
+                String::from_utf8_lossy(chunk)
+            );
+        }
+        assert_eq!(runtime.active_profiles(), names(&["generic", "linux-unix"]));
+        assert_eq!(runtime.stack_len(), 0);
+
+        // A Fortinet prompt waiting for input still switches on first sight.
+        runtime.observe_input(b"fw\r");
+        assert_eq!(
+            runtime.observe_output(b"fw\r\nFW-EDGE # ", &store),
+            Some(names(&["generic", "fortinet"]))
+        );
+    }
+
+    // Neighbor tables (LLDP/CDP) print other vendors' banners as command
+    // output once a banner-identified device is at its prompt.
+    #[test]
+    fn locked_remote_ignores_vendor_strong_signals_in_neighbor_output() {
+        let store = ProfileStore::builtin();
+        let mut runtime = ProfileRuntime::new(names(&["generic", "linux-unix"]));
+
+        runtime.observe_input(b"ssh mx1\r");
+        assert_eq!(
+            runtime.observe_output(b"--- JUNOS 22.4R3 Kernel 64-bit\n", &store),
+            Some(names(&["generic", "juniper"]))
+        );
+        runtime.accept_transition();
+        assert_eq!(runtime.observe_output(b"lab@mx1> ", &store), None);
+        runtime.observe_input(b"show lldp neighbors interface ge-0/0/0\r");
+        assert_eq!(
+            runtime.observe_output(
+                b"show lldp neighbors interface ge-0/0/0\r\nSystem Description : Cisco IOS Software, C3750E Software (C3750E-UNIVERSALK9-M), Version 15.0(2)SE11\r\n\r\nlab@mx1> ",
+                &store
+            ),
+            None
+        );
+        assert_eq!(runtime.active_profiles(), names(&["generic", "juniper"]));
+        assert_eq!(
+            runtime.observe_output(b"Connection to mx1 closed.\n", &store),
+            Some(names(&["generic", "linux-unix"]))
+        );
+    }
+
+    #[test]
+    fn locked_remote_with_banner_and_prompt_in_one_read_ignores_neighbor_output() {
+        let store = ProfileStore::builtin();
+        for (neighbor, profile) in [
+            (
+                &b"System Description: \r\nJuniper Networks, Inc. mx480 internet router, kernel JUNOS 18.4R1-S5\r\ncore-sw1#"[..],
+                "juniper",
+            ),
+            (b"Gi1/0/2  up  up  ubuntu-build01 eth0\r\ncore-sw1#", "linux-unix"),
+        ] {
+            let mut runtime = ProfileRuntime::new(names(&["generic", "linux-unix"]));
+            runtime.observe_input(b"ssh core-sw1\r");
+            assert_eq!(
+                runtime.observe_output(
+                    b"Cisco Nexus Operating System (NX-OS) Software\r\ncore-sw1# ",
+                    &store
+                ),
+                Some(names(&["generic", "cisco"]))
+            );
+            runtime.accept_transition();
+            runtime.observe_input(b"show lldp neighbors detail\r");
+            assert_eq!(
+                runtime.observe_output(neighbor, &store),
+                None,
+                "{profile} neighbor output switched the profile"
+            );
+            assert_eq!(runtime.active_profiles(), names(&["generic", "cisco"]));
+            assert_eq!(runtime.stack_len(), 1);
+
+            // A typed remote command still lets the next banner switch.
+            runtime.observe_input(b"ssh mx1\r");
+            assert_eq!(
+                runtime.observe_output(b"--- JUNOS 22.4R3 Kernel 64-bit\n", &store),
+                Some(names(&["generic", "juniper"]))
+            );
+            assert_eq!(runtime.stack_len(), 2);
+        }
+    }
+
+    // A prompt alone cannot tell apart vendors that share a prompt shape, so
+    // `show version` output may still refine a prompt-detected profile.
+    #[test]
+    fn prompt_detected_remote_still_refines_from_show_version() {
+        let store = ProfileStore::builtin();
+        let mut runtime = ProfileRuntime::new(names(&["generic", "linux-unix"]));
+
+        runtime.observe_input(b"ssh lab-aruba-01\r");
+        assert_eq!(runtime.observe_output(b"\r\nLAB-ARUBA-01# ", &store), None);
+        runtime.observe_input(b"\r");
+        assert_eq!(
+            runtime.observe_output(b"\r\nLAB-ARUBA-01# ", &store),
+            Some(names(&["generic", "cisco"]))
+        );
+        runtime.accept_transition();
+        runtime.observe_input(b"show version\r");
+        assert_eq!(
+            runtime.observe_output(
+                b"show version\r\nArubaOS-CX 10.13.1000\r\nLAB-ARUBA-01# ",
+                &store
+            ),
+            Some(names(&["generic", "arubacx"]))
+        );
+        assert_eq!(runtime.stack_len(), 1);
     }
 
     #[test]
@@ -1712,6 +2324,198 @@ mod tests {
                 target: None,
             })
         );
+    }
+
+    // The shell completes a TAB-finished word on screen, so the typed text
+    // before the TAB is not the host that the close message will name.
+    #[test]
+    fn tab_completed_ssh_target_unwinds_on_the_completed_host_close() {
+        let store = ProfileStore::builtin();
+        let mut runtime = ProfileRuntime::new(names(&["generic", "linux-unix"]));
+
+        runtime.observe_input(b"ssh rou\t\r");
+        assert_eq!(
+            runtime.pending_remote,
+            Some(super::RemoteAttempt {
+                policy: super::ClosePolicy::SshLike,
+                target: None,
+            })
+        );
+        assert_eq!(
+            runtime.observe_output(b"--- JUNOS 22.4R3 Kernel 64-bit\n", &store),
+            Some(names(&["generic", "juniper"]))
+        );
+        runtime.accept_transition();
+        assert_eq!(
+            runtime.observe_output(b"Connection to router-a closed.\n", &store),
+            Some(names(&["generic", "linux-unix"]))
+        );
+        assert_eq!(runtime.stack_len(), 0);
+    }
+
+    // OpenSSH reports the HostName an ssh_config alias resolves to, not the
+    // alias that was typed.
+    #[test]
+    fn ssh_alias_unwinds_on_its_hostname_close() {
+        let store = ProfileStore::builtin();
+        let mut runtime = ProfileRuntime::new(names(&["generic", "linux-unix"]));
+
+        runtime.observe_input(b"ssh rtr1\r");
+        assert_eq!(
+            runtime.observe_output(b"--- JUNOS 22.4R3 Kernel 64-bit\n", &store),
+            Some(names(&["generic", "juniper"]))
+        );
+        runtime.accept_transition();
+        assert_eq!(
+            runtime.observe_output(b"Connection to 192.0.2.1 closed.\n", &store),
+            Some(names(&["generic", "linux-unix"]))
+        );
+        assert_eq!(runtime.stack_len(), 0);
+    }
+
+    // An alias session whose device no profile recognises closes under its
+    // HostName while its attempt is still pending. That close ends the
+    // attempt, or the next prompt records a connection that never closes.
+    #[test]
+    fn untracked_alias_close_ends_its_pending_attempt() {
+        let store = ProfileStore::builtin();
+        let mut runtime = ProfileRuntime::new(names(&["generic", "linux-unix"]));
+
+        runtime.observe_input(b"ssh web\r");
+        assert_eq!(
+            runtime.observe_output(b"ssh web\r\n[admin@web01 ~]$ ", &store),
+            None
+        );
+        runtime.observe_input(b"uptime\r");
+        runtime.observe_input(b"exit\r");
+        assert_eq!(
+            runtime.observe_output(
+                b"exit\r\nConnection to 192.0.2.10 closed.\r\nuser@laptop:~$ ",
+                &store
+            ),
+            None
+        );
+        assert_eq!(runtime.pending_remote, None);
+        assert_eq!(runtime.observe_output(b"user@laptop:~$ ", &store), None);
+        assert_eq!(runtime.stack_len(), 0);
+        runtime.observe_input(b"fw\r");
+        assert_eq!(
+            runtime.observe_output(b"fw\r\nFW-EDGE # ", &store),
+            Some(names(&["generic", "fortinet"]))
+        );
+
+        // Nested in a tracked connection, the parent stays open.
+        let mut runtime = ProfileRuntime::new(names(&["generic", "linux-unix"]));
+        runtime.observe_input(b"ssh router-a\r");
+        assert_eq!(
+            runtime.observe_output(b"--- JUNOS 22.4R3 Kernel 64-bit\r\nlab@mx1> ", &store),
+            Some(names(&["generic", "juniper"]))
+        );
+        runtime.accept_transition();
+        runtime.observe_input(b"ssh web\r");
+        assert_eq!(
+            runtime.observe_output(b"ssh web\r\n[admin@web01 ~]$ ", &store),
+            None
+        );
+        runtime.observe_input(b"exit\r");
+        assert_eq!(
+            runtime.observe_output(
+                b"exit\r\nConnection to 192.0.2.10 closed.\r\nlab@mx1> ",
+                &store
+            ),
+            None
+        );
+        assert_eq!(runtime.pending_remote, None);
+        assert_eq!(runtime.stack_len(), 1);
+        assert_eq!(
+            runtime.observe_output(b"exit\r\nConnection to router-a closed.\r\n", &store),
+            Some(names(&["generic", "linux-unix"]))
+        );
+        assert_eq!(runtime.stack_len(), 0);
+    }
+
+    #[test]
+    fn nested_ssh_alias_unwinds_only_its_own_connection() {
+        let store = ProfileStore::builtin();
+        let mut runtime = ProfileRuntime::new(names(&["generic", "linux-unix"]));
+
+        runtime.observe_input(b"ssh router-a\r");
+        assert_eq!(
+            runtime.observe_output(b"--- JUNOS 22.4R3 Kernel 64-bit\n", &store),
+            Some(names(&["generic", "juniper"]))
+        );
+        runtime.accept_transition();
+        runtime.observe_input(b"ssh rtr2\r");
+        assert_eq!(
+            runtime.observe_output(b"Cisco IOS Software\n", &store),
+            Some(names(&["generic", "cisco"]))
+        );
+        runtime.accept_transition();
+        assert_eq!(runtime.stack_len(), 2);
+
+        // A close naming the parent's target is not the child's alias close.
+        assert_eq!(
+            runtime.observe_output(b"Connection to router-a closed.\n", &store),
+            None
+        );
+        assert_eq!(runtime.stack_len(), 2);
+
+        assert_eq!(
+            runtime.observe_output(b"Connection to 192.0.2.2 closed.\n", &store),
+            Some(names(&["generic", "juniper"]))
+        );
+        runtime.accept_transition();
+        assert_eq!(runtime.stack_len(), 1);
+        // The parent saw a nested attempt, so only its own target closes it.
+        assert_eq!(
+            runtime.observe_output(b"Connection to 192.0.2.1 closed.\n", &store),
+            None
+        );
+        assert_eq!(runtime.stack_len(), 1);
+        assert_eq!(
+            runtime.observe_output(b"Connection to router-a closed.\n", &store),
+            Some(names(&["generic", "linux-unix"]))
+        );
+        assert_eq!(runtime.stack_len(), 0);
+    }
+
+    // Once a nested attempt was typed, a close naming another host may belong
+    // to that attempt, so it must not unwind the parent connection.
+    #[test]
+    fn unmatched_close_after_a_nested_attempt_keeps_the_parent_connection() {
+        let store = ProfileStore::builtin();
+        let mut runtime = ProfileRuntime::new(names(&["generic", "linux-unix"]));
+
+        runtime.observe_input(b"ssh router-a\r");
+        assert_eq!(
+            runtime.observe_output(b"--- JUNOS 22.4R3 Kernel 64-bit\n", &store),
+            Some(names(&["generic", "juniper"]))
+        );
+        runtime.accept_transition();
+        runtime.observe_input(b"ssh hostb\r");
+        assert_eq!(runtime.observe_output(b"hello\n", &store), None);
+        for line in [
+            &b"show version\r"[..],
+            b"show route\r",
+            b"show arp\r",
+            b"show log\r",
+            b"show chassis\r",
+        ] {
+            runtime.observe_input(line);
+        }
+        assert_eq!(runtime.pending_remote, None);
+
+        assert_eq!(
+            runtime.observe_output(b"Connection to hostb closed.\n", &store),
+            None
+        );
+        assert_eq!(runtime.active_profiles(), names(&["generic", "juniper"]));
+        assert_eq!(runtime.stack_len(), 1);
+        assert_eq!(
+            runtime.observe_output(b"Connection to router-a closed.\n", &store),
+            Some(names(&["generic", "linux-unix"]))
+        );
+        assert_eq!(runtime.stack_len(), 0);
     }
 
     #[test]

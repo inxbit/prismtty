@@ -160,6 +160,35 @@ fn ipv6_rule_ignores_scope_resolution_operators() {
     }
 }
 
+// A trailing period or ellipsis ends the sentence, not the address; a dot
+// followed by more of the token still rejects OIDs, longer dotted strings and
+// reverse-DNS names.
+#[test]
+fn addresses_before_sentence_punctuation_are_highlighted() {
+    let link_local_fixture = "fe80::1";
+    for valid in [
+        "Trying 192.0.2.1...".to_string(),
+        "Connected to 192.0.2.1.".to_string(),
+        "192.0.2.1/32.".to_string(),
+        "Trying 2001:db8::1...".to_string(),
+        format!("{link_local_fixture}%en0."),
+    ] {
+        assert_colored("generic", &valid, CYAN);
+    }
+    for invalid in [
+        "192.0.2.1.4.1.9",
+        "127.2.0.192.in-addr.arpa",
+        "192.0.2.1.5",
+        "192.0.2.1234",
+        "192.0.2.1.nip.io",
+        "192.0.2.1._x",
+        "2001:db8::1.2",
+        "2001:db8::1.x",
+    ] {
+        assert_not_colored("generic", invalid, CYAN);
+    }
+}
+
 #[test]
 fn interface_subunits_require_at_least_one_digit() {
     assert_colored("cisco", "Gi1/0/1.0", BLUE);
@@ -186,6 +215,8 @@ fn port_numbers_and_host_boundaries_are_validated() {
         "host-name:22".to_string(),
         "[2001:db8::1]:443".to_string(),
         format!("[{link_local_fixture}%en0]:22"),
+        "host:22.".to_string(),
+        "0.0.0.0:8080 ".to_string(),
     ] {
         assert_colored("linux-unix", &valid, PORT_GREEN);
     }
@@ -198,6 +229,12 @@ fn port_numbers_and_host_boundaries_are_validated() {
         "10:07:20".to_string(),
         "[fe80::1%]:22".to_string(),
         format!("[{link_local_fixture}%bad/zone]:22"),
+        // Image tags and package versions, not ports.
+        "ubuntu:22.04".to_string(),
+        "python:3.12-slim".to_string(),
+        "nginx:1.25.3".to_string(),
+        "Version: 1:2.35-0ubuntu3.8".to_string(),
+        "host:80.5".to_string(),
     ] {
         assert_not_colored("linux-unix", &invalid, PORT_GREEN);
     }
@@ -251,6 +288,21 @@ fn juniper_prompt_highlighting_uses_the_detection_charset() {
             .contains(&"juniper".to_string())
     );
     assert_colored("juniper", prompt, PROMPT_BLUE);
+}
+
+// After `configure`, every Junos prompt ends in `#`.
+#[test]
+fn juniper_prompt_highlights_configuration_mode_marker() {
+    for prompt in [
+        "user@router#",
+        "user@router# show | compare",
+        "ops.user-name@edge-router.example# \r\n",
+    ] {
+        assert_colored("juniper", prompt, PROMPT_BLUE);
+    }
+    // Still requires a delimiter after the marker and a bare host.
+    assert_not_colored("juniper", "user@router#x", PROMPT_BLUE);
+    assert_not_colored("juniper", "root@linux:~# ls", PROMPT_BLUE);
 }
 
 #[test]

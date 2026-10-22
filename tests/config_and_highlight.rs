@@ -278,6 +278,179 @@ rules:
 }
 
 #[test]
+fn noninteractive_stream_restores_program_sgr_set_in_an_earlier_push() {
+    let yaml = r##"
+rules:
+  - description: bad status
+    regex: (?i)\berror\b
+    color: f#ff0000 bold
+"##;
+
+    // The program's color arrives in an earlier read than the highlighted
+    // token: as its own write, or ahead of a token split across reads.
+    for chunks in [
+        ["\x1b[32m", "service error tail\x1b[0m\n"],
+        ["\x1b[32mservice err", "or tail\x1b[0m\n"],
+    ] {
+        let config = PrismConfig::from_chromaterm_yaml(yaml).expect("chromaterm config loads");
+        let highlighter = Highlighter::from_config(config).expect("rules compile");
+        let mut streaming = StreamingHighlighter::new(highlighter);
+        let mut output = String::new();
+        for chunk in chunks {
+            output.push_str(&streaming.push_str(chunk));
+        }
+        output.push_str(&String::from_utf8(streaming.finish()).expect("valid utf8"));
+
+        assert!(
+            output.contains("error\x1b[0m\x1b[32m tail"),
+            "program color set in an earlier push must be restored: {output:?}"
+        );
+    }
+}
+
+#[test]
+fn stream_restores_program_sgr_left_by_terminal_resets_and_saves() {
+    let yaml = r##"
+rules:
+  - description: bad status
+    regex: (?i)\berror\b
+    color: f#ff0000 bold
+"##;
+
+    // The program's color once the controls ran, as xterm draws it: RIS and
+    // DECSTR reset it, DECSC, CSI s and mode 1049 save it, DECRC, CSI u and
+    // leaving mode 1049 restore it, each screen keeps its own saved copy, and
+    // modes 47 and 1047 switch screens without saving.
+    for (program, color) in [
+        ("\x1b[?1049h\x1b[33mx\x1b[?1049l", None),
+        ("\x1b[?1049h\x1b[44;33mx\x1b[?1049l", None),
+        ("\x1b[32m\x1b[?1049h\x1b[33mx\x1b[?1049l", Some("32")),
+        ("\x1b[32m\x1b[?1049h\x1b[0;44;33mx\x1b[?1049l", Some("32")),
+        ("\x1b[33mx\x1bc", None),
+        ("\x1b[33mx\x1b[!p", None),
+        ("\x1b[32m\x1b7\x1b[33mx\x1b8", Some("32")),
+        ("\x1b[32m\x1b[s\x1b[33mx\x1b[u", Some("32")),
+        ("\x1b\x00[32m\x1b\x007\x1b[33mx\x1b\x008", Some("32")),
+        ("\x1b[32m\x1b7\x1b[33mx\x1b[!p\x1b8", None),
+        ("\x1b[32m\x1b[?1049h\x1b[33m\x1b7x\x1b[?1049l", Some("32")),
+        ("\x1b[32m\x1b[?1047h\x1b[33mx\x1b[?1047l", Some("33")),
+    ] {
+        let config = PrismConfig::from_chromaterm_yaml(yaml).expect("chromaterm config loads");
+        let highlighter = Highlighter::from_config(config).expect("rules compile");
+        let full_restore = format!(
+            "error\x1b[0m{} tail",
+            color.map_or(String::new(), |code| format!("\x1b[{code}m"))
+        );
+        let minimal_restore = format!("error \x1b[{}mtail", color.unwrap_or("39"));
+
+        for (interactive, restore) in [(false, &full_restore), (true, &minimal_restore)] {
+            // In a read of its own, with each control in a read of its own,
+            // and in the read with the highlighted token.
+            let mut each_control = program
+                .split('\x1b')
+                .filter(|control| !control.is_empty())
+                .map(|control| format!("\x1b{control}"))
+                .collect::<Vec<_>>();
+            each_control.push("disk error tail\n".to_string());
+            for chunks in [
+                vec![program.to_string(), "disk error tail\n".to_string()],
+                each_control,
+                vec![format!("{program}disk error tail\n")],
+            ] {
+                let mut streaming = if interactive {
+                    new_interactive_streaming(highlighter.clone())
+                } else {
+                    StreamingHighlighter::new(highlighter.clone())
+                };
+                let mut output = String::new();
+                for chunk in &chunks {
+                    output.push_str(&streaming.push_str(chunk));
+                }
+                output.push_str(&String::from_utf8(streaming.finish()).expect("valid utf8"));
+
+                assert!(
+                    output.contains(restore.as_str()),
+                    "{program:?} must leave {color:?} restored after the highlight: {output:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn stream_ends_highlight_before_the_terminal_saves_the_rendition() {
+    let yaml = r##"
+rules:
+  - description: bad status
+    regex: (?i)\berror\b
+    color: f#ff0000
+"##;
+    let config = PrismConfig::from_chromaterm_yaml(yaml).expect("chromaterm config loads");
+    let highlighter = Highlighter::from_config(config).expect("rules compile");
+
+    // A save made while the highlight is drawn would bring the highlight
+    // color back with the restore, onto text the rule never matched.
+    for (interactive, chunks, saved) in [
+        (
+            false,
+            &["disk error\x1b7 tail\x1b8 more\n"][..],
+            "error\x1b[0m\x1b7",
+        ),
+        (
+            false,
+            &["disk error\x1b[?1048h tail\n"][..],
+            "error\x1b[0m\x1b[?1048h",
+        ),
+        (
+            false,
+            &["disk error\x1b[s tail\x1b[u more\n"][..],
+            "error\x1b[0m\x1b[s",
+        ),
+        (
+            false,
+            &["disk error\x1b\x007 tail\x1b\x008 more\n"][..],
+            "error\x1b[0m\x1b\x007",
+        ),
+        (
+            true,
+            &["disk error\x1b7 tail\x1b8 more\n"][..],
+            "error\x1b[39m\x1b7",
+        ),
+        (
+            true,
+            &["disk error \x1b7tail\x1b8 more\n"][..],
+            "error \x1b[39m\x1b7",
+        ),
+        (
+            true,
+            &["disk error ", "\x1b[stail\x1b[u more\n"][..],
+            "error \x1b[39m\x1b[s",
+        ),
+        (
+            true,
+            &["disk error ", "\x1b[?1049hx\x1b[?1049l more\n"][..],
+            "error \x1b[39m\x1b[?1049h",
+        ),
+    ] {
+        let mut streaming = if interactive {
+            new_interactive_streaming(highlighter.clone())
+        } else {
+            StreamingHighlighter::new(highlighter.clone())
+        };
+        let mut output = String::new();
+        for chunk in chunks {
+            output.push_str(&streaming.push_str(chunk));
+        }
+        output.push_str(&String::from_utf8(streaming.finish()).expect("valid utf8"));
+
+        assert!(
+            output.contains(saved),
+            "the highlight must end before {chunks:?} saves the rendition: {output:?}"
+        );
+    }
+}
+
+#[test]
 fn preserves_composed_native_sgr_after_highlighted_prompt_time() {
     let yaml = r##"
 rules:
@@ -522,6 +695,34 @@ fn detects_arista_from_ceos_banner_and_highlights_eos_interfaces() {
     assert!(output.contains("\x1b[38;2;0;153;255mEt2"));
     assert!(output.contains("\x1b[38;2;0;153;255mPort-Channel10"));
     assert!(output.contains("\x1b[38;2;0;153;255mVlan1191"));
+}
+
+// Modular and breakout ports have three levels (slot/port/lane); the whole
+// name is one interface.
+#[test]
+fn arista_interface_rule_covers_three_level_names() {
+    let store = ProfileStore::builtin();
+    let config = PrismConfig::from_profiles(&store, &["arista"]).expect("arista loads");
+    let highlighter = Highlighter::from_config(config).expect("rules compile");
+    let output = highlighter.highlight_str(
+        "Ethernet3/1/1 is up\nEt3/1/1  connected\nEthernet3/1/1.100\nEthernet49/1\n",
+    );
+
+    for name in [
+        "Ethernet3/1/1",
+        "Et3/1/1",
+        "Ethernet3/1/1.100",
+        "Ethernet49/1",
+    ] {
+        assert!(
+            output.contains(&format!("\x1b[38;2;0;153;255m{name}\x1b[0m")),
+            "{name} should highlight as one interface: {output:?}"
+        );
+    }
+    assert!(
+        !output.contains("Ethernet3/1\x1b[0m/1"),
+        "three-level name split: {output:?}"
+    );
 }
 
 #[test]
@@ -863,7 +1064,12 @@ fn streaming_highlighter_discards_earliest_oversized_unterminated_string() {
     let output = streaming.push(&input);
 
     assert!(output.is_empty(), "unterminated OSC payload leaked");
-    assert_eq!(streaming.push(b"\x07visible\n"), b"visible\n");
+    // The second introducer ends the discarded string, as it does in a
+    // terminal, and starts an OSC of its own.
+    let mut expected = b"\x1b]52;".to_vec();
+    expected.extend(std::iter::repeat_n(b'B', 1_000));
+    expected.extend(b"\x07visible\n");
+    assert_eq!(streaming.push(b"\x07visible\n"), expected);
 }
 
 #[test]
@@ -1376,6 +1582,45 @@ fn interactive_streaming_highlighter_highlights_output_after_cr_only_command_ech
         output.contains("\x1b[38;2;0;153;255mVlan1107"),
         "{output:?}"
     );
+}
+
+// Text before %, #, > or $ looks like a prompt with a command after it, but a
+// line that already ended with LF is finished output, as its CRLF form is.
+#[test]
+fn interactive_streaming_highlights_complete_lf_lines_with_prompt_like_prefixes() {
+    let store = ProfileStore::builtin();
+    let input = "%LINK-3-UPDOWN: Interface Gi0/1, changed state to down\nGi0/1 is down, 50% load 192.0.2.1\n";
+    let render = |text: &str| {
+        let config = PrismConfig::from_profiles(&store, &["cisco"]).expect("cisco loads");
+        let highlighter = Highlighter::from_config(config).expect("rules compile");
+        let mut streaming = new_interactive_streaming(highlighter);
+        let mut output = streaming.push_str(text);
+        output.push_str(&String::from_utf8(streaming.finish()).expect("valid utf8"));
+        output
+    };
+
+    let lf_output = render(input);
+    assert_eq!(strip_ansi(lf_output.as_bytes()), input.as_bytes());
+    assert_eq!(
+        lf_output.replace('\n', "\r\n"),
+        render(&input.replace('\n', "\r\n")),
+        "LF and CRLF lines must render alike"
+    );
+    assert!(lf_output.contains("m%LINK-3-UPDOWN"), "{lf_output:?}");
+    assert!(lf_output.contains("m192.0.2.1"), "{lf_output:?}");
+}
+
+#[test]
+fn interactive_streaming_still_passes_typed_echo_after_lf_terminated_output() {
+    let store = ProfileStore::builtin();
+    let config = PrismConfig::from_profiles(&store, &["cisco"]).expect("cisco loads");
+    let highlighter = Highlighter::from_config(config).expect("rules compile");
+    let mut streaming = new_interactive_streaming(highlighter);
+
+    let _ = streaming.push_str("Gi0/1 is down\nRouter#");
+    assert_eq!(streaming.push_str("s"), "s");
+    assert_eq!(streaming.push_str("h"), "h");
+    assert_eq!(streaming.push_str(" ip"), " ip");
 }
 
 #[test]
@@ -2358,6 +2603,62 @@ fn generic_syslog_severity_tags_are_highlighted() {
     );
 }
 
+// IOS XR tags carry a subfacility: FACILITY-SUBFACILITY-SEVERITY-MNEMONIC.
+#[test]
+fn generic_syslog_ios_xr_four_part_tags_are_highlighted() {
+    let store = ProfileStore::builtin();
+    let config = PrismConfig::from_profiles(&store, &["generic"]).expect("generic loads");
+    let highlighter = Highlighter::from_config(config).expect("rules compile");
+    let output = highlighter.highlight_str(
+        "ifmgr[245]: %PKT_INFRA-LINK-3-UPDOWN : Interface Gi0/0/0/0\n\
+         bgp[1052]: %ROUTING-BGP-5-ADJCHANGE : neighbor\n\
+         config[1]: %MGBL-CONFIG-6-DB_COMMIT : committed\n\
+         %SYS-5-CONFIG_I done\n",
+    );
+
+    assert!(
+        output.contains("\x1b[1;38;2;255;51;51m%PKT_INFRA-LINK-3-UPDOWN\x1b[0m"),
+        "{output:?}"
+    );
+    assert!(
+        output.contains("\x1b[38;2;255;255;0m%ROUTING-BGP-5-ADJCHANGE\x1b[0m"),
+        "{output:?}"
+    );
+    assert!(
+        output.contains("\x1b[38;2;101;215;253m%MGBL-CONFIG-6-DB_COMMIT\x1b[0m"),
+        "{output:?}"
+    );
+    assert!(
+        output.contains("\x1b[38;2;255;255;0m%SYS-5-CONFIG_I\x1b[0m"),
+        "{output:?}"
+    );
+}
+
+// The plural and doubled-consonant forms get the same state color as the
+// words they come from, matching how `denied` and `errors` are already colored.
+#[test]
+fn generic_state_rules_cover_permitted_and_failures() {
+    let store = ProfileStore::builtin();
+    let config = PrismConfig::from_profiles(&store, &["generic"]).expect("generic loads");
+    let highlighter = Highlighter::from_config(config).expect("rules compile");
+    let output = highlighter.highlight_str(
+        "list ACL-IN permitted tcp\n0 output buffer failures\npermit permits\nfailure failed\n",
+    );
+
+    for word in ["permitted", "permit", "permits"] {
+        assert!(
+            output.contains(&format!("\x1b[38;2;0;255;0m{word}\x1b[0m")),
+            "{word} should be a good state: {output:?}"
+        );
+    }
+    for word in ["failures", "failure", "failed"] {
+        assert!(
+            output.contains(&format!("\x1b[1;38;2;255;0;0m{word}\x1b[0m")),
+            "{word} should be a bad state: {output:?}"
+        );
+    }
+}
+
 // AUDIT M9: BGP transient/fault states (Active, Connect) must keep the Versa
 // blue and not be repainted green by the inherited generic good-state rule.
 #[test]
@@ -2555,6 +2856,57 @@ fn cisco_interface_rule_requires_a_number() {
         assert!(
             !prose.contains(&format!("\x1b[38;2;0;153;255m{word}")),
             "{word} wrongly highlighted as an interface: {prose:?}"
+        );
+    }
+}
+
+// NX-OS full names, IOS-XE/XR short Gig names, mGig ports, 4-level IOS-XR
+// names and bundles are interfaces too; a `fae1` hextet in a MAC or IPv6
+// address is not.
+#[test]
+fn cisco_interface_rule_covers_nxos_and_xr_names() {
+    let store = ProfileStore::builtin();
+    let config = PrismConfig::from_profiles(&store, &["cisco"]).expect("cisco loads");
+    let h = Highlighter::from_config(config).expect("rules compile");
+
+    for name in [
+        "Ethernet1/1",
+        "HundredGigE1/0/49",
+        "TenGigE0/0/0/1",
+        "TwentyFiveGigE1/0/1",
+        "Twe1/0/1",
+        "TwoGigabitEthernet1/0/1",
+        "Tw1/0/1",
+        "FiveGigabitEthernet1/0/2",
+        "GigabitEthernet0/0/0/0",
+        "GigabitEthernet0/0/0/0.100",
+        "Bundle-Ether1",
+        "FortyGigE1/0/1",
+    ] {
+        let output = h.highlight_str(&format!("{name} is up\n"));
+        assert!(
+            output.contains(&format!("\x1b[38;2;0;153;255m{name}\x1b[0m")),
+            "{name} should highlight as an interface: {output:?}"
+        );
+    }
+
+    let prose = h.highlight_str("serial loopback Te done ethernet the1 fi gi tw five\n");
+    assert!(
+        !prose.contains("\x1b[38;2;0;153;255m"),
+        "prose wrongly highlighted as an interface: {prose:?}"
+    );
+
+    let hex = h.highlight_str("0011.fae1.3344 2001:db8:fae1::1\n");
+    assert!(
+        !hex.contains("\x1b[38;2;0;153;255mfae1"),
+        "MAC/IPv6 hextet wrongly highlighted as an interface: {hex:?}"
+    );
+
+    let existing = h.highlight_str("FastEthernet0/1 Fa0/1 Gi1/0/1 Po10\n");
+    for name in ["FastEthernet0/1", "Fa0/1", "Gi1/0/1", "Po10"] {
+        assert!(
+            existing.contains(&format!("\x1b[38;2;0;153;255m{name}\x1b[0m")),
+            "{name} should still highlight: {existing:?}"
         );
     }
 }
