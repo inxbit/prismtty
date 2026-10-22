@@ -2044,6 +2044,14 @@ mod tests {
             b"\x1b\xc3\x9d0;t\x07",
             b"\x1b\x00\xdd0;t\x07",
             b"\x1b\x1b\xc3\x90q\x1b\\",
+            // UTF-8 C1 controls, which xterm ignores after ESC, and strings
+            // that the byte after them would open there.
+            b"\xc2\x80",
+            b"\xc2\x8e",
+            b"\x1b\xc2\x80]0;t\x07",
+            b"\x1b\x00\xc2\x9b]0;t\x07",
+            b"\x1b\xc2\x80\xc2\x81]0;t\x07",
+            b"\x1b\xc2\x80\xc3\x9d0;t\x07",
             b"\x1b[31m",
             b"\x1b[0m",
             b"\x1b]0;title\x07",
@@ -2145,9 +2153,10 @@ mod tests {
     /// parser executes or ignores in the escape state, is followed by a byte
     /// in A0-FF. xterm looks such a byte, or the character it starts, up in
     /// the Latin-1 half of its escape table, which mirrors ASCII and so holds
-    /// string introducers, CSI and ST. A UTF-8 C1 control, `C2 80` to `C2 9F`,
-    /// is that control instead, which the ESC may precede as it may the raw
-    /// form.
+    /// string introducers, CSI and ST. In UTF-8 mode it ignores a UTF-8 C1
+    /// control, `C2 80` to `C2 9F`, there, so the byte after that selects the
+    /// sequence instead. A raw C1 byte is that control, which the ESC may
+    /// precede.
     fn escape_before_latin1_byte(bytes: &[u8]) -> Option<usize> {
         (0..bytes.len())
             .filter(|&start| bytes[start] == 0x1b)
@@ -2159,11 +2168,7 @@ mod tests {
                 ) {
                     next += 1;
                 }
-                match bytes.get(next) {
-                    Some(0xc2) => !matches!(bytes.get(next + 1), Some(0x80..=0x9f)),
-                    Some(byte) => *byte >= 0xa0,
-                    None => false,
-                }
+                bytes.get(next).is_some_and(|byte| *byte >= 0xa0)
             })
     }
 
@@ -2230,10 +2235,11 @@ mod tests {
         output
     }
 
-    // The ESC and the Latin-1 character that xterm would read with it may
-    // arrive in different reads, with the ESC's controls split anywhere and
-    // the character's UTF-8 bytes split from each other. Wherever the reads
-    // split, --sanitize drops the ESC and keeps the rest visible.
+    // The ESC and the Latin-1 character or UTF-8 C1 control that xterm would
+    // read with it may arrive in different reads, with the ESC's controls
+    // split anywhere and the character's UTF-8 bytes split from each other.
+    // Wherever the reads split, --sanitize drops the ESC and reads the rest
+    // on its own.
     #[test]
     fn sanitize_drops_escapes_before_latin1_characters_at_every_read_split() {
         let cases: &[(&[u8], &[u8])] = &[
@@ -2254,9 +2260,24 @@ mod tests {
                 b"a\x1b[1\x00\xc3\x9e0;t\x07b",
             ),
             (b"a\x1b]0;x\x1b\xc3\x9f0;t\x07b", b"a\xc3\x9f0;t\x07b"),
+            // A UTF-8 C1 control, which xterm ignores after ESC, is read on
+            // its own, and one that starts a string is dropped with it.
+            (b"a\x1b\xc2\x80]0;title\x07b", b"a\xc2\x80]0;title\x07b"),
+            (b"a\x1b\x00\xc2\x9b]0;t\x07b", b"a\x00\xc2\x9b]0;t\x07b"),
+            (
+                b"a\x1b\x1b\xc2\x80\xc2\x81]0;t\x07b",
+                b"a\xc2\x80\xc2\x81]0;t\x07b",
+            ),
+            (
+                b"a\x1b\xc2\x80\xc3\x9d0;t\x07b",
+                b"a\xc2\x80\xc3\x9d0;t\x07b",
+            ),
+            (b"a\x1b[1\x1b\xc2\x8e]0;t\x07b", b"a\x1b[1\xc2\x8e]0;t\x07b"),
+            (b"a\x1b\x00\xc2\x9d0;t\x07b", b"ab"),
             // Cut off by the end of the input, which leaves it whole, as it
             // would be without the ESC.
             (b"a\x1b\x00\xc3", b"a\x00\xc3"),
+            (b"a\x1b\xc2", b"a\xc2"),
             (b"a\x1b\xe2\x9d", b"a\xe2\x9d"),
             (b"a\x1b\x07\xf0\x9f\x8e", b"a\x07\xf0\x9f\x8e"),
         ];
@@ -2294,35 +2315,38 @@ mod tests {
             }
         }
 
-        // The end of a string discarded as oversized, and the ESC that ended
-        // it, replayed when it closed the previous read.
         let tail = super::MAX_INCOMPLETE_ESCAPE_BYTES + 16;
-        let mut oversized_string = b"a\x1b]0;".to_vec();
-        oversized_string.resize(tail, b'x');
-        oversized_string.extend_from_slice(b"\x1b\xc3\x9d0;title\x07b");
-        // A run of escape-state controls past the limit for an open escape.
-        let mut long_controls = b"a\x1b".to_vec();
-        long_controls.resize(tail, 0);
-        long_controls.extend_from_slice(b"\xc3\x9d0;title\x07b");
-        for (input, expected) in [
-            (oversized_string, b"a\xc3\x9d0;title\x07b".to_vec()),
-            (
-                long_controls.clone(),
-                [&long_controls[..1], &long_controls[2..]].concat(),
-            ),
-        ] {
-            let splits = (1..input.len())
-                .filter(|split| *split < 8 || split % 1000 == 0 || split + 8 >= tail);
-            for split in splits {
-                let (first, second) = input.split_at(split);
-                assert_eq!(
-                    run_chunk_pipeline(&[first, second], ChunkPipeline::Sanitize),
-                    expected,
-                    "split at {split} of {} bytes",
-                    input.len()
-                );
+        for rest in [b"\xc3\x9d0;title\x07b".as_slice(), b"\xc2\x80]0;title\x07b"] {
+            // The end of a string discarded as oversized, and the ESC that
+            // ended it, replayed when it closed the previous read.
+            let mut oversized_string = b"a\x1b]0;".to_vec();
+            oversized_string.resize(tail, b'x');
+            oversized_string.push(0x1b);
+            oversized_string.extend_from_slice(rest);
+            // A run of escape-state controls past the limit for an open escape.
+            let mut long_controls = b"a\x1b".to_vec();
+            long_controls.resize(tail, 0);
+            long_controls.extend_from_slice(rest);
+            for (input, expected) in [
+                (oversized_string, [b"a", rest].concat()),
+                (
+                    long_controls.clone(),
+                    [&long_controls[..1], &long_controls[2..]].concat(),
+                ),
+            ] {
+                let splits = (1..input.len())
+                    .filter(|split| *split < 8 || split % 1000 == 0 || split + 8 >= tail);
+                for split in splits {
+                    let (first, second) = input.split_at(split);
+                    assert_eq!(
+                        run_chunk_pipeline(&[first, second], ChunkPipeline::Sanitize),
+                        expected,
+                        "split at {split} of {} bytes",
+                        input.len()
+                    );
+                }
+                assert_eq!(run_sanitized_stream(&[&input], false, None, None), expected);
             }
-            assert_eq!(run_sanitized_stream(&[&input], false, None, None), expected);
         }
     }
 
@@ -2339,6 +2363,8 @@ mod tests {
             [b"a\x1b".as_slice(), b"\xc3\x9d0;title\x07b"],
             [b"a\x1b\x00\xc3".as_slice(), b"\x9d0;title\x07b"],
             [b"a\x1b".as_slice(), b"\xdd0;title\x07b"],
+            [b"a\x1b".as_slice(), b"\xc2\x80]0;title\x07b"],
+            [b"a\x1b\x00\xc2".as_slice(), b"\x80]0;title\x07b"],
         ] {
             let trace_file = tempfile::NamedTempFile::new().expect("trace temp file");
             let output = run_sanitized_stream(

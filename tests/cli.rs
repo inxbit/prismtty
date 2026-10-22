@@ -920,6 +920,32 @@ fn sanitize_drops_escapes_that_latin1_characters_would_complete() {
     );
 }
 
+// In UTF-8 mode xterm ignores a C1 control encoded as UTF-8 in the escape
+// state, so ESC C2 80 ] opens an OSC. --sanitize drops the ESC and reads the
+// control on its own, still dropping a string control with its string.
+#[test]
+fn sanitize_drops_escapes_that_utf8_c1_controls_follow() {
+    let mut empty_config = tempfile::NamedTempFile::new().expect("empty config");
+    writeln!(empty_config, "rules: []").expect("write empty config");
+    let input = b"a\x1b\xc2\x80]0;title\x07b\x1b\x00\xc2\x9b]0;t\x07c\x1b\xc2\x9c]0;t\x07\
+        d\x1b\xc2\x8e]52;c;U0VDUkVU\x07e\x1b\xc2\x80\xc2\x81]0;t\x07f\x1b\xc2\x80\xc3\x9d0;t\x07\
+        g\x1b\xc2\x9d0;t\x07h\x1b\x80i\n";
+    let expected = b"a\xc2\x80]0;title\x07b\x00\xc2\x9b]0;t\x07c\xc2\x9c]0;t\x07\
+        d\xc2\x8e]52;c;U0VDUkVU\x07e\xc2\x80\xc2\x81]0;t\x07f\xc2\x80\xc3\x9d0;t\x07\
+        gh\x1b\x80i\n";
+
+    let mut cmd = Command::cargo_bin("ct")
+        .unwrap_or_else(|_| Command::cargo_bin("prismtty").expect("binary exists"));
+    cmd.arg("--sanitize")
+        .arg("--config")
+        .arg(empty_config.path())
+        .write_stdin(input.as_slice());
+    let output = cmd.output().expect("command runs");
+
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(output.stdout, expected, "{:02x?}", output.stdout);
+}
+
 #[test]
 fn profiles_list_includes_v1_builtin_profiles() {
     let mut cmd = Command::cargo_bin("prismtty").expect("binary exists");
