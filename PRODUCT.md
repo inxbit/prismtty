@@ -79,7 +79,7 @@ Guardrail: the repo holds no comparison against any other tool. Describe what Pr
 
 ## Evidence on Hand
 
-- 28 releases since 2026-05-12 (v0.2.1) to 1.2.5 (2026-08-20), all in CHANGELOG.md; MIT licensed; crates.io, docs.rs, Homebrew tap, GitHub Releases with checksums and attestations.
+- 29 releases since 2026-05-12 (v0.2.1) to 1.3.0 (2026-10-22), all in CHANGELOG.md; MIT licensed; crates.io, docs.rs, Homebrew tap, GitHub Releases with checksums and attestations.
 - Maintainer-measured before/after deltas (own hardware, not head-to-head): piped highlighting of a synthetic 20k-line router dump 0.57 s to 0.14 s; interactive throughput 1.1 to 4.4 MiB/s; release binary 2.28 MB to 1.76 MB (CHANGELOG 1.2.2).
 - 485 Rust tests, 35 node tests; CI on macOS + Ubuntu with cargo-audit, cargo-deny, MSRV, privacy scan.
 - Synthetic fixtures: `fixtures/cisco.txt`, `juniper.txt`, `linux-unix.txt`, and 10 replay fixtures across 8 profiles in `fixtures/replay/` with an expectations contract.
