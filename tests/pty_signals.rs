@@ -1383,12 +1383,22 @@ fn uncatchable_stop_then_continue_reapplies_raw_mode() {
     child_guard.disarm();
 }
 
-/// Runs `script` with `sh -c` as the session leader of a fresh PTY. With
-/// `set -m` the shell does job control like an interactive one: it can start
-/// the wrapper as a background job and move it between foreground and
-/// background. `PTTY` names the wrapper binary, and the script should write
-/// the wrapper's pid to `$PRISMTTY_WRAPPER_PID` and the wrapped child's to
-/// `$PRISMTTY_CHILD_PID` so both can be cleaned up.
+/// The shell that runs a `JobControlShell` script. macOS's sh is bash 3.2,
+/// which after `set -m` in a non-interactive shell neither hands the terminal
+/// to a job on `fg` nor notices that its foreground job stopped. The dash that
+/// macOS also ships does both, as do the dash and newer bash behind sh on
+/// Linux.
+#[cfg(target_os = "macos")]
+const JOB_CONTROL_SHELL: &str = "/bin/dash";
+#[cfg(not(target_os = "macos"))]
+const JOB_CONTROL_SHELL: &str = "sh";
+
+/// Runs `script` with `JOB_CONTROL_SHELL -c` as the session leader of a fresh
+/// PTY. With `set -m` the shell does job control like an interactive one: it
+/// can start the wrapper as a background job and move it between foreground
+/// and background. `PTTY` names the wrapper binary, and the script should
+/// write the wrapper's pid to `$PRISMTTY_WRAPPER_PID` and the wrapped child's
+/// to `$PRISMTTY_CHILD_PID` so both can be cleaned up.
 struct JobControlShell {
     // Dropped first, so the wrapper and the wrapped child are killed before
     // the shell, whatever state the test left them in.
@@ -1413,7 +1423,7 @@ impl JobControlShell {
         let pair = native_pty_system()
             .openpty(PtySize::default())
             .expect("openpty");
-        let mut builder = CommandBuilder::new("sh");
+        let mut builder = CommandBuilder::new(JOB_CONTROL_SHELL);
         builder.env("PTTY", env!("CARGO_BIN_EXE_ptty"));
         builder.env("PRISMTTY_WRAPPER_PID", &wrapper_pid_path);
         builder.env("PRISMTTY_CHILD_PID", &child_pid_path);
