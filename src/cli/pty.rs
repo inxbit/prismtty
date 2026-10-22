@@ -767,7 +767,7 @@ fn program_candidates(program: &OsStr, cwd: Option<&Path>) -> Vec<PathBuf> {
 /// blanks (space, tab) after `#!`, and ends the interpreter name at a blank,
 /// a NUL or the end of the line.
 struct ShebangSyntax {
-    /// How much of the file the kernel reads.
+    /// How much of the file every version of the kernel reads.
     buffer_bytes: usize,
     /// The bytes that end the line.
     line_ends: &'static [u8],
@@ -778,11 +778,14 @@ struct ShebangSyntax {
     names_in_unended_line: bool,
 }
 
-/// Linux, `load_script` in fs/binfmt_script.c: the buffer is BINPRM_BUF_SIZE,
-/// and the newline search (strnchr) stops at a NUL, so the line of a short
-/// file with no newline ends where the file does. `#` is part of the name.
+/// Linux, `load_script` in fs/binfmt_script.c: the newline search (strnchr)
+/// stops at a NUL, so the line of a short file with no newline ends where the
+/// file does. `#` is part of the name. The buffer is BINPRM_BUF_SIZE, 256
+/// bytes since Linux 5.1 but 128 before, where a name that does not end in
+/// it is ENOEXEC (5.0, 4.x stable) or cut off there (older kernels). Reading
+/// 128 bytes leaves such a name to the spawn on every version.
 const LINUX_SHEBANG: ShebangSyntax = ShebangSyntax {
-    buffer_bytes: 256,
+    buffer_bytes: 128,
     line_ends: b"\n\0",
     names_in_unended_line: true,
 };
@@ -2576,6 +2579,8 @@ mod tests {
         write("unterminated.sh", &format!("#!/{}", "a".repeat(300)), 0o755);
         write("short.sh", "#!/nonexistent/interp", 0o755);
         write("hash.sh", "#!/bin/sh#x\necho ran\n", 0o755);
+        let long_name = format!("/nonexistent/{}", "a".repeat(150));
+        write("long.sh", &format!("#!{long_name}\necho ran\n"), 0o755);
         let cwd = Some(dir.path());
 
         let code =
@@ -2600,17 +2605,20 @@ mod tests {
         // execve, which reports ENOEXEC and lets execvp try /bin/sh.
         assert_eq!(code("./unterminated.sh"), None);
         // Linux ends the line of a short file with no newline at its end, and
-        // `#` is part of the name. macOS ends the line at `#`, and reports
-        // ENOEXEC for a line with no end at all.
+        // `#` is part of the name, but a name past 128 bytes runs differently
+        // by kernel version. macOS ends the line at `#`, reports ENOEXEC for a
+        // line with no end at all, and reads 512 bytes on every version.
         #[cfg(target_os = "linux")]
         {
             assert_eq!(code("./short.sh"), Some(127));
             assert_eq!(code("./hash.sh"), Some(127));
+            assert_eq!(code("./long.sh"), None);
         }
         #[cfg(target_vendor = "apple")]
         {
             assert_eq!(code("./short.sh"), None);
             assert_eq!(code("./hash.sh"), None);
+            assert_eq!(code("./long.sh"), Some(127));
         }
         // Nothing to check: spawn reports these itself.
         assert_eq!(code("./absent.sh"), None);
@@ -2649,9 +2657,9 @@ mod tests {
         super::script_interpreter(start, syntax).map(|path| path.display().to_string())
     }
 
-    // fs/binfmt_script.c: a 256-byte buffer; the line ends at a newline or a
-    // NUL; only a blank or a NUL ends the name; with no line end in the
-    // buffer, a name followed by a blank still runs.
+    // fs/binfmt_script.c: a 128-byte buffer before Linux 5.1; the line ends at
+    // a newline or a NUL; only a blank or a NUL ends the name; with no line
+    // end in the buffer, a name followed by a blank still runs.
     #[test]
     fn linux_shebang_syntax_matches_binfmt_script() {
         let linux = |start: &[u8]| interpreter(start, &super::LINUX_SHEBANG);
@@ -2668,9 +2676,13 @@ mod tests {
         assert_eq!(linux(b"#!/missing").as_deref(), Some("/missing"));
         assert_eq!(linux(b"#!/missing  ").as_deref(), Some("/missing"));
         // No line end in the buffer: the blank after the name must be in it.
-        let name = format!("/{}", "a".repeat(252));
-        assert_eq!(linux(&long(253, " -x\n")).as_deref(), Some(name.as_str()));
-        assert_eq!(linux(&long(254, " -x\n")), None);
+        let name = format!("/{}", "a".repeat(124));
+        assert_eq!(linux(&long(125, "\n")).as_deref(), Some(name.as_str()));
+        assert_eq!(linux(&long(125, " -x\n")).as_deref(), Some(name.as_str()));
+        assert_eq!(linux(&long(126, " -x\n")), None);
+        // Linux 5.1 reads 256 bytes and runs this name, but earlier kernels
+        // report ENOEXEC or cut it off.
+        assert_eq!(linux(&long(126, "\n")), None);
         assert_eq!(linux(&long(300, "\n")), None);
         assert_eq!(
             linux(format!("#!/missing {}", "a".repeat(300)).as_bytes()).as_deref(),
