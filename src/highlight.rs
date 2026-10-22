@@ -4426,10 +4426,12 @@ pub fn strip_ansi(input: &[u8]) -> Vec<u8> {
 /// 7-bit ESC and 8-bit C1 sequences a hostile child or remote device can abuse
 /// (window-title spoofing, OSC 52 clipboard injection, DCS payload smuggling);
 /// everything a normal TUI needs to render survives. An unterminated string
-/// sequence at the end of the input is dropped rather than passed through, and
-/// so is an ESC that a terminal would read together with the non-ASCII byte
-/// after it, which is then read on its own, and every DOCS sequence (`ESC %`),
-/// which can switch the terminal out of UTF-8.
+/// sequence at the end of the input is dropped rather than passed through.
+/// So are controls that a terminal could read as a string introducer or that
+/// could switch it out of UTF-8: an ESC that a non-ASCII byte follows (the
+/// byte is kept) with any control that the ESC cancelled, every DOCS sequence
+/// (`ESC %`), a CSI that holds a byte from 80 up or that a C1 control cancels,
+/// and a CSI that sets, resets or restores DEC private mode 42.
 pub fn strip_string_escapes(input: &[u8]) -> Vec<u8> {
     let mut sanitized = Vec::with_capacity(input.len());
     let mut idx = 0;
@@ -4489,10 +4491,12 @@ pub fn strip_string_escapes(input: &[u8]) -> Vec<u8> {
                     // then the 9D in U+201D opens an OSC. xterm also ignores a
                     // C1 control inside DOCS and reads U+00C0 and U+00C7 as
                     // `@` and `G`, so DOCS is dropped however it ends, with
-                    // the chain that reached it, and what ended it is read on
-                    // its own. A terminal already set to another encoding is
-                    // beyond what --sanitize can protect, since prismtty reads
-                    // output as UTF-8.
+                    // the chain that reached it. The C0 controls and DEL
+                    // inside it and a CAN or SUB that ends it go with it; an
+                    // ESC, C1 control or other non-ASCII byte that ends it is
+                    // read on its own. A terminal already set to another
+                    // encoding is beyond what --sanitize can protect, since
+                    // prismtty reads output as UTF-8.
                     EscapeScan::Complete(end) | EscapeScan::Restart(end) if docs => {
                         sanitized.truncate(chain_start);
                         idx = end;
@@ -5497,7 +5501,9 @@ rules:
     // U+201D (E2 80 9D) byte by byte, and the 9D opens an OSC. xterm ignores
     // a C1 control inside DOCS and reads U+00C0 and U+00C7 as its `@` and `G`,
     // so --sanitize drops every DOCS however it ends, with the chain that
-    // reached it, and reads what ended it on its own.
+    // reached it. The C0 controls and DEL inside it and a CAN or SUB that
+    // ends it go with it; an ESC, C1 control or other non-ASCII byte that
+    // ends it is read on its own.
     #[test]
     fn sanitize_drops_docs_sequences() {
         let rest = "\u{201d}0;title\x07b".as_bytes();
@@ -5516,6 +5522,8 @@ rules:
             b"\x9b1\x1b%@",
             b"\xc2\x8e\x1b%G",
             b"\x1b%\x18",
+            b"\x1b%\x1a",
+            b"\x1b%\r/\n\x18",
         ] {
             let input = [b"a", docs, rest].concat();
             assert_eq!(
