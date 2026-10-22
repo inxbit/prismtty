@@ -3893,6 +3893,16 @@ struct TopLevelScanStop {
     cancellation_root: Option<usize>,
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Bytes the top-level escape scans on this thread set out to read, from
+    /// where each one starts to the end of its buffer. A sanitize split that
+    /// rescans its prefix adds the prefix again, so stream tests sum them to
+    /// see how often a split rescans a read.
+    pub(crate) static TOP_LEVEL_SCAN_BYTES: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
 /// Runs the scan of `incomplete_top_level_escape_start` on from `from`,
 /// passing each stop it makes after `from` to `stop`. Taking `stop` as a
 /// trait object keeps one copy of the scan for every caller.
@@ -3901,6 +3911,9 @@ fn resume_top_level_escape_scan(
     from: TopLevelScanStop,
     stop: &mut dyn FnMut(TopLevelScanStop),
 ) -> Option<usize> {
+    #[cfg(test)]
+    TOP_LEVEL_SCAN_BYTES
+        .with(|scanned| scanned.set(scanned.get() + bytes.len().saturating_sub(from.idx)));
     let TopLevelScanStop {
         mut idx,
         mut cancellation_root,

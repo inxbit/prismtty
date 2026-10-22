@@ -2265,28 +2265,44 @@ mod tests {
     // Such a run arriving in small reads is carried whole, so every read
     // splits the growing carry again and steps back over a control per split.
     // Each of those splits must resume the scan near it instead of rescanning
-    // the carry before it. A worker thread keeps a regression from hanging.
+    // the carry before it. The scans are measured by the bytes they cover
+    // rather than by time, so a busy machine cannot fail the test. A worker
+    // thread keeps a regression from hanging.
     #[test]
     fn sanitize_split_scans_a_carried_run_of_cut_off_characters_once_per_read() {
+        use crate::highlight::TOP_LEVEL_SCAN_BYTES;
+
         let (sender, receiver) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let mut opened_strings = Vec::new();
+            let mut scans = Vec::new();
             for group in [b"\x1b\xf0\x9f\x9c".as_slice(), b"\x1b\xc2".as_slice()] {
                 let input = group.repeat(64 * 1024 / group.len());
                 let mut state = super::ChunkFilterState::default();
+                let mut reassembled = 0;
+                TOP_LEVEL_SCAN_BYTES.with(|scanned| scanned.set(0));
                 for read in input.chunks(64) {
+                    reassembled += state.carry.len() + read.len();
                     let prepared = super::prepare_chunk(read, false, true, &mut state);
                     if let Some(start) = walk_vt_parser(prepared.bytes(), false).0 {
                         opened_strings.push((group, start));
                     }
                 }
+                let scanned = TOP_LEVEL_SCAN_BYTES.with(std::cell::Cell::get);
+                scans.push((group, scanned, reassembled));
             }
-            let _ = sender.send(opened_strings);
+            let _ = sender.send((opened_strings, scans));
         });
-        let opened_strings = receiver
-            .recv_timeout(std::time::Duration::from_secs(8))
-            .expect("64 KiB of each run in 64-byte reads should be split within 8s");
+        let (opened_strings, scans) = receiver
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("64 KiB of each run in 64-byte reads should be split within 30s");
         assert!(opened_strings.is_empty(), "{opened_strings:02x?}");
+        for (group, scanned, reassembled) in scans {
+            assert!(
+                scanned < 2 * reassembled,
+                "splits of {reassembled} reassembled bytes of {group:02x?} runs scanned {scanned}"
+            );
+        }
     }
 
     #[test]
