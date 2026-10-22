@@ -882,7 +882,7 @@ fn sanitize_drops_escapes_that_latin1_characters_would_complete() {
     let input = b"a\x1b\xc3\x9d0;title\x07b\x1b\x00\xc3\x9d0;t\x07c\x1b\x1b\xc3\x9d2;t\x07\
         d\x1b\xdd52;c;U0VDUkVU\x07e\x1b\xc3\x90q\x1b\\f\x1b[1\x1b\xc3\x9e0;t\x07g\n";
     let expected = b"a\xc3\x9d0;title\x07b\x00\xc3\x9d0;t\x07c\xc3\x9d2;t\x07\
-        d\xdd52;c;U0VDUkVU\x07e\xc3\x90q\x1b\\f\x1b[1\xc3\x9e0;t\x07g\n";
+        d\xdd52;c;U0VDUkVU\x07e\xc3\x90q\x1b\\f\xc3\x9e0;t\x07g\n";
 
     for (input, expected) in [
         (input.as_slice(), expected.as_slice()),
@@ -938,7 +938,7 @@ fn sanitize_drops_escapes_that_c1_controls_follow() {
         d\xc2\x8e]52;c;U0VDUkVU\x07e\xc2\x80\xc2\x81]0;t\x07f\xc2\x80\xc3\x9d0;t\x07\
         gh\x80i\x80]0;title\x07j\x9b]0;t\x07\
         k\x00\x8e]52;c;U0VDUkVU\x07lm\
-        n\x1b[1\x9b1mo\n";
+        n\x9b1mo\n";
 
     for (input, expected) in [
         (input.as_slice(), expected.as_slice()),
@@ -981,6 +981,36 @@ fn sanitize_drops_docs_sequences() {
 
         assert!(output.status.success(), "{output:?}");
         assert_eq!(output.stdout, expected.as_bytes(), "{:02x?}", output.stdout);
+    }
+}
+
+// In UTF-8 mode xterm ignores a C1 control inside a CSI and reads a Latin-1
+// character there as the ASCII byte it mirrors, so ESC [ ? 4 U+00B2 h and
+// ESC [ ? 4 C2 80 2 h are DECSET 42 (DECNRCM) to it, which can take it out of
+// UTF-8, and then the 9D in U+201D opens an OSC. --sanitize drops such CSIs
+// and a control that a dropped ESC cancelled; without it, they pass through.
+#[test]
+fn sanitize_drops_csis_that_could_switch_xterm_out_of_utf8() {
+    let mut empty_config = tempfile::NamedTempFile::new().expect("empty config");
+    writeln!(empty_config, "rules: []").expect("write empty config");
+    let input = b"a\x1b[?4\xc2\xb2h\xe2\x80\x9d0;t\x07b\x1b[?4\xc2\x802h\xe2\x80\x9dc\
+        \x1b[?4\x1b\xc2\xb2h\xe2\x80\x9dd\x1b[1\x1b\xc3\x9ee\x1b[1;31mf\x1b[0m\n";
+    let expected = b"a\xe2\x80\x9d0;t\x07b\xc2\x802h\xe2\x80\x9dc\xc2\xb2h\xe2\x80\x9dd\
+        \xc3\x9ee\x1b[1;31mf\x1b[0m\n";
+
+    for (sanitize, expected) in [(true, expected.as_slice()), (false, input.as_slice())] {
+        let mut cmd = Command::cargo_bin("ct")
+            .unwrap_or_else(|_| Command::cargo_bin("prismtty").expect("binary exists"));
+        if sanitize {
+            cmd.arg("--sanitize");
+        }
+        cmd.arg("--config")
+            .arg(empty_config.path())
+            .write_stdin(input.as_slice());
+        let output = cmd.output().expect("command runs");
+
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(output.stdout, expected, "{:02x?}", output.stdout);
     }
 }
 

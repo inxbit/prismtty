@@ -4433,7 +4433,7 @@ pub fn strip_string_escapes(input: &[u8]) -> Vec<u8> {
     while idx < input.len() {
         if input[idx] == 0x1b || c1_control_at(input, idx).is_some() {
             // The chain is emitted up to `copied` as it goes, so a string
-            // control or DOCS that it reaches can still drop all of it.
+            // control, DOCS or CSI that it reaches can still drop all of it.
             let chain_start = sanitized.len();
             let mut copied = idx;
             let mut current = idx;
@@ -4449,18 +4449,22 @@ pub fn strip_string_escapes(input: &[u8]) -> Vec<u8> {
                 // a Latin-1 xterm. In UTF-8 mode it ignores a C1 control there,
                 // UTF-8 encoded or raw, and Alacritty ignores every byte from
                 // 80 up, so in `ESC 80 ]` the `]` opens an OSC. Other
-                // terminals show the character or run the control, so only the
-                // ESC run is dropped. A C1 control goes on with the chain, as
-                // it would after the ESC, so a string control that it reaches
-                // still drops the chain from its first control; a C1 string
-                // control is left to the chain. A character is read on its
-                // own, and one cut off by the end of the input stays whole, as
-                // it did while the ESC waited for it, so its C1-valued bytes
-                // are not read as controls that drop it.
+                // terminals show the character or run the control, so the ESC
+                // run is dropped and its C0 controls are kept. A control that
+                // its first ESC cancelled would be completed by the bytes
+                // after the run, so it is dropped with the chain that reached
+                // it. A C1 control goes on with the chain, as it would after
+                // the ESC, so a string control that it reaches still drops the
+                // chain from its first control; a C1 string control is left to
+                // the chain. A character is read on its own, and one cut off
+                // by the end of the input stays whole, as it did while the ESC
+                // waited for it, so its C1-valued bytes are not read as
+                // controls that drop it.
                 if escape_precedes_non_ascii(input, current) {
                     let next = skip_escape_state_controls(input, current + 1);
+                    sanitized.truncate(chain_start);
                     if c1_control_at(input, next).is_some() {
-                        extend_without_open_escapes(&mut sanitized, input, copied, current, next);
+                        push_escape_run_controls(&mut sanitized, input, copied, current, next);
                         copied = next;
                         current = next;
                         continue;
@@ -4470,11 +4474,12 @@ pub fn strip_string_escapes(input: &[u8]) -> Vec<u8> {
                     } else {
                         next
                     };
-                    extend_without_open_escapes(&mut sanitized, input, copied, current, end);
+                    push_escape_run_controls(&mut sanitized, input, copied, current, end);
                     idx = end;
                     break;
                 }
                 let docs = is_docs_escape(input, current);
+                let csi_parameters = csi_parameters_start(input, current);
                 match scan_escape_for_neutralization(input, current) {
                     // DOCS selects how xterm decodes its input: `ESC % @`
                     // leaves UTF-8 unless its utf8 resource is "always", and
@@ -4490,7 +4495,35 @@ pub fn strip_string_escapes(input: &[u8]) -> Vec<u8> {
                         idx = end;
                         break;
                     }
+                    // In UTF-8 mode xterm ignores a C1 control inside a CSI
+                    // and reads a character from U+00A0 to U+00FF there, which
+                    // a lone raw A0-BF byte before an ASCII byte decodes to,
+                    // as the ASCII byte it mirrors. So it reads
+                    // `CSI ? 4 C2 B2 h` and `CSI ? 4 C2 80 2 h` as
+                    // `CSI ? 42 h`, and Alacritty ignores every byte from 80
+                    // up there. A CSI that holds a byte from 80 up, however it
+                    // ends, or that a C1 control cancels is dropped with the
+                    // chain that reached it, and the C1 control is read as
+                    // before.
+                    EscapeScan::Restart(restart)
+                        if csi_parameters.is_some_and(|parameters| {
+                            input[parameters..=restart].iter().any(|byte| *byte >= 0x80)
+                        }) =>
+                    {
+                        sanitized.truncate(chain_start);
+                        copied = restart;
+                        current = restart;
+                    }
                     EscapeScan::Restart(restart) => current = restart,
+                    EscapeScan::Complete(end)
+                        if csi_parameters.is_some_and(|parameters| {
+                            input[parameters..end].iter().any(|byte| *byte >= 0x80)
+                        }) =>
+                    {
+                        sanitized.truncate(chain_start);
+                        idx = end;
+                        break;
+                    }
                     EscapeScan::Complete(end) => {
                         sanitized.extend_from_slice(&input[copied..end]);
                         idx = end;
@@ -4503,7 +4536,8 @@ pub fn strip_string_escapes(input: &[u8]) -> Vec<u8> {
                         // The terminal is still in the escape state after these
                         // controls, so emitting the ESC would let a `]` in the
                         // next read open a string control.
-                        extend_without_open_escapes(
+                        sanitized.truncate(chain_start);
+                        push_escape_run_controls(
                             &mut sanitized,
                             input,
                             copied,
@@ -4555,12 +4589,14 @@ fn is_docs_escape(bytes: &[u8], start: usize) -> bool {
     bytes[start] == 0x1b && bytes.get(skip_escape_state_controls(bytes, start + 1)) == Some(&b'%')
 }
 
-/// Appends `input[from..end]` without the ESCs of the bare ESC run that ends
-/// with the one at `current`, each followed only by escape-state controls up
-/// to the next. A bare ESC that the next one cancels leaves the terminal in
+/// Appends the controls of the bare ESC run in `input[from..=current]` that
+/// ends with the ESC at `current`, each ESC followed only by escape-state
+/// controls up to the next: `input[open..end]` without its ESCs, where `open`
+/// starts the run. A bare ESC that the next one cancels leaves the terminal in
 /// the escape state too, so the byte at `end` would still select a sequence.
-/// The controls are kept, and so is a real control earlier in the chain.
-fn extend_without_open_escapes(
+/// A real control before the run, which its first ESC cancelled, is not
+/// appended.
+fn push_escape_run_controls(
     sanitized: &mut Vec<u8>,
     input: &[u8],
     from: usize,
@@ -4574,8 +4610,21 @@ fn extend_without_open_escapes(
         }
         open = from + previous;
     }
-    sanitized.extend_from_slice(&input[from..open]);
     sanitized.extend(input[open..end].iter().filter(|byte| **byte != 0x1b));
+}
+
+/// Where the parameters of a CSI that starts at `start` begin: after `ESC [`,
+/// past the escape-state controls between them, or after a C1 CSI, raw or
+/// UTF-8 encoded.
+fn csi_parameters_start(bytes: &[u8], start: usize) -> Option<usize> {
+    if bytes[start] == 0x1b {
+        let introducer = skip_escape_state_controls(bytes, start + 1);
+        return (bytes.get(introducer) == Some(&b'[')).then_some(introducer + 1);
+    }
+    match c1_control_at(bytes, start) {
+        Some((0x9b, width)) => Some(start + width),
+        _ => None,
+    }
 }
 
 fn valid_utf8_char_width_at(input: &[u8], idx: usize) -> Option<usize> {
@@ -5134,13 +5183,17 @@ rules:
         // An escape left open by a long run of controls is not emitted, since
         // the terminal would still be waiting to read a string introducer.
         // Neither is a bare escape that it cancelled, which would leave the
-        // terminal in the same state.
+        // terminal in the same state, nor a control that the run cancelled,
+        // which the next read could complete.
         let controls = vec![0; super::MAX_INCOMPLETE_NON_STRING_ESCAPE_BYTES + 1];
         for (prefix, expected) in [
             (b"ok\x1b".as_slice(), b"ok".as_slice()),
             (b"ok\x1b\x1b".as_slice(), b"ok".as_slice()),
             (b"ok\x1b\x00\x1b".as_slice(), b"ok\x00".as_slice()),
-            (b"ok\x1b[1\x1b\x1b".as_slice(), b"ok\x1b[1".as_slice()),
+            (b"ok\x1b[1\x1b\x1b".as_slice(), b"ok".as_slice()),
+            (b"ok\x1b[?4\x1b\r\x1b".as_slice(), b"ok\r".as_slice()),
+            (b"ok\x9b1\x1b".as_slice(), b"ok".as_slice()),
+            (b"ok\x1b(\x1b".as_slice(), b"ok".as_slice()),
         ] {
             let oversized = [prefix, &controls].concat();
             assert_eq!(
@@ -5169,10 +5222,13 @@ rules:
                     (b"\x1b\x7f\r\n", b"\x7f\r\n"),
                     (b"\x1b\x1b", b""),
                     (b"\x1b\x00\x1b\x01", b"\x00\x01"),
-                    // A real control that a bare ESC cancels keeps its ESC.
-                    (b"\x1b[1\x1b", b"\x1b[1"),
-                    (b"\x1b(\x1b\x1b\x00", b"\x1b(\x00"),
-                    (b"\x9b1\x1b", b"\x9b1"),
+                    // A real control that a bare ESC cancels is dropped too,
+                    // or the character would complete it, and the controls
+                    // of the run stay.
+                    (b"\x1b[1\x1b", b""),
+                    (b"\x1b(\x1b\x1b\x00", b"\x00"),
+                    (b"\x9b1\x1b", b""),
+                    (b"\x1b[?4\x1b\r", b"\r"),
                     // A string control that the bare ESC ends is dropped.
                     (b"\x1b]0;x\x1b", b""),
                 ] {
@@ -5197,7 +5253,7 @@ rules:
             (b"a\x1b\xe2\x9d", b"a\xe2\x9d"),
             (b"a\x1b\x07\xf0\x9f\x8e", b"a\x07\xf0\x9f\x8e"),
             (b"a\x1b\x1b\xf0\x9f\x98", b"a\xf0\x9f\x98"),
-            (b"a\x1b[1\x1b\xe2\x90", b"a\x1b[1\xe2\x90"),
+            (b"a\x1b[1\x1b\xe2\x90", b"a\xe2\x90"),
         ] {
             assert_eq!(super::strip_string_escapes(input), expected, "{input:02x?}");
         }
@@ -5286,11 +5342,13 @@ rules:
                 b"a\xc2\x80\xc3\x9d0;t\x07b",
             ),
             (b"a\x1b\xc2\x9b31mb", b"a\xc2\x9b31mb"),
-            // A real control that a bare ESC cancels keeps its ESC, and a
-            // string control that the bare ESC ends is dropped.
-            (b"a\x1b[1\x1b\xc2\x80]0;t\x07b", b"a\x1b[1\xc2\x80]0;t\x07b"),
-            (b"a\x1b(\x1b\x1b\x00\xc2\x8e]b", b"a\x1b(\x00\xc2\x8e]b"),
-            (b"a\x9b1\x1b\xc2\x80]0;t\x07b", b"a\x9b1\xc2\x80]0;t\x07b"),
+            // A real control that a bare ESC cancels is dropped too, or the
+            // bytes after the control would complete it, and so is a string
+            // control that the bare ESC ends.
+            (b"a\x1b[1\x1b\xc2\x80]0;t\x07b", b"a\xc2\x80]0;t\x07b"),
+            (b"a\x1b(\x1b\x1b\x00\xc2\x8e]b", b"a\x00\xc2\x8e]b"),
+            (b"a\x9b1\x1b\xc2\x80]0;t\x07b", b"a\xc2\x80]0;t\x07b"),
+            (b"a\x1b[?4\x1b\x802hb", b"a\x802hb"),
             (b"a\x1b]0;x\x1b\xc2\x80]0;t\x07b", b"a\xc2\x80]0;t\x07b"),
             // A string control is still dropped with the whole chain.
             (b"a\x1b[1\x1b\xc2\x9d0;t\x07b", b"ab"),
@@ -5321,10 +5379,11 @@ rules:
     }
 
     // A C1 control after a dropped ESC run goes on with the chain whose
-    // control the run's first ESC cancelled, as it would after the ESC. So a
-    // string control that a CSI or single shift there reaches still drops the
-    // chain from its first control, which the string would otherwise leave
-    // open, and a chain that ends without one loses only the ESC run.
+    // control the run's first ESC cancelled, as it would after the ESC. That
+    // control is dropped, or the bytes after the run would complete it, and a
+    // string control that a CSI or single shift there reaches drops the chain
+    // from its first control. A chain that ends without one keeps the
+    // controls of the run and the C1 control's sequence.
     #[test]
     fn sanitize_keeps_the_chain_of_a_c1_control_after_a_dropped_escape() {
         for root in [
@@ -5367,7 +5426,7 @@ rules:
                     let input = [b"a".as_slice(), &chain, end, b"b"].concat();
                     assert_eq!(
                         super::strip_string_escapes(&input),
-                        [b"a", root, kept, control, end, b"b"].concat(),
+                        [b"a", kept, control, end, b"b"].concat(),
                         "{input:02x?}"
                     );
                 }
@@ -5381,8 +5440,8 @@ rules:
                 b"a\x1b[1\x1b\x9b1\x1b\xc2\x8e\x1b]0;t\x07b".as_slice(),
                 b"ab".as_slice(),
             ),
-            (b"a\x1b[1\x1b\x9b1\x1b\xc2\x8exb", b"a\x1b[1\x9b1\xc2\x8exb"),
-            (b"a\x1b(\x1b\x80\x1b]0;t\x07b", b"a\x1b(\x80b"),
+            (b"a\x1b[1\x1b\x9b1\x1b\xc2\x8exb", b"a\xc2\x8exb"),
+            (b"a\x1b(\x1b\x80\x1b]0;t\x07b", b"a\x80b"),
         ] {
             assert_eq!(super::strip_string_escapes(input), expected, "{input:02x?}");
         }
@@ -5455,6 +5514,143 @@ rules:
         let mut highlighted = streaming.push(docs);
         highlighted.extend(streaming.finish());
         assert_eq!(highlighted, docs);
+    }
+
+    // In UTF-8 mode xterm ignores a C1 control inside a CSI, UTF-8 encoded or
+    // a lone raw byte that an ASCII byte follows, reads a character from
+    // U+00A0 to U+00FF there, or a lone raw A0-BF byte, as the ASCII byte it
+    // mirrors, and adds a combining character to the cell before without
+    // reading it. So it reads `CSI ? 4 C2 B2 h`, `CSI ? 4 B2 h` and
+    // `CSI ? 4 C2 80 2 h` as `CSI ? 42 h`. Alacritty ignores every byte from
+    // 80 up inside a CSI. --sanitize drops a CSI that holds such a byte or
+    // that a C1 control cancels, with the chain that reached it, and reads
+    // the C1 control on its own as before.
+    #[test]
+    fn sanitize_drops_csis_that_hold_bytes_from_80_up() {
+        for introducer in [
+            b"\x1b[".as_slice(),
+            b"\x1b\x00[",
+            b"\x1b\x7f\r[",
+            b"\x9b",
+            b"\xc2\x9b",
+        ] {
+            for inside in [
+                "\u{b2}".as_bytes(),
+                b"\xb2",
+                "\u{e8}".as_bytes(),
+                b"\xe8",
+                "\u{a0}".as_bytes(),
+                b"\xff",
+                b"\xc3",
+                "\u{301}".as_bytes(),
+                "\u{201d}".as_bytes(),
+            ] {
+                let input = [b"a", introducer, b"?4", inside, b"2h\x1b[mb"].concat();
+                assert_eq!(
+                    super::strip_string_escapes(&input),
+                    b"a\x1b[mb",
+                    "{input:02x?}"
+                );
+            }
+            for control in 0x80u8..=0x9f {
+                for encoded in [[0xc2, control].as_slice(), &[control]] {
+                    let input = [b"a", introducer, b"?4", encoded, b"2h\x1b\\b"].concat();
+                    let expected = if super::is_c1_string_escape_start(control) {
+                        b"ab".to_vec()
+                    } else {
+                        [b"a", encoded, b"2h\x1b\\b"].concat()
+                    };
+                    assert_eq!(
+                        super::strip_string_escapes(&input),
+                        expected,
+                        "{input:02x?}"
+                    );
+                }
+            }
+        }
+
+        for (input, expected) in [
+            // A Latin-1 character can be the final byte to xterm.
+            (b"a\x1b[1\xc3\x9e0;t\x07b".as_slice(), b"a\x07b".as_slice()),
+            // An ESC that ends the CSI is read as before, a CAN or SUB that
+            // ends it goes with it, and so do the controls that the chain
+            // cancelled on the way.
+            (b"a\x1b[?4\xc2\xb2\x1b[mb", b"a\x1b[mb"),
+            (b"a\x1b[1\xc3\xa9\x1b]0;t\x07b", b"ab"),
+            (b"a\x1b[1\xc3\xa9\x18b", b"ab"),
+            (b"a\x9b1\xb2\x1ab", b"ab"),
+            (b"a\x1b(\x1b[1\xc3\xa9mb", b"ab"),
+            (b"a\x1b[1\x1b[?4\xc2\xb2hb", b"ab"),
+            (b"a\x8e\x1b\x00[\xb2mb", b"ab"),
+            (b"a\x1b[31\x9b1mb", b"a\x9b1mb"),
+            (b"a\x1b[1\xc2\x9d0;t\x07b", b"ab"),
+            // ASCII CSIs, with controls inside them, are kept.
+            (
+                b"a\x1b[1;31m\x9b0m\xc2\x9b2J\x1b[\r1mb",
+                b"a\x1b[1;31m\x9b0m\xc2\x9b2J\x1b[\r1mb",
+            ),
+        ] {
+            assert_eq!(super::strip_string_escapes(input), expected, "{input:02x?}");
+        }
+
+        // Cut off by the end of a read, it is carried like any other
+        // incomplete CSI, so the next read decides.
+        for input in [
+            b"a\x1b[1\xc3\xa9".as_slice(),
+            b"a\x9b?4\xc2",
+            b"a\x1b[1\xb2",
+        ] {
+            assert_eq!(super::incomplete_sanitize_start(input), Some(1));
+        }
+    }
+
+    // An ESC run dropped because a Latin-1 character or a C1 control follows
+    // it would leave the control that its first ESC cancelled open for the
+    // bytes after the run: `ESC [ ? 4 ESC C2 B2 h` would reach xterm as
+    // `CSI ? 4 C2 B2 h`, DECSET 42, and `ESC [ 1 ESC C3 9E` as `CSI 1 ^`.
+    // --sanitize drops that control with the run and keeps the run's
+    // controls.
+    #[test]
+    fn sanitize_drops_controls_that_a_dropped_escape_cancelled() {
+        let rest = "h\u{201d}0;t\x07b".as_bytes();
+        for root in [
+            b"\x1b[?4".as_slice(),
+            b"\x1b[1",
+            b"\x1b\x00[1",
+            b"\x9b?4",
+            b"\xc2\x9b1",
+            b"\x1b(",
+            b"\x1b#",
+            b"\x1b ",
+            b"\x1bN",
+            b"\x1bO",
+            b"\x8e",
+            b"\xc2\x8f",
+        ] {
+            for (escapes, kept) in [
+                (b"\x1b".as_slice(), b"".as_slice()),
+                (b"\x1b\x00", b"\x00"),
+                (b"\x1b\x1b\r", b"\r"),
+            ] {
+                for follower in [
+                    "\u{b2}".as_bytes(),
+                    b"\xb2",
+                    "\u{de}".as_bytes(),
+                    "\u{e8}".as_bytes(),
+                    b"\xc2\x80",
+                    b"\x80",
+                    b"\xc2\x8e",
+                    b"\x9b",
+                ] {
+                    let input = [b"a", root, escapes, follower, rest].concat();
+                    assert_eq!(
+                        super::strip_string_escapes(&input),
+                        [b"a", kept, follower, rest].concat(),
+                        "{input:02x?}"
+                    );
+                }
+            }
+        }
     }
 
     // Preserve mode keeps such a string as one opaque control, so highlighting

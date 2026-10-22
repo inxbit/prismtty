@@ -2062,6 +2062,18 @@ mod tests {
             b"\x1b%/G",
             b"\x1b%",
             b"%",
+            // CSIs that hold a byte from 80 up, which xterm in UTF-8 mode
+            // reads as the ASCII byte it mirrors or ignores, and controls that
+            // an ESC dropped before such a byte cancelled.
+            b"\x1b[?4",
+            b"h",
+            "\u{b2}".as_bytes(),
+            b"\xb2",
+            "\u{301}".as_bytes(),
+            b"\x1b[?4\xc2\xb2h",
+            b"\x1b[?4\xc2\x802h",
+            b"\x1b[?4\x1b\xc2\xb2h",
+            b"\x1b[1\x1b\xc3\x9e",
             b"\x1b[31m",
             b"\x1b[0m",
             b"\x1b]0;title\x07",
@@ -2159,6 +2171,11 @@ mod tests {
                         None,
                         "{pipeline:?} let DOCS through for {input:02x?}: {expected:02x?}"
                     );
+                    assert_eq!(
+                        csi_that_could_switch_xterm_out_of_utf8(&expected),
+                        None,
+                        "{pipeline:?} let a CSI with a byte from 80 up through for {input:02x?}: {expected:02x?}"
+                    );
                 }
             }
         }
@@ -2209,6 +2226,40 @@ mod tests {
             bytes[start] == 0x1b
                 && bytes.get(skip_escape_state_controls(bytes, start + 1)) == Some(&b'%')
         })
+    }
+
+    /// The offset of a CSI that holds a byte from 80 up, which xterm in UTF-8
+    /// mode reads as the ASCII byte it mirrors or ignores, so that the CSI
+    /// can be DECSET 42 to it, which switches it out of UTF-8. Alacritty
+    /// ignores such a byte. A CSI starts at ESC [, past escape-state controls,
+    /// or at a C1 CSI outside a UTF-8 character, and runs on past C0 controls,
+    /// DEL and every byte from 80 up to its final byte, CAN, SUB or ESC.
+    fn csi_that_could_switch_xterm_out_of_utf8(bytes: &[u8]) -> Option<usize> {
+        let mut idx = 0;
+        while idx < bytes.len() {
+            let parameters = match bytes[idx..] {
+                [0x1b, ..] => {
+                    let introducer = skip_escape_state_controls(bytes, idx + 1);
+                    (bytes.get(introducer) == Some(&b'[')).then_some(introducer + 1)
+                }
+                [0xc2, 0x9b, ..] => Some(idx + 2),
+                [0x9b, ..] => Some(idx + 1),
+                _ => None,
+            };
+            let Some(parameters) = parameters else {
+                idx += utf8_text_width(bytes, idx).unwrap_or(1);
+                continue;
+            };
+            let end = bytes[parameters..]
+                .iter()
+                .position(|byte| matches!(byte, 0x18 | 0x1a | 0x1b | 0x40..=0x7e))
+                .map_or(bytes.len(), |offset| parameters + offset);
+            if bytes[parameters..end].iter().any(|byte| *byte >= 0x80) {
+                return Some(idx);
+            }
+            idx = end;
+        }
+        None
     }
 
     /// Runs `chunks` through `highlight_stream` with `--sanitize` and no
@@ -2331,10 +2382,7 @@ mod tests {
                 b"a\x1b\x00\x1b\r\n\x7f\xd8x\x1b\\b",
                 b"a\x00\r\n\x7f\xd8x\x1b\\b",
             ),
-            (
-                b"a\x1b[1\x1b\x00\xc3\x9e0;t\x07b",
-                b"a\x1b[1\x00\xc3\x9e0;t\x07b",
-            ),
+            (b"a\x1b[1\x1b\x00\xc3\x9e0;t\x07b", b"a\x00\xc3\x9e0;t\x07b"),
             (b"a\x1b]0;x\x1b\xc3\x9f0;t\x07b", b"a\xc3\x9f0;t\x07b"),
             // A UTF-8 C1 control, which xterm ignores after ESC, is read on
             // its own, and one that starts a string is dropped with it.
@@ -2348,7 +2396,7 @@ mod tests {
                 b"a\x1b\xc2\x80\xc3\x9d0;t\x07b",
                 b"a\xc2\x80\xc3\x9d0;t\x07b",
             ),
-            (b"a\x1b[1\x1b\xc2\x8e]0;t\x07b", b"a\x1b[1\xc2\x8e]0;t\x07b"),
+            (b"a\x1b[1\x1b\xc2\x8e]0;t\x07b", b"a\xc2\x8e]0;t\x07b"),
             (b"a\x1b\x00\xc2\x9d0;t\x07b", b"ab"),
             // So is a raw C1 control, which xterm in UTF-8 mode and Alacritty
             // ignore there too.
@@ -2407,8 +2455,8 @@ mod tests {
     // control the run's first ESC cancelled. A string control that it reaches
     // drops the chain from that control, as the filter for oversized strings
     // does, so the output is the same for a short string and a long one, and
-    // a chain that ends without one loses only the ESC run, wherever the
-    // reads split.
+    // a chain that ends without one loses the ESC run and the control that it
+    // cancelled, wherever the reads split.
     #[test]
     fn sanitize_keeps_the_chain_of_a_c1_control_after_a_dropped_escape_at_every_read_split() {
         let chains = [
@@ -2424,10 +2472,10 @@ mod tests {
         for (input, expected) in [
             (
                 b"a\x1b[1\x1b\xc2\x9b1mb".as_slice(),
-                b"a\x1b[1\xc2\x9b1mb".as_slice(),
+                b"a\xc2\x9b1mb".as_slice(),
             ),
-            (b"a\x8e\x1b\x00\x9b1mb", b"a\x8e\x00\x9b1mb"),
-            (b"a\x1b(\x1b\x8fxb", b"a\x1b(\x8fxb"),
+            (b"a\x8e\x1b\x00\x9b1mb", b"a\x00\x9b1mb"),
+            (b"a\x1b(\x1b\x8fxb", b"a\x8fxb"),
         ] {
             assert_sanitized_at_every_read_split(input, expected);
         }
@@ -2470,6 +2518,31 @@ mod tests {
             (b"a\x1b%\x1b]0;t\x07b", b"ab"),
             // At the end of the input it is neutralized, as `ESC (` is.
             (b"a\x1b%", b"a^%"),
+        ] {
+            assert_sanitized_at_every_read_split(input, expected);
+        }
+    }
+
+    // A CSI that holds a byte from 80 up or that a C1 control cancels, and a
+    // control that a dropped ESC run cancelled, can each reach xterm as
+    // DECSET 42, which takes it out of UTF-8. --sanitize drops them wherever
+    // the reads split, and keeps ASCII CSIs.
+    #[test]
+    fn sanitize_drops_csis_that_could_switch_xterm_out_of_utf8_at_every_read_split() {
+        for (input, expected) in [
+            (b"a\x1b[?4\xc2\xb2hb".as_slice(), b"ab".as_slice()),
+            (b"a\x1b[?4\xb2hb", b"ab"),
+            (b"a\x9b?4\xcc\x812hb", b"ab"),
+            (b"a\x1b[?4\xc2\x802hb", b"a\xc2\x802hb"),
+            (b"a\xc2\x9b?4\x802hb", b"a\x802hb"),
+            (b"a\x1b[1\xc3\xa9\x1b[mb", b"a\x1b[mb"),
+            (
+                b"a\x1b[?4\x1b\xc2\xb2h\xe2\x80\x9d0;t\x07b",
+                b"a\xc2\xb2h\xe2\x80\x9d0;t\x07b",
+            ),
+            (b"a\x1b[1\x1b\xc3\x9eb", b"a\xc3\x9eb"),
+            (b"a\x1b(\x1b\x00\x80b", b"a\x00\x80b"),
+            (b"a\x1b[?25h\x9b?1049lb", b"a\x1b[?25h\x9b?1049lb"),
         ] {
             assert_sanitized_at_every_read_split(input, expected);
         }
