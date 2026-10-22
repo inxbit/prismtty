@@ -1218,9 +1218,9 @@ fn normalize_child_pty_flags(
 /// non-blocking read, or an output queue the terminal has not drained yet, is
 /// not an I/O failure. Clearing the flag instead would change it for those
 /// programs too, and miss it being set again mid-session.
-struct WaitWhenWouldBlock<T> {
-    inner: T,
-    fd: RawFd,
+pub(super) struct WaitWhenWouldBlock<T> {
+    pub(super) inner: T,
+    pub(super) fd: RawFd,
 }
 
 impl<R: Read> Read for WaitWhenWouldBlock<R> {

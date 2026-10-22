@@ -28,7 +28,7 @@ use crate::terminal_text::escape_untrusted;
 
 use args::{Action, Options, parse_args, print_help};
 use profile_selection::profile_store;
-use pty::run_command;
+use pty::{WaitWhenWouldBlock, run_command};
 use runtime::{register_for_reload, request_reload};
 use stream::{InputSource, highlight_stream, prepare_session};
 use trace::IoTrace;
@@ -244,7 +244,7 @@ fn run_inner(args: Vec<OsString>) -> Result<ExitCode, CliError> {
 }
 
 fn run_stdin(options: Options) -> Result<ExitCode, CliError> {
-    let mut stdout = io::stdout();
+    let stdout = io::stdout();
     let interactive = stdin_mode_interactive_highlighting(stdout.is_terminal());
     // Reject a bad config before reading: with empty input it would otherwise
     // never be loaded, and with input it would cost the first chunk.
@@ -252,6 +252,12 @@ fn run_stdin(options: Options) -> Result<ExitCode, CliError> {
     let trace = IoTrace::open(options.trace_io.as_deref())?;
     let (_registration, reload_watcher) = register_for_reload();
     let stdin = io::stdin();
+    // As in PTY mode, another program on the terminal can leave stdout
+    // non-blocking.
+    let mut stdout = WaitWhenWouldBlock {
+        fd: stdout.as_raw_fd(),
+        inner: stdout,
+    };
     highlight_stream(
         stdin.lock(),
         &mut stdout,

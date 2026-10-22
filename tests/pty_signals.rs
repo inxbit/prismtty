@@ -2079,17 +2079,10 @@ fn terminal_hangup_with_blocked_input_forwarder_still_terminates() {
     );
 }
 
-/// Runs `ptty sh -c <script>` as the session leader of the PTY that `master`
-/// belongs to, on a terminal file description with O_NONBLOCK set. The
-/// wrapper's stdin, stdout and stderr all share that description, as they do
-/// when it is started from a shell.
-fn spawn_ptty_on_nonblocking_terminal(
-    master: &dyn portable_pty::MasterPty,
-    script: &str,
-) -> ProcessGuard {
+/// Opens the slave of the PTY that `master` belongs to as a new file
+/// description with O_NONBLOCK set.
+fn open_nonblocking_terminal(master: &dyn portable_pty::MasterPty) -> File {
     use std::os::unix::fs::OpenOptionsExt;
-    use std::os::unix::process::CommandExt;
-    use std::process::{Command, Stdio};
 
     let tty = OpenOptions::new()
         .read(true)
@@ -2107,6 +2100,21 @@ fn spawn_ptty_on_nonblocking_terminal(
             "F_SETFL failed"
         );
     }
+    tty
+}
+
+/// Runs `ptty sh -c <script>` as the session leader of the PTY that `master`
+/// belongs to, on a terminal file description with O_NONBLOCK set. The
+/// wrapper's stdin, stdout and stderr all share that description, as they do
+/// when it is started from a shell.
+fn spawn_ptty_on_nonblocking_terminal(
+    master: &dyn portable_pty::MasterPty,
+    script: &str,
+) -> ProcessGuard {
+    use std::os::unix::process::CommandExt;
+    use std::process::{Command, Stdio};
+
+    let tty = open_nonblocking_terminal(master);
     let mut command = Command::new(env!("CARGO_BIN_EXE_ptty"));
     command
         .args(["sh", "-c", script])
@@ -2196,6 +2204,48 @@ fn nonblocking_terminal_output_does_not_kill_the_session() {
     let status = ptty
         .wait_for_exit(Duration::from_secs(20))
         .expect("wrapper exits after the burst");
+    let output = capture.wait_until(Duration::from_secs(2), |out| {
+        contains_bytes(out, b"BURSTEND")
+    });
+    let tail = String::from_utf8_lossy(&output[output.len().saturating_sub(300)..]);
+    assert_eq!(status.code(), Some(0), "output ends with: {tail:?}");
+    assert!(
+        contains_bytes(&output, b"BURSTEND"),
+        "the burst did not reach the terminal; output ends with: {tail:?}"
+    );
+}
+
+/// Stdin mode (`cmd | prismtty`) writes to the terminal through such a
+/// description as well. A burst that the terminal does not drain at once must
+/// wait for room there too instead of ending the run with an I/O error.
+#[test]
+fn nonblocking_terminal_output_does_not_end_stdin_mode() {
+    use std::process::{Command, Stdio};
+
+    let pair = native_pty_system()
+        .openpty(PtySize::default())
+        .expect("openpty");
+    let tty = open_nonblocking_terminal(&*pair.master);
+    let work = tempfile::tempdir().expect("work directory");
+    let input = work.path().join("burst.txt");
+    let mut burst: String = (0..2000).map(|i| format!("burst line {i}\n")).collect();
+    burst.push_str("BURSTEND\n");
+    std::fs::write(&input, burst).expect("write burst");
+    let mut ptty = ProcessGuard::new(
+        Command::new(env!("CARGO_BIN_EXE_ptty"))
+            .stdin(File::open(&input).expect("open burst"))
+            .stdout(Stdio::from(tty.try_clone().expect("stdout tty")))
+            .stderr(Stdio::from(tty))
+            .spawn()
+            .expect("spawn ptty"),
+    );
+    // Read nothing yet, so the burst fills the terminal's output queue.
+    thread::sleep(Duration::from_millis(500));
+    let capture = CaptureTask::from_master(&*pair.master);
+
+    let status = ptty
+        .wait_for_exit(Duration::from_secs(20))
+        .expect("prismtty exits after the burst");
     let output = capture.wait_until(Duration::from_secs(2), |out| {
         contains_bytes(out, b"BURSTEND")
     });
