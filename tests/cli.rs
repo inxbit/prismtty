@@ -870,6 +870,50 @@ fn escape_ended_string_controls_do_not_hide_later_output() {
     }
 }
 
+// xterm reads a character of U+00FF or below after ESC from the Latin-1 half
+// of its escape table, which mirrors ASCII, so ESC U+00DD opens an OSC and ESC
+// U+00D0 a DCS; a Latin-1 xterm reads the raw bytes D0-DF the same way.
+// Escape-state controls and a second ESC leave it in the escape state.
+// --sanitize drops such ESCs and keeps the rest visible.
+#[test]
+fn sanitize_drops_escapes_that_latin1_characters_would_complete() {
+    let mut empty_config = tempfile::NamedTempFile::new().expect("empty config");
+    writeln!(empty_config, "rules: []").expect("write empty config");
+    let input = b"a\x1b\xc3\x9d0;title\x07b\x1b\x00\xc3\x9d0;t\x07c\x1b\x1b\xc3\x9d2;t\x07\
+        d\x1b\xdd52;c;U0VDUkVU\x07e\x1b\xc3\x90q\x1b\\f\x1b[1\x1b\xc3\x9e0;t\x07g\n";
+    let expected = b"a\xc3\x9d0;title\x07b\x00\xc3\x9d0;t\x07c\xc3\x9d2;t\x07\
+        d\xdd52;c;U0VDUkVU\x07e\xc3\x90q\x1b\\f\x1b[1\xc3\x9e0;t\x07g\n";
+
+    let mut cmd = Command::cargo_bin("ct")
+        .unwrap_or_else(|_| Command::cargo_bin("prismtty").expect("binary exists"));
+    cmd.arg("--sanitize")
+        .arg("--config")
+        .arg(empty_config.path())
+        .write_stdin(input.as_slice());
+    let output = cmd.output().expect("command runs");
+
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(output.stdout, expected, "{:02x?}", output.stdout);
+
+    // The same holds for a command's output read from its PTY.
+    let output = Command::cargo_bin("ptty")
+        .expect("ptty binary exists")
+        .arg("--sanitize")
+        .arg("--config")
+        .arg(empty_config.path())
+        .arg("printf")
+        .arg("a\\033\\303\\2350;title\\007b\\033\\000\\335c")
+        .timeout(Duration::from_secs(10))
+        .output()
+        .expect("ptty runs");
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(
+        output.stdout, b"a\xc3\x9d0;title\x07b\x00\xddc",
+        "{:02x?}",
+        output.stdout
+    );
+}
+
 #[test]
 fn profiles_list_includes_v1_builtin_profiles() {
     let mut cmd = Command::cargo_bin("prismtty").expect("binary exists");

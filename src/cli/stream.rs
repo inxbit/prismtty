@@ -2031,6 +2031,19 @@ mod tests {
             b"\x9b\xf0\x9f\xc2",
             b"\x9b\xf0\x9f\xc2\x9c",
             b"\xff",
+            // Latin-1 characters that xterm reads after ESC as string
+            // introducers, ST and CSI, UTF-8 encoded and raw.
+            b"\xc3",
+            "\u{dd}".as_bytes(),
+            "\u{d0}".as_bytes(),
+            "\u{dc}".as_bytes(),
+            "\u{db}".as_bytes(),
+            b"\xdd",
+            b"\xd0",
+            b"\xdf",
+            b"\x1b\xc3\x9d0;t\x07",
+            b"\x1b\x00\xdd0;t\x07",
+            b"\x1b\x1b\xc3\x90q\x1b\\",
             b"\x1b[31m",
             b"\x1b[0m",
             b"\x1b]0;title\x07",
@@ -2118,8 +2131,236 @@ mod tests {
                         first_string, None,
                         "{pipeline:?} let a string control through for {input:02x?}: {expected:02x?}"
                     );
+                    assert_eq!(
+                        escape_before_latin1_byte(&expected),
+                        None,
+                        "{pipeline:?} let xterm read ESC with a Latin-1 byte for {input:02x?}: {expected:02x?}"
+                    );
                 }
             }
+        }
+    }
+
+    /// The offset of an ESC that, past the C0 controls and DEL that a VT
+    /// parser executes or ignores in the escape state, is followed by a byte
+    /// in A0-FF. xterm looks such a byte, or the character it starts, up in
+    /// the Latin-1 half of its escape table, which mirrors ASCII and so holds
+    /// string introducers, CSI and ST. A UTF-8 C1 control, `C2 80` to `C2 9F`,
+    /// is that control instead, which the ESC may precede as it may the raw
+    /// form.
+    fn escape_before_latin1_byte(bytes: &[u8]) -> Option<usize> {
+        (0..bytes.len())
+            .filter(|&start| bytes[start] == 0x1b)
+            .find(|&start| {
+                let mut next = start + 1;
+                while matches!(
+                    bytes.get(next),
+                    Some(0x00..=0x17 | 0x19 | 0x1c..=0x1f | 0x7f)
+                ) {
+                    next += 1;
+                }
+                match bytes.get(next) {
+                    Some(0xc2) => !matches!(bytes.get(next + 1), Some(0x80..=0x9f)),
+                    Some(byte) => *byte >= 0xa0,
+                    None => false,
+                }
+            })
+    }
+
+    /// Runs `chunks` through `highlight_stream` with `--sanitize` and no
+    /// highlighting rules, one read per chunk, and returns what it wrote.
+    /// With `idle_fd`, the interactive read loop waits on that descriptor
+    /// before each read and draws its held-back output when it stays idle.
+    fn run_sanitized_stream(
+        chunks: &[&[u8]],
+        interactive: bool,
+        idle_fd: Option<std::os::fd::RawFd>,
+        trace_path: Option<&std::path::Path>,
+    ) -> Vec<u8> {
+        struct ChunkedReader(std::collections::VecDeque<Vec<u8>>);
+        impl std::io::Read for ChunkedReader {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                let Some(mut chunk) = self.0.pop_front() else {
+                    return Ok(0);
+                };
+                if chunk.len() > buf.len() {
+                    self.0.push_front(chunk.split_off(buf.len()));
+                }
+                buf[..chunk.len()].copy_from_slice(&chunk);
+                Ok(chunk.len())
+            }
+        }
+
+        let mut config = tempfile::NamedTempFile::new().expect("temp config");
+        std::io::Write::write_all(&mut config, b"rules: []\n").expect("write temp config");
+        let options = crate::cli::args::Options {
+            profiles: vec!["generic".to_string()],
+            no_auto_detect: true,
+            no_dynamic_profile: true,
+            config: Some(config.path().to_path_buf()),
+            sanitize: true,
+            ..Default::default()
+        };
+        let session = super::HighlightSession::new(
+            &options,
+            crate::profiles::ProfileStore::builtin(),
+            interactive,
+            vec!["generic".to_string()],
+        )
+        .expect("session builds");
+        let input = super::InputSource {
+            interactive,
+            pty_fd: None,
+            idle_fd,
+            recent_input: None,
+        };
+        let trace = super::IoTrace::open(trace_path).expect("trace opens");
+        let reader = ChunkedReader(chunks.iter().map(|chunk| chunk.to_vec()).collect());
+        let mut output = Vec::new();
+        super::highlight_stream(
+            reader,
+            &mut output,
+            super::PreparedSession { session },
+            input,
+            None,
+            trace,
+            None,
+        )
+        .expect("highlight_stream succeeds");
+        output
+    }
+
+    // The ESC and the Latin-1 character that xterm would read with it may
+    // arrive in different reads, with the ESC's controls split anywhere and
+    // the character's UTF-8 bytes split from each other. Wherever the reads
+    // split, --sanitize drops the ESC and keeps the rest visible.
+    #[test]
+    fn sanitize_drops_escapes_before_latin1_characters_at_every_read_split() {
+        let cases: &[(&[u8], &[u8])] = &[
+            (b"a\x1b\xc3\x9d0;title\x07b", b"a\xc3\x9d0;title\x07b"),
+            (
+                b"a\x1b\x00\xc3\x9d0;title\x07b",
+                b"a\x00\xc3\x9d0;title\x07b",
+            ),
+            (b"a\x1b\x1b\xc3\x9d0;title\x07b", b"a\xc3\x9d0;title\x07b"),
+            (b"a\x1b\xdd0;title\x07b", b"a\xdd0;title\x07b"),
+            (b"a\x1b\xc3\x90q\x1b\\b", b"a\xc3\x90q\x1b\\b"),
+            (
+                b"a\x1b\x00\x1b\r\n\x7f\xd8x\x1b\\b",
+                b"a\x00\r\n\x7f\xd8x\x1b\\b",
+            ),
+            (
+                b"a\x1b[1\x1b\x00\xc3\x9e0;t\x07b",
+                b"a\x1b[1\x00\xc3\x9e0;t\x07b",
+            ),
+            (b"a\x1b]0;x\x1b\xc3\x9f0;t\x07b", b"a\xc3\x9f0;t\x07b"),
+            // Cut off by the end of the input.
+            (b"a\x1b\x00\xc3", b"a\x00\xc3"),
+        ];
+        for &(input, expected) in cases {
+            let mut chunkings: Vec<Vec<&[u8]>> = vec![vec![input], input.chunks(1).collect()];
+            for split in 1..input.len() {
+                let (first, second) = input.split_at(split);
+                chunkings.push(vec![first, second]);
+            }
+            let mut three_reads = Vec::new();
+            for split in 1..input.len() {
+                for second_split in split + 1..input.len() {
+                    three_reads.push(vec![
+                        &input[..split],
+                        &input[split..second_split],
+                        &input[second_split..],
+                    ]);
+                }
+            }
+            for chunks in chunkings.iter().chain(&three_reads) {
+                assert_eq!(
+                    run_chunk_pipeline(chunks, ChunkPipeline::Sanitize),
+                    expected,
+                    "{input:02x?} in reads {chunks:02x?}"
+                );
+            }
+            for chunks in &chunkings {
+                for interactive in [false, true] {
+                    assert_eq!(
+                        run_sanitized_stream(chunks, interactive, None, None),
+                        expected,
+                        "interactive {interactive}: {input:02x?} in reads {chunks:02x?}"
+                    );
+                }
+            }
+        }
+
+        // The end of a string discarded as oversized, and the ESC that ended
+        // it, replayed when it closed the previous read.
+        let tail = super::MAX_INCOMPLETE_ESCAPE_BYTES + 16;
+        let mut oversized_string = b"a\x1b]0;".to_vec();
+        oversized_string.resize(tail, b'x');
+        oversized_string.extend_from_slice(b"\x1b\xc3\x9d0;title\x07b");
+        // A run of escape-state controls past the limit for an open escape.
+        let mut long_controls = b"a\x1b".to_vec();
+        long_controls.resize(tail, 0);
+        long_controls.extend_from_slice(b"\xc3\x9d0;title\x07b");
+        for (input, expected) in [
+            (oversized_string, b"a\xc3\x9d0;title\x07b".to_vec()),
+            (
+                long_controls.clone(),
+                [&long_controls[..1], &long_controls[2..]].concat(),
+            ),
+        ] {
+            let splits = (1..input.len())
+                .filter(|split| *split < 8 || split % 1000 == 0 || split + 8 >= tail);
+            for split in splits {
+                let (first, second) = input.split_at(split);
+                assert_eq!(
+                    run_chunk_pipeline(&[first, second], ChunkPipeline::Sanitize),
+                    expected,
+                    "split at {split} of {} bytes",
+                    input.len()
+                );
+            }
+            assert_eq!(run_sanitized_stream(&[&input], false, None, None), expected);
+        }
+    }
+
+    // The interactive read loop draws output held back for a token after it
+    // has been quiet for a while, but an ESC at the end of a read is carried
+    // by the sanitizer and never held there, so the flush cannot draw it
+    // before the character that the next read brings.
+    #[test]
+    fn sanitize_holdback_flush_does_not_draw_an_escape_before_a_latin1_character() {
+        use std::os::fd::AsRawFd;
+
+        let pty = nix::pty::openpty(None, None).expect("openpty");
+        for chunks in [
+            [b"a\x1b".as_slice(), b"\xc3\x9d0;title\x07b"],
+            [b"a\x1b\x00\xc3".as_slice(), b"\x9d0;title\x07b"],
+            [b"a\x1b".as_slice(), b"\xdd0;title\x07b"],
+        ] {
+            let trace_file = tempfile::NamedTempFile::new().expect("trace temp file");
+            let output = run_sanitized_stream(
+                &chunks,
+                true,
+                Some(pty.master.as_raw_fd()),
+                Some(trace_file.path()),
+            );
+            let expected: Vec<u8> = chunks
+                .concat()
+                .into_iter()
+                .filter(|byte| *byte != 0x1b)
+                .collect();
+            assert_eq!(output, expected, "{chunks:02x?}");
+
+            let trace_text = std::fs::read_to_string(trace_file.path()).expect("read trace");
+            let holdback = b"holdback"
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            assert!(
+                trace_text.contains(&format!("FLUSH {holdback}")),
+                "the holdback flush did not run for {chunks:02x?}; trace:\n{trace_text}"
+            );
         }
     }
 

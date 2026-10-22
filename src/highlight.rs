@@ -4423,7 +4423,9 @@ pub fn strip_ansi(input: &[u8]) -> Vec<u8> {
 /// 7-bit ESC and 8-bit C1 sequences a hostile child or remote device can abuse
 /// (window-title spoofing, OSC 52 clipboard injection, DCS payload smuggling);
 /// everything a normal TUI needs to render survives. An unterminated string
-/// sequence at the end of the input is dropped rather than passed through.
+/// sequence at the end of the input is dropped rather than passed through, and
+/// so is an ESC that a terminal would read together with the non-ASCII
+/// character after it, which stays visible.
 pub fn strip_string_escapes(input: &[u8]) -> Vec<u8> {
     let mut sanitized = Vec::with_capacity(input.len());
     let mut idx = 0;
@@ -4438,6 +4440,23 @@ pub fn strip_string_escapes(input: &[u8]) -> Vec<u8> {
                 }
                 match scan_escape_for_neutralization(input, current) {
                     EscapeScan::Restart(restart) => current = restart,
+                    // xterm reads a character of U+00FF or below after ESC from
+                    // the Latin-1 half of its escape table, which mirrors
+                    // ASCII: U+00DD opens an OSC and U+00D0 a DCS, as the raw
+                    // bytes do in a Latin-1 xterm. Other terminals show the
+                    // character, so only the ESC is dropped.
+                    _ if escape_precedes_non_ascii(input, current) => {
+                        let character = skip_escape_state_controls(input, current + 1);
+                        extend_without_open_escapes(
+                            &mut sanitized,
+                            input,
+                            root,
+                            current,
+                            character,
+                        );
+                        idx = character;
+                        break;
+                    }
                     EscapeScan::Complete(end) => {
                         sanitized.extend_from_slice(&input[root..end]);
                         idx = end;
@@ -4449,19 +4468,14 @@ pub fn strip_string_escapes(input: &[u8]) -> Vec<u8> {
                     {
                         // The terminal is still in the escape state after these
                         // controls, so emitting the ESC would let a `]` in the
-                        // next read open a string control. A bare ESC that this
-                        // one cancelled leaves it in that state too.
-                        let mut open = current;
-                        while let Some(previous) =
-                            input[root..open].iter().rposition(|byte| *byte == 0x1b)
-                        {
-                            if skip_escape_state_controls(input, root + previous + 1) != open {
-                                break;
-                            }
-                            open = root + previous;
-                        }
-                        sanitized.extend_from_slice(&input[root..open]);
-                        sanitized.extend(input[open..].iter().filter(|byte| **byte != 0x1b));
+                        // next read open a string control.
+                        extend_without_open_escapes(
+                            &mut sanitized,
+                            input,
+                            root,
+                            current,
+                            input.len(),
+                        );
                         idx = input.len();
                         break;
                     }
@@ -4483,6 +4497,40 @@ pub fn strip_string_escapes(input: &[u8]) -> Vec<u8> {
         idx += 1;
     }
     sanitized
+}
+
+/// True when the ESC at `start`, past its escape-state controls, is followed
+/// by a non-ASCII byte that is not a C1 control: a UTF-8 lead byte, a raw
+/// Latin-1 byte or an invalid byte.
+fn escape_precedes_non_ascii(bytes: &[u8], start: usize) -> bool {
+    if bytes[start] != 0x1b {
+        return false;
+    }
+    let next = skip_escape_state_controls(bytes, start + 1);
+    bytes.get(next).is_some_and(|byte| *byte >= 0xa0) && c1_control_at(bytes, next).is_none()
+}
+
+/// Appends `input[root..end]` without the ESCs of the bare ESC run that ends
+/// with the one at `current`, each followed only by escape-state controls up
+/// to the next. A bare ESC that the next one cancels leaves the terminal in
+/// the escape state too, so the byte at `end` would still select a sequence.
+/// The controls are kept, and so is a real control earlier in the chain.
+fn extend_without_open_escapes(
+    sanitized: &mut Vec<u8>,
+    input: &[u8],
+    root: usize,
+    current: usize,
+    end: usize,
+) {
+    let mut open = current;
+    while let Some(previous) = input[root..open].iter().rposition(|byte| *byte == 0x1b) {
+        if skip_escape_state_controls(input, root + previous + 1) != open {
+            break;
+        }
+        open = root + previous;
+    }
+    sanitized.extend_from_slice(&input[root..open]);
+    sanitized.extend(input[open..end].iter().filter(|byte| **byte != 0x1b));
 }
 
 fn valid_utf8_char_width_at(input: &[u8], idx: usize) -> Option<usize> {
@@ -5055,6 +5103,76 @@ rules:
                 [expected, &controls].concat(),
                 "open ESC was emitted for {prefix:02x?}"
             );
+        }
+    }
+
+    // xterm reads a character of U+00FF or below after ESC from the upper half
+    // of its escape table, which mirrors ASCII: ESC U+00DD opens an OSC, U+00D0
+    // a DCS, U+00D8 an SOS, U+00DE a PM, U+00DF an APC, U+00DB a CSI and
+    // U+00DC is ST, and a Latin-1 xterm reads the raw bytes the same way.
+    // Escape-state controls and a bare ESC that the next one cancels leave the
+    // terminal in the escape state, so none of those ESCs may reach it. Other
+    // terminals show the character, so it and the controls stay visible.
+    #[test]
+    fn sanitize_drops_escapes_that_a_latin1_character_would_complete() {
+        for code in [0xd0u8, 0xd8, 0xdb, 0xdc, 0xdd, 0xde, 0xdf, 0xa0, 0xc0, 0xff] {
+            let encoded = char::from(code).to_string().into_bytes();
+            for character in [encoded.as_slice(), &[code]] {
+                for (escapes, kept) in [
+                    (b"\x1b".as_slice(), b"".as_slice()),
+                    (b"\x1b\x00", b"\x00"),
+                    (b"\x1b\x7f\r\n", b"\x7f\r\n"),
+                    (b"\x1b\x1b", b""),
+                    (b"\x1b\x00\x1b\x01", b"\x00\x01"),
+                    // A real control that a bare ESC cancels keeps its ESC.
+                    (b"\x1b[1\x1b", b"\x1b[1"),
+                    (b"\x1b(\x1b\x1b\x00", b"\x1b(\x00"),
+                    (b"\x9b1\x1b", b"\x9b1"),
+                    // A string control that the bare ESC ends is dropped.
+                    (b"\x1b]0;x\x1b", b""),
+                ] {
+                    let input = [b"a", escapes, character, b"0;title\x07b"].concat();
+                    let expected = [b"a", kept, character, b"0;title\x07b"].concat();
+                    assert_eq!(
+                        super::strip_string_escapes(&input),
+                        expected,
+                        "ESC was emitted before {character:02x?} in {input:02x?}"
+                    );
+                }
+            }
+        }
+
+        // The character may be cut off by the end of the input, or follow a
+        // run of controls past the limit for an open escape.
+        assert_eq!(super::strip_string_escapes(b"a\x1b\xc3"), b"a\xc3");
+        assert_eq!(super::strip_string_escapes(b"a\x1b\x00\xc2"), b"a\x00\xc2");
+        let controls = vec![0; super::MAX_INCOMPLETE_NON_STRING_ESCAPE_BYTES + 1];
+        for character in [b"\xc3\x9d".as_slice(), b"\xdd", b"\xc3"] {
+            let input = [b"ok\x1b\x1b".as_slice(), &controls, character].concat();
+            assert_eq!(
+                super::strip_string_escapes(&input),
+                [b"ok".as_slice(), &controls, character].concat()
+            );
+        }
+
+        // A C1 control after ESC still restarts the parse there, and ESC
+        // followed by an ASCII byte is unchanged.
+        for input in [
+            b"a\x1b\x9d0;t\x07b".as_slice(),
+            b"a\x1b\xc2\x9d0;t\x07b",
+            b"a\x1b\x00\xc2\x90q\x1b\\b",
+            b"a\x1b\x1b\x980;t\x1b\\b",
+        ] {
+            assert_eq!(super::strip_string_escapes(input), b"ab", "{input:02x?}");
+        }
+        for input in [
+            b"a\x1b\x9b31mb".as_slice(),
+            b"a\x1b\xc2\x9b31mb",
+            b"a\x1b7b\x1b\x008\x1b(Bc",
+            b"a\x1b",
+            b"a\x1b\x00",
+        ] {
+            assert_eq!(super::strip_string_escapes(input), input, "{input:02x?}");
         }
     }
 
