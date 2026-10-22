@@ -883,12 +883,13 @@ fn unusable_script_interpreter(program: &OsStr, cwd: Option<&Path>) -> Option<Cl
 /// data of a pipe or file, then end of input, however often it reads. The PTY
 /// slave is its stdout, stderr and controlling terminal. portable-pty always
 /// puts the slave on stdin, so this mirrors its spawn otherwise: the program
-/// is resolved against the same directory and PATH, with the same messages,
-/// SHELL is set when unset (the builder's environment is the process's own on
-/// this path), and the child starts as a session leader with default signal
-/// dispositions and an empty signal mask. Inherited descriptors are marked
-/// close-on-exec rather than closed, which keeps std's exec-error pipe
-/// working, so an execve failure is reported instead of aborting the child.
+/// is resolved against the same directory and PATH (`resolve_program` says
+/// where its messages differ), SHELL is set when unset (the builder's
+/// environment is the process's own on this path), and the child starts as a
+/// session leader with default signal dispositions and an empty signal mask.
+/// Inherited descriptors are marked close-on-exec rather than closed, which
+/// keeps std's exec-error pipe working, so an execve failure is reported
+/// instead of aborting the child.
 fn spawn_with_caller_stdin(
     builder: &CommandBuilder,
     master: &dyn portable_pty::MasterPty,
@@ -984,8 +985,12 @@ fn home_dir(builder: &CommandBuilder) -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("/"))
 }
 
-/// Resolves the program as portable-pty's spawn does, with its messages: a
-/// name with a `/` against `dir`, any other name in each PATH entry.
+/// Resolves the program as portable-pty's spawn does: a name with a `/`
+/// against `dir`, any other name in each PATH entry. The messages are its
+/// own, except for an absolute path that is missing or not executable, which
+/// reads as a relative one does (portable-pty says "doesn't exist on the
+/// filesystem" and adds the errno), and an empty name, for which portable-pty
+/// also lists each PATH entry as a directory.
 fn resolve_program(program: &OsStr, dir: &Path) -> anyhow::Result<PathBuf> {
     use std::os::unix::ffi::OsStrExt;
 
