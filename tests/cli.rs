@@ -923,8 +923,8 @@ fn sanitize_drops_escapes_that_latin1_characters_would_complete() {
 // In UTF-8 mode xterm ignores a C1 control in the escape state, encoded as
 // UTF-8 or as a lone raw byte, and Alacritty ignores any byte from 80 up
 // there, so ESC C2 80 ] and ESC 80 ] open an OSC. --sanitize drops the ESC
-// and reads the control on its own, still dropping a string control with its
-// string.
+// and reads the control on its own. A string control is still dropped with
+// its string, and with the chain that reached it.
 #[test]
 fn sanitize_drops_escapes_that_c1_controls_follow() {
     let mut empty_config = tempfile::NamedTempFile::new().expect("empty config");
@@ -932,22 +932,30 @@ fn sanitize_drops_escapes_that_c1_controls_follow() {
     let input = b"a\x1b\xc2\x80]0;title\x07b\x1b\x00\xc2\x9b]0;t\x07c\x1b\xc2\x9c]0;t\x07\
         d\x1b\xc2\x8e]52;c;U0VDUkVU\x07e\x1b\xc2\x80\xc2\x81]0;t\x07f\x1b\xc2\x80\xc3\x9d0;t\x07\
         g\x1b\xc2\x9d0;t\x07h\x1b\x80i\x1b\x80]0;title\x07j\x1b\x9b]0;t\x07\
-        k\x1b\x00\x8e]52;c;U0VDUkVU\x07l\n";
+        k\x1b\x00\x8e]52;c;U0VDUkVU\x07l\x1b[1\x1b\xc2\x9b\x1b]0;t\x07m\x1b(\x1b\x8e\x1b]0;t\x07\
+        n\x1b[1\x1b\x9b1mo\n";
     let expected = b"a\xc2\x80]0;title\x07b\x00\xc2\x9b]0;t\x07c\xc2\x9c]0;t\x07\
         d\xc2\x8e]52;c;U0VDUkVU\x07e\xc2\x80\xc2\x81]0;t\x07f\xc2\x80\xc3\x9d0;t\x07\
         gh\x80i\x80]0;title\x07j\x9b]0;t\x07\
-        k\x00\x8e]52;c;U0VDUkVU\x07l\n";
+        k\x00\x8e]52;c;U0VDUkVU\x07lm\
+        n\x1b[1\x9b1mo\n";
 
-    let mut cmd = Command::cargo_bin("ct")
-        .unwrap_or_else(|_| Command::cargo_bin("prismtty").expect("binary exists"));
-    cmd.arg("--sanitize")
-        .arg("--config")
-        .arg(empty_config.path())
-        .write_stdin(input.as_slice());
-    let output = cmd.output().expect("command runs");
+    for (input, expected) in [
+        (input.as_slice(), expected.as_slice()),
+        // A chain cut off by the end of the input is dropped whole too.
+        (b"a\x1b[1\x1b\xc2\x9b\x1b]0;t\x07", b"a"),
+    ] {
+        let mut cmd = Command::cargo_bin("ct")
+            .unwrap_or_else(|_| Command::cargo_bin("prismtty").expect("binary exists"));
+        cmd.arg("--sanitize")
+            .arg("--config")
+            .arg(empty_config.path())
+            .write_stdin(input);
+        let output = cmd.output().expect("command runs");
 
-    assert!(output.status.success(), "{output:?}");
-    assert_eq!(output.stdout, expected, "{:02x?}", output.stdout);
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(output.stdout, expected, "{:02x?}", output.stdout);
+    }
 }
 
 #[test]

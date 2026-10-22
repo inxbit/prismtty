@@ -2255,6 +2255,43 @@ mod tests {
         output
     }
 
+    /// Asserts that `input` sanitizes to `expected` in one read, a byte per
+    /// read, and split anywhere into two or three reads, through the per-read
+    /// filter and through `highlight_stream`.
+    fn assert_sanitized_at_every_read_split(input: &[u8], expected: &[u8]) {
+        let mut chunkings: Vec<Vec<&[u8]>> = vec![vec![input], input.chunks(1).collect()];
+        for split in 1..input.len() {
+            let (first, second) = input.split_at(split);
+            chunkings.push(vec![first, second]);
+        }
+        let mut three_reads = Vec::new();
+        for split in 1..input.len() {
+            for second_split in split + 1..input.len() {
+                three_reads.push(vec![
+                    &input[..split],
+                    &input[split..second_split],
+                    &input[second_split..],
+                ]);
+            }
+        }
+        for chunks in chunkings.iter().chain(&three_reads) {
+            assert_eq!(
+                run_chunk_pipeline(chunks, ChunkPipeline::Sanitize),
+                expected,
+                "{input:02x?} in reads {chunks:02x?}"
+            );
+        }
+        for chunks in &chunkings {
+            for interactive in [false, true] {
+                assert_eq!(
+                    run_sanitized_stream(chunks, interactive, None, None),
+                    expected,
+                    "interactive {interactive}: {input:02x?} in reads {chunks:02x?}"
+                );
+            }
+        }
+    }
+
     // The ESC and the Latin-1 character or C1 control that xterm would read
     // with it may arrive in different reads, with the ESC's controls split
     // anywhere and the character's UTF-8 bytes split from each other.
@@ -2309,37 +2346,7 @@ mod tests {
             (b"a\x1b\x07\xf0\x9f\x8e", b"a\x07\xf0\x9f\x8e"),
         ];
         for &(input, expected) in cases {
-            let mut chunkings: Vec<Vec<&[u8]>> = vec![vec![input], input.chunks(1).collect()];
-            for split in 1..input.len() {
-                let (first, second) = input.split_at(split);
-                chunkings.push(vec![first, second]);
-            }
-            let mut three_reads = Vec::new();
-            for split in 1..input.len() {
-                for second_split in split + 1..input.len() {
-                    three_reads.push(vec![
-                        &input[..split],
-                        &input[split..second_split],
-                        &input[second_split..],
-                    ]);
-                }
-            }
-            for chunks in chunkings.iter().chain(&three_reads) {
-                assert_eq!(
-                    run_chunk_pipeline(chunks, ChunkPipeline::Sanitize),
-                    expected,
-                    "{input:02x?} in reads {chunks:02x?}"
-                );
-            }
-            for chunks in &chunkings {
-                for interactive in [false, true] {
-                    assert_eq!(
-                        run_sanitized_stream(chunks, interactive, None, None),
-                        expected,
-                        "interactive {interactive}: {input:02x?} in reads {chunks:02x?}"
-                    );
-                }
-            }
+            assert_sanitized_at_every_read_split(input, expected);
         }
 
         let tail = super::MAX_INCOMPLETE_ESCAPE_BYTES + 16;
@@ -2374,6 +2381,55 @@ mod tests {
                 }
                 assert_eq!(run_sanitized_stream(&[&input], false, None, None), expected);
             }
+        }
+    }
+
+    // A C1 control after a dropped ESC run goes on with the chain whose
+    // control the run's first ESC cancelled. A string control that it reaches
+    // drops the chain from that control, as the filter for oversized strings
+    // does, so the output is the same for a short string and a long one, and
+    // a chain that ends without one loses only the ESC run, wherever the
+    // reads split.
+    #[test]
+    fn sanitize_keeps_the_chain_of_a_c1_control_after_a_dropped_escape_at_every_read_split() {
+        let chains = [
+            b"a\x1b[1\x1b\xc2\x9b".as_slice(),
+            b"a\x1b(\x1b\x00\x8e",
+            b"a\x9b1\x1b\x1b\x9b",
+            b"a\x8f\x1b\xc2\x8f",
+        ];
+        for chain in chains {
+            assert_sanitized_at_every_read_split(&[chain, b"\x1b]0;t\x07b"].concat(), b"ab");
+            assert_sanitized_at_every_read_split(&[chain, b"\x1b]0;t\x07"].concat(), b"a");
+        }
+        for (input, expected) in [
+            (
+                b"a\x1b[1\x1b\xc2\x9b1mb".as_slice(),
+                b"a\x1b[1\xc2\x9b1mb".as_slice(),
+            ),
+            (b"a\x8e\x1b\x00\x9b1mb", b"a\x8e\x00\x9b1mb"),
+            (b"a\x1b(\x1b\x8fxb", b"a\x1b(\x8fxb"),
+        ] {
+            assert_sanitized_at_every_read_split(input, expected);
+        }
+
+        let tail = super::MAX_INCOMPLETE_ESCAPE_BYTES + 16;
+        for chain in chains {
+            let mut input = [chain, b"\x1b]0;"].concat();
+            input.resize(tail, b'x');
+            input.extend_from_slice(b"\x07b");
+            let splits = (1..input.len())
+                .filter(|split| *split < 16 || split % 1000 == 0 || split + 8 >= tail);
+            for split in splits {
+                let (first, second) = input.split_at(split);
+                assert_eq!(
+                    run_chunk_pipeline(&[first, second], ChunkPipeline::Sanitize),
+                    b"ab",
+                    "split at {split} of {} bytes",
+                    input.len()
+                );
+            }
+            assert_eq!(run_sanitized_stream(&[&input], false, None, None), b"ab");
         }
     }
 
