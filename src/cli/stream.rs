@@ -2057,6 +2057,11 @@ mod tests {
             b"\x1b\x80]0;x\x07",
             b"\x1b\x9b]",
             b"\x1b\x00\x8e]",
+            // DOCS, which can switch xterm out of UTF-8.
+            b"\x1b%@",
+            b"\x1b%/G",
+            b"\x1b%",
+            b"%",
             b"\x1b[31m",
             b"\x1b[0m",
             b"\x1b]0;title\x07",
@@ -2149,6 +2154,11 @@ mod tests {
                         None,
                         "{pipeline:?} let a terminal read ESC with a non-ASCII byte for {input:02x?}: {expected:02x?}"
                     );
+                    assert_eq!(
+                        docs_escape(&expected),
+                        None,
+                        "{pipeline:?} let DOCS through for {input:02x?}: {expected:02x?}"
+                    );
                 }
             }
         }
@@ -2190,6 +2200,15 @@ mod tests {
                     && !control
                         .is_some_and(|control| matches!(control, 0x90 | 0x98 | 0x9d | 0x9e | 0x9f))
             })
+    }
+
+    /// The offset of an ESC that, past its escape-state controls, starts a
+    /// DOCS sequence, which can switch xterm out of UTF-8.
+    fn docs_escape(bytes: &[u8]) -> Option<usize> {
+        (0..bytes.len()).find(|&start| {
+            bytes[start] == 0x1b
+                && bytes.get(skip_escape_state_controls(bytes, start + 1)) == Some(&b'%')
+        })
     }
 
     /// Runs `chunks` through `highlight_stream` with `--sanitize` and no
@@ -2430,6 +2449,29 @@ mod tests {
                 );
             }
             assert_eq!(run_sanitized_stream(&[&input], false, None, None), b"ab");
+        }
+    }
+
+    // `ESC % @` can switch xterm out of UTF-8, and its 9D in U+201D would
+    // then open an OSC. --sanitize drops every DOCS wherever the reads split,
+    // and a cut-off one is carried like any other incomplete escape.
+    #[test]
+    fn sanitize_drops_docs_at_every_read_split() {
+        for (input, expected) in [
+            (
+                "a\x1b%@\u{201d}0;title\x07b".as_bytes(),
+                "a\u{201d}0;title\x07b".as_bytes(),
+            ),
+            (b"a\x1b\x00%/Gb", b"ab"),
+            (b"a\x1b[1\x1b%Gb", b"ab"),
+            (b"a\x1b%\xc2\x80@b", b"a\xc2\x80@b"),
+            (b"a\x1b%\x80@b", b"a\x80@b"),
+            (b"a\x1b%\xc3\x80b", b"a\xc3\x80b"),
+            (b"a\x1b%\x1b]0;t\x07b", b"ab"),
+            // At the end of the input it is neutralized, as `ESC (` is.
+            (b"a\x1b%", b"a^%"),
+        ] {
+            assert_sanitized_at_every_read_split(input, expected);
         }
     }
 

@@ -958,6 +958,32 @@ fn sanitize_drops_escapes_that_c1_controls_follow() {
     }
 }
 
+// DOCS selects how xterm decodes its input, unless its utf8 resource is
+// "always": after ESC % @ it reads U+201D (E2 80 9D) byte by byte, and the 9D
+// opens an OSC. --sanitize drops every DOCS; without it, DOCS passes through.
+#[test]
+fn sanitize_drops_docs_sequences() {
+    let mut empty_config = tempfile::NamedTempFile::new().expect("empty config");
+    writeln!(empty_config, "rules: []").expect("write empty config");
+    let input = "a\x1b%@\u{201d}0;title\x07b\x1b%Gc\x1b%/Gd\x1b\x00%@e\x1b%\u{c0}f\n";
+    let expected = "a\u{201d}0;title\x07bcde\u{c0}f\n";
+
+    for (sanitize, expected) in [(true, expected), (false, input)] {
+        let mut cmd = Command::cargo_bin("ct")
+            .unwrap_or_else(|_| Command::cargo_bin("prismtty").expect("binary exists"));
+        if sanitize {
+            cmd.arg("--sanitize");
+        }
+        cmd.arg("--config")
+            .arg(empty_config.path())
+            .write_stdin(input);
+        let output = cmd.output().expect("command runs");
+
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(output.stdout, expected.as_bytes(), "{:02x?}", output.stdout);
+    }
+}
+
 #[test]
 fn profiles_list_includes_v1_builtin_profiles() {
     let mut cmd = Command::cargo_bin("prismtty").expect("binary exists");

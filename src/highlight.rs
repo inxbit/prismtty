@@ -4425,14 +4425,15 @@ pub fn strip_ansi(input: &[u8]) -> Vec<u8> {
 /// everything a normal TUI needs to render survives. An unterminated string
 /// sequence at the end of the input is dropped rather than passed through, and
 /// so is an ESC that a terminal would read together with the non-ASCII byte
-/// after it, which is then read on its own.
+/// after it, which is then read on its own, and every DOCS sequence (`ESC %`),
+/// which can switch the terminal out of UTF-8.
 pub fn strip_string_escapes(input: &[u8]) -> Vec<u8> {
     let mut sanitized = Vec::with_capacity(input.len());
     let mut idx = 0;
     while idx < input.len() {
         if input[idx] == 0x1b || c1_control_at(input, idx).is_some() {
             // The chain is emitted up to `copied` as it goes, so a string
-            // control that it reaches can still drop all of it.
+            // control or DOCS that it reaches can still drop all of it.
             let chain_start = sanitized.len();
             let mut copied = idx;
             let mut current = idx;
@@ -4473,7 +4474,22 @@ pub fn strip_string_escapes(input: &[u8]) -> Vec<u8> {
                     idx = end;
                     break;
                 }
+                let docs = is_docs_escape(input, current);
                 match scan_escape_for_neutralization(input, current) {
+                    // DOCS selects how xterm decodes its input: `ESC % @`
+                    // leaves UTF-8 unless its utf8 resource is "always", and
+                    // then the 9D in U+201D opens an OSC. xterm also ignores a
+                    // C1 control inside DOCS and reads U+00C0 and U+00C7 as
+                    // `@` and `G`, so DOCS is dropped however it ends, with
+                    // the chain that reached it, and what ended it is read on
+                    // its own. A terminal already set to another encoding is
+                    // beyond what --sanitize can protect, since prismtty reads
+                    // output as UTF-8.
+                    EscapeScan::Complete(end) | EscapeScan::Restart(end) if docs => {
+                        sanitized.truncate(chain_start);
+                        idx = end;
+                        break;
+                    }
                     EscapeScan::Restart(restart) => current = restart,
                     EscapeScan::Complete(end) => {
                         sanitized.extend_from_slice(&input[copied..end]);
@@ -4531,6 +4547,12 @@ fn escape_precedes_non_ascii(bytes: &[u8], start: usize) -> bool {
         Some((control, _width)) => !is_c1_string_escape_start(control),
         None => bytes.get(next).is_some_and(|byte| *byte >= 0x80),
     }
+}
+
+/// True when the ESC at `start`, past its escape-state controls, starts a
+/// DOCS sequence, whose first intermediate is `%`.
+fn is_docs_escape(bytes: &[u8], start: usize) -> bool {
+    bytes[start] == 0x1b && bytes.get(skip_escape_state_controls(bytes, start + 1)) == Some(&b'%')
 }
 
 /// Appends `input[from..end]` without the ESCs of the bare ESC run that ends
@@ -5364,6 +5386,75 @@ rules:
         ] {
             assert_eq!(super::strip_string_escapes(input), expected, "{input:02x?}");
         }
+    }
+
+    // DOCS selects how xterm decodes its input: after `ESC % @` it reads
+    // U+201D (E2 80 9D) byte by byte, and the 9D opens an OSC. xterm ignores
+    // a C1 control inside DOCS and reads U+00C0 and U+00C7 as its `@` and `G`,
+    // so --sanitize drops every DOCS however it ends, with the chain that
+    // reached it, and reads what ended it on its own.
+    #[test]
+    fn sanitize_drops_docs_sequences() {
+        let rest = "\u{201d}0;title\x07b".as_bytes();
+        for docs in [
+            b"\x1b%@".as_slice(),
+            b"\x1b%G",
+            b"\x1b%8",
+            b"\x1b%/G",
+            b"\x1b%/@",
+            b"\x1b% @",
+            b"\x1b\x00%\r@",
+            b"\x1b\x7f%\x00/\x00G",
+            b"\x1b\x1b%G",
+            b"\x1b[1\x1b%@",
+            b"\x1b(\x1b\x00%@",
+            b"\x9b1\x1b%@",
+            b"\xc2\x8e\x1b%G",
+            b"\x1b%\x18",
+        ] {
+            let input = [b"a", docs, rest].concat();
+            assert_eq!(
+                super::strip_string_escapes(&input),
+                [b"a", rest].concat(),
+                "{input:02x?}"
+            );
+        }
+
+        for (input, expected) in [
+            (b"a\x1b%\xc3\x80b".as_slice(), b"a\xc3\x80b".as_slice()),
+            (b"a\x1b%\xc3\x87b", b"a\xc3\x87b"),
+            (b"a\x1b%/\xc3\x87b", b"a\xc3\x87b"),
+            (b"a\x1b%\xc0b", b"a\xc0b"),
+            (b"a\x1b%\xc2\x80@b", b"a\xc2\x80@b"),
+            (b"a\x1b%\x80@b", b"a\x80@b"),
+            (b"a\x1b%\x9b1mb", b"a\x9b1mb"),
+            (b"a\x1b%\xc2\x9d0;t\x07b", b"ab"),
+            (b"a\x1b%\x1b[1mb", b"a\x1b[1mb"),
+            (b"a\x1b%\x1b]0;t\x07b", b"ab"),
+            (b"a\x1b%\x1b%Gb", b"ab"),
+        ] {
+            assert_eq!(super::strip_string_escapes(input), expected, "{input:02x?}");
+        }
+
+        // Cut off by the end of a read, it is carried like any other
+        // incomplete escape, so the final in the next read drops it.
+        for input in [b"a\x1b%".as_slice(), b"a\x1b%/", b"a\x1b\x00%\x00"] {
+            assert_eq!(super::incomplete_sanitize_start(input), Some(1));
+        }
+
+        // Another first intermediate starts no DOCS, and the other filters
+        // handle DOCS as before.
+        for input in [b"a\x1b(%5b".as_slice(), b"a\x1b %Gb", b"a\x1b#8b"] {
+            assert_eq!(super::strip_string_escapes(input), input, "{input:02x?}");
+        }
+        let docs = b"a\x1b%@b\x1b%Gc";
+        assert_eq!(super::strip_ansi(docs), b"abc");
+        let mut streaming = StreamingHighlighter::new(
+            Highlighter::from_config(PrismConfig::default()).expect("empty config"),
+        );
+        let mut highlighted = streaming.push(docs);
+        highlighted.extend(streaming.finish());
+        assert_eq!(highlighted, docs);
     }
 
     // Preserve mode keeps such a string as one opaque control, so highlighting
