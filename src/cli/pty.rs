@@ -633,7 +633,10 @@ pub(super) fn run_command(options: Options, command: Vec<OsString>) -> Result<Ex
     let mut resize_watcher =
         cleanup_child_on_err(PtyResizeWatcher::start(pair.master), &mut child)?;
 
-    let mut stdout = io::stdout();
+    let mut stdout = WaitWhenWouldBlock {
+        inner: io::stdout(),
+        fd: libc::STDOUT_FILENO,
+    };
     let stream_result = highlight_stream(
         &mut reader,
         &mut stdout,
@@ -1125,43 +1128,64 @@ fn normalize_child_pty_flags(
     (local, input, output)
 }
 
-/// Reads from `inner`, waiting for `fd` to become readable whenever a read
-/// reports `WouldBlock`. A terminal's open file description is shared by
-/// every process on it, so another program can leave or set `O_NONBLOCK` on
-/// stdin; an empty non-blocking read is not an input failure. Clearing the
-/// flag instead would change it for those programs too, and miss it being set
-/// again mid-session.
-struct WaitWhenWouldBlock<R> {
-    inner: R,
+/// Reads from or writes to `inner`, waiting for `fd` to become ready whenever
+/// the call reports `WouldBlock`. A terminal's open file description is
+/// shared by every process on it, and usually by prismtty's stdin and stdout
+/// too, so another program can leave or set `O_NONBLOCK` on them; an empty
+/// non-blocking read, or an output queue the terminal has not drained yet, is
+/// not an I/O failure. Clearing the flag instead would change it for those
+/// programs too, and miss it being set again mid-session.
+struct WaitWhenWouldBlock<T> {
+    inner: T,
     fd: RawFd,
 }
 
 impl<R: Read> Read for WaitWhenWouldBlock<R> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        loop {
-            match self.inner.read(buf) {
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                    wait_until_readable(self.fd)?;
-                }
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-                result => return result,
+        retry_when_would_block(self.fd, libc::POLLIN, || self.inner.read(buf))
+    }
+}
+
+// A write that fails took none of `buf`, as `Write` requires and std's
+// buffered stdout keeps, so it can be retried as it is.
+impl<W: Write> Write for WaitWhenWouldBlock<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        retry_when_would_block(self.fd, libc::POLLOUT, || self.inner.write(buf))
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        retry_when_would_block(self.fd, libc::POLLOUT, || self.inner.flush())
+    }
+}
+
+fn retry_when_would_block<T>(
+    fd: RawFd,
+    events: libc::c_short,
+    mut call: impl FnMut() -> io::Result<T>,
+) -> io::Result<T> {
+    loop {
+        match call() {
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                wait_until_ready(fd, events)?;
             }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            result => return result,
         }
     }
 }
 
-fn wait_until_readable(fd: RawFd) -> io::Result<()> {
+fn wait_until_ready(fd: RawFd, events: libc::c_short) -> io::Result<()> {
     let mut poll_fd = libc::pollfd {
         fd,
-        events: libc::POLLIN,
+        events,
         revents: 0,
     };
     loop {
         // SAFETY: `poll_fd` is a valid, exclusively borrowed pollfd and the count matches.
         if unsafe { libc::poll(&mut poll_fd, 1, -1) } >= 0 {
-            // POLLIN, POLLHUP and POLLERR all mean the next read does not
-            // report WouldBlock again: it returns data, end of input or the
-            // error.
+            // The requested event, POLLHUP and POLLERR all mean the next call
+            // does not report WouldBlock again: it transfers data, sees end of
+            // input or returns the error.
             return Ok(());
         }
         let error = io::Error::last_os_error();
@@ -1211,7 +1235,10 @@ fn forward_stdin_to_pty<R: Read, W: Write>(
         if local_echo {
             let echo = echo_state.push(input);
             if !echo.is_empty() {
-                let mut stdout = io::stdout().lock();
+                let mut stdout = WaitWhenWouldBlock {
+                    inner: io::stdout().lock(),
+                    fd: libc::STDOUT_FILENO,
+                };
                 stdout.write_all(&echo)?;
                 stdout.flush()?;
             }
@@ -2307,6 +2334,48 @@ mod tests {
                 .expect("end of input once the writer closes"),
             0
         );
+    }
+
+    // stdout shares the terminal's file description with stdin, so it can be
+    // non-blocking too, and a burst of output then fills the terminal's queue.
+    #[test]
+    fn stdout_writer_waits_through_would_block_instead_of_failing() {
+        use std::io::{Read, Write};
+        use std::os::fd::FromRawFd;
+
+        let (read_fd, write_fd) = super::pipe_fds().expect("pipe");
+        super::set_fd_nonblocking(write_fd).expect("nonblocking write end");
+        // SAFETY: both descriptors were just created by pipe and are owned only here.
+        let (mut reader, writer) = unsafe {
+            (
+                std::fs::File::from_raw_fd(read_fd),
+                std::fs::File::from_raw_fd(write_fd),
+            )
+        };
+        let mut stdout = super::WaitWhenWouldBlock {
+            inner: writer,
+            fd: write_fd,
+        };
+        let mut queued = 0;
+        loop {
+            match stdout.inner.write(&[b'x'; 4096]) {
+                Ok(written) => queued += written,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(error) => panic!("fill pipe: {error}"),
+            }
+        }
+        let drainer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            let mut drained = Vec::new();
+            reader.read_to_end(&mut drained).expect("drain pipe");
+            drained
+        });
+        stdout.write_all(b"hello").expect("write waits for room");
+        stdout.flush().expect("flush");
+        drop(stdout);
+        let drained = drainer.join().expect("drainer");
+        assert_eq!(drained.len(), queued + 5);
+        assert!(drained.ends_with(b"hello"));
     }
 
     #[test]

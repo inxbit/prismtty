@@ -2041,24 +2041,23 @@ fn terminal_hangup_with_blocked_input_forwarder_still_terminates() {
     );
 }
 
-/// The terminal's open file description is shared by every process on it, so
-/// another program (a libuv tool, a crashed TUI) can leave O_NONBLOCK set on
-/// it. The stdin forwarder must wait for input instead of treating EAGAIN as
-/// an input failure that kills the wrapped session.
-#[test]
-fn nonblocking_terminal_stdin_does_not_kill_the_session() {
+/// Runs `ptty sh -c <script>` as the session leader of the PTY that `master`
+/// belongs to, on a terminal file description with O_NONBLOCK set. The
+/// wrapper's stdin, stdout and stderr all share that description, as they do
+/// when it is started from a shell.
+fn spawn_ptty_on_nonblocking_terminal(
+    master: &dyn portable_pty::MasterPty,
+    script: &str,
+) -> ProcessGuard {
     use std::os::unix::fs::OpenOptionsExt;
-    use std::os::unix::process::{CommandExt, ExitStatusExt};
+    use std::os::unix::process::CommandExt;
     use std::process::{Command, Stdio};
 
-    let pair = native_pty_system()
-        .openpty(PtySize::default())
-        .expect("openpty");
     let tty = OpenOptions::new()
         .read(true)
         .write(true)
         .custom_flags(libc::O_NOCTTY)
-        .open(pair.master.tty_name().expect("outer PTY tty name"))
+        .open(master.tty_name().expect("outer PTY tty name"))
         .expect("open outer slave tty");
     // SAFETY: F_GETFL and F_SETFL take integer arguments; `tty` is a descriptor this test owns.
     unsafe {
@@ -2070,10 +2069,9 @@ fn nonblocking_terminal_stdin_does_not_kill_the_session() {
             "F_SETFL failed"
         );
     }
-    let capture = CaptureTask::from_master(&*pair.master);
     let mut command = Command::new(env!("CARGO_BIN_EXE_ptty"));
     command
-        .args(["sh", "-c", "echo READY; read x; echo got=$x"])
+        .args(["sh", "-c", script])
         .stdin(Stdio::from(tty.try_clone().expect("stdin tty")))
         .stdout(Stdio::from(tty.try_clone().expect("stdout tty")))
         .stderr(Stdio::from(tty.try_clone().expect("stderr tty")));
@@ -2086,9 +2084,23 @@ fn nonblocking_terminal_stdin_does_not_kill_the_session() {
             Ok(())
         });
     }
-    let mut ptty = ProcessGuard::new(command.spawn().expect("spawn ptty"));
-    drop(command);
-    drop(tty);
+    ProcessGuard::new(command.spawn().expect("spawn ptty"))
+}
+
+/// The terminal's open file description is shared by every process on it, so
+/// another program (a libuv tool, a crashed TUI) can leave O_NONBLOCK set on
+/// it. The stdin forwarder must wait for input instead of treating EAGAIN as
+/// an input failure that kills the wrapped session.
+#[test]
+fn nonblocking_terminal_stdin_does_not_kill_the_session() {
+    use std::os::unix::process::ExitStatusExt;
+
+    let pair = native_pty_system()
+        .openpty(PtySize::default())
+        .expect("openpty");
+    let capture = CaptureTask::from_master(&*pair.master);
+    let mut ptty =
+        spawn_ptty_on_nonblocking_terminal(&*pair.master, "echo READY; read x; echo got=$x");
 
     let ready = capture.wait_until(Duration::from_secs(10), |out| contains_bytes(out, b"READY"));
     assert!(
@@ -2124,5 +2136,35 @@ fn nonblocking_terminal_stdin_does_not_kill_the_session() {
         Some(0),
         "output: {:?}",
         String::from_utf8_lossy(&output)
+    );
+}
+
+/// The same description is the wrapper's stdout, so a burst of output that
+/// the terminal does not drain at once fills its queue and a write reports
+/// EAGAIN. The wrapper must wait for room instead of ending the session.
+#[test]
+fn nonblocking_terminal_output_does_not_kill_the_session() {
+    let pair = native_pty_system()
+        .openpty(PtySize::default())
+        .expect("openpty");
+    let mut ptty = spawn_ptty_on_nonblocking_terminal(
+        &*pair.master,
+        "i=0; while [ $i -lt 2000 ]; do echo \"burst line $i\"; i=$((i+1)); done; echo BURSTEND",
+    );
+    // Read nothing yet, so the burst fills the terminal's output queue.
+    thread::sleep(Duration::from_millis(500));
+    let capture = CaptureTask::from_master(&*pair.master);
+
+    let status = ptty
+        .wait_for_exit(Duration::from_secs(20))
+        .expect("wrapper exits after the burst");
+    let output = capture.wait_until(Duration::from_secs(2), |out| {
+        contains_bytes(out, b"BURSTEND")
+    });
+    let tail = String::from_utf8_lossy(&output[output.len().saturating_sub(300)..]);
+    assert_eq!(status.code(), Some(0), "output ends with: {tail:?}");
+    assert!(
+        contains_bytes(&output, b"BURSTEND"),
+        "the burst did not reach the terminal; output ends with: {tail:?}"
     );
 }
