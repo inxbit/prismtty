@@ -967,9 +967,24 @@ fn spawn_with_caller_stdin(
             Ok(())
         });
     }
-    let child = command.spawn().map_err(|error| CliError::Spawn {
-        code: exec_failure_exit_code(&error),
-        source: anyhow::anyhow!("Unable to spawn {}: {error}", program.display()),
+    let child = command.spawn().map_err(|error| {
+        // std enters `dir` in the child before the exec and reports a failure
+        // there as the spawn's. Only the $HOME fallback can be a directory the
+        // child cannot enter, and then the program is not to blame.
+        if !(dir.is_dir() && is_executable(&dir)) {
+            return CliError::Spawn {
+                code: 1,
+                source: anyhow::anyhow!(
+                    "Unable to enter {} to spawn {}: {error}",
+                    dir.display(),
+                    program.display()
+                ),
+            };
+        }
+        CliError::Spawn {
+            code: exec_failure_exit_code(&error),
+            source: anyhow::anyhow!("Unable to spawn {}: {error}", program.display()),
+        }
     })?;
     Ok(Box::new(child))
 }

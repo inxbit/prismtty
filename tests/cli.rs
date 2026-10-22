@@ -695,6 +695,50 @@ fn wrapped_command_starts_when_the_working_directory_cannot_be_searched() {
     }
 }
 
+// When the $HOME fallback above cannot be entered either, the spawn fails on
+// chdir, not on the program. That must name the directory, not report the
+// program as missing (127) or not executable (126).
+#[test]
+#[cfg(unix)]
+fn wrapped_command_reports_a_home_fallback_it_cannot_enter() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let base = tempfile::tempdir().expect("base directory");
+    let locked = base
+        .path()
+        .canonicalize()
+        .expect("canonical base directory")
+        .join("locked");
+    fs::create_dir(&locked).expect("locked directory");
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o600)).expect("lock");
+    let can_search_anyway = fs::metadata(locked.join(".")).is_ok();
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o700)).expect("unlock");
+    if can_search_anyway {
+        eprintln!("skipped: this user (root?) can search a mode 0600 directory");
+        return;
+    }
+    let missing_home = base.path().join("missing-home");
+
+    let output = StdCommand::new("sh")
+        .arg("-c")
+        .arg(r#"cd "$1" && chmod 0600 . && exec "$2" sh -c 'echo ran'"#)
+        .arg("sh")
+        .arg(&locked)
+        .arg(assert_cmd::cargo::cargo_bin("ptty"))
+        .env("HOME", &missing_home)
+        .stdin(Stdio::null())
+        .output()
+        .expect("ptty runs");
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o700)).expect("unlock");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "stderr: {stderr}");
+    assert!(
+        stderr.contains(&format!("Unable to enter {}", missing_home.display())),
+        "stderr: {stderr}"
+    );
+}
+
 #[test]
 fn accepts_chromaterm_cli_compatibility_flags() {
     let mut config = tempfile::NamedTempFile::new().expect("temp config");
