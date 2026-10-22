@@ -987,16 +987,18 @@ fn sanitize_drops_docs_sequences() {
 // In UTF-8 mode xterm ignores a C1 control inside a CSI and reads a Latin-1
 // character there as the ASCII byte it mirrors, so ESC [ ? 4 U+00B2 h and
 // ESC [ ? 4 C2 80 2 h are DECSET 42 (DECNRCM) to it, which can take it out of
-// UTF-8, and then the 9D in U+201D opens an OSC. --sanitize drops such CSIs
-// and a control that a dropped ESC cancelled; without it, they pass through.
+// UTF-8, and then the 9D in U+201D opens an OSC. --sanitize drops such CSIs,
+// a control that a dropped ESC cancelled, and every change to mode 42;
+// without it, they pass through.
 #[test]
 fn sanitize_drops_csis_that_could_switch_xterm_out_of_utf8() {
     let mut empty_config = tempfile::NamedTempFile::new().expect("empty config");
     writeln!(empty_config, "rules: []").expect("write empty config");
     let input = b"a\x1b[?4\xc2\xb2h\xe2\x80\x9d0;t\x07b\x1b[?4\xc2\x802h\xe2\x80\x9dc\
-        \x1b[?4\x1b\xc2\xb2h\xe2\x80\x9dd\x1b[1\x1b\xc3\x9ee\x1b[1;31mf\x1b[0m\n";
+        \x1b[?4\x1b\xc2\xb2h\xe2\x80\x9dd\x1b[1\x1b\xc3\x9ee\x1b[?42h\xe2\x80\x9df\
+        \x1b[?1;042l\xe2\x80\x9dg\xc2\x9b?42r\x9b?1:42hh\x1b[1;31mi\x1b[0m\n";
     let expected = b"a\xe2\x80\x9d0;t\x07b\xc2\x802h\xe2\x80\x9dc\xc2\xb2h\xe2\x80\x9dd\
-        \xc3\x9ee\x1b[1;31mf\x1b[0m\n";
+        \xc3\x9ee\xe2\x80\x9df\xe2\x80\x9dgh\x1b[1;31mi\x1b[0m\n";
 
     for (sanitize, expected) in [(true, expected.as_slice()), (false, input.as_slice())] {
         let mut cmd = Command::cargo_bin("ct")

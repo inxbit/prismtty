@@ -36,6 +36,9 @@ const TOP_LEVEL_SCAN_LOOKAHEAD: usize = 4;
 /// this many bytes instead of one per control. A later scan resuming from one
 /// reads at most this much more than it would from the nearest stop.
 const SANITIZE_SPLIT_STOP_SPACING: usize = 64;
+/// How many CSI parameters xterm keeps. Past them it ignores `;` and `:` and
+/// reads every further digit into the last parameter.
+const XTERM_MAX_CSI_PARAMETERS: usize = 30;
 const MAX_TENTATIVE_UTF8_SUFFIX_BYTES: usize = 2;
 const PCRE2_JIT_STACK_LIMIT_BYTES: usize = 32 * 1024;
 const PCRE2_MATCH_LIMIT: usize = 100_000;
@@ -4515,9 +4518,14 @@ pub fn strip_string_escapes(input: &[u8]) -> Vec<u8> {
                         current = restart;
                     }
                     EscapeScan::Restart(restart) => current = restart,
+                    // So is one that sets, resets or restores mode 42
+                    // (DECNRCM), which can take xterm out of UTF-8 even when
+                    // its utf8 resource is "always", and then the 9D in U+201D
+                    // opens an OSC.
                     EscapeScan::Complete(end)
                         if csi_parameters.is_some_and(|parameters| {
                             input[parameters..end].iter().any(|byte| *byte >= 0x80)
+                                || changes_decnrcm(&input[parameters..end])
                         }) =>
                     {
                         sanitized.truncate(chain_start);
@@ -4625,6 +4633,44 @@ fn csi_parameters_start(bytes: &[u8], start: usize) -> Option<usize> {
         Some((0x9b, width)) => Some(start + width),
         _ => None,
     }
+}
+
+/// True when `csi`, the bytes of an ASCII CSI after its introducer, sets,
+/// resets or restores DEC private mode 42: `?`, parameters split on `;` and
+/// `:` of which one is 42, and the final `h`, `l` or `r`, with no
+/// intermediate. The terminal runs or ignores C0 controls and DEL inside a
+/// CSI without ending it, so they are skipped. xterm reads the digits after
+/// its last parameter into it, so after 29 others `4;2` is 42 too.
+fn changes_decnrcm(csi: &[u8]) -> bool {
+    let Some((final_byte, parameters)) = csi.split_last() else {
+        return false;
+    };
+    if !matches!(final_byte, b'h' | b'l' | b'r') {
+        return false;
+    }
+    let parameters: Vec<u8> = parameters
+        .iter()
+        .copied()
+        .filter(|byte| !matches!(byte, 0x00..=0x1f | 0x7f))
+        .collect();
+    let Some(parameters) = parameters.strip_prefix(b"?") else {
+        return false;
+    };
+    if !parameters.iter().all(|byte| (0x30..=0x3f).contains(byte)) {
+        return false;
+    }
+    let is_42 = |parameter: &[u8]| {
+        parameter.iter().all(u8::is_ascii_digit)
+            && parameter
+                .iter()
+                .skip_while(|digit| **digit == b'0')
+                .eq(b"42")
+    };
+    let parameters: Vec<&[u8]> = parameters
+        .split(|byte| matches!(byte, b';' | b':'))
+        .collect();
+    let (kept, merged) = parameters.split_at(parameters.len().min(XTERM_MAX_CSI_PARAMETERS - 1));
+    kept.iter().any(|parameter| is_42(parameter)) || is_42(&merged.concat())
 }
 
 fn valid_utf8_char_width_at(input: &[u8], idx: usize) -> Option<usize> {
@@ -5650,6 +5696,110 @@ rules:
                     );
                 }
             }
+        }
+    }
+
+    // DECSET, DECRST and XTRESTORE of DEC private mode 42 (DECNRCM) make
+    // xterm swap its UTF-8 mode out, even when its utf8 resource is "always",
+    // and then the 9D in U+201D opens an OSC. --sanitize drops them in every
+    // CSI form, wherever 42 stands among the parameters.
+    #[test]
+    fn sanitize_drops_decnrcm_changes() {
+        let rest = "\u{201d}0;t\x07b".as_bytes();
+        for introducer in [b"\x1b[".as_slice(), b"\x1b\x00[", b"\x9b", b"\xc2\x9b"] {
+            for parameters in [
+                b"?42".as_slice(),
+                b"?042",
+                b"?0042",
+                b"?1;42",
+                b"?42;1049",
+                b"?25;0042;7",
+                b"?;42",
+                b"?42;",
+                b"?1:42",
+                b"?42:1",
+                b"?4\r2",
+                b"?\x0042\x7f",
+            ] {
+                for final_byte in [b"h", b"l", b"r"] {
+                    let input = [b"a", introducer, parameters, final_byte, rest].concat();
+                    assert_eq!(
+                        super::strip_string_escapes(&input),
+                        [b"a", rest].concat(),
+                        "{input:02x?}"
+                    );
+                }
+            }
+        }
+
+        // Reached through a chain, it goes with the chain.
+        for chain in [
+            b"a\x1b(\x1b[?42h".as_slice(),
+            b"a\x1b\x9b?42l",
+            b"a\x1b[1\x1b\xc2\x9b?42r",
+        ] {
+            let input = [chain, rest].concat();
+            assert_eq!(
+                super::strip_string_escapes(&input),
+                [b"a", rest].concat(),
+                "{input:02x?}"
+            );
+        }
+
+        // xterm keeps 30 parameters and reads the digits after the 30th into
+        // it, so after 29 others `4;2` is 42, and `42;0` is 420.
+        for (others, last, dropped) in [
+            (29, b"42".as_slice(), true),
+            (29, b"4;2", true),
+            (29, b"4:2", true),
+            (29, b"0;04;;2", true),
+            (29, b"1;42", false),
+            (29, b"42;0", false),
+            (28, b"4;2", false),
+        ] {
+            for final_byte in [b"h", b"l", b"r"] {
+                let csi = [
+                    b"\x1b[?".as_slice(),
+                    &b"1;".repeat(others),
+                    last,
+                    final_byte,
+                ]
+                .concat();
+                let input = [b"a", csi.as_slice(), rest].concat();
+                let expected = if dropped {
+                    [b"a", rest].concat()
+                } else {
+                    input.clone()
+                };
+                assert_eq!(
+                    super::strip_string_escapes(&input),
+                    expected,
+                    "{input:02x?}"
+                );
+            }
+        }
+
+        // Other modes, ANSI mode 42, saving mode 42, and a sequence with an
+        // intermediate or another final byte are kept.
+        for csi in [
+            b"\x1b[?25h".as_slice(),
+            b"\x1b[?1049l",
+            b"\x1b[?4h",
+            b"\x1b[?2;4r",
+            b"\x1b[?420h",
+            b"\x1b[?4200000000000000000042h",
+            b"\x1b[?4?2h",
+            b"\x1b[42h",
+            b"\x1b[>42h",
+            b"\x1b[?42s",
+            b"\x1b[?42m",
+            b"\x1b[?42$p",
+            b"\x1b[?42 h",
+            b"\x9b?1049h",
+            b"\xc2\x9b?25l",
+        ] {
+            let input = [b"a", csi, rest].concat();
+            assert_eq!(super::strip_string_escapes(&input), input, "{input:02x?}");
         }
     }
 

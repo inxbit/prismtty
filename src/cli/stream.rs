@@ -2063,10 +2063,14 @@ mod tests {
             b"\x1b%",
             b"%",
             // CSIs that hold a byte from 80 up, which xterm in UTF-8 mode
-            // reads as the ASCII byte it mirrors or ignores, and controls that
-            // an ESC dropped before such a byte cancelled.
+            // reads as the ASCII byte it mirrors or ignores, controls that an
+            // ESC dropped before such a byte cancelled, and changes to DEC
+            // private mode 42, which can also switch xterm out of UTF-8.
             b"\x1b[?4",
+            b"?42",
             b"h",
+            b"l",
+            b"r",
             "\u{b2}".as_bytes(),
             b"\xb2",
             "\u{301}".as_bytes(),
@@ -2074,6 +2078,11 @@ mod tests {
             b"\x1b[?4\xc2\x802h",
             b"\x1b[?4\x1b\xc2\xb2h",
             b"\x1b[1\x1b\xc3\x9e",
+            b"\x1b[?42h",
+            b"\x1b\x00[?1;042l",
+            b"\x9b?42r",
+            b"\xc2\x9b?1:42h",
+            b"\x1b[?;;;;;;;;;;;;;;;;;;;;;;;;;;;;;4;2h",
             b"\x1b[31m",
             b"\x1b[0m",
             b"\x1b]0;title\x07",
@@ -2174,7 +2183,7 @@ mod tests {
                     assert_eq!(
                         csi_that_could_switch_xterm_out_of_utf8(&expected),
                         None,
-                        "{pipeline:?} let a CSI with a byte from 80 up through for {input:02x?}: {expected:02x?}"
+                        "{pipeline:?} let a CSI with a byte from 80 up or DECNRCM through for {input:02x?}: {expected:02x?}"
                     );
                 }
             }
@@ -2229,11 +2238,12 @@ mod tests {
     }
 
     /// The offset of a CSI that holds a byte from 80 up, which xterm in UTF-8
-    /// mode reads as the ASCII byte it mirrors or ignores, so that the CSI
-    /// can be DECSET 42 to it, which switches it out of UTF-8. Alacritty
-    /// ignores such a byte. A CSI starts at ESC [, past escape-state controls,
-    /// or at a C1 CSI outside a UTF-8 character, and runs on past C0 controls,
-    /// DEL and every byte from 80 up to its final byte, CAN, SUB or ESC.
+    /// mode reads as the ASCII byte it mirrors or ignores and Alacritty
+    /// ignores, or that sets, resets or restores DEC private mode 42, which
+    /// can switch xterm out of UTF-8. A CSI starts at ESC [, past escape-state
+    /// controls, or at a C1 CSI outside a UTF-8 character, and runs on past C0
+    /// controls, DEL and every byte from 80 up to its final byte, CAN, SUB or
+    /// ESC.
     fn csi_that_could_switch_xterm_out_of_utf8(bytes: &[u8]) -> Option<usize> {
         let mut idx = 0;
         while idx < bytes.len() {
@@ -2257,9 +2267,41 @@ mod tests {
             if bytes[parameters..end].iter().any(|byte| *byte >= 0x80) {
                 return Some(idx);
             }
+            if matches!(bytes.get(end), Some(b'h' | b'l' | b'r'))
+                && sets_dec_private_mode_42(&bytes[parameters..end])
+            {
+                return Some(idx);
+            }
             idx = end;
         }
         None
+    }
+
+    /// True when xterm reads `parameters`, the bytes of a CSI before a final
+    /// h, l or r, as DEC private modes that include 42. It runs C0 controls
+    /// and ignores DEL there, ignores the whole sequence at an intermediate or
+    /// a second private marker, and keeps 30 parameters, reading every digit
+    /// after the 30th into it. A `:` counts as a `;`.
+    fn sets_dec_private_mode_42(parameters: &[u8]) -> bool {
+        let mut bytes = parameters
+            .iter()
+            .filter(|byte| !matches!(byte, 0x00..=0x1f | 0x7f));
+        if bytes.next() != Some(&b'?') {
+            return false;
+        }
+        let mut values = vec![0u32];
+        for byte in bytes {
+            match byte {
+                b'0'..=b'9' => {
+                    let value = values.last_mut().expect("a parameter");
+                    *value = (*value * 10 + u32::from(byte - b'0')).min(65_535);
+                }
+                b';' | b':' if values.len() < 30 => values.push(0),
+                b';' | b':' => {}
+                _ => return false,
+            }
+        }
+        values.contains(&42)
     }
 
     /// Runs `chunks` through `highlight_stream` with `--sanitize` and no
@@ -2523,10 +2565,10 @@ mod tests {
         }
     }
 
-    // A CSI that holds a byte from 80 up or that a C1 control cancels, and a
-    // control that a dropped ESC run cancelled, can each reach xterm as
-    // DECSET 42, which takes it out of UTF-8. --sanitize drops them wherever
-    // the reads split, and keeps ASCII CSIs.
+    // A CSI that holds a byte from 80 up or that a C1 control cancels, a
+    // control that a dropped ESC run cancelled, and a change to DEC private
+    // mode 42 can each take xterm out of UTF-8. --sanitize drops them
+    // wherever the reads split, and keeps ASCII CSIs.
     #[test]
     fn sanitize_drops_csis_that_could_switch_xterm_out_of_utf8_at_every_read_split() {
         for (input, expected) in [
@@ -2542,10 +2584,17 @@ mod tests {
             ),
             (b"a\x1b[1\x1b\xc3\x9eb", b"a\xc3\x9eb"),
             (b"a\x1b(\x1b\x00\x80b", b"a\x00\x80b"),
+            (b"a\x1b[?42h\xe2\x80\x9db", b"a\xe2\x80\x9db"),
+            (b"a\x1b\x00[?1;042lb", b"ab"),
+            (b"a\xc2\x9b?1:42rb", b"ab"),
+            (b"a\x1b[?4\r2hb", b"ab"),
             (b"a\x1b[?25h\x9b?1049lb", b"a\x1b[?25h\x9b?1049lb"),
         ] {
             assert_sanitized_at_every_read_split(input, expected);
         }
+        // After 29 other parameters xterm reads `4;2` as 42.
+        let input = [b"a\x1b[?".as_slice(), &[b';'; 29], b"4;2hb"].concat();
+        assert_sanitized_at_every_read_split(&input, b"ab");
     }
 
     // The interactive read loop draws output held back for a token after it
