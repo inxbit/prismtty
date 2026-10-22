@@ -3526,6 +3526,39 @@ mod tests {
     }
 
     #[test]
+    fn output_of_a_child_that_exits_before_the_slave_is_closed_is_read() {
+        use std::io::Read;
+
+        let pair = portable_pty::native_pty_system()
+            .openpty(portable_pty::PtySize::default())
+            .expect("openpty");
+        let mut builder = portable_pty::CommandBuilder::new("printf");
+        builder.arg("short-lived output");
+        builder.cwd("/");
+        let mut child =
+            super::spawn_with_caller_stdin(&builder, &*pair.master).expect("spawn printf");
+        // Let the child write and exit while the parent still holds the slave,
+        // as a short command can before the parent reaches the close.
+        std::thread::sleep(Duration::from_millis(300));
+        drop(pair.slave);
+
+        let mut reader = pair.master.try_clone_reader().expect("master reader");
+        let mut output = Vec::new();
+        let mut buffer = [0u8; 256];
+        loop {
+            match reader.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(read) => output.extend_from_slice(&buffer[..read]),
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                // EIO: every slave descriptor is closed (Linux).
+                Err(_) => break,
+            }
+        }
+        assert_eq!(super::reap_child(&mut child).expect("reap printf"), 0);
+        assert_eq!(output, b"short-lived output");
+    }
+
+    #[test]
     fn master_write_eio_ends_forwarding_without_failure() {
         // EIO on the PTY master means the slave side is gone: the wrapped child
         // has exited (a paste ending in `exit`, or fast typing). That is the
