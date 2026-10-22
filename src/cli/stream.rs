@@ -2052,6 +2052,11 @@ mod tests {
             b"\x1b\x00\xc2\x9b]0;t\x07",
             b"\x1b\xc2\x80\xc2\x81]0;t\x07",
             b"\x1b\xc2\x80\xc3\x9d0;t\x07",
+            // Raw C1 controls, which xterm in UTF-8 mode and Alacritty also
+            // ignore after ESC.
+            b"\x1b\x80]0;x\x07",
+            b"\x1b\x9b]",
+            b"\x1b\x00\x8e]",
             b"\x1b[31m",
             b"\x1b[0m",
             b"\x1b]0;title\x07",
@@ -2140,35 +2145,50 @@ mod tests {
                         "{pipeline:?} let a string control through for {input:02x?}: {expected:02x?}"
                     );
                     assert_eq!(
-                        escape_before_latin1_byte(&expected),
+                        escape_before_non_ascii_byte(&expected),
                         None,
-                        "{pipeline:?} let xterm read ESC with a Latin-1 byte for {input:02x?}: {expected:02x?}"
+                        "{pipeline:?} let a terminal read ESC with a non-ASCII byte for {input:02x?}: {expected:02x?}"
                     );
                 }
             }
         }
     }
 
-    /// The offset of an ESC that, past the C0 controls and DEL that a VT
-    /// parser executes or ignores in the escape state, is followed by a byte
-    /// in A0-FF. xterm looks such a byte, or the character it starts, up in
-    /// the Latin-1 half of its escape table, which mirrors ASCII and so holds
-    /// string introducers, CSI and ST. In UTF-8 mode it ignores a UTF-8 C1
-    /// control, `C2 80` to `C2 9F`, there, so the byte after that selects the
-    /// sequence instead. A raw C1 byte is that control, which the ESC may
-    /// precede.
-    fn escape_before_latin1_byte(bytes: &[u8]) -> Option<usize> {
+    /// Where the C0 controls and DEL that a VT parser executes or ignores in
+    /// the escape state end, from `idx` on.
+    fn skip_escape_state_controls(bytes: &[u8], mut idx: usize) -> usize {
+        while matches!(
+            bytes.get(idx),
+            Some(0x00..=0x17 | 0x19 | 0x1c..=0x1f | 0x7f)
+        ) {
+            idx += 1;
+        }
+        idx
+    }
+
+    /// The offset of an ESC that, past its escape-state controls, is followed
+    /// by a byte from 80 up that does not start a C1 string control. xterm
+    /// looks a byte in A0-FF, or the character it starts, up in the Latin-1
+    /// half of its escape table, which mirrors ASCII and so holds string
+    /// introducers, CSI and ST. In UTF-8 mode it ignores a C1 control there,
+    /// UTF-8 encoded or a lone raw byte, and Alacritty ignores every byte from
+    /// 80 up, so the byte after that selects the sequence instead. An ESC
+    /// before a C1 string control opens the string, which the string check
+    /// finds.
+    fn escape_before_non_ascii_byte(bytes: &[u8]) -> Option<usize> {
         (0..bytes.len())
             .filter(|&start| bytes[start] == 0x1b)
             .find(|&start| {
-                let mut next = start + 1;
-                while matches!(
-                    bytes.get(next),
-                    Some(0x00..=0x17 | 0x19 | 0x1c..=0x1f | 0x7f)
-                ) {
-                    next += 1;
-                }
-                bytes.get(next).is_some_and(|byte| *byte >= 0xa0)
+                let next = skip_escape_state_controls(bytes, start + 1);
+                let control = match bytes.get(next..) {
+                    Some([0xc2, control @ 0x80..=0x9f, ..] | [control @ 0x80..=0x9f, ..]) => {
+                        Some(*control)
+                    }
+                    _ => None,
+                };
+                bytes.get(next).is_some_and(|byte| *byte >= 0x80)
+                    && !control
+                        .is_some_and(|control| matches!(control, 0x90 | 0x98 | 0x9d | 0x9e | 0x9f))
             })
     }
 
@@ -2235,9 +2255,9 @@ mod tests {
         output
     }
 
-    // The ESC and the Latin-1 character or UTF-8 C1 control that xterm would
-    // read with it may arrive in different reads, with the ESC's controls
-    // split anywhere and the character's UTF-8 bytes split from each other.
+    // The ESC and the Latin-1 character or C1 control that xterm would read
+    // with it may arrive in different reads, with the ESC's controls split
+    // anywhere and the character's UTF-8 bytes split from each other.
     // Wherever the reads split, --sanitize drops the ESC and reads the rest
     // on its own.
     #[test]
@@ -2274,6 +2294,13 @@ mod tests {
             ),
             (b"a\x1b[1\x1b\xc2\x8e]0;t\x07b", b"a\x1b[1\xc2\x8e]0;t\x07b"),
             (b"a\x1b\x00\xc2\x9d0;t\x07b", b"ab"),
+            // So is a raw C1 control, which xterm in UTF-8 mode and Alacritty
+            // ignore there too.
+            (b"a\x1b\x80]0;title\x07b", b"a\x80]0;title\x07b"),
+            (b"a\x1b\x9b]0;t\x07b", b"a\x9b]0;t\x07b"),
+            (b"a\x1b\x00\x8e]0;t\x07b", b"a\x00\x8e]0;t\x07b"),
+            (b"a\x1b\x1b\x80\x81]0;t\x07b", b"a\x80\x81]0;t\x07b"),
+            (b"a\x1b\x00\x9d0;t\x07b", b"ab"),
             // Cut off by the end of the input, which leaves it whole, as it
             // would be without the ESC.
             (b"a\x1b\x00\xc3", b"a\x00\xc3"),
@@ -2365,6 +2392,7 @@ mod tests {
             [b"a\x1b".as_slice(), b"\xdd0;title\x07b"],
             [b"a\x1b".as_slice(), b"\xc2\x80]0;title\x07b"],
             [b"a\x1b\x00\xc2".as_slice(), b"\x80]0;title\x07b"],
+            [b"a\x1b".as_slice(), b"\x80]0;title\x07b"],
         ] {
             let trace_file = tempfile::NamedTempFile::new().expect("trace temp file");
             let output = run_sanitized_stream(
