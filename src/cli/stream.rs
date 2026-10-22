@@ -2146,6 +2146,8 @@ mod tests {
             // A cut-off character the next read shows can never complete.
             b"\xf0\x9f\x72\xe0",
             b"\xf0\x9f\x01",
+            // Text that a split before the escape cuts off, holding an OSC.
+            b"\xf0\x9d\x9c\x1b[31m",
         ];
         for input in cases {
             for pipeline in [ChunkPipeline::Sanitize, ChunkPipeline::Strip] {
@@ -2186,6 +2188,49 @@ mod tests {
                 walk_vt_parser(&output, false),
                 (None, VtState::Ground),
                 "{pipeline:?}: {output:02x?}"
+            );
+        }
+    }
+
+    // Text in a legacy encoding is full of bytes that look like UTF-8 lead
+    // bytes, which are never controls. A split before an escape that the read
+    // cuts off must not step back over such text, or each read that ends that
+    // way is held back, and several in a row are dropped.
+    #[test]
+    fn sanitize_split_does_not_carry_legacy_text_before_a_cut_off_escape() {
+        // KOI8-R for "сообщение": every byte is a UTF-8 lead byte.
+        let word = b"\xd3\xcf\xcf\xc2\xdd\xc5\xce\xc9\xc5";
+        let mut read = b"ok ".to_vec();
+        read.extend_from_slice(word);
+        let text_len = read.len();
+        read.extend_from_slice(b"\x1b[");
+        assert_eq!(super::incomplete_sanitize_start(&read), Some(text_len));
+
+        let reads: Vec<Vec<u8>> = (0..8)
+            .map(|_| {
+                let mut read = b"0m ".to_vec();
+                read.extend_from_slice(&b"x".repeat(4000));
+                read.push(b' ');
+                read.extend_from_slice(word);
+                read.extend_from_slice(b"\x1b[");
+                read
+            })
+            .collect();
+        let chunks: Vec<&[u8]> = reads.iter().map(Vec::as_slice).collect();
+        let input = reads.concat();
+        for pipeline in [
+            ChunkPipeline::Preserve,
+            ChunkPipeline::Sanitize,
+            ChunkPipeline::Strip,
+        ] {
+            let whole = run_chunk_pipeline(&[&input], pipeline);
+            let output = run_chunk_pipeline(&chunks, pipeline);
+            assert!(
+                output == whole,
+                "{pipeline:?} output of {} reads is {} bytes, not {}",
+                chunks.len(),
+                output.len(),
+                whole.len()
             );
         }
     }

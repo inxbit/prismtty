@@ -3908,13 +3908,21 @@ fn escape_is_incomplete_at(bytes: &[u8], start: usize) -> bool {
 /// The prefix before the split is sanitized on its own, and there a character
 /// the split cut off looks unfinished: a CSI or ESC that ends in it would be
 /// emitted whole, though the rest of the read shows its C1-valued bytes are
-/// controls. So split again until that prefix ends with nothing open.
+/// controls. So split again until that prefix ends with no control open. Only
+/// the end of the read can cut off a character that later bytes complete.
+/// Before a split, one in text never completes, and the sanitizer already
+/// reads its C1-valued bytes as controls, so text that looks like lead bytes,
+/// as a legacy encoding does, is not carried with the split.
 pub(crate) fn incomplete_sanitize_start(bytes: &[u8]) -> Option<usize> {
     let mut split = bytes.len();
-    for _ in 0..MAX_SANITIZE_SPLIT_PASSES {
+    for pass in 0..MAX_SANITIZE_SPLIT_PASSES {
         let prefix = &bytes[..split];
         let escape = incomplete_top_level_escape_start(prefix).unwrap_or(split);
-        let utf8 = incomplete_utf8_start(prefix).unwrap_or(split);
+        let utf8 = if pass == 0 {
+            incomplete_utf8_start(prefix).unwrap_or(split)
+        } else {
+            split
+        };
         let next = escape.min(utf8);
         if next == split {
             return (split < bytes.len()).then_some(split);
