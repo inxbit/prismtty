@@ -4458,7 +4458,8 @@ pub fn strip_string_escapes(input: &[u8]) -> Vec<u8> {
                 // run is dropped and its C0 controls are kept. A control that
                 // its first ESC cancelled would be completed by the bytes
                 // after the run, so it is dropped with the chain that reached
-                // it. A C1 control goes on with the chain, as it would after
+                // it, apart from the C0 controls of the ESC runs in that
+                // chain. A C1 control goes on with the chain, as it would after
                 // the ESC, so a string control that it reaches still drops the
                 // chain from its first control; a C1 string control is left to
                 // the chain. A character is read on its own, and one cut off
@@ -4467,7 +4468,6 @@ pub fn strip_string_escapes(input: &[u8]) -> Vec<u8> {
                 // controls that drop it.
                 if escape_precedes_non_ascii(input, current) {
                     let next = skip_escape_state_controls(input, current + 1);
-                    sanitized.truncate(chain_start);
                     if c1_control_at(input, next).is_some() {
                         push_escape_run_controls(&mut sanitized, input, copied, current, next);
                         copied = next;
@@ -4548,7 +4548,6 @@ pub fn strip_string_escapes(input: &[u8]) -> Vec<u8> {
                         // The terminal is still in the escape state after these
                         // controls, so emitting the ESC would let a `]` in the
                         // next read open a string control.
-                        sanitized.truncate(chain_start);
                         push_escape_run_controls(
                             &mut sanitized,
                             input,
@@ -5495,6 +5494,25 @@ rules:
         ] {
             assert_eq!(super::strip_string_escapes(input), expected, "{input:02x?}");
         }
+
+        // A later dropped ESC run keeps the C0 controls that an earlier one
+        // in the chain kept, since the terminal runs them either way.
+        for (input, expected) in [
+            (
+                b"a\x1b\r\xc2\x8e\x1b\xc3\x9eb".as_slice(),
+                b"a\r\xc3\x9eb".as_slice(),
+            ),
+            (b"a\x1b\n\x9b1\x1b\x80b", b"a\n\x80b"),
+            (b"a\x1b\r\x8e\x1b\x00\x1b\xc2\x9b1mb", b"a\r\x00\xc2\x9b1mb"),
+        ] {
+            assert_eq!(super::strip_string_escapes(input), expected, "{input:02x?}");
+        }
+        let controls = vec![0; super::MAX_INCOMPLETE_ESCAPE_BYTES + 1];
+        let input = [b"a\x1b\r\xc2\x8e\x1b".as_slice(), &controls].concat();
+        assert_eq!(
+            super::strip_string_escapes(&input),
+            [b"a\r".as_slice(), &controls].concat()
+        );
     }
 
     // DOCS selects how xterm decodes its input: after `ESC % @` it reads
