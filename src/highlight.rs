@@ -4504,8 +4504,8 @@ pub fn strip_string_escapes(input: &[u8]) -> Vec<u8> {
                     }
                     // In UTF-8 mode xterm ignores a C1 control inside a CSI
                     // and reads a character from U+00A0 to U+00FF there, which
-                    // a lone raw A0-BF byte before an ASCII byte decodes to,
-                    // as the ASCII byte it mirrors. So it reads
+                    // a lone raw A0-BF byte before a byte from 21 to 7F decodes
+                    // to, as the ASCII byte it mirrors. So it reads
                     // `CSI ? 4 C2 B2 h` and `CSI ? 4 C2 80 2 h` as
                     // `CSI ? 42 h`, and Alacritty ignores every byte from 80
                     // up there. A CSI that holds a byte from 80 up, however it
@@ -4651,29 +4651,34 @@ fn changes_decnrcm(csi: &[u8]) -> bool {
     if !matches!(final_byte, b'h' | b'l' | b'r') {
         return false;
     }
-    let parameters: Vec<u8> = parameters
+    let mut parameters = parameters
         .iter()
-        .copied()
-        .filter(|byte| !matches!(byte, 0x00..=0x1f | 0x7f))
-        .collect();
-    let Some(parameters) = parameters.strip_prefix(b"?") else {
-        return false;
-    };
-    if !parameters.iter().all(|byte| (0x30..=0x3f).contains(byte)) {
+        .filter(|byte| !matches!(byte, 0x00..=0x1f | 0x7f));
+    if parameters.next() != Some(&b'?') {
         return false;
     }
-    let is_42 = |parameter: &[u8]| {
-        parameter.iter().all(u8::is_ascii_digit)
-            && parameter
-                .iter()
-                .skip_while(|digit| **digit == b'0')
-                .eq(b"42")
-    };
-    let parameters: Vec<&[u8]> = parameters
-        .split(|byte| matches!(byte, b';' | b':'))
-        .collect();
-    let (kept, merged) = parameters.split_at(parameters.len().min(XTERM_MAX_CSI_PARAMETERS - 1));
-    kept.iter().any(|parameter| is_42(parameter)) || is_42(&merged.concat())
+    // The parameter being read, capped at 65535 as xterm caps it, or `None`
+    // once a byte other than a digit means it cannot be 42. Past the last
+    // parameter that xterm keeps, `;` and `:` are skipped and digits run on.
+    let mut value = Some(0u32);
+    let mut separators = 0;
+    let mut sets_42 = false;
+    for byte in parameters {
+        match byte {
+            b'0'..=b'9' => {
+                value = value.map(|value| (value * 10 + u32::from(byte - b'0')).min(65_535));
+            }
+            b';' | b':' if separators < XTERM_MAX_CSI_PARAMETERS - 1 => {
+                sets_42 |= value == Some(42);
+                separators += 1;
+                value = Some(0);
+            }
+            b';' | b':' => {}
+            b'<'..=b'?' => value = None,
+            _ => return false,
+        }
+    }
+    sets_42 || value == Some(42)
 }
 
 fn valid_utf8_char_width_at(input: &[u8], idx: usize) -> Option<usize> {
