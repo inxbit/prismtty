@@ -2235,7 +2235,7 @@ mod tests {
         }
     }
 
-    // Each split of a sanitized read rescans the prefix before it, so a read
+    // Each split of a sanitized read checks the prefix before it, so a read
     // of controls that each end in a character the next one cuts off must not
     // be rescanned once per control.
     #[test]
