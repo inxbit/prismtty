@@ -762,19 +762,85 @@ fn program_candidates(program: &OsStr, cwd: Option<&Path>) -> Vec<PathBuf> {
     }
 }
 
-/// Size of the start of a file the kernel reads to find a `#!` line.
-const SCRIPT_HEADER_BYTES: u64 = 256;
+/// How a kernel reads the `#!` line of a script. It reads the start of the
+/// file into a buffer, zero-filled past the end of a shorter file, skips
+/// blanks (space, tab) after `#!`, and ends the interpreter name at a blank,
+/// a NUL or the end of the line.
+struct ShebangSyntax {
+    /// How much of the file the kernel reads.
+    buffer_bytes: usize,
+    /// The bytes that end the line.
+    line_ends: &'static [u8],
+    /// Whether a line with no end in the buffer still names an interpreter
+    /// when a blank follows the name, which only cuts off its arguments.
+    /// Otherwise the kernel reports ENOEXEC, and execvp runs the file with
+    /// /bin/sh.
+    names_in_unended_line: bool,
+}
+
+/// Linux, `load_script` in fs/binfmt_script.c: the buffer is BINPRM_BUF_SIZE,
+/// and the newline search (strnchr) stops at a NUL, so the line of a short
+/// file with no newline ends where the file does. `#` is part of the name.
+const LINUX_SHEBANG: ShebangSyntax = ShebangSyntax {
+    buffer_bytes: 256,
+    line_ends: b"\n\0",
+    names_in_unended_line: true,
+};
+
+/// macOS, `exec_shell_imgact` in XNU's bsd/kern/kern_exec.c: the buffer is
+/// IMG_SHSIZE, and `#` ends the line as a newline does. A NUL ends neither,
+/// so a short file with no newline is ENOEXEC.
+const XNU_SHEBANG: ShebangSyntax = ShebangSyntax {
+    buffer_bytes: 512,
+    line_ends: b"\n#",
+    names_in_unended_line: false,
+};
+
+/// The `#!` syntax of the kernel prismtty runs on, where it is known.
+const KERNEL_SHEBANG: Option<ShebangSyntax> =
+    if cfg!(any(target_os = "linux", target_os = "android")) {
+        Some(LINUX_SHEBANG)
+    } else if cfg!(target_vendor = "apple") {
+        Some(XNU_SHEBANG)
+    } else {
+        None
+    };
+
+/// The interpreter a kernel with `syntax` runs for a file that starts with
+/// `start`, or None when it runs none: not a script, no name, or ENOEXEC.
+fn script_interpreter(start: &[u8], syntax: &ShebangSyntax) -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let mut buffer = start[..start.len().min(syntax.buffer_bytes)].to_vec();
+    buffer.resize(syntax.buffer_bytes, 0);
+    let line = buffer.strip_prefix(b"#!")?;
+    let (line, ended) = match line.iter().position(|byte| syntax.line_ends.contains(byte)) {
+        Some(end) => (&line[..end], true),
+        None if syntax.names_in_unended_line => (line, false),
+        None => return None,
+    };
+    let is_blank = |byte: &u8| matches!(byte, b' ' | b'\t');
+    let name = &line[line.iter().position(|byte| !is_blank(byte))?..];
+    let name = match name.iter().position(|byte| is_blank(byte) || *byte == 0) {
+        Some(end) => &name[..end],
+        // The buffer may have cut the name off: ENOEXEC.
+        None if !ended => return None,
+        None => name,
+    };
+    (!name.is_empty()).then(|| PathBuf::from(OsStr::from_bytes(name)))
+}
 
 /// Checks the `#!` interpreter of a script before it is spawned. A script
 /// whose interpreter cannot be executed only fails in execve, after the fork.
 /// portable-pty, which spawns the command from a terminal, closes every
 /// descriptor above 2 in the child, std's exec-error pipe included, so the
 /// child aborts with "fatal runtime error" instead of the spawn reporting the
-/// failure. The line is parsed as the kernel does: only a blank or the line
-/// end ends the name, so a CRLF script names `/bin/sh\r`.
+/// failure. The line is parsed as the kernel does, so a CRLF script names
+/// `/bin/sh\r`. Whatever the kernel would not reject for certain is left to
+/// the spawn: an empty name, a relative one when the child's directory is not
+/// known, and every script on a kernel whose syntax is not known here.
 fn unusable_script_interpreter(program: &OsStr, cwd: Option<&Path>) -> Option<CliError> {
-    use std::os::unix::ffi::OsStrExt;
-
+    let syntax = KERNEL_SHEBANG?;
     let script = program_candidates(program, cwd)
         .into_iter()
         .find(|candidate| !candidate.is_dir() && is_executable(candidate))?;
@@ -782,23 +848,20 @@ fn unusable_script_interpreter(program: &OsStr, cwd: Option<&Path>) -> Option<Cl
     if !script.is_file() {
         return None;
     }
-    let mut header = Vec::new();
+    let mut start = Vec::new();
     std::fs::File::open(&script)
         .ok()?
-        .take(SCRIPT_HEADER_BYTES)
-        .read_to_end(&mut header)
+        .take(syntax.buffer_bytes as u64)
+        .read_to_end(&mut start)
         .ok()?;
-    let line = header.strip_prefix(b"#!")?;
-    let line = &line[..line.iter().position(|&byte| byte == b'\n')?];
-    let start = line.iter().position(|byte| !matches!(byte, b' ' | b'\t'))?;
-    let line = &line[start..];
-    let end = line
-        .iter()
-        .position(|byte| matches!(byte, b' ' | b'\t' | b'\0'))
-        .unwrap_or(line.len());
-    let interpreter = Path::new(OsStr::from_bytes(&line[..end]));
-    // A relative interpreter is found from the child's directory.
-    let interpreter_path = cwd.unwrap_or(Path::new("")).join(interpreter);
+    let interpreter = script_interpreter(&start, &syntax)?;
+    // A relative interpreter is found from the child's directory, which is
+    // $HOME, not known here, when the caller's cannot be entered.
+    let interpreter_path = match cwd {
+        Some(cwd) => cwd.join(&interpreter),
+        None if interpreter.is_absolute() => interpreter.clone(),
+        None => return None,
+    };
     let code = match std::fs::metadata(&interpreter_path) {
         Err(error) if error.kind() == io::ErrorKind::NotFound => 127,
         Err(_) => 126,
@@ -2491,6 +2554,8 @@ mod tests {
         write("ok.sh", "#! \t/bin/sh -e\necho ran\n", 0o755);
         write("plain.sh", "echo ran\n", 0o755);
         write("unterminated.sh", &format!("#!/{}", "a".repeat(300)), 0o755);
+        write("short.sh", "#!/nonexistent/interp", 0o755);
+        write("hash.sh", "#!/bin/sh#x\necho ran\n", 0o755);
         let cwd = Some(dir.path());
 
         let code =
@@ -2514,6 +2579,19 @@ mod tests {
         // A first line with no end in the bytes the kernel reads is left to
         // execve, which reports ENOEXEC and lets execvp try /bin/sh.
         assert_eq!(code("./unterminated.sh"), None);
+        // Linux ends the line of a short file with no newline at its end, and
+        // `#` is part of the name. macOS ends the line at `#`, and reports
+        // ENOEXEC for a line with no end at all.
+        #[cfg(target_os = "linux")]
+        {
+            assert_eq!(code("./short.sh"), Some(127));
+            assert_eq!(code("./hash.sh"), Some(127));
+        }
+        #[cfg(target_vendor = "apple")]
+        {
+            assert_eq!(code("./short.sh"), None);
+            assert_eq!(code("./hash.sh"), None);
+        }
         // Nothing to check: spawn reports these itself.
         assert_eq!(code("./absent.sh"), None);
         assert_eq!(code("./interp"), None);
@@ -2522,6 +2600,104 @@ mod tests {
         // SAFETY: `fifo` is a valid NUL-terminated path that outlives the call.
         assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o700) }, 0, "mkfifo");
         assert_eq!(code("./fifo"), None);
+    }
+
+    // When the child falls back to $HOME, a relative interpreter is found from
+    // there, so it cannot be checked from prismtty's directory.
+    #[test]
+    fn relative_interpreter_is_not_checked_when_the_child_directory_is_unknown() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("temp directory");
+        let write = |name: &str, body: &str| {
+            let path = dir.path().join(name);
+            std::fs::write(&path, body).expect("write script");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+                .expect("script is executable");
+            path
+        };
+        let relative = write("relative.sh", "#!prismtty-no-such-interp\necho ran\n");
+        let absolute = write("absolute.sh", "#!/nonexistent/interp\necho ran\n");
+        let check = super::unusable_script_interpreter;
+
+        assert!(check(relative.as_os_str(), Some(dir.path())).is_some());
+        assert!(check(relative.as_os_str(), None).is_none());
+        assert!(check(absolute.as_os_str(), None).is_some());
+    }
+
+    fn interpreter(start: &[u8], syntax: &super::ShebangSyntax) -> Option<String> {
+        super::script_interpreter(start, syntax).map(|path| path.display().to_string())
+    }
+
+    // fs/binfmt_script.c: a 256-byte buffer; the line ends at a newline or a
+    // NUL; only a blank or a NUL ends the name; with no line end in the
+    // buffer, a name followed by a blank still runs.
+    #[test]
+    fn linux_shebang_syntax_matches_binfmt_script() {
+        let linux = |start: &[u8]| interpreter(start, &super::LINUX_SHEBANG);
+        let long = |name_bytes: usize, rest: &str| {
+            format!("#!/{}{rest}", "a".repeat(name_bytes - 1)).into_bytes()
+        };
+
+        assert_eq!(linux(b"#!/bin/sh\necho ran\n").as_deref(), Some("/bin/sh"));
+        assert_eq!(linux(b"#! \t/bin/sh -e\n").as_deref(), Some("/bin/sh"));
+        assert_eq!(linux(b"#!/bin/sh\r\n").as_deref(), Some("/bin/sh\r"));
+        assert_eq!(linux(b"#!/bin/sh#x\n").as_deref(), Some("/bin/sh#x"));
+        assert_eq!(linux(b"#!/bin/sh\0x\n").as_deref(), Some("/bin/sh"));
+        // A short file with no newline ends its line at its end.
+        assert_eq!(linux(b"#!/missing").as_deref(), Some("/missing"));
+        assert_eq!(linux(b"#!/missing  ").as_deref(), Some("/missing"));
+        // No line end in the buffer: the blank after the name must be in it.
+        let name = format!("/{}", "a".repeat(252));
+        assert_eq!(linux(&long(253, " -x\n")).as_deref(), Some(name.as_str()));
+        assert_eq!(linux(&long(254, " -x\n")), None);
+        assert_eq!(linux(&long(300, "\n")), None);
+        assert_eq!(
+            linux(format!("#!/missing {}", "a".repeat(300)).as_bytes()).as_deref(),
+            Some("/missing")
+        );
+        // No name, or not a script: nothing to check.
+        assert_eq!(linux(b"#!"), None);
+        assert_eq!(linux(b"#!\n/bin/sh\n"), None);
+        assert_eq!(linux(b"#! \t \n"), None);
+        assert_eq!(linux(format!("#!{}", " ".repeat(300)).as_bytes()), None);
+        assert_eq!(linux(b"echo ran\n"), None);
+        assert_eq!(linux(b"#"), None);
+        assert_eq!(linux(b""), None);
+    }
+
+    // XNU exec_shell_imgact: a 512-byte buffer; the line ends at a newline or
+    // `#`, and a line with no end in the buffer is ENOEXEC, so a short file
+    // with no newline runs with /bin/sh through execvp.
+    #[test]
+    fn xnu_shebang_syntax_matches_exec_shell_imgact() {
+        let xnu = |start: &[u8]| interpreter(start, &super::XNU_SHEBANG);
+
+        assert_eq!(xnu(b"#!/bin/sh\necho ran\n").as_deref(), Some("/bin/sh"));
+        assert_eq!(xnu(b"#! \t/bin/sh -e\n").as_deref(), Some("/bin/sh"));
+        assert_eq!(xnu(b"#!/bin/sh\r\n").as_deref(), Some("/bin/sh\r"));
+        assert_eq!(xnu(b"#!/bin/sh#x\n").as_deref(), Some("/bin/sh"));
+        assert_eq!(xnu(b"#!/bin/sh -x #y\n").as_deref(), Some("/bin/sh"));
+        assert_eq!(xnu(b"#!/bin/sh\0x\n").as_deref(), Some("/bin/sh"));
+        assert_eq!(xnu(b"#!/missing"), None);
+        assert_eq!(xnu(b"#!/missing\0\0\n").as_deref(), Some("/missing"));
+        // The line end must be in the buffer.
+        let name = format!("/{}", "a".repeat(508));
+        assert_eq!(
+            xnu(format!("#!{name}\n").as_bytes()).as_deref(),
+            Some(name.as_str())
+        );
+        assert_eq!(xnu(format!("#!{name}a\n").as_bytes()), None);
+        assert_eq!(
+            xnu(format!("#!/missing {}", "a".repeat(600)).as_bytes()),
+            None
+        );
+        // No name, or not a script: nothing to check.
+        assert_eq!(xnu(b"#!#\n"), None);
+        assert_eq!(xnu(b"#! \t#/bin/sh\n"), None);
+        assert_eq!(xnu(b"#!\n/bin/sh\n"), None);
+        assert_eq!(xnu(b"#!\0/bin/sh\n"), None);
+        assert_eq!(xnu(b"echo ran\n"), None);
     }
 
     #[test]

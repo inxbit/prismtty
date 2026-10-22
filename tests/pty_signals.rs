@@ -899,38 +899,46 @@ fn interactive_script_with_unusable_interpreter_exits_127() {
     use std::os::unix::fs::PermissionsExt;
 
     let work = tempfile::tempdir().expect("work directory");
-    let script = work.path().join("crlf.sh");
-    std::fs::write(&script, "#!/bin/sh\r\necho ran\r\n").expect("write script");
-    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
-        .expect("script is executable");
-    let pair = native_pty_system()
-        .openpty(PtySize::default())
-        .expect("openpty");
-    let mut builder = CommandBuilder::new(env!("CARGO_BIN_EXE_ptty"));
-    builder.cwd(work.path());
-    builder.arg("./crlf.sh");
-    let child = pair
-        .slave
-        .spawn_command(builder)
-        .expect("spawn interactive ptty");
-    drop(pair.slave);
-    let mut ptty = PtySession::new(child, &*pair.master);
+    let mut scripts = vec![("crlf.sh", "#!/bin/sh\r\necho ran\r\n")];
+    // Linux ends the `#!` line of a short file with no newline at its end.
+    // macOS reports ENOEXEC for it instead, and execvp runs it with /bin/sh.
+    if cfg!(target_os = "linux") {
+        scripts.push(("short.sh", "#!/nonexistent/prismtty-interp"));
+    }
+    for (name, body) in scripts {
+        let script = work.path().join(name);
+        std::fs::write(&script, body).expect("write script");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+            .expect("script is executable");
+        let pair = native_pty_system()
+            .openpty(PtySize::default())
+            .expect("openpty");
+        let mut builder = CommandBuilder::new(env!("CARGO_BIN_EXE_ptty"));
+        builder.cwd(work.path());
+        builder.arg(format!("./{name}"));
+        let child = pair
+            .slave
+            .spawn_command(builder)
+            .expect("spawn interactive ptty");
+        drop(pair.slave);
+        let mut ptty = PtySession::new(child, &*pair.master);
 
-    let status = ptty.wait_for_exit(Duration::from_secs(10));
-    let output = ptty.capture().wait_until(Duration::from_secs(2), |out| {
-        contains_bytes(out, b"bad interpreter")
-    });
-    assert_eq!(
-        status,
-        Some(127),
-        "output: {:?}",
-        String::from_utf8_lossy(&output)
-    );
-    assert!(
-        contains_bytes(&output, b"bad interpreter"),
-        "the bad interpreter was not reported: {:?}",
-        String::from_utf8_lossy(&output)
-    );
+        let status = ptty.wait_for_exit(Duration::from_secs(10));
+        let output = ptty.capture().wait_until(Duration::from_secs(2), |out| {
+            contains_bytes(out, b"bad interpreter")
+        });
+        assert_eq!(
+            status,
+            Some(127),
+            "{name} output: {:?}",
+            String::from_utf8_lossy(&output)
+        );
+        assert!(
+            contains_bytes(&output, b"bad interpreter"),
+            "{name}: the bad interpreter was not reported: {:?}",
+            String::from_utf8_lossy(&output)
+        );
+    }
 }
 
 fn assert_terminal_restored_after(signal: libc::c_int) {
