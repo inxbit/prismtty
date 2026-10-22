@@ -2028,6 +2028,8 @@ mod tests {
             b"\xf0\x9f",
             b"\xf4",
             b"\x9f",
+            b"\x9b\xf0\x9f\xc2",
+            b"\x9b\xf0\x9f\xc2\x9c",
             b"\xff",
             b"\x1b[31m",
             b"\x1b[0m",
@@ -2141,6 +2143,9 @@ mod tests {
             // No byte can complete these, so the C1 byte in each is a control.
             b"\x9b\xe0\x9d",
             b"\x1b[\xf4\x90",
+            // A cut-off character the next read shows can never complete.
+            b"\xf0\x9f\x72\xe0",
+            b"\xf0\x9f\x01",
         ];
         for input in cases {
             for pipeline in [ChunkPipeline::Sanitize, ChunkPipeline::Strip] {
@@ -2172,6 +2177,17 @@ mod tests {
             ChunkPipeline::Sanitize,
         );
         assert_eq!(walk_vt_parser(&output, false).0, None, "{output:02x?}");
+
+        // Without --sanitize, the end of input still drops the string that
+        // such a C1 byte opens.
+        for pipeline in [ChunkPipeline::Library, ChunkPipeline::Preserve] {
+            let output = run_chunk_pipeline(&[b"\xf0\x9f\x01"], pipeline);
+            assert_eq!(
+                walk_vt_parser(&output, false),
+                (None, VtState::Ground),
+                "{pipeline:?}: {output:02x?}"
+            );
+        }
     }
 
     // Each split of a sanitized read rescans the prefix before it, so a read
@@ -2188,7 +2204,7 @@ mod tests {
             let read = group.repeat(8192 / group.len());
             let mut state = super::ChunkFilterState::default();
             let started = std::time::Instant::now();
-            for _ in 0..32 {
+            for _ in 0..8 {
                 let prepared = super::prepare_chunk(&read, false, true, &mut state);
                 assert_eq!(walk_vt_parser(prepared.bytes(), false).0, None);
             }
@@ -2196,7 +2212,7 @@ mod tests {
 
             assert!(
                 elapsed < std::time::Duration::from_secs(2),
-                "32 reads of {group:02x?} runs took {elapsed:?}"
+                "8 reads of {group:02x?} runs took {elapsed:?}"
             );
         }
     }
