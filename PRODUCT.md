@@ -81,7 +81,7 @@ Guardrail: the repo holds no comparison against any other tool. Describe what Pr
 
 - 29 releases since 2026-05-12 (v0.2.1) to 1.3.0 (2026-10-22), all in CHANGELOG.md; MIT licensed; crates.io, docs.rs, Homebrew tap, GitHub Releases with checksums and attestations.
 - Maintainer-measured before/after deltas (own hardware, not head-to-head): piped highlighting of a synthetic 20k-line router dump 0.57 s to 0.14 s; interactive throughput 1.1 to 4.4 MiB/s; release binary 2.28 MB to 1.76 MB (CHANGELOG 1.2.2).
-- 485 Rust tests, 35 node tests; CI on macOS + Ubuntu with cargo-audit, cargo-deny, MSRV, privacy scan.
+- 658 Rust tests, 49 node tests (1.3.0); CI on macOS + Ubuntu with cargo-audit, cargo-deny, MSRV, privacy scan.
 - Synthetic fixtures: `fixtures/cisco.txt`, `juniper.txt`, `linux-unix.txt`, and 10 replay fixtures across 8 profiles in `fixtures/replay/` with an expectations contract.
 - **Real output is producible:** `prismtty -R -p <profile> < fixtures/<file>` (run hermetically: empty HOME/XDG, `PRISMTTY_RUNTIME_DIR` set) emits truecolor ANSI that converts to HTML; replay renders pass the expectations contract. Real default colors are the profiles' own: interfaces `#0099ff`, addresses `#00ffff`, good state `#00ff00`, bad state bold `#ff0000`, prompts `#ffffff`, accents `#ff00ff`. Real quirks show (Cisco `OK?` header and systemd `Loaded:` colored as good). Auto-detect picks the right profile for the three primary fixtures.
 - ADR `docs/adr/0001-prompt-echo-aware-idle-flush.md` (published raw on the site).

@@ -101,6 +101,15 @@ For `cargo install` on Debian/Ubuntu, install:
 sudo apt-get install libpcre2-dev pkg-config
 ```
 
+Cargo installs the binaries only. Shell completions for zsh, bash, and fish
+live in the repository's
+[`completions/`](https://github.com/inxbit/prismtty/tree/main/completions)
+directory; copy the file for your shell into its completions directory. Fish
+loads a completion file only by the command's name, so also link
+`prismtty.fish` as `ptty.fish` and `ct.fish`. For the bash-completion on-demand
+directory, install `prismtty.bash` there as `prismtty`, `ptty`, and `ct`, or
+source it from `~/.bashrc`.
+
 ### GitHub Release
 
 Prebuilt release archives and checksums are available on the
