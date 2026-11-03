@@ -89,8 +89,14 @@
   let settled = Boolean(navigator.connection?.saveData); // nothing left to play
   let easing = 0; // animation frame of the ease
   let stall = 0; // timer that gives up on footage that stopped arriving
+  // Whether the footage has produced a frame. A browser can run the clock
+  // and drop every frame (Safari 27 did, for any clip), so the plate stays
+  // until requestVideoFrameCallback reports one. Without that API, 'playing'
+  // is taken at its word.
+  let shown = !(video && 'requestVideoFrameCallback' in video);
 
   // The intro is over: hold the frame it stopped on and bring in the light.
+  // Footage that never produced a frame gives way to the still plate.
   function settle() {
     settled = true;
     clearTimeout(stall);
@@ -98,13 +104,16 @@
     easing = 0;
     video.pause();
     root.classList.add('prism-live');
+    if (!shown) {
+      video.hidden = true;
+      root.classList.remove('prism-playing');
+    }
   }
 
   // The footage broke: drop it and fall back to the still plate.
   function giveUp() {
+    shown = false;
     settle();
-    video.hidden = true;
-    root.classList.remove('prism-playing');
   }
 
   // One step per frame near the end. playbackRate = sqrt(left / EASE) is a
@@ -145,8 +154,19 @@
       }
       clearTimeout(stall);
       video.hidden = false;
-      root.classList.add('prism-playing');
+      if (shown) root.classList.add('prism-playing');
     });
+    // The footage sits above the plate and paints nothing until it has a
+    // frame. The plate steps aside once a frame is reported and the footage
+    // is unhidden, whichever comes last: a frame can be reported for the
+    // hidden element (Firefox on load, any engine while paused off screen).
+    if (!shown) {
+      video.requestVideoFrameCallback(() => {
+        if (settled) return;
+        shown = true;
+        if (!video.hidden) root.classList.add('prism-playing');
+      });
+    }
     // timeupdate (about 4 Hz) only opens the window; the frames do the ease.
     video.addEventListener('timeupdate', () => {
       const left = video.duration - video.currentTime;
@@ -179,7 +199,7 @@
     motes = Array.from({ length: 34 }, (_, i) => ({
       x: ((i * 0.6180339887) % 1) * canvas.width,
       y: (0.08 + 0.84 * ((i * 0.3819660113) % 1)) * canvas.height,
-      r: (0.5 + ((i * 7) % 5) * 0.22) * scale,
+      s: Math.max(1, Math.round((0.5 + ((i * 7) % 5) * 0.22) * scale)), // side, whole device px
       v: (0.1 + ((i * 3) % 7) * 0.025) * scale,
     }));
   }
@@ -207,9 +227,9 @@
       const fade = Math.min(1, Math.min(m.x, w - m.x) / (w * 0.08));
       const lit = 0.06 + 0.8 * light(m.x / w, y / h);
       ctx.globalAlpha = lit * fade;
-      ctx.beginPath();
-      ctx.arc(m.x, y, m.r, 0, Math.PI * 2);
-      ctx.fill();
+      // Snapped to whole device pixels, each mote is a crisp point rather
+      // than a sub-pixel smear.
+      ctx.fillRect(Math.round(m.x - m.s / 2), Math.round(y - m.s / 2), m.s, m.s);
     }
     frame = visible && drawable ? requestAnimationFrame(draw) : 0;
   }
