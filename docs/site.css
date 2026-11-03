@@ -458,24 +458,28 @@ a {
   opacity: 1;
 }
 
+/* The flow band hugs the beam line of the plate and the footage: a 2u core
+   with 1u edges, tilted 1.29deg to follow the beam's fall. */
 .beam {
   position: absolute;
   left: calc(500 * var(--u));
-  top: calc(504 * var(--u));
+  top: calc(506 * var(--u));
   width: calc(246 * var(--u));
-  height: calc(12 * var(--u));
+  height: calc(4 * var(--u));
   background: repeating-linear-gradient(
     90deg,
     transparent 0,
     transparent calc(34 * var(--u)),
-    rgb(255 255 255 / 0.5) calc(62 * var(--u)),
+    rgb(255 255 255 / 0.75) calc(62 * var(--u)),
     transparent calc(90 * var(--u))
   );
   background-size: calc(90 * var(--u)) 100%;
-  -webkit-mask-image: linear-gradient(180deg, transparent, #000 42%, #000 58%, transparent),
+  transform-origin: 0 50%;
+  transform: rotate(1.29deg);
+  -webkit-mask-image: linear-gradient(180deg, transparent, #000 25%, #000 75%, transparent),
     linear-gradient(90deg, transparent, #000 22%, #000 88%, transparent);
   -webkit-mask-composite: source-in;
-  mask-image: linear-gradient(180deg, transparent, #000 42%, #000 58%, transparent),
+  mask-image: linear-gradient(180deg, transparent, #000 25%, #000 75%, transparent),
     linear-gradient(90deg, transparent, #000 22%, #000 88%, transparent);
   mask-composite: intersect;
   mix-blend-mode: screen;
