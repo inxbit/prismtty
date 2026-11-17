@@ -2351,11 +2351,7 @@ fn looks_like_prompt_echo_prefix(line: &[u8]) -> bool {
     }
 
     let trimmed = trim_ascii_whitespace_end(line);
-    if matches!(trimmed, b">" | b"#") {
-        return false;
-    }
-
-    true
+    !matches!(trimmed, b">" | b"#")
 }
 
 fn redraws_interactive_prompt_line(line: &[u8]) -> bool {
