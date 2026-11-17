@@ -1874,7 +1874,7 @@ mod tests {
         assert!(PromptMatcherKind::AristaHostMarker.matches_startup("leaf01#"));
         assert!(!PromptMatcherKind::PaloAltoUserAtHost.matches_startup("admin@router>"));
         assert!(PromptMatcherKind::PaloAltoUserAtHost.matches_startup("admin@pa-edge>"));
-        assert!(PromptMatcherKind::UnixUserAtHostPath.matches_startup("cdassy@MacBook-Pro ~ %"));
+        assert!(PromptMatcherKind::UnixUserAtHostPath.matches_startup("operator@MacBook-Pro ~ %"));
         assert!(!PromptMatcherKind::UnixUserAtHostPath.matches_startup("admin@mx480%"));
     }
 
