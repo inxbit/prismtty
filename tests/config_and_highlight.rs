@@ -277,6 +277,17 @@ rules:
     assert!(output.contains("error\x1b[0m\x1b[32m tail"));
 }
 
+// A terminal runs a line feed or carriage return it meets inside a CSI, as
+// after an escape cut short at a line end. Stripping the control must not
+// join the two lines.
+#[test]
+fn strip_ansi_keeps_the_line_controls_inside_a_csi() {
+    assert_eq!(strip_ansi(b"A\x1b[31\nmB"), b"A\nB");
+    assert_eq!(strip_ansi(b"text\x1b[\r\nnext"), b"text\r\next");
+    // A string control's payload is not run: none of it survives.
+    assert_eq!(strip_ansi(b"A\x1b]0;ti\ntle\x07B"), b"AB");
+}
+
 #[test]
 fn noninteractive_stream_restores_program_sgr_set_in_an_earlier_push() {
     let yaml = r##"

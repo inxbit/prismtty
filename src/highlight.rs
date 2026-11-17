@@ -4421,12 +4421,22 @@ fn is_token_continuation(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'/' | b'.')
 }
 
-/// Removes ANSI escape sequences and returns only visible bytes.
+/// Removes ANSI escape sequences and returns only visible bytes. A terminal
+/// runs the format effectors (backspace through carriage return) it meets
+/// inside a CSI, so those stay: dropping them with the control would join
+/// the lines around an escape cut short at a line end.
 pub fn strip_ansi(input: &[u8]) -> Vec<u8> {
     let mut stripped = Vec::new();
     for token in tokenize_ansi(input) {
-        if let Token::Text(text) = token {
-            stripped.extend(text);
+        match token {
+            Token::Text(text) => stripped.extend(text),
+            Token::Ansi(bytes) if is_csi_sequence(&bytes) => stripped.extend(
+                bytes
+                    .iter()
+                    .copied()
+                    .filter(|byte| matches!(byte, 0x08..=0x0d)),
+            ),
+            Token::Ansi(_) => {}
         }
     }
     stripped
