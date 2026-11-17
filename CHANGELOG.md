@@ -2,6 +2,78 @@
 
 All notable changes to PrismTTY are documented here.
 
+## Unreleased
+
+### Security
+
+- Apply `--sanitize` and `--strip-ansi` to `profiles test`. It printed its
+  fixture without the filtering the two flags ask for, so an OSC 52 clipboard
+  write in a captured fixture still reached the terminal under `--sanitize`.
+- Refuse a `--trace-io` file that has a second hard link. The trace was
+  appended to whatever else the path was linked to.
+- Open the reload marker and pid files without blocking. A FIFO in place of
+  the marker made `prismtty --reload` hang forever.
+
+### Fixed
+
+- Treat only real SGR controls as the program's colors. Any CSI ending in `m`
+  counted, so xterm's key modifier option (`CSI > 4 ; 1 m`, XTMODKEYS) was
+  tracked as bold and the text after each highlight was redrawn bold or
+  faint. The same control was deleted from the stream when a prompt's colors
+  were neutralized, so the terminal never changed how it reports keys. A
+  control with an intermediate byte (`CSI + 31 m`) is no longer read as a
+  color, and a C0 control inside an SGR no longer loses the color.
+- Reject surplus arguments to `profiles list`, `show`, `validate` and `test`.
+  `profiles validate good.yml broken.yml` reported success having read only
+  the first file.
+- Write the `--show-profile` and `--benchmark` reports when the input is
+  empty.
+- Wait for input when the filter inherits a non-blocking stdin, instead of
+  exiting with "Resource temporarily unavailable".
+- Let an exclusive rule style all of its own capture groups. With colors on
+  groups 0 and 1, group 1 was skipped because group 0 had already protected
+  the span.
+- Match a profile's strong signals as whole words. `rhel` inside
+  `ServerHello` selected linux-unix, `ios xe` inside `BIOS XE` and
+  `asa version` inside `NASA version` selected cisco, and `pan-os` inside
+  `japan-osaka` selected palo-alto.
+- Skip SS3 keys whole in `--local-echo`. An arrow or function key sent in
+  application mode (`ESC O A`) was echoed as `OA`.
+- Reject a numeric capture key that does not fit the platform's `usize`. On
+  a 32-bit build 4294967296 wrapped to group 0.
+
+### Profiles
+
+- generic: a good-state word after `not` is no longer green (`not reachable`,
+  `not  connected` in aligned columns, `not valid`), and `not reachable` is a
+  bad state like `not connected`.
+- generic: bare `den` (a site code, a word) is no longer painted as a denial;
+  `deny`, `denies` and `denied` still are.
+- generic: an IPv6 zone that holds `-`, `.` or `_` (`%eth-0`, `%bond0.100`)
+  is colored with its address instead of splitting it.
+- arubacx and fortinet: configuration-context prompts (`switch(config)#`,
+  `FGT (global) #`) are colored like the plain prompt.
+- palo-alto: aggregate interfaces (`ae1`, `ae1.107`) are colored.
+
+### Library API
+
+- `strip_ansi` keeps the format effectors (backspace through carriage return)
+  found inside a CSI or a plain escape sequence, as a terminal runs them.
+  It used to drop them with the control, which joined the lines around an
+  escape cut short at a line end. Controls inside a string control are still
+  removed with it.
+
+### Release and QA
+
+- CI builds the crate package (`cargo package --locked`), so a file missing
+  from the `include` list fails a pull request instead of a release tag.
+- The privacy scan checks file content and paths separately for IPv6
+  addresses. It scanned `git grep` records whole, so a line number joined an
+  address that began the line. It also checks zero-padded IPv4 octets.
+- A prompt matcher test used a real local account name; it is synthetic now.
+- The READMEs no longer say a release archive contains its checksum, and
+  name the PCRE2 runtime requirement.
+
 ## 1.3.0 - 2026-10-22
 
 ### Security
