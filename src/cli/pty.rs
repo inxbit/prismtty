@@ -1475,6 +1475,15 @@ fn local_echo_escape_step(input: &[u8], idx: usize) -> LocalEchoStep {
     let Some(next) = input.get(idx + 1) else {
         return LocalEchoStep::Incomplete;
     };
+    // SS3: an arrow or function key in application mode, `ESC O` plus one
+    // final byte.
+    if *next == b'O' {
+        return if idx + 2 < input.len() {
+            LocalEchoStep::Skip(idx + 3)
+        } else {
+            LocalEchoStep::Incomplete
+        };
+    }
     if *next != b'[' {
         return LocalEchoStep::Skip(idx + 1);
     }
@@ -2786,6 +2795,17 @@ mod tests {
         assert!(echo.push(b"\x1b").is_empty());
         assert!(echo.push(b"[A").is_empty());
         assert_eq!(echo.push(b"show\r"), b"show\r\n");
+    }
+
+    // In application cursor-key mode an arrow or function key arrives as SS3
+    // (`ESC O A`, `ESC O P`). Its final byte is part of the key, not text.
+    #[test]
+    fn local_echo_skips_ss3_keys_whole_even_when_split() {
+        assert_eq!(super::local_echo_bytes(b"a\x1bOAb\x1bOPc"), b"abc");
+
+        let mut echo = super::LocalEchoState::default();
+        assert!(echo.push(b"\x1bO").is_empty());
+        assert_eq!(echo.push(b"Ax"), b"x");
     }
 
     #[test]

@@ -102,7 +102,14 @@ for line in result.stdout.splitlines():
         try:
             address = ipaddress.ip_address(match.group(0))
         except ValueError:
-            continue
+            # Devices print zero-padded octets (10.001.2.3), which ipaddress
+            # refuses. They name the same address.
+            try:
+                address = ipaddress.ip_address(
+                    ".".join(str(int(octet)) for octet in match.group(0).split("."))
+                )
+            except ValueError:
+                continue
         if (
             match.group(0) not in allowed_netmasks
             and match.group(0) not in allowed_wildcard_masks
@@ -125,6 +132,9 @@ result = subprocess.run(
         "--untracked",
         "--exclude-standard",
         "-n",
+        # NUL after the path and the line number, so neither can run into an
+        # address that begins the line.
+        "-z",
         "-I",
         "-E",
         ":",
@@ -150,8 +160,11 @@ ipv6_pattern = re.compile(
     r"(?![0-9A-Za-z_])"
 )
 findings = []
-for line in result.stdout.splitlines():
-    for match in ipv6_pattern.finditer(line):
+for record in result.stdout.split("\n"):
+    path, _, rest = record.partition("\0")
+    number, _, content = rest.partition("\0")
+    line = f"{path}:{number}:{content}"
+    for match in [*ipv6_pattern.finditer(path), *ipv6_pattern.finditer(content)]:
         address_text = match.group("bracketed") or match.group("plain")
         try:
             address = ipaddress.ip_address(address_text)

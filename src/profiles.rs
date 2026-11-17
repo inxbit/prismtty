@@ -1220,6 +1220,8 @@ impl PromptMatcherKind {
     }
 }
 
+/// Case-insensitive search of `needle` where it begins a word; see
+/// `begins_a_word`.
 fn contains_case_insensitive(haystack: &str, needle: &str) -> bool {
     if needle.is_empty() {
         return true;
@@ -1233,7 +1235,20 @@ fn contains_case_insensitive(haystack: &str, needle: &str) -> bool {
         end <= haystack.len()
             && haystack.is_char_boundary(end)
             && haystack.as_bytes()[start..end].eq_ignore_ascii_case(needle.as_bytes())
+            && begins_a_word(haystack, needle, start)
     })
+}
+
+/// A signal names a product, so it counts where it begins a word, not in the
+/// middle of one: `rhel` is not found in `ServerHello`, `ios xe` in
+/// `BIOS XE`, nor `pan-os` in `japan-osaka`. What follows is free, because
+/// vendors glue a model or version on (`Nexus9000`, `rhel9`, `ubuntu2204`).
+fn begins_a_word(haystack: &str, needle: &str, start: usize) -> bool {
+    let is_word = |byte: Option<&u8>| byte.is_some_and(|byte| is_detection_word_byte(*byte));
+    let continues_a_word = start > 0
+        && is_word(haystack.as_bytes().get(start - 1))
+        && is_word(needle.as_bytes().first());
+    !continues_a_word
 }
 
 /// Case-insensitive search of `needle` in an ASCII-lowercased haystack.
@@ -1241,7 +1256,9 @@ fn contains_in_lower(lower: &str, needle: &str) -> bool {
     if needle.bytes().any(|byte| byte.is_ascii_uppercase()) {
         contains_case_insensitive(lower, needle)
     } else {
-        lower.contains(needle)
+        lower
+            .match_indices(needle)
+            .any(|(start, _)| begins_a_word(lower, needle, start))
     }
 }
 
@@ -1855,7 +1872,7 @@ mod tests {
         assert!(PromptMatcherKind::AristaHostMarker.matches_startup("leaf01#"));
         assert!(!PromptMatcherKind::PaloAltoUserAtHost.matches_startup("admin@router>"));
         assert!(PromptMatcherKind::PaloAltoUserAtHost.matches_startup("admin@pa-edge>"));
-        assert!(PromptMatcherKind::UnixUserAtHostPath.matches_startup("cdassy@MacBook-Pro ~ %"));
+        assert!(PromptMatcherKind::UnixUserAtHostPath.matches_startup("operator@MacBook-Pro ~ %"));
         assert!(!PromptMatcherKind::UnixUserAtHostPath.matches_startup("admin@mx480%"));
     }
 

@@ -23,7 +23,9 @@ use thiserror::Error;
 use crate::config::{
     MAX_PROFILE_TEST_FILE_BYTES, PrismConfig, load_profile_file, read_bounded_regular_file,
 };
-use crate::highlight::{Highlighter, RuleMatchError, StreamingHighlighter};
+use crate::highlight::{
+    Highlighter, RuleMatchError, StreamingHighlighter, strip_ansi, strip_string_escapes,
+};
 use crate::terminal_text::escape_untrusted;
 
 use args::{Action, Options, parse_args, print_help};
@@ -203,6 +205,15 @@ fn run_inner(args: Vec<OsString>) -> Result<ExitCode, CliError> {
         Action::ProfilesTest { profile, fixture } => {
             let input =
                 read_bounded_regular_file(&fixture, MAX_PROFILE_TEST_FILE_BYTES, "fixture")?;
+            // The fixture is printed to the terminal like program output, so
+            // the flags that remove escapes from that output apply to it too.
+            let input = if options.strip_ansi {
+                strip_ansi(&input)
+            } else if options.sanitize {
+                strip_string_escapes(&input)
+            } else {
+                input
+            };
             let store = profile_store()?;
             let config = PrismConfig::from_profiles(&store, &[profile.as_str()])?;
             let highlighter = Highlighter::from_config(config)?;
@@ -252,14 +263,17 @@ fn run_stdin(options: Options) -> Result<ExitCode, CliError> {
     let trace = IoTrace::open(options.trace_io.as_deref())?;
     let (_registration, reload_watcher) = register_for_reload();
     let stdin = io::stdin();
-    // As in PTY mode, another program on the terminal can leave stdout
-    // non-blocking.
+    // As in PTY mode, another program on the terminal or pipe can leave
+    // stdin and stdout non-blocking.
     let mut stdout = WaitWhenWouldBlock {
         fd: stdout.as_raw_fd(),
         inner: stdout,
     };
     highlight_stream(
-        stdin.lock(),
+        WaitWhenWouldBlock {
+            fd: stdin.as_raw_fd(),
+            inner: stdin.lock(),
+        },
         &mut stdout,
         prepared,
         InputSource {

@@ -17,7 +17,7 @@ profile:
     runtime_prompt: cisco_host_marker
 rules:
   - description: ArubaCX prompt
-    regex: '(?m)^[A-Za-z0-9_.-]+[>#]'
+    regex: '(?m)^[A-Za-z0-9_.-]+(\([A-Za-z0-9_./-]+\))?[>#]'
     color: f#ffffff
   - description: ArubaCX interface
     regex: '(?i)\b((\d+/\d+/\d+)|(lag\d+)|(vlan\d+)|(loopback\d+)|(mgmt))(\.\d+)?\b'

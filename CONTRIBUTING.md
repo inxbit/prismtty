@@ -118,7 +118,7 @@ writing anything.
 Generated images and video keep their provenance next to them. PNGs carry the
 prompt or capture notes in an embedded `impeccable:prompt` text chunk; other
 files use a `.json` sidecar named after the file (for example
-`prism-loop.mp4.json`) with a `prompt` field. Update it when you replace the
+`prism-intro.mp4.json`) with a `prompt` field. Update it when you replace the
 asset.
 
 Browsers and caches keep CSS, JavaScript, and font files for a while, so a

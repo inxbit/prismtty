@@ -116,7 +116,10 @@ Prebuilt release archives and checksums are available on the
 [GitHub releases page](https://github.com/inxbit/prismtty/releases).
 
 Each release archive contains the binaries, license/readme files, example
-profiles, shell completions, and a `.tar.gz.sha256` checksum.
+profiles, and shell completions. Its `.tar.gz.sha256` checksum is a separate
+file next to it on the release page. The binaries load PCRE2 at run time: from
+Homebrew (`brew install pcre2`) on macOS, and from the system `libpcre2-8` on
+Linux.
 
 Installed commands:
 

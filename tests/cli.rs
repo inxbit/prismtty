@@ -88,6 +88,54 @@ fn cli_usage_errors_include_context_without_pinning_clap_wording() {
     }
 }
 
+// A profiles subcommand takes a fixed number of arguments. A surplus one used
+// to be dropped without a word, so `profiles validate good.yml broken.yml`
+// reported success having read only the first file.
+#[test]
+fn profiles_subcommands_reject_surplus_arguments() {
+    let cases: &[(&[&str], &str)] = &[
+        (&["profiles", "list", "surplus-arg"], "surplus-arg"),
+        (&["profiles", "show", "cisco", "surplus-arg"], "surplus-arg"),
+        (
+            &[
+                "profiles",
+                "validate",
+                "profiles/custom-router.example.yml",
+                "missing-profile.yml",
+            ],
+            "missing-profile.yml",
+        ),
+        (
+            &[
+                "profiles",
+                "test",
+                "cisco",
+                "fixtures/cisco.txt",
+                "surplus-arg",
+            ],
+            "surplus-arg",
+        ),
+    ];
+
+    for (args, surplus) in cases {
+        let output = Command::cargo_bin("prismtty")
+            .expect("binary exists")
+            .args(*args)
+            .output()
+            .expect("command runs");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !output.status.success(),
+            "expected {args:?} to fail, stdout: {:?}, stderr: {stderr:?}",
+            String::from_utf8_lossy(&output.stdout),
+        );
+        assert!(
+            stderr.contains("unexpected") && stderr.contains(surplus),
+            "stderr for {args:?} did not name the surplus argument: {stderr:?}"
+        );
+    }
+}
+
 #[test]
 fn cli_usage_errors_preserve_lines_and_prefix_untrusted_continuations() {
     let output = Command::cargo_bin("prismtty")
@@ -128,6 +176,63 @@ fn stdin_mode_highlights_with_forced_profile() {
         .stdout(predicate::str::contains("192.0.2.1"))
         .stdout(predicate::str::contains("down"))
         .stdout(predicate::str::contains("\u{1b}["));
+}
+
+// Another program can leave `O_NONBLOCK` set on the pipe or terminal prismtty
+// inherits as stdin. A read that finds it empty means "no input yet": the
+// filter waits for it instead of failing with EAGAIN.
+#[test]
+#[cfg(unix)]
+fn stdin_mode_waits_for_input_on_a_nonblocking_stdin() {
+    use std::os::fd::{FromRawFd, OwnedFd};
+
+    let mut fds = [0; 2];
+    // SAFETY: `fds` has room for the two descriptors `pipe` writes; each is
+    // then owned by exactly one `OwnedFd`. The fcntl calls only set flags on
+    // those descriptors: O_NONBLOCK on the read end, and close-on-exec on
+    // the write end so the filter does not inherit it and wait on itself for
+    // end of input.
+    let (read_end, write_end) = unsafe {
+        assert_eq!(libc::pipe(fds.as_mut_ptr()), 0, "pipe");
+        let flags = libc::fcntl(fds[0], libc::F_GETFL);
+        assert_eq!(
+            libc::fcntl(fds[0], libc::F_SETFL, flags | libc::O_NONBLOCK),
+            0,
+            "could not set O_NONBLOCK"
+        );
+        assert_eq!(
+            libc::fcntl(fds[1], libc::F_SETFD, libc::FD_CLOEXEC),
+            0,
+            "could not set FD_CLOEXEC"
+        );
+        (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1]))
+    };
+    let mut empty_config = tempfile::NamedTempFile::new().expect("empty config");
+    writeln!(empty_config, "rules: []").expect("write empty config");
+
+    let child = StdCommand::new(assert_cmd::cargo::cargo_bin("prismtty"))
+        .args(["--profile", "generic", "--config"])
+        .arg(empty_config.path())
+        .stdin(Stdio::from(read_end))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("prismtty starts");
+    // Long enough for the filter to reach its first read of the empty pipe.
+    thread::sleep(Duration::from_millis(300));
+    // A filter that already gave up closed the pipe; its exit status below
+    // is the failure worth reporting, not this write.
+    let mut write_end = fs::File::from(write_end);
+    let _ = write_end.write_all(b"late input\n");
+    drop(write_end);
+
+    let output = child.wait_with_output().expect("prismtty exits");
+    assert!(
+        output.status.success(),
+        "stderr: {:?}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "late input\n");
 }
 
 #[test]
@@ -1464,6 +1569,130 @@ fn show_profile_reports_selected_profiles_to_stderr() {
     cmd.assert().success().stderr(predicate::str::contains(
         "prismtty: profiles selected: generic, juniper",
     ));
+}
+
+// `profiles test` prints a captured fixture to the terminal, so the two flags
+// that remove escapes from program output apply to it as well: with
+// `--sanitize` an OSC 52 clipboard write in the capture must not reach stdout.
+#[test]
+fn profiles_test_applies_sanitize_and_strip_ansi_to_the_fixture() {
+    let mut fixture = tempfile::NamedTempFile::new().expect("fixture");
+    fixture
+        .write_all(b"before\x1b]52;c;U0VDUkVU\x07after \x1b[31mred\x1b[0m plain\n")
+        .expect("write fixture");
+
+    let run = |flag: &str| {
+        let output = Command::cargo_bin("prismtty")
+            .expect("binary exists")
+            .arg(flag)
+            .args(["profiles", "test", "generic"])
+            .arg(fixture.path())
+            .output()
+            .expect("command runs");
+        assert!(output.status.success(), "{flag}: {output:?}");
+        output.stdout
+    };
+
+    let sanitized = run("--sanitize");
+    assert_eq!(
+        String::from_utf8_lossy(&sanitized),
+        "beforeafter \u{1b}[31mred\u{1b}[0m plain\n",
+        "--sanitize keeps colors and drops the string escape"
+    );
+
+    let stripped = run("--strip-ansi");
+    assert_eq!(
+        String::from_utf8_lossy(&stripped),
+        "beforeafter red plain\n",
+        "--strip-ansi drops every source escape"
+    );
+}
+
+// `--show-profile` and `--benchmark` ask for a report, and an input that ends
+// before its first byte is still a run: both reports are written.
+#[test]
+fn empty_input_still_reports_the_profile_and_the_benchmark() {
+    let mut empty_config = tempfile::NamedTempFile::new().expect("empty config");
+    writeln!(empty_config, "rules: []").expect("write empty config");
+
+    let output = Command::cargo_bin("prismtty")
+        .expect("binary exists")
+        .args(["--show-profile", "--benchmark", "--profile", "generic"])
+        .arg("--config")
+        .arg(empty_config.path())
+        .write_stdin("")
+        .output()
+        .expect("command runs");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(output.status.success(), "{stderr:?}");
+    assert!(output.stdout.is_empty(), "{:?}", output.stdout);
+    assert!(
+        stderr.contains("prismtty: profiles selected: generic"),
+        "the profile report is missing: {stderr:?}"
+    );
+    assert!(
+        stderr.contains("Benchmark results (time spent, match count):"),
+        "the benchmark report is missing: {stderr:?}"
+    );
+}
+
+// A vendor's strong signal counts where it begins a word, not inside one:
+// `rhel` in `ServerHello` is not Red Hat. A model or version glued on after
+// it (`Nexus9000`, `rhel9`) still counts.
+#[test]
+fn strong_signals_match_only_where_they_begin_a_word() {
+    let mut empty_config = tempfile::NamedTempFile::new().expect("empty config");
+    writeln!(empty_config, "rules: []").expect("write empty config");
+    let selected = |line: &str| {
+        let output = Command::cargo_bin("prismtty")
+            .expect("binary exists")
+            .arg("--show-profile")
+            .arg("--config")
+            .arg(empty_config.path())
+            .write_stdin(format!("{line}\n"))
+            .output()
+            .expect("command runs");
+        assert!(output.status.success(), "{output:?}");
+        String::from_utf8_lossy(&output.stderr).into_owned()
+    };
+
+    for line in [
+        "TLS handshake: ServerHello received",
+        "route via japan-osaka-1 gateway",
+        "BIOS XE firmware table",
+        "NASA version 2 dataset",
+    ] {
+        // Auto-detection that stays on generic reports nothing.
+        assert_eq!(selected(line), "", "{line:?}");
+    }
+    for (line, profile) in [
+        ("Cisco IOS XE Software, Version 17.9.4", "cisco"),
+        (": ASA Version 9.8(2)", "cisco"),
+        ("sw-version: PAN-OS 10.1.6", "palo-alto"),
+        ("Red Hat Enterprise Linux release 9.3 (RHEL)", "linux-unix"),
+        ("--- JUNOS 22.4R3 Kernel 64-bit", "juniper"),
+        ("cisco Nexus9000 C93180YC-EX chassis", "cisco"),
+        ("Linux build01 5.14.0-362.el9.x86_64 rhel9", "linux-unix"),
+        (
+            "Welcome to Ubuntu2204 (GNU/Linux 5.15.0-91-generic x86_64)",
+            "linux-unix",
+        ),
+        ("Version: FortiGateRugged-60F v7.2.5,build1517", "fortinet"),
+        ("Version: FortiGate-VM64 v7.4.1", "fortinet"),
+        ("Arista Networks EOS shell", "arista"),
+        ("Software image version: 4.31.1F (Arista cEOSLab)", "arista"),
+        ("ArubaOS-CX Version 10.13.1000", "arubacx"),
+        ("Versa Networks FlexVNF software", "versa"),
+        ("versa-flexvnf release 22.1.3", "versa"),
+        ("Model: PA-VM", "palo-alto"),
+    ] {
+        assert!(
+            selected(line).contains(&format!("generic, {profile}")),
+            "{line:?} should select {profile}: {}",
+            selected(line)
+        );
+    }
 }
 
 #[test]

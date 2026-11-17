@@ -321,7 +321,11 @@ fn write_private_file(path: &Path, contents: &[u8]) -> io::Result<()> {
         .write(true)
         .truncate(true)
         .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW)
+        // O_NONBLOCK: opening a FIFO for writing otherwise blocks until it
+        // has a reader. With it the open fails or returns at once, and the
+        // file type check below refuses anything that is not a regular file.
+        // It has no effect on writes to a regular file.
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(path)?;
     ensure_private_runtime_file(&file, path)?;
     file.write_all(contents)
@@ -504,6 +508,40 @@ mod tests {
             std::fs::read_to_string(&target).expect("target reads"),
             "original\n"
         );
+    }
+
+    // Opening a FIFO for writing blocks until something reads it. A FIFO in
+    // place of the reload marker must be refused, not waited on forever.
+    #[cfg(unix)]
+    #[test]
+    fn runtime_write_file_refuses_a_fifo_without_blocking() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let temp = tempfile::tempdir().expect("tempdir creates");
+        let runtime = temp.path().join("runtime");
+        let reload = runtime.join("reload");
+        super::ensure_private_runtime_dir(&runtime).expect("runtime dir creates");
+        let fifo_path =
+            std::ffi::CString::new(reload.as_os_str().as_bytes()).expect("path has no NUL");
+        // SAFETY: `fifo_path` is a valid NUL-terminated path; mkfifo only
+        // creates the FIFO there.
+        assert_eq!(unsafe { libc::mkfifo(fifo_path.as_ptr(), 0o600) }, 0);
+
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let writer_path = reload.clone();
+        let writer = std::thread::spawn(move || {
+            let _ = done_tx.send(super::write_private_file(&writer_path, b"now\n"));
+        });
+        let result = done_rx.recv_timeout(std::time::Duration::from_secs(5));
+        if result.is_err() {
+            // Give the blocked open its reader so the thread can end.
+            let _ = std::fs::File::open(&reload);
+        }
+        writer.join().expect("writer thread ends");
+
+        result
+            .expect("opening the FIFO blocked")
+            .expect_err("a FIFO is not a runtime file");
     }
 
     #[cfg(unix)]

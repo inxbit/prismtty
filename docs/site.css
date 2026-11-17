@@ -524,6 +524,7 @@ a {
   .out .ln:nth-child(3) { --d: 0.86s; }
   .out .ln:nth-child(4) { --d: 1.04s; }
   .out .ln:nth-child(5) { --d: 1.22s; }
+  .out .ln:nth-child(6) { --d: 1.4s; }
 
   .out-raw .ln {
     animation-delay: var(--d);

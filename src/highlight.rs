@@ -1997,8 +1997,7 @@ fn visible_byte_map_and_ansi_ranges(input: &[u8]) -> (Vec<VisibleByte>, Vec<Ansi
             } else {
                 ansi_sequence_end(input, idx)
             };
-            let is_sgr = is_csi_sequence(&input[idx..end])
-                && input.get(end.saturating_sub(1)) == Some(&b'm');
+            let is_sgr = sgr_parameters(&input[idx..end]).is_some();
             let ends_open_control = is_sgr
                 && ansi_ranges.last().is_some_and(|previous: &AnsiRange| {
                     previous.end == idx
@@ -2490,6 +2489,11 @@ impl Highlighter {
             // A rule that hit a runtime error still reports the matches it
             // found around the failing span, so apply them before deciding
             // what the error means for the rest of the session.
+            //
+            // An exclusive rule protects its spans from later rules only, so
+            // they are marked once all of its own capture groups are applied:
+            // group 1 lies inside group 0, which is styled first.
+            let mut exclusive_spans = Vec::new();
             for (start, end, style) in matches {
                 if start >= end || end > styles.len() {
                     continue;
@@ -2505,12 +2509,15 @@ impl Highlighter {
                 {
                     continue;
                 }
-                for idx in start..end {
-                    styles[idx].merge_from(&style);
-                    if rule.exclusive {
-                        protected[idx] = true;
-                    }
+                for cell in &mut styles[start..end] {
+                    cell.merge_from(&style);
                 }
+                if rule.exclusive {
+                    exclusive_spans.push(start..end);
+                }
+            }
+            for span in exclusive_spans {
+                protected[span].fill(true);
             }
 
             // The matches found around a failing span are applied above; the
@@ -3343,14 +3350,9 @@ struct SgrRendition {
 
 impl SgrRendition {
     fn apply_sequence(&mut self, bytes: &[u8]) {
-        let Some(body_start) = csi_introducer_len(bytes) else {
+        let Some(body) = sgr_parameters(bytes) else {
             return;
         };
-        if !bytes.ends_with(b"m") {
-            return;
-        }
-
-        let body = &bytes[body_start..bytes.len() - 1];
         if body.is_empty() {
             self.reset_all();
             return;
@@ -3599,6 +3601,26 @@ fn parse_semicolon_extended_color(parameters: &[&[u8]]) -> ExtendedColorParse {
             consumed: 1,
         },
     }
+}
+
+/// The parameters of `bytes` when it is an SGR: a CSI that ends in `m` and
+/// holds only digits, `;` and `:`. A private marker makes it another control
+/// (`CSI > Pp ; Pv m` is xterm's key modifier option, XTMODKEYS), and a
+/// terminal ignores one with an intermediate byte. A terminal runs a C0
+/// control found inside a CSI and ignores DEL, so neither is a parameter.
+fn sgr_parameters(bytes: &[u8]) -> Option<Vec<u8>> {
+    let (final_byte, body) = bytes[csi_introducer_len(bytes)?..].split_last()?;
+    if *final_byte != b'm' {
+        return None;
+    }
+    let body = body
+        .iter()
+        .copied()
+        .filter(|byte| !byte.is_ascii_control())
+        .collect::<Vec<_>>();
+    body.iter()
+        .all(|byte| byte.is_ascii_digit() || matches!(byte, b';' | b':'))
+        .then_some(body)
 }
 
 fn parse_sgr_number(parameter: &[u8]) -> Option<u16> {
@@ -4406,12 +4428,23 @@ fn is_token_continuation(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'/' | b'.')
 }
 
-/// Removes ANSI escape sequences and returns only visible bytes.
+/// Removes ANSI escape sequences and returns only visible bytes. A terminal
+/// runs the format effectors (backspace through carriage return) it meets
+/// inside an escape sequence or a CSI, so those stay: dropping them with the
+/// control would join the lines around an escape cut short at a line end.
+/// Inside a string control they are payload and go with it.
 pub fn strip_ansi(input: &[u8]) -> Vec<u8> {
     let mut stripped = Vec::new();
     for token in tokenize_ansi(input) {
-        if let Token::Text(text) = token {
-            stripped.extend(text);
+        match token {
+            Token::Text(text) => stripped.extend(text),
+            Token::Ansi(bytes) if StringControlKind::at(&bytes, 0).is_none() => stripped.extend(
+                bytes
+                    .iter()
+                    .copied()
+                    .filter(|byte| matches!(byte, 0x08..=0x0d)),
+            ),
+            Token::Ansi(_) => {}
         }
     }
     stripped
