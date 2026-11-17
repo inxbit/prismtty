@@ -114,6 +114,16 @@ pub(super) fn highlight_stream<R: Read, W: Write>(
     let mut chunk_filter = ChunkFilterState::default();
     let read = reader.read(&mut buffer)?;
     if read == 0 {
+        // An input that ends before its first byte is still a run: the
+        // reports that were asked for are written.
+        session.report_current();
+        if options.benchmark {
+            print_benchmark_report(
+                session.benchmark_report(),
+                input_bytes,
+                started.elapsed().as_secs_f64(),
+            );
+        }
         return Ok(());
     }
 

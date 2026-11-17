@@ -1514,6 +1514,35 @@ fn show_profile_reports_selected_profiles_to_stderr() {
     ));
 }
 
+// `--show-profile` and `--benchmark` ask for a report, and an input that ends
+// before its first byte is still a run: both reports are written.
+#[test]
+fn empty_input_still_reports_the_profile_and_the_benchmark() {
+    let mut empty_config = tempfile::NamedTempFile::new().expect("empty config");
+    writeln!(empty_config, "rules: []").expect("write empty config");
+
+    let output = Command::cargo_bin("prismtty")
+        .expect("binary exists")
+        .args(["--show-profile", "--benchmark", "--profile", "generic"])
+        .arg("--config")
+        .arg(empty_config.path())
+        .write_stdin("")
+        .output()
+        .expect("command runs");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(output.status.success(), "{stderr:?}");
+    assert!(output.stdout.is_empty(), "{:?}", output.stdout);
+    assert!(
+        stderr.contains("prismtty: profiles selected: generic"),
+        "the profile report is missing: {stderr:?}"
+    );
+    assert!(
+        stderr.contains("Benchmark results (time spent, match count):"),
+        "the benchmark report is missing: {stderr:?}"
+    );
+}
+
 #[test]
 fn raw_c1_string_payload_is_not_used_for_profile_detection() {
     let mut empty_config = tempfile::NamedTempFile::new().expect("empty config");
