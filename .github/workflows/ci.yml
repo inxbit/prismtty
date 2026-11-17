@@ -73,6 +73,10 @@ jobs:
           echo "apt could not install the PCRE2 build dependency"
           exit 1
       - run: cargo test --locked
+      # The crate ships an allowlist of files (`include` in Cargo.toml). Build
+      # what would be published here, so a missing file fails a pull request
+      # instead of a release tag that cannot be moved or deleted.
+      - run: cargo package --locked
 
   test:
     name: Test
