@@ -3350,9 +3350,24 @@ impl SgrRendition {
             return;
         }
 
-        let body = &bytes[body_start..bytes.len() - 1];
+        // A terminal runs a C0 control found inside a CSI and ignores DEL;
+        // neither is part of the parameters.
+        let body = bytes[body_start..bytes.len() - 1]
+            .iter()
+            .copied()
+            .filter(|byte| !byte.is_ascii_control())
+            .collect::<Vec<_>>();
         if body.is_empty() {
             self.reset_all();
+            return;
+        }
+        // Only digits, `;` and `:` make an SGR. A private marker makes it
+        // another control (`CSI > 4 ; 1 m` sets xterm's modifyOtherKeys), and
+        // a terminal ignores one with an intermediate byte.
+        if !body
+            .iter()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b';' | b':'))
+        {
             return;
         }
 

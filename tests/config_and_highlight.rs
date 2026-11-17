@@ -334,6 +334,13 @@ rules:
         ("\x1b[32m\x1b7\x1b[33mx\x1b[!p\x1b8", None),
         ("\x1b[32m\x1b[?1049h\x1b[33m\x1b7x\x1b[?1049l", Some("32")),
         ("\x1b[32m\x1b[?1047h\x1b[33mx\x1b[?1047l", Some("33")),
+        // Only digits, `;` and `:` make an SGR. `CSI > 4 ; 1 m` is xterm's
+        // modifyOtherKeys (fish, vim and tmux send it), not bold; a control
+        // with an intermediate byte such as `+` is ignored outright.
+        ("\x1b[32m\x1b[>4;1mx", Some("32")),
+        ("\x1b[32m\x1b[+33mx", Some("32")),
+        // A C0 control inside a CSI is not part of its parameters.
+        ("\x1b[3\x002mx", Some("32")),
     ] {
         let config = PrismConfig::from_chromaterm_yaml(yaml).expect("chromaterm config loads");
         let highlighter = Highlighter::from_config(config).expect("rules compile");
