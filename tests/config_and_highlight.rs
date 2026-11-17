@@ -277,6 +277,32 @@ rules:
     assert!(output.contains("error\x1b[0m\x1b[32m tail"));
 }
 
+// `exclusive` keeps later rules off a match. It must not keep the rule's own
+// capture groups off it: group 1 lies inside group 0, which is styled first.
+#[test]
+fn exclusive_rule_applies_all_of_its_own_overlapping_groups() {
+    let yaml = r##"
+rules:
+  - description: whole match and group
+    regex: (abc)
+    exclusive: true
+    color:
+      0: f#ffffff
+      1: underline
+  - description: later rule
+    regex: abc
+    color: f#ff0000
+"##;
+
+    let config = PrismConfig::from_chromaterm_yaml(yaml).expect("chromaterm config loads");
+    let highlighter = Highlighter::from_config(config).expect("rules compile");
+
+    assert_eq!(
+        highlighter.highlight_str("abc\n"),
+        "\x1b[4;38;2;255;255;255mabc\x1b[0m\n"
+    );
+}
+
 // A terminal runs a line feed or carriage return it meets inside a CSI, as
 // after an escape cut short at a line end. Stripping the control must not
 // join the two lines.

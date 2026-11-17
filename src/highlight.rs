@@ -2490,6 +2490,11 @@ impl Highlighter {
             // A rule that hit a runtime error still reports the matches it
             // found around the failing span, so apply them before deciding
             // what the error means for the rest of the session.
+            //
+            // An exclusive rule protects its spans from later rules only, so
+            // they are marked once all of its own capture groups are applied:
+            // group 1 lies inside group 0, which is styled first.
+            let mut exclusive_spans = Vec::new();
             for (start, end, style) in matches {
                 if start >= end || end > styles.len() {
                     continue;
@@ -2505,12 +2510,15 @@ impl Highlighter {
                 {
                     continue;
                 }
-                for idx in start..end {
-                    styles[idx].merge_from(&style);
-                    if rule.exclusive {
-                        protected[idx] = true;
-                    }
+                for cell in &mut styles[start..end] {
+                    cell.merge_from(&style);
                 }
+                if rule.exclusive {
+                    exclusive_spans.push(start..end);
+                }
+            }
+            for span in exclusive_spans {
+                protected[span].fill(true);
             }
 
             // The matches found around a failing span are applied above; the
