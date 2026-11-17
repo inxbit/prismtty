@@ -23,7 +23,9 @@ use thiserror::Error;
 use crate::config::{
     MAX_PROFILE_TEST_FILE_BYTES, PrismConfig, load_profile_file, read_bounded_regular_file,
 };
-use crate::highlight::{Highlighter, RuleMatchError, StreamingHighlighter};
+use crate::highlight::{
+    Highlighter, RuleMatchError, StreamingHighlighter, strip_ansi, strip_string_escapes,
+};
 use crate::terminal_text::escape_untrusted;
 
 use args::{Action, Options, parse_args, print_help};
@@ -203,6 +205,15 @@ fn run_inner(args: Vec<OsString>) -> Result<ExitCode, CliError> {
         Action::ProfilesTest { profile, fixture } => {
             let input =
                 read_bounded_regular_file(&fixture, MAX_PROFILE_TEST_FILE_BYTES, "fixture")?;
+            // The fixture is printed to the terminal like program output, so
+            // the flags that remove escapes from that output apply to it too.
+            let input = if options.strip_ansi {
+                strip_ansi(&input)
+            } else if options.sanitize {
+                strip_string_escapes(&input)
+            } else {
+                input
+            };
             let store = profile_store()?;
             let config = PrismConfig::from_profiles(&store, &[profile.as_str()])?;
             let highlighter = Highlighter::from_config(config)?;

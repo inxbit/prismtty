@@ -1571,6 +1571,43 @@ fn show_profile_reports_selected_profiles_to_stderr() {
     ));
 }
 
+// `profiles test` prints a captured fixture to the terminal, so the two flags
+// that remove escapes from program output apply to it as well: with
+// `--sanitize` an OSC 52 clipboard write in the capture must not reach stdout.
+#[test]
+fn profiles_test_applies_sanitize_and_strip_ansi_to_the_fixture() {
+    let mut fixture = tempfile::NamedTempFile::new().expect("fixture");
+    fixture
+        .write_all(b"before\x1b]52;c;U0VDUkVU\x07after \x1b[31mred\x1b[0m plain\n")
+        .expect("write fixture");
+
+    let run = |flag: &str| {
+        let output = Command::cargo_bin("prismtty")
+            .expect("binary exists")
+            .arg(flag)
+            .args(["profiles", "test", "generic"])
+            .arg(fixture.path())
+            .output()
+            .expect("command runs");
+        assert!(output.status.success(), "{flag}: {output:?}");
+        output.stdout
+    };
+
+    let sanitized = run("--sanitize");
+    assert_eq!(
+        String::from_utf8_lossy(&sanitized),
+        "beforeafter \u{1b}[31mred\u{1b}[0m plain\n",
+        "--sanitize keeps colors and drops the string escape"
+    );
+
+    let stripped = run("--strip-ansi");
+    assert_eq!(
+        String::from_utf8_lossy(&stripped),
+        "beforeafter red plain\n",
+        "--strip-ansi drops every source escape"
+    );
+}
+
 // `--show-profile` and `--benchmark` ask for a report, and an input that ends
 // before its first byte is still a run: both reports are written.
 #[test]
