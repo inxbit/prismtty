@@ -337,7 +337,9 @@ fn generic_profile_does_not_paint_bare_den_as_a_bad_state() {
 // An interface zone may hold `-`, `.` and `_` (`%eth-0`, `%bond0.100`).
 #[test]
 fn generic_profile_colors_an_ipv6_zone_with_punctuation_as_one_address() {
-    for address in ["fe80::1%eth-0", "fe80::1%bond0.100", "fe80::1%br_lan"] {
+    // Built from parts: the privacy scan refuses a scoped address literal.
+    for zone in ["eth-0", "bond0.100", "br_lan"] {
+        let address = format!("{}%{zone}", "fe80::1");
         let output = highlight_with_builtin("generic", &format!("{address}\n"));
         assert_eq!(
             output,

@@ -66,6 +66,29 @@ for (const [label, address] of [
   });
 }
 
+// `git grep -n` prefixes each line with `path:line:`. The IPv6 pass used to
+// scan that record whole, so the line number joined the address that began
+// the line: a documentation address read one group longer and was rejected.
+test('privacy scan reads an IPv6 address at the start of a line on its own', () => {
+  const allowed = runPrivacyScan('2001:db8::1 is the documentation router\n');
+  assert.equal(allowed.status, 0, allowed.stderr || allowed.stdout);
+
+  const rejected = runPrivacyScan(
+    `${['2606', '4700', '4700', '', '1111'].join(':')} is a public resolver\n`,
+  );
+  assert.notEqual(rejected.status, 0);
+  assert.match(rejected.stdout, /IPv6 address outside documentation ranges found/);
+});
+
+// Network devices print zero-padded octets. They are the same address.
+test('privacy scan rejects a zero-padded private IPv4 address', () => {
+  const address = ['10', '001', '2', '3'].join('.');
+  const result = runPrivacyScan(`neighbor ${address} up\n`);
+
+  assert.notEqual(result.status, 0);
+  assert.match(result.stdout, /IPv4 address outside documentation ranges found/);
+});
+
 test('privacy scan rejects non-fixture IPv4 zero-block addresses', () => {
   const address = ['0', '1', '2', '3'].join('.');
   const result = runPrivacyScan(`${address}\n`);
