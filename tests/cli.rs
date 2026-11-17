@@ -1637,6 +1637,49 @@ fn empty_input_still_reports_the_profile_and_the_benchmark() {
     );
 }
 
+// A vendor's strong signal is a word or phrase, not any run of letters that
+// happens to spell it: `rhel` inside `ServerHello` is not Red Hat.
+#[test]
+fn strong_signals_match_whole_words_only() {
+    let mut empty_config = tempfile::NamedTempFile::new().expect("empty config");
+    writeln!(empty_config, "rules: []").expect("write empty config");
+    let selected = |line: &str| {
+        let output = Command::cargo_bin("prismtty")
+            .expect("binary exists")
+            .arg("--show-profile")
+            .arg("--config")
+            .arg(empty_config.path())
+            .write_stdin(format!("{line}\n"))
+            .output()
+            .expect("command runs");
+        assert!(output.status.success(), "{output:?}");
+        String::from_utf8_lossy(&output.stderr).into_owned()
+    };
+
+    for line in [
+        "TLS handshake: ServerHello received",
+        "route via japan-osaka-1 gateway",
+        "BIOS XE firmware table",
+        "NASA version 2 dataset",
+    ] {
+        // Auto-detection that stays on generic reports nothing.
+        assert_eq!(selected(line), "", "{line:?}");
+    }
+    for (line, profile) in [
+        ("Cisco IOS XE Software, Version 17.9.4", "cisco"),
+        (": ASA Version 9.8(2)", "cisco"),
+        ("sw-version: PAN-OS 10.1.6", "palo-alto"),
+        ("Red Hat Enterprise Linux release 9.3 (RHEL)", "linux-unix"),
+        ("--- JUNOS 22.4R3 Kernel 64-bit", "juniper"),
+    ] {
+        assert!(
+            selected(line).contains(&format!("generic, {profile}")),
+            "{line:?} should select {profile}: {}",
+            selected(line)
+        );
+    }
+}
+
 #[test]
 fn raw_c1_string_payload_is_not_used_for_profile_detection() {
     let mut empty_config = tempfile::NamedTempFile::new().expect("empty config");

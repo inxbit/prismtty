@@ -1220,6 +1220,8 @@ impl PromptMatcherKind {
     }
 }
 
+/// Case-insensitive search of `needle` as a whole word or phrase; see
+/// `is_whole_word_match`.
 fn contains_case_insensitive(haystack: &str, needle: &str) -> bool {
     if needle.is_empty() {
         return true;
@@ -1233,7 +1235,22 @@ fn contains_case_insensitive(haystack: &str, needle: &str) -> bool {
         end <= haystack.len()
             && haystack.is_char_boundary(end)
             && haystack.as_bytes()[start..end].eq_ignore_ascii_case(needle.as_bytes())
+            && is_whole_word_match(haystack, needle, start, end)
     })
+}
+
+/// A signal is a word or phrase, not any run of letters that spells it: where
+/// the needle starts or ends with a word byte, the match at `start..end` may
+/// not continue a word on that side. `rhel` is then not found in
+/// `ServerHello`, nor `ios xe` in `BIOS XE`, while a needle that ends in
+/// punctuation (`versa-`) still matches as a prefix.
+fn is_whole_word_match(haystack: &str, needle: &str, start: usize, end: usize) -> bool {
+    let is_word = |byte: Option<&u8>| byte.is_some_and(|byte| is_detection_word_byte(*byte));
+    let haystack = haystack.as_bytes();
+    let needle = needle.as_bytes();
+    let continues_before = start > 0 && is_word(haystack.get(start - 1)) && is_word(needle.first());
+    let continues_after = is_word(haystack.get(end)) && is_word(needle.last());
+    !continues_before && !continues_after
 }
 
 /// Case-insensitive search of `needle` in an ASCII-lowercased haystack.
@@ -1241,7 +1258,9 @@ fn contains_in_lower(lower: &str, needle: &str) -> bool {
     if needle.bytes().any(|byte| byte.is_ascii_uppercase()) {
         contains_case_insensitive(lower, needle)
     } else {
-        lower.contains(needle)
+        lower.match_indices(needle).any(|(start, matched)| {
+            is_whole_word_match(lower, needle, start, start + matched.len())
+        })
     }
 }
 
