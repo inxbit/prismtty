@@ -252,14 +252,17 @@ fn run_stdin(options: Options) -> Result<ExitCode, CliError> {
     let trace = IoTrace::open(options.trace_io.as_deref())?;
     let (_registration, reload_watcher) = register_for_reload();
     let stdin = io::stdin();
-    // As in PTY mode, another program on the terminal can leave stdout
-    // non-blocking.
+    // As in PTY mode, another program on the terminal or pipe can leave
+    // stdin and stdout non-blocking.
     let mut stdout = WaitWhenWouldBlock {
         fd: stdout.as_raw_fd(),
         inner: stdout,
     };
     highlight_stream(
-        stdin.lock(),
+        WaitWhenWouldBlock {
+            fd: stdin.as_raw_fd(),
+            inner: stdin.lock(),
+        },
         &mut stdout,
         prepared,
         InputSource {

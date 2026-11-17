@@ -178,6 +178,63 @@ fn stdin_mode_highlights_with_forced_profile() {
         .stdout(predicate::str::contains("\u{1b}["));
 }
 
+// Another program can leave `O_NONBLOCK` set on the pipe or terminal prismtty
+// inherits as stdin. A read that finds it empty means "no input yet": the
+// filter waits for it instead of failing with EAGAIN.
+#[test]
+#[cfg(unix)]
+fn stdin_mode_waits_for_input_on_a_nonblocking_stdin() {
+    use std::os::fd::{FromRawFd, OwnedFd};
+
+    let mut fds = [0; 2];
+    // SAFETY: `fds` has room for the two descriptors `pipe` writes; each is
+    // then owned by exactly one `OwnedFd`. The fcntl calls only set flags on
+    // those descriptors: O_NONBLOCK on the read end, and close-on-exec on
+    // the write end so the filter does not inherit it and wait on itself for
+    // end of input.
+    let (read_end, write_end) = unsafe {
+        assert_eq!(libc::pipe(fds.as_mut_ptr()), 0, "pipe");
+        let flags = libc::fcntl(fds[0], libc::F_GETFL);
+        assert_eq!(
+            libc::fcntl(fds[0], libc::F_SETFL, flags | libc::O_NONBLOCK),
+            0,
+            "could not set O_NONBLOCK"
+        );
+        assert_eq!(
+            libc::fcntl(fds[1], libc::F_SETFD, libc::FD_CLOEXEC),
+            0,
+            "could not set FD_CLOEXEC"
+        );
+        (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1]))
+    };
+    let mut empty_config = tempfile::NamedTempFile::new().expect("empty config");
+    writeln!(empty_config, "rules: []").expect("write empty config");
+
+    let child = StdCommand::new(assert_cmd::cargo::cargo_bin("prismtty"))
+        .args(["--profile", "generic", "--config"])
+        .arg(empty_config.path())
+        .stdin(Stdio::from(read_end))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("prismtty starts");
+    // Long enough for the filter to reach its first read of the empty pipe.
+    thread::sleep(Duration::from_millis(300));
+    // A filter that already gave up closed the pipe; its exit status below
+    // is the failure worth reporting, not this write.
+    let mut write_end = fs::File::from(write_end);
+    let _ = write_end.write_all(b"late input\n");
+    drop(write_end);
+
+    let output = child.wait_with_output().expect("prismtty exits");
+    assert!(
+        output.status.success(),
+        "stderr: {:?}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "late input\n");
+}
+
 #[test]
 fn wrapped_command_can_trace_pty_output_bytes() {
     let trace = tempfile::NamedTempFile::new().expect("trace file");
