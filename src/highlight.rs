@@ -1997,8 +1997,7 @@ fn visible_byte_map_and_ansi_ranges(input: &[u8]) -> (Vec<VisibleByte>, Vec<Ansi
             } else {
                 ansi_sequence_end(input, idx)
             };
-            let is_sgr = is_csi_sequence(&input[idx..end])
-                && input.get(end.saturating_sub(1)) == Some(&b'm');
+            let is_sgr = sgr_parameters(&input[idx..end]).is_some();
             let ends_open_control = is_sgr
                 && ansi_ranges.last().is_some_and(|previous: &AnsiRange| {
                     previous.end == idx
@@ -3351,31 +3350,11 @@ struct SgrRendition {
 
 impl SgrRendition {
     fn apply_sequence(&mut self, bytes: &[u8]) {
-        let Some(body_start) = csi_introducer_len(bytes) else {
+        let Some(body) = sgr_parameters(bytes) else {
             return;
         };
-        if !bytes.ends_with(b"m") {
-            return;
-        }
-
-        // A terminal runs a C0 control found inside a CSI and ignores DEL;
-        // neither is part of the parameters.
-        let body = bytes[body_start..bytes.len() - 1]
-            .iter()
-            .copied()
-            .filter(|byte| !byte.is_ascii_control())
-            .collect::<Vec<_>>();
         if body.is_empty() {
             self.reset_all();
-            return;
-        }
-        // Only digits, `;` and `:` make an SGR. A private marker makes it
-        // another control (`CSI > 4 ; 1 m` sets xterm's modifyOtherKeys), and
-        // a terminal ignores one with an intermediate byte.
-        if !body
-            .iter()
-            .all(|byte| byte.is_ascii_digit() || matches!(byte, b';' | b':'))
-        {
             return;
         }
 
@@ -3622,6 +3601,26 @@ fn parse_semicolon_extended_color(parameters: &[&[u8]]) -> ExtendedColorParse {
             consumed: 1,
         },
     }
+}
+
+/// The parameters of `bytes` when it is an SGR: a CSI that ends in `m` and
+/// holds only digits, `;` and `:`. A private marker makes it another control
+/// (`CSI > Pp ; Pv m` is xterm's key modifier option, XTMODKEYS), and a
+/// terminal ignores one with an intermediate byte. A terminal runs a C0
+/// control found inside a CSI and ignores DEL, so neither is a parameter.
+fn sgr_parameters(bytes: &[u8]) -> Option<Vec<u8>> {
+    let (final_byte, body) = bytes[csi_introducer_len(bytes)?..].split_last()?;
+    if *final_byte != b'm' {
+        return None;
+    }
+    let body = body
+        .iter()
+        .copied()
+        .filter(|byte| !byte.is_ascii_control())
+        .collect::<Vec<_>>();
+    body.iter()
+        .all(|byte| byte.is_ascii_digit() || matches!(byte, b';' | b':'))
+        .then_some(body)
 }
 
 fn parse_sgr_number(parameter: &[u8]) -> Option<u16> {

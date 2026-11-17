@@ -372,8 +372,8 @@ rules:
         ("\x1b[32m\x1b[?1049h\x1b[33m\x1b7x\x1b[?1049l", Some("32")),
         ("\x1b[32m\x1b[?1047h\x1b[33mx\x1b[?1047l", Some("33")),
         // Only digits, `;` and `:` make an SGR. `CSI > 4 ; 1 m` is xterm's
-        // modifyOtherKeys (fish, vim and tmux send it), not bold; a control
-        // with an intermediate byte such as `+` is ignored outright.
+        // key modifier option (XTMODKEYS), not bold; a control with an
+        // intermediate byte such as `+` is ignored outright.
         ("\x1b[32m\x1b[>4;1mx", Some("32")),
         ("\x1b[32m\x1b[+33mx", Some("32")),
         // A C0 control inside a CSI is not part of its parameters.
@@ -2291,6 +2291,31 @@ fn interactive_streaming_highlighter_neutralizes_source_sgr_on_fortinet_prompt_e
 
     assert_eq!(strip_ansi(output.as_bytes()), strip_ansi(input.as_bytes()));
     assert_all_token_occurrences_have_no_foreground(&output, "diagnose");
+}
+
+// Neutralizing a prompt's color removes its SGR controls and nothing else. A
+// control that only ends in `m`, such as xterm's key modifier option
+// `CSI > 4 ; 1 m` (XTMODKEYS), changes how the terminal reports keys and must
+// reach it.
+#[test]
+fn interactive_streaming_highlighter_keeps_non_sgr_controls_when_neutralizing_prompt_echo_sgr() {
+    let store = ProfileStore::builtin();
+    let config = PrismConfig::from_profiles(&store, &["fortinet"]).expect("fortinet loads");
+    let highlighter = Highlighter::from_config(config).expect("rules compile");
+    let mut streaming = new_interactive_streaming(highlighter);
+
+    let input = concat!(
+        "\x1b[38;2;255;255;255mFGT01 # ",
+        "\x1b[>4;1m",
+        "\x1b[38;2;255;0;255mdiagnose "
+    );
+    let output = streaming.push_str(input);
+
+    assert_all_token_occurrences_have_no_foreground(&output, "diagnose");
+    assert!(
+        output.contains("\x1b[>4;1m"),
+        "the key modifier control was removed with the colors: {output:?}"
+    );
 }
 
 #[test]
