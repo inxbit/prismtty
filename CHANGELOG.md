@@ -33,10 +33,11 @@ All notable changes to PrismTTY are documented here.
 - Let an exclusive rule style all of its own capture groups. With colors on
   groups 0 and 1, group 1 was skipped because group 0 had already protected
   the span.
-- Match a profile's strong signals as whole words. `rhel` inside
-  `ServerHello` selected linux-unix, `ios xe` inside `BIOS XE` and
+- Match a profile's strong signals only where they begin a word. `rhel`
+  inside `ServerHello` selected linux-unix, `ios xe` inside `BIOS XE` and
   `asa version` inside `NASA version` selected cisco, and `pan-os` inside
-  `japan-osaka` selected palo-alto.
+  `japan-osaka` selected palo-alto. A model or version glued on after the
+  signal (`Nexus9000`, `rhel9`) still matches.
 - Skip SS3 keys whole in `--local-echo`. An arrow or function key sent in
   application mode (`ESC O A`) was echoed as `OA`.
 - Reject a numeric capture key that does not fit the platform's `usize`. On

@@ -1637,10 +1637,11 @@ fn empty_input_still_reports_the_profile_and_the_benchmark() {
     );
 }
 
-// A vendor's strong signal is a word or phrase, not any run of letters that
-// happens to spell it: `rhel` inside `ServerHello` is not Red Hat.
+// A vendor's strong signal counts where it begins a word, not inside one:
+// `rhel` in `ServerHello` is not Red Hat. A model or version glued on after
+// it (`Nexus9000`, `rhel9`) still counts.
 #[test]
-fn strong_signals_match_whole_words_only() {
+fn strong_signals_match_only_where_they_begin_a_word() {
     let mut empty_config = tempfile::NamedTempFile::new().expect("empty config");
     writeln!(empty_config, "rules: []").expect("write empty config");
     let selected = |line: &str| {
@@ -1671,6 +1672,20 @@ fn strong_signals_match_whole_words_only() {
         ("sw-version: PAN-OS 10.1.6", "palo-alto"),
         ("Red Hat Enterprise Linux release 9.3 (RHEL)", "linux-unix"),
         ("--- JUNOS 22.4R3 Kernel 64-bit", "juniper"),
+        ("cisco Nexus9000 C93180YC-EX chassis", "cisco"),
+        ("Linux build01 5.14.0-362.el9.x86_64 rhel9", "linux-unix"),
+        (
+            "Welcome to Ubuntu2204 (GNU/Linux 5.15.0-91-generic x86_64)",
+            "linux-unix",
+        ),
+        ("Version: FortiGateRugged-60F v7.2.5,build1517", "fortinet"),
+        ("Version: FortiGate-VM64 v7.4.1", "fortinet"),
+        ("Arista Networks EOS shell", "arista"),
+        ("Software image version: 4.31.1F (Arista cEOSLab)", "arista"),
+        ("ArubaOS-CX Version 10.13.1000", "arubacx"),
+        ("Versa Networks FlexVNF software", "versa"),
+        ("versa-flexvnf release 22.1.3", "versa"),
+        ("Model: PA-VM", "palo-alto"),
     ] {
         assert!(
             selected(line).contains(&format!("generic, {profile}")),
