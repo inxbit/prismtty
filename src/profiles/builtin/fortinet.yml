@@ -23,7 +23,7 @@ profile:
     prompt_confidence: single_from_baseline_or_remote_hint
 rules:
   - description: Fortinet prompt
-    regex: '(?m)^[A-Za-z0-9_.-]+ #'
+    regex: '(?m)^[A-Za-z0-9_.-]+( \([^)\r\n]+\))? #'
     color: f#ffffff
   - description: Fortinet terms
     regex: '(?i)\b(vdom|policyid|srcintf|dstintf|utm|ipsec|phase1|phase2|diagnose|vd-root)\b'

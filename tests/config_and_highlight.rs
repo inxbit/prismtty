@@ -277,6 +277,113 @@ rules:
     assert!(output.contains("error\x1b[0m\x1b[32m tail"));
 }
 
+fn highlight_with_builtin(profile: &str, input: &str) -> String {
+    let store = ProfileStore::builtin();
+    let config = PrismConfig::from_profiles(&store, &[profile]).expect("profile loads");
+    Highlighter::from_config(config)
+        .expect("rules compile")
+        .highlight_str(input)
+}
+
+const GREEN: &str = "\x1b[38;2;0;255;0m";
+const RED_BOLD: &str = "\x1b[1;38;2;255;0;0m";
+
+// A good-state word after `not` reports a fault. It must not be painted
+// green, whatever the spacing a device aligns its columns with.
+#[test]
+fn generic_profile_does_not_paint_a_negated_good_state_green() {
+    for line in [
+        "route is not reachable\n",
+        "interface is not  connected\n",
+        "peer is not\tconnected\n",
+        "clock is not synchronized\n",
+        "license is not valid\n",
+        "port is not-connected\n",
+    ] {
+        let output = highlight_with_builtin("generic", line);
+        assert!(!output.contains(GREEN), "{line:?} -> {output:?}");
+    }
+    for (line, phrase) in [
+        ("route is not reachable\n", "not reachable"),
+        ("interface is not  connected\n", "not  connected"),
+    ] {
+        let output = highlight_with_builtin("generic", line);
+        assert!(
+            output.contains(&format!("{RED_BOLD}{phrase}\x1b[0m")),
+            "{line:?} -> {output:?}"
+        );
+    }
+    // The plain forms keep their color.
+    for line in ["route is reachable\n", "port is connected\n", "link up\n"] {
+        let output = highlight_with_builtin("generic", line);
+        assert!(output.contains(GREEN), "{line:?} -> {output:?}");
+    }
+}
+
+// `den` alone is a site code or a word, not a denial.
+#[test]
+fn generic_profile_does_not_paint_bare_den_as_a_bad_state() {
+    let output = highlight_with_builtin("generic", "den-core-01 uplink to DEN2; lion den\n");
+    assert!(!output.contains(RED_BOLD), "{output:?}");
+    for word in ["deny", "denies", "denied"] {
+        let output = highlight_with_builtin("generic", &format!("acl {word} tcp\n"));
+        assert!(
+            output.contains(&format!("{RED_BOLD}{word}\x1b[0m")),
+            "{output:?}"
+        );
+    }
+}
+
+// An interface zone may hold `-`, `.` and `_` (`%eth-0`, `%bond0.100`).
+#[test]
+fn generic_profile_colors_an_ipv6_zone_with_punctuation_as_one_address() {
+    for address in ["fe80::1%eth-0", "fe80::1%bond0.100", "fe80::1%br_lan"] {
+        let output = highlight_with_builtin("generic", &format!("{address}\n"));
+        assert_eq!(
+            output,
+            format!("\x1b[38;2;0;255;255m{address}\x1b[0m\n"),
+            "{address}"
+        );
+    }
+}
+
+// Configuration-context prompts are prompts too, and PAN-OS names aggregate
+// interfaces `aeN` and `aeN.M`.
+#[test]
+fn vendor_profiles_color_context_prompts_and_aggregate_interfaces() {
+    for (profile, line, colored) in [
+        ("arubacx", "switch(config)# vlan 10\n", "switch(config)#"),
+        (
+            "arubacx",
+            "switch(config-if)# no shutdown\n",
+            "switch(config-if)#",
+        ),
+        ("arubacx", "switch# show vlan\n", "switch#"),
+        (
+            "fortinet",
+            "FGT-01 (global) # get system status\n",
+            "FGT-01 (global) #",
+        ),
+        (
+            "fortinet",
+            "FGT-01 (interface) # edit port1\n",
+            "FGT-01 (interface) #",
+        ),
+        ("fortinet", "FGT-01 # get system status\n", "FGT-01 #"),
+        ("palo-alto", "ae1.107 vsys1\n", "ae1.107"),
+        ("palo-alto", "ae2 vsys1\n", "ae2"),
+    ] {
+        let output = highlight_with_builtin(profile, line);
+        let start = output.find(colored).unwrap_or_else(|| {
+            panic!("{profile}: {colored:?} was split by a style change in {output:?}")
+        });
+        assert!(
+            output[..start].ends_with('m') && output[start + colored.len()..].starts_with("\x1b["),
+            "{profile}: {colored:?} is not one colored span in {output:?}"
+        );
+    }
+}
+
 // `exclusive` keeps later rules off a match. It must not keep the rule's own
 // capture groups off it: group 1 lies inside group 0, which is styled first.
 #[test]

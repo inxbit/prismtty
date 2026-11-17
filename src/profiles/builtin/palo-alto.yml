@@ -20,7 +20,7 @@ rules:
     regex: '(?m)^[A-Za-z0-9_.-]+@[^>#\n]+[>#]'
     color: f#00bfff
   - description: PAN-OS interface
-    regex: '(?i)\b(ethernet\d+/\d+(\.\d+)?|tunnel\.\d+|loopback\.\d+)\b'
+    regex: '(?i)\b(ethernet\d+/\d+(\.\d+)?|ae\d+(\.\d+)?|tunnel\.\d+|loopback\.\d+)\b'
     color: f#0099ff
   - description: PAN-OS terms
     regex: '(?i)\b(vsys\d*|security-policy|nat-policy|globalprotect|wildfire|threat|url-filtering|ha\d?|panorama)\b'
