@@ -138,6 +138,14 @@ fn open_trace_file(path: &Path) -> io::Result<File> {
             ),
         ));
     }
+    // A second hard link is a second name for the same file: the trace would
+    // be appended to whatever else that name is used for.
+    if metadata.nlink() != 1 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("trace file has more than one hard link: {}", path.display()),
+        ));
+    }
     // Writes keep their usual blocking semantics; O_APPEND is preserved.
     let fd = file.as_raw_fd();
     // SAFETY: `fd` is the open descriptor owned by `file`; F_GETFL only reads
@@ -274,6 +282,31 @@ mod tests {
             .expect("trace symlink should be rejected");
 
         assert_ne!(error.kind(), std::io::ErrorKind::NotFound);
+        assert_eq!(
+            std::fs::read_to_string(&target).expect("target reads"),
+            "original\n"
+        );
+    }
+
+    // A second name for a file is a second way to reach it: the trace must
+    // not be appended to whatever else the path was hard-linked to.
+    #[cfg(unix)]
+    #[test]
+    fn trace_file_rejects_a_hard_linked_target() {
+        let dir = tempfile::tempdir().expect("tempdir creates");
+        let target = dir.path().join("target.log");
+        let path = dir.path().join("trace.log");
+        std::fs::write(&target, "original\n").expect("target writes");
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600))
+            .expect("mode sets");
+        std::fs::hard_link(&target, &path).expect("hard link creates");
+
+        let trace = super::IoTrace::open(Some(&path));
+        if let Ok(trace) = &trace {
+            trace.log("OUT", b"secret");
+        }
+
+        assert!(trace.is_err(), "a hard-linked trace file was accepted");
         assert_eq!(
             std::fs::read_to_string(&target).expect("target reads"),
             "original\n"
