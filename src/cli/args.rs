@@ -191,6 +191,22 @@ fn parse_profiles_command(
         .map(|arg| arg.to_string_lossy().to_string())
         .unwrap_or_else(|| "list".to_string());
 
+    // Each subcommand reads a fixed number of arguments. A surplus one is an
+    // error rather than dropped, so `profiles validate a.yml b.yml` cannot
+    // report success having read only `a.yml`.
+    let expected_args = match subcommand.as_str() {
+        "list" => 1,
+        "show" | "validate" => 2,
+        "test" => 3,
+        _ => usize::MAX,
+    };
+    if let Some(surplus) = args.get(expected_args) {
+        return Err(CliError::Usage(format!(
+            "profiles {subcommand} unexpected argument '{}'",
+            escape_untrusted(&surplus.to_string_lossy())
+        )));
+    }
+
     match subcommand.as_str() {
         "list" => Ok((options, Action::ProfilesList)),
         "show" => {

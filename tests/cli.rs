@@ -88,6 +88,54 @@ fn cli_usage_errors_include_context_without_pinning_clap_wording() {
     }
 }
 
+// A profiles subcommand takes a fixed number of arguments. A surplus one used
+// to be dropped without a word, so `profiles validate good.yml broken.yml`
+// reported success having read only the first file.
+#[test]
+fn profiles_subcommands_reject_surplus_arguments() {
+    let cases: &[(&[&str], &str)] = &[
+        (&["profiles", "list", "surplus-arg"], "surplus-arg"),
+        (&["profiles", "show", "cisco", "surplus-arg"], "surplus-arg"),
+        (
+            &[
+                "profiles",
+                "validate",
+                "profiles/custom-router.example.yml",
+                "missing-profile.yml",
+            ],
+            "missing-profile.yml",
+        ),
+        (
+            &[
+                "profiles",
+                "test",
+                "cisco",
+                "fixtures/cisco.txt",
+                "surplus-arg",
+            ],
+            "surplus-arg",
+        ),
+    ];
+
+    for (args, surplus) in cases {
+        let output = Command::cargo_bin("prismtty")
+            .expect("binary exists")
+            .args(*args)
+            .output()
+            .expect("command runs");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !output.status.success(),
+            "expected {args:?} to fail, stdout: {:?}, stderr: {stderr:?}",
+            String::from_utf8_lossy(&output.stdout),
+        );
+        assert!(
+            stderr.contains("unexpected") && stderr.contains(surplus),
+            "stderr for {args:?} did not name the surplus argument: {stderr:?}"
+        );
+    }
+}
+
 #[test]
 fn cli_usage_errors_preserve_lines_and_prefix_untrusted_continuations() {
     let output = Command::cargo_bin("prismtty")
