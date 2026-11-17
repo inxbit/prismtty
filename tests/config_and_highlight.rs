@@ -417,6 +417,7 @@ rules:
 fn strip_ansi_keeps_the_line_controls_inside_a_csi() {
     assert_eq!(strip_ansi(b"A\x1b[31\nmB"), b"A\nB");
     assert_eq!(strip_ansi(b"text\x1b[\r\nnext"), b"text\r\next");
+    assert_eq!(strip_ansi(b"line1\x1b\r\nnext"), b"line1\r\next");
     // A string control's payload is not run: none of it survives.
     assert_eq!(strip_ansi(b"A\x1b]0;ti\ntle\x07B"), b"AB");
 }
