@@ -697,13 +697,18 @@ fn parse_capture_ref(
 ) -> Result<CaptureRef, ConfigError> {
     match value {
         serde_norway::Value::Number(number) => {
-            let Some(group) = number.as_u64() else {
+            // `try_from`, not `as`: on a 32-bit target a cast would wrap
+            // 4294967296 to group 0, the whole match.
+            let Some(group) = number
+                .as_u64()
+                .and_then(|group| usize::try_from(group).ok())
+            else {
                 return Err(ConfigError::InvalidCaptureKey {
                     description: escape_untrusted(description),
                     key: escape_untrusted(&number.to_string()),
                 });
             };
-            Ok(CaptureRef::Index(group as usize))
+            Ok(CaptureRef::Index(group))
         }
         serde_norway::Value::String(name) => parse_capture_ref_string(description, name),
         other => Err(ConfigError::InvalidCaptureKey {
