@@ -18,13 +18,13 @@ rules:
     color: f#ff9aff
     exclusive: true
   - description: bad operational state
-    regex: '(?i)\b(password|abnormal(ly)?|down|los(t|s|ing)|err(or(s)?)?|den(y|ies|ied)|reject(ing|ed)?|drop(ped|s)?|fail(s|ed|ures?)?|not[ \t-]{1,2}(connect(ed)?|reachable)|disconnect(ed)?|unreachable|invalid|bad|notconnect|unusable|blocking|blocked|collision(s)?|unsynchronized|mismatch|runts|CRC|resets)\b'
+    regex: '(?i)\b(password|abnormal(ly)?|down|los(t|s|ing)|err(or(s)?)?|den(y|ies|ied)|reject(ing|ed)?|drop(ped|s)?|fail(s|ed|ures?)?|not[ \t-]+(connect(ed)?|reachable)|disconnect(ed)?|unreachable|invalid|bad|notconnect|unusable|blocking|blocked|collision(s)?|unsynchronized|mismatch|runts|CRC|resets)\b'
     color: f#ff0000 bold
   - description: warning state
     regex: '(?i)\b(warning(s)?|degraded|standby|learning|listening|passive)\b'
     color: f#ffff00
   - description: good operational state
-    regex: '(?i)\b(?<!not )(?<!not-)(?<!not  )(?<!not\t)(up|ok(ay)?|permit(t?ed|s)?|accept(s|ed)?|enable(d)?|online|succe((ss(ful|fully)?)|ed(ed)?)?|connect(ed)?|reachable|valid|forwarding|synchronized|active)\b'
+    regex: '(?i)\bnot[ \t-]+(?&good)\b(*SKIP)(*F)|\b(?<good>up|ok(ay)?|permit(t?ed|s)?|accept(s|ed)?|enable(d)?|online|succe((ss(ful|fully)?)|ed(ed)?)?|connect(ed)?|reachable|valid|forwarding|synchronized|active)\b'
     color: f#00ff00
   - description: syslog severe
     regex: '(%\w+(?:-\w+)?-[0-3]-\w+)\b'

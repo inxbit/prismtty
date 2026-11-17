@@ -286,6 +286,7 @@ fn highlight_with_builtin(profile: &str, input: &str) -> String {
 }
 
 const GREEN: &str = "\x1b[38;2;0;255;0m";
+const GREEN_FOREGROUND: &str = "38;2;0;255;0m";
 const RED_BOLD: &str = "\x1b[1;38;2;255;0;0m";
 
 // A good-state word after `not` reports a fault. It must not be painted
@@ -296,16 +297,22 @@ fn generic_profile_does_not_paint_a_negated_good_state_green() {
         "route is not reachable\n",
         "interface is not  connected\n",
         "peer is not\tconnected\n",
+        "peer is not \tconnected\n",
+        "peer is not   connected\n",
+        "peer is not        reachable\n",
         "clock is not synchronized\n",
         "license is not valid\n",
         "port is not-connected\n",
     ] {
         let output = highlight_with_builtin("generic", line);
-        assert!(!output.contains(GREEN), "{line:?} -> {output:?}");
+        // Whatever attributes it is merged with, no green foreground.
+        assert!(!output.contains(GREEN_FOREGROUND), "{line:?} -> {output:?}");
     }
     for (line, phrase) in [
         ("route is not reachable\n", "not reachable"),
         ("interface is not  connected\n", "not  connected"),
+        ("peer is not \tconnected\n", "not \tconnected"),
+        ("peer is not        reachable\n", "not        reachable"),
     ] {
         let output = highlight_with_builtin("generic", line);
         assert!(
@@ -314,7 +321,13 @@ fn generic_profile_does_not_paint_a_negated_good_state_green() {
         );
     }
     // The plain forms keep their color.
-    for line in ["route is reachable\n", "port is connected\n", "link up\n"] {
+    for line in [
+        "route is reachable\n",
+        "port is connected\n",
+        "link up\n",
+        "cannot connect, then connected\n",
+        "notable uptime: link up\n",
+    ] {
         let output = highlight_with_builtin("generic", line);
         assert!(output.contains(GREEN), "{line:?} -> {output:?}");
     }

@@ -1476,12 +1476,13 @@ fn local_echo_escape_step(input: &[u8], idx: usize) -> LocalEchoStep {
         return LocalEchoStep::Incomplete;
     };
     // SS3: an arrow or function key in application mode, `ESC O` plus one
-    // final byte.
+    // final byte. Anything else after `ESC O` is not a key: the `O` and what
+    // follows are handled as typed.
     if *next == b'O' {
-        return if idx + 2 < input.len() {
-            LocalEchoStep::Skip(idx + 3)
-        } else {
-            LocalEchoStep::Incomplete
+        return match input.get(idx + 2) {
+            None => LocalEchoStep::Incomplete,
+            Some(0x40..=0x7e) => LocalEchoStep::Skip(idx + 3),
+            Some(_) => LocalEchoStep::Skip(idx + 1),
         };
     }
     if *next != b'[' {
@@ -2806,6 +2807,10 @@ mod tests {
         let mut echo = super::LocalEchoState::default();
         assert!(echo.push(b"\x1bO").is_empty());
         assert_eq!(echo.push(b"Ax"), b"x");
+
+        // Only a final byte completes the key. Escape, `O`, Enter typed one
+        // after the other must still echo the line break.
+        assert_eq!(super::local_echo_bytes(b"x\x1bO\ry\r"), b"xO\r\ny\r\n");
     }
 
     #[test]
