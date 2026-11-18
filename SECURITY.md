@@ -50,6 +50,15 @@ examples that preserve only the token shape needed to reproduce the issue.
   `(?=.*foo)`) can still consume substantial CPU on long lines. PrismTTY also
   warns once per session when a rule crosses five seconds of cumulative
   matching time; use `--benchmark` to identify slow rules in a config.
+- A raw byte `90`, `98`, `9D`, `9E` or `9F` that is not part of a UTF-8
+  character opens a string control only on a terminal that is not in UTF-8
+  mode. PrismTTY reads it that way unless the locale says UTF-8 (the first of
+  `LC_ALL`, `LC_CTYPE` and `LANG` that is set). In a UTF-8 locale such a
+  string ends at the end of its line, so a stray byte from line noise or a
+  legacy code page cannot hide the rest of the session; `--sanitize` still
+  removes the byte and the rest of that line. In any other locale, or with
+  none set, the string runs to its terminator and everything after an
+  unterminated one is withheld.
 - By default PrismTTY is a transparent wrapper: escape sequences from the
   wrapped program pass through unchanged, exactly like `ssh` or `tmux`. When
   working against untrusted remote devices, `--sanitize` strips string-type

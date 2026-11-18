@@ -1695,6 +1695,117 @@ fn strong_signals_match_only_where_they_begin_a_word() {
     }
 }
 
+/// Runs the filter over `input` with exactly the given locale variables.
+fn filter_with_locale(
+    config: &std::path::Path,
+    flags: &[&str],
+    locale: &[(&str, &str)],
+    input: &[u8],
+) -> Vec<u8> {
+    let mut command = Command::cargo_bin("prismtty").expect("binary exists");
+    command
+        .args(["--rgb", "--no-auto-detect", "--config"])
+        .arg(config)
+        .args(flags)
+        .env_remove("LC_ALL")
+        .env_remove("LC_CTYPE")
+        .env_remove("LANG");
+    for (name, value) in locale {
+        command.env(name, value);
+    }
+    let output = command
+        .write_stdin(input.to_vec())
+        .output()
+        .expect("command runs");
+    assert!(output.status.success(), "{output:?}");
+    output.stdout
+}
+
+fn config_that_paints_up_green() -> tempfile::NamedTempFile {
+    let mut config = tempfile::NamedTempFile::new().expect("config");
+    writeln!(
+        config,
+        "rules:\n  - description: up\n    regex: \\bup\\b\n    color: f#00ff00"
+    )
+    .expect("write config");
+    config
+}
+
+// A raw byte from 90, 98, 9D, 9E or 9F opens a string control only on a
+// terminal that is not in UTF-8 mode. On a UTF-8 terminal it is an invalid
+// byte, and line noise, a legacy code page or a UTF-8 character cut in half
+// all produce one with no terminator to follow: it used to swallow every
+// later byte of the session. When the locale says UTF-8, such a string ends
+// at the end of its line, so one stray byte costs at most the rest of that
+// line.
+#[test]
+fn in_a_utf8_locale_a_stray_raw_c1_string_opener_costs_one_line_at_most() {
+    let config = config_that_paints_up_green();
+    let highlighted_up = "\u{1b}[38;2;0;255;0mup\u{1b}[0m";
+
+    for opener in *b"\x90\x98\x9d\x9e\x9f" {
+        let mut input = b"line1\nfoo ".to_vec();
+        input.push(opener);
+        input.extend_from_slice(b" bar\nGi0/1 is up\nline4\n");
+
+        for locale in [
+            &[("LC_ALL", "en_US.UTF-8")][..],
+            &[("LANG", "C.UTF-8")][..],
+            &[("LC_CTYPE", "UTF-8"), ("LANG", "C")][..],
+        ] {
+            // Default mode is transparent: every byte arrives, in order, and
+            // the lines after the stray byte are highlighted again.
+            let mut expected = b"line1\nfoo ".to_vec();
+            expected.push(opener);
+            expected.extend_from_slice(b" bar\nGi0/1 is ");
+            expected.extend_from_slice(highlighted_up.as_bytes());
+            expected.extend_from_slice(b"\nline4\n");
+            assert_eq!(
+                filter_with_locale(config.path(), &[], locale, &input),
+                expected,
+                "default mode, opener {opener:#x}, {locale:?}"
+            );
+
+            // `--sanitize` still removes the opener and what it may hide,
+            // but only to the end of that line.
+            assert_eq!(
+                String::from_utf8_lossy(&filter_with_locale(
+                    config.path(),
+                    &["--sanitize"],
+                    locale,
+                    &input
+                )),
+                format!("line1\nfoo \nGi0/1 is {highlighted_up}\nline4\n"),
+                "--sanitize, opener {opener:#x}, {locale:?}"
+            );
+        }
+    }
+}
+
+// Without a UTF-8 locale nothing changes: the byte is the control an 8-bit
+// terminal reads, and the string runs to its terminator. `LC_ALL` wins over
+// `LANG`, and no locale at all is not a UTF-8 one.
+#[test]
+fn outside_a_utf8_locale_a_raw_c1_string_still_runs_to_its_terminator() {
+    let config = config_that_paints_up_green();
+    let input = b"line1\nfoo \x9f bar\nGi0/1 is up\nline4\n";
+
+    for locale in [
+        &[][..],
+        &[("LC_ALL", "C")][..],
+        &[("LANG", "en_US.ISO-8859-1")][..],
+        &[("LC_ALL", "C"), ("LANG", "en_US.UTF-8")][..],
+    ] {
+        for flags in [&[][..], &["--sanitize"][..]] {
+            assert_eq!(
+                String::from_utf8_lossy(&filter_with_locale(config.path(), flags, locale, input)),
+                "line1\nfoo ",
+                "{flags:?}, {locale:?}"
+            );
+        }
+    }
+}
+
 #[test]
 fn raw_c1_string_payload_is_not_used_for_profile_detection() {
     let mut empty_config = tempfile::NamedTempFile::new().expect("empty config");
