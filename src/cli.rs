@@ -24,7 +24,8 @@ use crate::config::{
     MAX_PROFILE_TEST_FILE_BYTES, PrismConfig, load_profile_file, read_bounded_regular_file,
 };
 use crate::highlight::{
-    Highlighter, RuleMatchError, StreamingHighlighter, strip_ansi, strip_string_escapes,
+    Highlighter, RuleMatchError, StreamingHighlighter, set_terminal_reads_utf8, strip_ansi,
+    strip_string_escapes,
 };
 use crate::terminal_text::escape_untrusted;
 
@@ -111,6 +112,13 @@ pub fn run() -> ExitCode {
 
 fn run_inner(args: Vec<OsString>) -> Result<ExitCode, CliError> {
     let (options, action) = parse_args(args)?;
+    // Decided once from prismtty's own environment, before any output is
+    // read. It never follows the stream and a reload does not revisit it.
+    set_terminal_reads_utf8(locale_reads_utf8(
+        std::env::var_os("LC_ALL"),
+        std::env::var_os("LC_CTYPE"),
+        std::env::var_os("LANG"),
+    ));
     // Reports are written with `writeln!` rather than `println!`, which panics
     // when the reader has gone away instead of returning the error.
     match action {
@@ -296,12 +304,78 @@ fn stdin_mode_interactive_highlighting(stdout_is_terminal: bool) -> bool {
     stdout_is_terminal
 }
 
+/// Whether the locale says the terminal reads UTF-8. The first of `LC_ALL`,
+/// `LC_CTYPE` and `LANG` that is set and not empty decides, in POSIX order,
+/// and its codeset must be UTF-8: the part after the `.` (`en_US.UTF-8`,
+/// `C.utf8`), or the whole value when it has none (`LC_CTYPE=UTF-8` on
+/// macOS). No locale at all is not a UTF-8 one.
+fn locale_reads_utf8(
+    lc_all: Option<OsString>,
+    lc_ctype: Option<OsString>,
+    lang: Option<OsString>,
+) -> bool {
+    let Some(locale) = [lc_all, lc_ctype, lang]
+        .into_iter()
+        .flatten()
+        .find(|value| !value.is_empty())
+    else {
+        return false;
+    };
+    let locale = locale.to_string_lossy();
+    let without_modifier = locale.split('@').next().unwrap_or_default();
+    let codeset = without_modifier
+        .split_once('.')
+        .map_or(without_modifier, |(_, codeset)| codeset);
+    codeset.eq_ignore_ascii_case("utf-8") || codeset.eq_ignore_ascii_case("utf8")
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
     fn stdin_mode_uses_interactive_highlighting_when_output_is_terminal() {
         assert!(super::stdin_mode_interactive_highlighting(true));
         assert!(!super::stdin_mode_interactive_highlighting(false));
+    }
+
+    #[test]
+    fn locale_reads_utf8_follows_posix_precedence_and_the_codeset() {
+        let reads = |lc_all: Option<&str>, lc_ctype: Option<&str>, lang: Option<&str>| {
+            super::locale_reads_utf8(
+                lc_all.map(Into::into),
+                lc_ctype.map(Into::into),
+                lang.map(Into::into),
+            )
+        };
+
+        for locale in [
+            "en_US.UTF-8",
+            "C.UTF-8",
+            "en_US.utf8",
+            "UTF-8",
+            "de_DE.UTF-8@euro",
+        ] {
+            assert!(reads(None, None, Some(locale)), "LANG={locale}");
+            assert!(reads(None, Some(locale), None), "LC_CTYPE={locale}");
+            assert!(reads(Some(locale), None, None), "LC_ALL={locale}");
+        }
+        for locale in [
+            "C",
+            "POSIX",
+            "en_US",
+            "en_US.ISO-8859-1",
+            "ja_JP.eucJP",
+            "utf8_user",
+        ] {
+            assert!(!reads(None, None, Some(locale)), "LANG={locale}");
+        }
+        // No locale at all is not a UTF-8 one.
+        assert!(!reads(None, None, None));
+        assert!(!reads(Some(""), Some(""), Some("")));
+        // The first one that is set and not empty decides.
+        assert!(!reads(Some("C"), Some("UTF-8"), Some("en_US.UTF-8")));
+        assert!(reads(Some(""), Some("UTF-8"), Some("C")));
+        assert!(!reads(None, Some("C"), Some("en_US.UTF-8")));
+        assert!(reads(Some("en_US.UTF-8"), Some("C"), Some("C")));
     }
 
     #[test]

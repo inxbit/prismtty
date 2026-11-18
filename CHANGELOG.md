@@ -2,6 +2,33 @@
 
 All notable changes to PrismTTY are documented here.
 
+## Unreleased
+
+### Fixed
+
+- Stop one stray byte from hiding the rest of a session on a UTF-8 terminal.
+  A raw byte `90`, `98`, `9D`, `9E` or `9F` that is not part of a UTF-8
+  character opens a string control on a terminal that is not in UTF-8 mode,
+  so PrismTTY treated it as one in every mode: with no terminator after it,
+  all later output was withheld, discarded past 16 KiB and dropped at the end
+  of input. A legacy code page (`9E` is a letter in CP1250), a UTF-8 character cut
+  in half and serial line noise all produce such a byte, and a plain-text
+  device never sends the terminator. When the locale says UTF-8 (the first of
+  `LC_ALL`, `LC_CTYPE` and `LANG` that is set names a UTF-8 codeset), such a
+  string now ends at the end of its line. One stray byte then costs at most
+  the rest of that line: in default mode the line passes through unchanged
+  and unhighlighted, and `--sanitize` removes the byte and the rest of the
+  line. The lines after it are shown and highlighted as usual.
+  - Without a UTF-8 locale, an unset one included, nothing changes: the byte
+    is the control an 8-bit terminal reads and the string runs to its
+    terminator. The library also behaves as before.
+  - What is left on that one line: its text after the byte is held until the
+    line ends, so a prompt with a stray byte in it shows its tail when the
+    next line break arrives, and a last line with no line break loses the
+    text after the byte.
+  - A control written as the UTF-8 character (`C2 9D`) is a control on a
+    UTF-8 terminal too, and is handled as before.
+
 ## 1.3.1 - 2026-11-17
 
 ### Security
@@ -26,8 +53,8 @@ All notable changes to PrismTTY are documented here.
 - Reject surplus arguments to `profiles list`, `show`, `validate` and `test`.
   `profiles validate good.yml broken.yml` reported success having read only
   the first file.
-- Write the `--show-profile` and `--benchmark` reports when the input is
-  empty.
+- Write the `--benchmark` report, and the `--show-profile` report for a
+  forced profile, when the input is empty.
 - Wait for input when the filter inherits a non-blocking stdin, instead of
   exiting with "Resource temporarily unavailable".
 - Let an exclusive rule style all of its own capture groups. With colors on

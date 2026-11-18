@@ -2833,6 +2833,106 @@ mod tests {
         }
     }
 
+    // The same guarantees with the UTF-8 switch on, where a raw C1 string ends
+    // at its line end: however the reads fall, `--sanitize` and `--strip-ansi`
+    // give the same bytes and never let a terminal open a string control, an
+    // 8-bit terminal included. The input leans on raw C1 openers, line ends
+    // and the terminators that used to close such a string.
+    #[test]
+    fn utf8_terminal_switch_keeps_filtered_output_closed_and_independent_of_reads() {
+        const FRAGMENTS: &[&[u8]] = &[
+            b"\x90",
+            b"\x98",
+            b"\x9d",
+            b"\x9e",
+            b"\x9f",
+            b"\x9d0;title",
+            b"\x9d52;c;QUJD",
+            b"\x90q",
+            b"\x9b31m",
+            b"\x9c",
+            b"\xc2\x9d",
+            b"\xc2\x9c",
+            b"\xc2\x90",
+            b"\x07",
+            b"\x18",
+            b"\n",
+            b"\r\n",
+            b"\r",
+            b"\x1b",
+            b"\x1b]0;t",
+            b"\x1bP",
+            b"\x1b\\",
+            b"\x1b[31m",
+            b"\x1b[",
+            b"\xf0\x9f",
+            b"\xe2\x80",
+            b"\xe2\x80\x9d",
+            b"\xc3",
+            "\u{e9}".as_bytes(),
+            b"text ",
+            b"router# show ip\n",
+        ];
+
+        crate::highlight::TERMINAL_READS_UTF8_IN_THIS_THREAD.with(|switch| switch.set(Some(true)));
+        // The switch is on for this thread: the string ends with its line.
+        assert_eq!(
+            run_chunk_pipeline(&[b"a\x9f b\nc\n"], ChunkPipeline::Sanitize),
+            b"a\nc\n"
+        );
+        let mut rng = XorShift(0x0c15_7e87_0b0d_5eed);
+        for case in 0..600 {
+            let mut input = Vec::new();
+            let large = case % 50 == 49;
+            let fragments = if large { 2500 } else { 1 + rng.below(40) };
+            for _ in 0..fragments {
+                input.extend_from_slice(FRAGMENTS[rng.below(FRAGMENTS.len())]);
+            }
+
+            let mut chunkings: Vec<Vec<&[u8]>> =
+                vec![vec![input.as_slice()], input.chunks(8192).collect()];
+            let mut random = Vec::new();
+            let mut start = 0;
+            while start < input.len() {
+                let len = 1 + rng.below(if large { 2048 } else { 16 });
+                let end = input.len().min(start + len);
+                random.push(&input[start..end]);
+                start = end;
+            }
+            chunkings.push(random);
+            if !large {
+                chunkings.push(input.chunks(1).collect());
+            }
+
+            for pipeline in [ChunkPipeline::Sanitize, ChunkPipeline::Strip] {
+                let expected = run_chunk_pipeline(&chunkings[0], pipeline);
+                for chunks in &chunkings[1..] {
+                    let output = run_chunk_pipeline(chunks, pipeline);
+                    assert!(
+                        output == expected,
+                        "{pipeline:?} output depends on {} reads of {input:02x?}:\n{output:02x?}\n{expected:02x?}",
+                        chunks.len()
+                    );
+                }
+                let (first_string, _) = walk_vt_parser(&expected, false);
+                assert_eq!(
+                    first_string, None,
+                    "{pipeline:?} let a string control through for {input:02x?}: {expected:02x?}"
+                );
+                assert_eq!(
+                    escape_before_non_ascii_byte(&expected),
+                    None,
+                    "{pipeline:?} let a terminal read ESC with a non-ASCII byte for {input:02x?}: {expected:02x?}"
+                );
+                assert_eq!(
+                    csi_that_could_switch_xterm_out_of_utf8(&expected),
+                    None,
+                    "{pipeline:?} let a CSI with a byte from 80 up or DECNRCM through for {input:02x?}: {expected:02x?}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn preserve_mode_hides_split_string_payloads_from_dynamic_profile_detection() {
         for (prefix, tail) in [

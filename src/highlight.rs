@@ -11,6 +11,7 @@ use pcre2::bytes::{Regex, RegexBuilder};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use thiserror::Error;
 
@@ -191,6 +192,51 @@ pub struct StreamingHighlighter {
     disabled_rule_identities: HashSet<RuleIdentity>,
 }
 
+/// Whether the terminal is known to read UTF-8, as the locale says. Off unless
+/// the command line turns it on at startup, so the library keeps treating a
+/// raw C1 byte as the control an 8-bit terminal sees.
+static TERMINAL_READS_UTF8: AtomicBool = AtomicBool::new(false);
+
+thread_local! {
+    /// Test hook, read in test builds only: lets one test thread run with the
+    /// switch on without touching the tests that run beside it. It is not
+    /// behind a `cfg` attribute because the source-shape tests in this file
+    /// take everything before the first one as runtime code.
+    pub(crate) static TERMINAL_READS_UTF8_IN_THIS_THREAD: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Called once, before any output is read. The value must not change during a
+/// run: the tokenizer and both escape scanners read it, and they have to
+/// agree on where a string ends.
+pub(crate) fn set_terminal_reads_utf8(reads_utf8: bool) {
+    TERMINAL_READS_UTF8.store(reads_utf8, Ordering::Relaxed);
+}
+
+fn terminal_reads_utf8() -> bool {
+    if cfg!(test) {
+        if let Some(reads_utf8) = TERMINAL_READS_UTF8_IN_THIS_THREAD.with(std::cell::Cell::get) {
+            return reads_utf8;
+        }
+    }
+    TERMINAL_READS_UTF8.load(Ordering::Relaxed)
+}
+
+/// Whether a string control opened by a C1 byte of this encoded `width` also
+/// ends at the end of its line.
+///
+/// A raw C1 byte (one byte, not the UTF-8 form `C2 xx`) opens a string only on
+/// a terminal that is not in UTF-8 mode. On a UTF-8 terminal it is an invalid
+/// byte, and line noise, a legacy code page and a UTF-8 character cut in half
+/// all produce one with no terminator to follow: held to the usual rule, one
+/// stray byte swallows the rest of the session. So when the terminal is known
+/// to read UTF-8, such a string is bounded by its line. Otherwise nothing
+/// changes, and the string runs to its terminator as an 8-bit terminal reads
+/// it.
+fn raw_c1_string_ends_at_line_end(width: usize) -> bool {
+    width == 1 && terminal_reads_utf8()
+}
+
 /// Incrementally tracks an incomplete terminal string control. Once the
 /// control exceeds the bounded carry budget, its payload is discarded until a
 /// BEL/ST terminator, a CAN/SUB cancellation, or an ESC that starts another
@@ -245,6 +291,14 @@ impl StringControlKind {
         matches!(self, Self::EscOsc | Self::C1Osc(_))
     }
 
+    /// See `raw_c1_string_ends_at_line_end`.
+    fn ends_at_line_end(self) -> bool {
+        match self {
+            Self::C1Osc(width) | Self::C1String(_, width) => raw_c1_string_ends_at_line_end(width),
+            Self::EscOsc | Self::EscString(_) => false,
+        }
+    }
+
     fn matches_at(self, bytes: &[u8], start: usize) -> bool {
         Self::at(bytes, start).is_some_and(|(kind, _payload_start)| kind == self)
     }
@@ -281,7 +335,7 @@ impl TrackedStringControl {
             carry_offset: start.saturating_sub(drop_start),
             scanned: payload_start,
             total_bytes: payload_start - start,
-            payload: StringPayloadScanner::new(kind.allows_bel()),
+            payload: StringPayloadScanner::new(kind.allows_bel(), kind.ends_at_line_end()),
         }
     }
 
@@ -419,6 +473,7 @@ impl DiscardedStringControl {
 #[derive(Clone, Debug)]
 struct StringPayloadScanner {
     allows_bel: bool,
+    ends_at_line_end: bool,
     saw_escape: bool,
     utf8_remaining: u8,
     next_utf8_min: u8,
@@ -430,9 +485,10 @@ struct StringPayloadScanner {
 }
 
 impl StringPayloadScanner {
-    fn new(allows_bel: bool) -> Self {
+    fn new(allows_bel: bool, ends_at_line_end: bool) -> Self {
         Self {
             allows_bel,
+            ends_at_line_end,
             saw_escape: false,
             utf8_remaining: 0,
             next_utf8_min: 0x80,
@@ -498,6 +554,13 @@ impl StringPayloadScanner {
 
         if matches!(byte, 0x18 | 0x1a) || (self.allows_bel && byte == 0x07) || byte == 0x9c {
             return StringPayloadScan::CompleteAfterCurrent;
+        }
+        if self.ends_at_line_end && matches!(byte, b'\r' | b'\n') {
+            // The line end is not part of the string: it stays visible text.
+            return StringPayloadScan::CompleteBeforeCurrent {
+                replay: [0; MAX_TENTATIVE_UTF8_SUFFIX_BYTES],
+                replay_len: 0,
+            };
         }
         if byte == 0x1b {
             self.saw_escape = true;
@@ -2776,23 +2839,39 @@ fn csi_sequence_end(input: &[u8], mut idx: usize) -> usize {
 }
 
 fn osc_sequence_end(input: &[u8], mut idx: usize) -> usize {
-    string_terminator_end(input, &mut idx, true).unwrap_or(input.len())
+    string_terminator_end(input, &mut idx, true, false).unwrap_or(input.len())
 }
 
 fn c1_string_escape_end(input: &[u8], start: usize, control: u8, width: usize) -> usize {
-    match control {
-        0x9d => osc_sequence_end(input, start + width),
-        0x90 | 0x98 | 0x9e | 0x9f => string_sequence_end(input, start + width),
-        _ => (start + width).min(input.len()),
-    }
+    let allows_bel = match control {
+        0x9d => true,
+        0x90 | 0x98 | 0x9e | 0x9f => false,
+        _ => return (start + width).min(input.len()),
+    };
+    let mut idx = start + width;
+    string_terminator_end(
+        input,
+        &mut idx,
+        allows_bel,
+        raw_c1_string_ends_at_line_end(width),
+    )
+    .unwrap_or(input.len())
 }
 
 fn string_sequence_end(input: &[u8], mut idx: usize) -> usize {
-    string_terminator_end(input, &mut idx, false).unwrap_or(input.len())
+    string_terminator_end(input, &mut idx, false, false).unwrap_or(input.len())
 }
 
-fn string_terminator_end(input: &[u8], idx: &mut usize, allows_bel: bool) -> Option<usize> {
+fn string_terminator_end(
+    input: &[u8],
+    idx: &mut usize,
+    allows_bel: bool,
+    ends_at_line_end: bool,
+) -> Option<usize> {
     while *idx < input.len() {
+        if ends_at_line_end && matches!(input[*idx], b'\r' | b'\n') {
+            return Some(*idx);
+        }
         if c1_control_at(input, *idx) == Some((0x9c, 2)) {
             return Some(*idx + 2);
         }
@@ -4198,10 +4277,20 @@ fn scan_escape_for_neutralization(bytes: &[u8], start: usize) -> EscapeScan {
         return match control {
             0x8e | 0x8f => scan_single_shift_for_neutralization(bytes, start, start + width),
             0x9b => scan_c1_csi_for_neutralization(bytes, start, start + width),
-            0x9d => scan_c1_string_for_neutralization(bytes, start, start + width, true),
-            0x90 | 0x98 | 0x9e | 0x9f => {
-                scan_c1_string_for_neutralization(bytes, start, start + width, false)
-            }
+            0x9d => scan_c1_string_for_neutralization(
+                bytes,
+                start,
+                start + width,
+                true,
+                raw_c1_string_ends_at_line_end(width),
+            ),
+            0x90 | 0x98 | 0x9e | 0x9f => scan_c1_string_for_neutralization(
+                bytes,
+                start,
+                start + width,
+                false,
+                raw_c1_string_ends_at_line_end(width),
+            ),
             _ => EscapeScan::Complete(start + width),
         };
     }
@@ -4324,10 +4413,14 @@ fn scan_c1_string_for_neutralization(
     start: usize,
     mut idx: usize,
     allows_bel: bool,
+    ends_at_line_end: bool,
 ) -> EscapeScan {
     while idx < bytes.len() {
         if idx.saturating_sub(start) > MAX_INCOMPLETE_ESCAPE_BYTES {
             return EscapeScan::IncompleteOversized;
+        }
+        if ends_at_line_end && matches!(bytes[idx], b'\r' | b'\n') {
+            return EscapeScan::Complete(idx);
         }
         if c1_control_at(bytes, idx) == Some((0x9c, 2)) {
             return EscapeScan::Complete(idx + 2);
