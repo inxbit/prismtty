@@ -13,9 +13,8 @@ All notable changes to PrismTTY are documented here.
 - Unwind both connections when two nested ones close in one read. The first
   teardown line ended its connection and the second was dropped, so local
   output kept the outer device's profile. Only a line that names its
-  connection goes on to the next one.
-- Unwind a telnet connection the user closes at the `telnet>` prompt, which
-  prints "Connection closed." and not the "by foreign host" line.
+  connection goes on to the next one, and the close line that follows a
+  `logout` counts with it as one exit.
 - Keep a vendor's detection in live sessions when a `profiles.d` profile
   takes a built-in profile's name. A profile file cannot set the runtime
   metadata that detection uses, so such a profile, written to change a

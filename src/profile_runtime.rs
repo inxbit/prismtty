@@ -3,6 +3,9 @@ use crate::profiles::{ProfileStore, is_generic_profile_set};
 const OUTPUT_WINDOW_LIMIT: usize = 64 * 1024;
 const INPUT_LINE_LIMIT: usize = 4096;
 const CLOSE_MARKER_WINDOW_LIMIT: usize = 256;
+/// Most bytes of lines one read completes that are searched for a teardown
+/// line: two of the stream's 8 KiB reads, far below `OUTPUT_WINDOW_LIMIT`.
+const COMPLETED_LINES_SEARCH_LIMIT: usize = 16 * 1024;
 const DETECTION_BYTE_INTERVAL: usize = 4096;
 const PROFILE_STACK_LIMIT: usize = 8;
 /// Lines typed after a remote command before its attempt expires: a user
@@ -21,9 +24,6 @@ enum ClosePolicy {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CloseMarkerKind {
     SshLike,
-    /// A bare "Connection closed.": mosh prints it, and so does telnet when
-    /// the user closes the connection at its own prompt.
-    Closed,
     Telnet,
     Screen,
     Serial,
@@ -36,13 +36,9 @@ impl ClosePolicy {
             || marker == CloseMarkerKind::Logout
             || matches!(
                 (self, marker),
-                (
-                    ClosePolicy::SshLike,
-                    CloseMarkerKind::SshLike | CloseMarkerKind::Closed
-                ) | (
-                    ClosePolicy::Telnet,
-                    CloseMarkerKind::Telnet | CloseMarkerKind::Closed
-                ) | (ClosePolicy::Screen, CloseMarkerKind::Screen)
+                (ClosePolicy::SshLike, CloseMarkerKind::SshLike)
+                    | (ClosePolicy::Telnet, CloseMarkerKind::Telnet)
+                    | (ClosePolicy::Screen, CloseMarkerKind::Screen)
                     | (ClosePolicy::Serial, CloseMarkerKind::Serial)
             )
     }
@@ -311,13 +307,19 @@ impl ProfileRuntime {
 
         // Search every line this read completed, however long they are
         // together: a teardown line can be followed by a screenful of output
-        // in the same read. Never search less than the usual window.
+        // in the same read. Never search less than the usual window, and no
+        // more than a read can bring: past that the window limit may have
+        // cut the start of the first line off, and what is left of a line
+        // must not be read as a whole one.
         let completed_by_this_read = (unterminated_before + text.len())
             .saturating_sub(unterminated_tail_len(&self.output_window_lower));
-        let close_markers = observed_close_markers(recent_complete_lines(
-            &self.output_window_lower,
-            CLOSE_MARKER_WINDOW_LIMIT.max(completed_by_this_read),
-        ));
+        let searched = if completed_by_this_read <= COMPLETED_LINES_SEARCH_LIMIT {
+            CLOSE_MARKER_WINDOW_LIMIT.max(completed_by_this_read)
+        } else {
+            CLOSE_MARKER_WINDOW_LIMIT
+        };
+        let close_markers =
+            observed_close_markers(recent_complete_lines(&self.output_window_lower, searched));
         if !close_markers.is_empty() {
             let pending_match = self.pending_remote.as_ref().and_then(|pending| {
                 close_markers
@@ -752,6 +754,15 @@ impl ProfileRuntime {
         let before = self.active_profiles.clone();
         self.pop_profile();
         let mut later = &markers[1..];
+        // One exit prints `logout` and then its close line. That line ended
+        // the connection just popped, whichever host it names.
+        if markers[0].kind == CloseMarkerKind::Logout
+            && later
+                .first()
+                .is_some_and(|marker| marker.kind != CloseMarkerKind::Logout)
+        {
+            later = &later[1..];
+        }
         while let Some(marker) = self.stack.last().and_then(|frame| {
             later.iter().position(|marker| {
                 marker.target.is_some()
@@ -1071,14 +1082,12 @@ fn observed_close_markers(text: &str) -> Vec<ObservedCloseMarker> {
                     kind: CloseMarkerKind::Logout,
                     target: None,
                 })
-            } else if matches!(line, "connection closed" | "connection closed.") {
-                Some(ObservedCloseMarker {
-                    kind: CloseMarkerKind::Closed,
-                    target: None,
-                })
             } else if matches!(
                 line,
-                "connection closed by remote host" | "connection closed by remote host."
+                "connection closed"
+                    | "connection closed."
+                    | "connection closed by remote host"
+                    | "connection closed by remote host."
             ) {
                 Some(ObservedCloseMarker {
                     kind: CloseMarkerKind::SshLike,
@@ -2259,22 +2268,46 @@ mod tests {
         }
     }
 
-    // `quit` at the `telnet>` prompt prints "Connection closed.", not the
-    // "by foreign host" line the far end's close gives.
+    // The close line after `logout` belongs to the same exit, also when the
+    // host it names is the one the outer connection went to.
     #[test]
-    fn telnet_unwinds_when_the_user_closes_the_connection() {
+    fn a_close_line_after_logout_does_not_end_the_outer_connection_it_names() {
         let store = ProfileStore::builtin();
         let mut runtime = ProfileRuntime::new(names(&["generic", "linux-unix"]));
-        runtime.observe_input(b"telnet router\r");
+        runtime.observe_input(b"ssh router-a\r");
+        assert_eq!(
+            runtime.observe_output(b"--- JUNOS 22.4R3 Kernel 64-bit\n", &store),
+            Some(names(&["generic", "juniper"]))
+        );
+        // An alias for the same router, typed on it.
+        runtime.observe_input(b"ssh alias-a\r");
+        runtime.observe_output(b"--- JUNOS 22.4R3 Kernel 64-bit\n", &store);
+        assert_eq!(runtime.stack_len(), 2);
+
+        runtime.observe_output(b"logout\r\nConnection to router-a closed.\r\n", &store);
+        assert_eq!(runtime.active_profiles(), names(&["generic", "juniper"]));
+        assert_eq!(runtime.stack_len(), 1);
+    }
+
+    // The output window keeps the last 64 KiB. A read that overflows it loses
+    // the start of its first line, and what is left of that line is no line.
+    #[test]
+    fn a_line_cut_by_the_window_limit_is_not_a_close_marker() {
+        let store = ProfileStore::builtin();
+        let mut runtime = ProfileRuntime::new(names(&["generic", "linux-unix"]));
+        runtime.observe_input(b"ssh router-a\r");
         assert_eq!(
             runtime.observe_output(b"--- JUNOS 22.4R3 Kernel 64-bit\n", &store),
             Some(names(&["generic", "juniper"]))
         );
 
-        assert_eq!(
-            runtime.observe_output(b"Connection closed.\n", &store),
-            Some(names(&["generic", "linux-unix"]))
-        );
+        let prose = "status: ";
+        let line = "Connection to router-a closed.\n";
+        let filler = "y".repeat(super::OUTPUT_WINDOW_LIMIT - line.len() - 1);
+        let output = format!("{prose}{line}{filler}\n");
+        assert_eq!(runtime.observe_output(output.as_bytes(), &store), None);
+        assert_eq!(runtime.active_profiles(), names(&["generic", "juniper"]));
+        assert_eq!(runtime.stack_len(), 1);
     }
 
     #[test]
