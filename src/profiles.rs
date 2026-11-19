@@ -784,7 +784,13 @@ impl ProfileStore {
         rules: Vec<RuleSpec>,
     ) -> bool {
         let (inherits, detection) = normalize_profile_metadata_unbounded(inherits, detection);
-        self.insert_normalized_profile(name, inherits, detection, rules)
+        self.insert_normalized_profile(
+            name,
+            inherits,
+            detection,
+            ProfileRuntimeMeta::default(),
+            rules,
+        )
     }
 
     /// Registers a parsed user profile after enforcing complete-store metadata
@@ -798,7 +804,16 @@ impl ProfileStore {
     ) -> Result<bool, ProfileMetadataLimitError> {
         let (inherits, detection) = normalize_and_validate_profile_metadata(inherits, detection)?;
         self.validate_store_metadata_limits(&name, &inherits, &detection)?;
-        Ok(self.insert_normalized_profile(name, inherits, detection, rules))
+        // A profile file cannot set runtime metadata. One that takes the name
+        // of a profile that has it, to change a built-in's rules, keeps that
+        // profile's: without it the vendor is no longer detected in a live
+        // session.
+        let runtime = self
+            .profiles
+            .get(&name)
+            .map(|shadowed| shadowed.runtime.clone())
+            .unwrap_or_default();
+        Ok(self.insert_normalized_profile(name, inherits, detection, runtime, rules))
     }
 
     fn insert_normalized_profile(
@@ -806,6 +821,7 @@ impl ProfileStore {
         name: String,
         inherits: Vec<String>,
         detection: Vec<String>,
+        runtime: ProfileRuntimeMeta,
         rules: Vec<RuleSpec>,
     ) -> bool {
         let shadowed = self
@@ -816,7 +832,7 @@ impl ProfileStore {
                     name,
                     inherits,
                     detection,
-                    runtime: ProfileRuntimeMeta::default(),
+                    runtime,
                     rules,
                 },
             )

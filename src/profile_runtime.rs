@@ -310,12 +310,12 @@ impl ProfileRuntime {
                     .find(|marker| close_marker_matches(marker, pending.policy, &pending.target))
             });
             let top_match = self.stack.last().and_then(|frame| {
-                close_markers
-                    .iter()
-                    .find(|marker| close_marker_matches(marker, frame.close_policy, &frame.target))
+                close_markers.iter().position(|marker| {
+                    close_marker_matches(marker, frame.close_policy, &frame.target)
+                })
             });
             let top_specific_match = self.stack.last().and_then(|frame| {
-                close_markers.iter().find(|marker| {
+                close_markers.iter().position(|marker| {
                     marker.target.is_some()
                         && close_marker_matches(marker, frame.close_policy, &frame.target)
                         && !self.pending_remote.as_ref().is_some_and(|pending| {
@@ -325,11 +325,13 @@ impl ProfileRuntime {
                 })
             });
 
-            if top_specific_match.is_some() || (pending_match.is_none() && top_match.is_some()) {
+            if let Some(marker) =
+                top_specific_match.or(top_match.filter(|_| pending_match.is_none()))
+            {
                 self.pending_remote = None;
                 self.clear_output_window();
                 self.clear_pending_prompt();
-                return self.pop_profile();
+                return self.pop_profiles_closed_from(&close_markers[marker..]);
             }
             if pending_match.is_some() {
                 self.pending_remote = None;
@@ -337,28 +339,30 @@ impl ProfileRuntime {
                 self.clear_pending_prompt();
                 return None;
             }
-            if top_match.is_some() {
+            if let Some(marker) = top_match {
                 self.pending_remote = None;
                 self.clear_output_window();
                 self.clear_pending_prompt();
-                return self.pop_profile();
+                return self.pop_profiles_closed_from(&close_markers[marker..]);
             }
             // OpenSSH names the HostName an ssh_config alias resolves to, not
             // the typed alias. With no remote command typed inside this
             // connection, a targeted ssh close naming no other connection
             // can only be its own.
-            if self.pending_remote.is_none()
-                && self.stack.last().is_some_and(|frame| {
-                    !frame.nested_attempt_seen
-                        && close_markers.iter().any(|marker| {
-                            frame.close_policy.accepts(marker.kind)
-                                && is_untracked_ssh_close(marker, &self.stack)
-                        })
-                })
-            {
+            let untracked_close = self
+                .stack
+                .last()
+                .filter(|frame| self.pending_remote.is_none() && !frame.nested_attempt_seen)
+                .and_then(|frame| {
+                    close_markers.iter().position(|marker| {
+                        frame.close_policy.accepts(marker.kind)
+                            && is_untracked_ssh_close(marker, &self.stack)
+                    })
+                });
+            if let Some(marker) = untracked_close {
                 self.clear_output_window();
                 self.clear_pending_prompt();
-                return self.pop_profile();
+                return self.pop_profiles_closed_from(&close_markers[marker..]);
             }
             // Likewise an alias attempt that no output resolved ends on the
             // close naming its HostName; left pending, the next prompt would
@@ -722,6 +726,37 @@ impl ProfileRuntime {
             self.active_profiles = next;
             Some(self.active_profiles.clone())
         }
+    }
+
+    /// Pops the connection the first of `markers` closed, then each
+    /// connection under it that a later marker names. Leaving two nested
+    /// connections at once puts both teardown lines in one read. Only a
+    /// marker that names its connection goes on: a bare `logout` or
+    /// "Connection closed." after the first belongs to the same teardown.
+    fn pop_profiles_closed_from(&mut self, markers: &[ObservedCloseMarker]) -> Option<Vec<String>> {
+        let before = self.active_profiles.clone();
+        self.pop_profile();
+        let mut later = &markers[1..];
+        // One exit prints `logout` and then its close line. That line ended
+        // the connection just popped, whichever host it names.
+        if markers[0].kind == CloseMarkerKind::Logout
+            && later
+                .first()
+                .is_some_and(|marker| marker.kind != CloseMarkerKind::Logout)
+        {
+            later = &later[1..];
+        }
+        while let Some(marker) = self.stack.last().and_then(|frame| {
+            later.iter().position(|marker| {
+                marker.target.is_some()
+                    && marker.target == frame.target
+                    && frame.close_policy.accepts(marker.kind)
+            })
+        }) {
+            self.pop_profile();
+            later = &later[marker + 1..];
+        }
+        (self.active_profiles != before).then(|| self.active_profiles.clone())
     }
 
     fn push_frame(&mut self, remote_attempt: RemoteAttempt) {
@@ -2102,6 +2137,111 @@ mod tests {
             runtime.observe_output(b"Connection to router-a closed.\n", &store),
             Some(names(&["generic", "linux-unix"]))
         );
+    }
+
+    // Leaving two nested connections at once puts both teardown lines in one
+    // read. The first one popped its connection and the second was dropped.
+    #[test]
+    fn two_nested_closes_in_one_read_unwind_both_connections() {
+        let store = ProfileStore::builtin();
+        let mut runtime = ProfileRuntime::new(names(&["generic", "linux-unix"]));
+        runtime.observe_input(b"ssh router-a\r");
+        assert_eq!(
+            runtime.observe_output(b"--- JUNOS 22.4R3 Kernel 64-bit\n", &store),
+            Some(names(&["generic", "juniper"]))
+        );
+        runtime.observe_input(b"ssh core-sw\r");
+        assert_eq!(
+            runtime.observe_output(b"Cisco Nexus Operating System (NX-OS) Software\n", &store),
+            Some(names(&["generic", "cisco"]))
+        );
+
+        assert_eq!(
+            runtime.observe_output(
+                b"Connection to core-sw closed.\r\nConnection to router-a closed.\r\nuser@laptop:~$ ",
+                &store
+            ),
+            Some(names(&["generic", "linux-unix"]))
+        );
+        assert_eq!(runtime.stack_len(), 0);
+    }
+
+    // A profile file may not set runtime metadata, so a profiles.d profile
+    // that took a built-in's name, to change its colors, lost that vendor's
+    // dynamic detection with no way to get it back.
+    #[test]
+    fn a_user_profile_that_shadows_a_builtin_keeps_its_dynamic_detection() {
+        let mut store = ProfileStore::builtin();
+        assert!(
+            store
+                .try_insert_user_profile(
+                    "cisco".to_string(),
+                    vec!["generic".to_string()],
+                    Vec::new(),
+                    Vec::new(),
+                )
+                .expect("metadata within limits"),
+            "the user profile shadows the built-in"
+        );
+
+        let mut runtime = ProfileRuntime::new(names(&["generic", "linux-unix"]));
+        runtime.observe_input(b"ssh core-sw\r");
+        assert_eq!(
+            runtime.observe_output(b"Cisco Nexus Operating System (NX-OS) Software\n", &store),
+            Some(names(&["generic", "cisco"]))
+        );
+    }
+
+    // One ssh exit prints two lines, `logout` and the close. With an alias
+    // the close names the host, not what was typed, so `logout` is what ends
+    // the inner connection; the close line must not go on to end the outer.
+    #[test]
+    fn one_teardown_of_two_lines_ends_one_connection() {
+        let store = ProfileStore::builtin();
+        for close in [
+            "Connection to core-sw closed.",
+            "Connection to 192.0.2.9 closed.",
+        ] {
+            let mut runtime = ProfileRuntime::new(names(&["generic", "linux-unix"]));
+            runtime.observe_input(b"ssh router-a\r");
+            assert_eq!(
+                runtime.observe_output(b"--- JUNOS 22.4R3 Kernel 64-bit\n", &store),
+                Some(names(&["generic", "juniper"]))
+            );
+            runtime.observe_input(b"ssh core-sw\r");
+            assert_eq!(
+                runtime.observe_output(b"Cisco Nexus Operating System (NX-OS) Software\n", &store),
+                Some(names(&["generic", "cisco"]))
+            );
+
+            assert_eq!(
+                runtime.observe_output(format!("logout\r\n{close}\r\n").as_bytes(), &store),
+                Some(names(&["generic", "juniper"])),
+                "{close}"
+            );
+            assert_eq!(runtime.stack_len(), 1, "{close}");
+        }
+    }
+
+    // The close line after `logout` belongs to the same exit, also when the
+    // host it names is the one the outer connection went to.
+    #[test]
+    fn a_close_line_after_logout_does_not_end_the_outer_connection_it_names() {
+        let store = ProfileStore::builtin();
+        let mut runtime = ProfileRuntime::new(names(&["generic", "linux-unix"]));
+        runtime.observe_input(b"ssh router-a\r");
+        assert_eq!(
+            runtime.observe_output(b"--- JUNOS 22.4R3 Kernel 64-bit\n", &store),
+            Some(names(&["generic", "juniper"]))
+        );
+        // An alias for the same router, typed on it.
+        runtime.observe_input(b"ssh alias-a\r");
+        runtime.observe_output(b"--- JUNOS 22.4R3 Kernel 64-bit\n", &store);
+        assert_eq!(runtime.stack_len(), 2);
+
+        runtime.observe_output(b"logout\r\nConnection to router-a closed.\r\n", &store);
+        assert_eq!(runtime.active_profiles(), names(&["generic", "juniper"]));
+        assert_eq!(runtime.stack_len(), 1);
     }
 
     #[test]
