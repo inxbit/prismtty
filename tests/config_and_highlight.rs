@@ -347,6 +347,29 @@ fn generic_profile_does_not_paint_bare_den_as_a_bad_state() {
     }
 }
 
+// The title string of GNU screen and tmux is a string control for the
+// sanitizer, with or without C0 controls after its ESC.
+#[test]
+fn strip_string_escapes_drops_the_screen_title_string() {
+    use prismtty::highlight::strip_string_escapes;
+
+    assert_eq!(
+        strip_string_escapes(b"one \x1bktitle\x1b\\two\n"),
+        b"one two\n"
+    );
+    assert_eq!(
+        strip_string_escapes(b"one \x1b\x00ktitle\x1b\\two\n"),
+        b"one two\n"
+    );
+    // Unterminated at the end of the input: dropped, like any string.
+    assert_eq!(strip_string_escapes(b"one \x1bktitle"), b"one ");
+    // A `k` that no ESC is waiting for is a letter.
+    assert_eq!(
+        strip_string_escapes(b"ok \x1b[1mkeep\x1b[0m\n"),
+        b"ok \x1b[1mkeep\x1b[0m\n"
+    );
+}
+
 // An interface zone may hold `-`, `.` and `_` (`%eth-0`, `%bond0.100`).
 #[test]
 fn generic_profile_colors_an_ipv6_zone_with_punctuation_as_one_address() {

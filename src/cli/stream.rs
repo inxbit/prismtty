@@ -11,7 +11,8 @@ use nix::libc;
 use crate::highlight::{
     AnsiChunk, BenchmarkReport, Highlighter, MAX_INCOMPLETE_ESCAPE_BYTES,
     OversizedStringControlFilter, RuleIdentityRegistry, StreamingHighlighter,
-    incomplete_sanitize_start, is_incomplete_utf8_prefix, strip_ansi, strip_string_escapes,
+    incomplete_sanitize_start, is_incomplete_utf8_prefix, read_screen_titles_as_apc, strip_ansi,
+    strip_string_escapes,
 };
 use crate::profile_runtime::ProfileRuntime;
 use crate::profiles::ProfileStore;
@@ -886,6 +887,11 @@ fn prepare_chunk(
     };
     let mut combined = std::mem::take(&mut state.carry);
     combined.extend_from_slice(&incoming);
+    if sanitize {
+        // Before the split below: an unfinished title string has to be
+        // carried to the next read like any other string, not let through.
+        read_screen_titles_as_apc(&mut combined);
+    }
     let combined = state
         .oversized_string_controls
         .filter_reassembled(&combined);
@@ -1739,6 +1745,61 @@ mod tests {
         }
         output.extend(streaming.finish());
         output
+    }
+
+    // GNU screen and tmux read `ESC k title ST` as the window title. With
+    // --sanitize it is removed like the other title strings, wherever the
+    // reads fall; without it the bytes pass through untouched.
+    #[test]
+    fn sanitize_drops_a_screen_title_string_however_the_reads_fall() {
+        for input in [
+            b"one \x1bktitle\x1b\\two\n".as_slice(),
+            // C0 controls that keep the terminal in the escape state.
+            b"one \x1b\x00ktitle\x1b\\two\n".as_slice(),
+            // Ended by another escape, and never ended at all.
+            b"one \x1bktitle\x1b[1mtwo\n".as_slice(),
+            b"one \x1bktitle two\n".as_slice(),
+        ] {
+            let whole = run_chunk_pipeline(&[input], ChunkPipeline::Sanitize);
+            assert!(
+                !whole.windows(5).any(|window| window == b"title"),
+                "{:?} left the title in {:?}",
+                input.escape_ascii().to_string(),
+                whole.escape_ascii().to_string()
+            );
+            assert!(
+                whole.starts_with(b"one "),
+                "{:?}",
+                whole.escape_ascii().to_string()
+            );
+            assert_eq!(
+                run_chunk_pipeline(&[input], ChunkPipeline::Preserve),
+                input,
+                "without --sanitize the bytes pass through"
+            );
+            for split in 1..input.len() {
+                let (first, second) = input.split_at(split);
+                for pipeline in [ChunkPipeline::Sanitize, ChunkPipeline::Preserve] {
+                    assert_eq!(
+                        run_chunk_pipeline(&[first, second], pipeline),
+                        run_chunk_pipeline(&[input], pipeline),
+                        "split at {split} of {:?}",
+                        input.escape_ascii().to_string()
+                    );
+                }
+            }
+            let bytes: Vec<&[u8]> = input.chunks(1).collect();
+            assert_eq!(
+                run_chunk_pipeline(&bytes, ChunkPipeline::Sanitize),
+                whole,
+                "one byte per read of {:?}",
+                input.escape_ascii().to_string()
+            );
+        }
+        assert_eq!(
+            run_chunk_pipeline(&[b"one \x1bktitle\x1b\\two\n"], ChunkPipeline::Sanitize),
+            b"one two\n"
+        );
     }
 
     // Where a read boundary falls inside a UTF-8 character or a string payload

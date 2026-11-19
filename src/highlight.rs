@@ -4581,6 +4581,33 @@ pub fn strip_ansi(input: &[u8]) -> Vec<u8> {
     stripped
 }
 
+/// Rewrites each `ESC k` as `ESC _`, in place. GNU screen and tmux read
+/// `ESC k title ST` as a string that sets the window title; no other terminal
+/// does, so it is a plain two-byte escape everywhere else in this file. For
+/// sanitizing, where a title a remote device can set is what must not get
+/// through, it is read as the APC string it is shaped like: same length, same
+/// ways to end, and so found, carried across reads and dropped the same way.
+pub(crate) fn read_screen_titles_as_apc(bytes: &mut [u8]) {
+    let mut from = 0;
+    while let Some(title) = screen_title_final_from(bytes, from) {
+        bytes[title] = b'_';
+        from = title + 1;
+    }
+}
+
+/// The index of the `k` of the first `ESC k` at or after `from`, past the C0
+/// controls a terminal runs after ESC.
+fn screen_title_final_from(bytes: &[u8], mut from: usize) -> Option<usize> {
+    while let Some(offset) = bytes[from..].iter().position(|byte| *byte == 0x1b) {
+        from += offset + 1;
+        let after = skip_escape_state_controls(bytes, from);
+        if bytes.get(after) == Some(&b'k') {
+            return Some(after);
+        }
+    }
+    None
+}
+
 /// Removes string-type escape sequences — OSC, DCS, SOS, PM, APC — while
 /// keeping visible text, CSI/SGR, and simple escapes intact. These are the
 /// 7-bit ESC and 8-bit C1 sequences a hostile child or remote device can abuse
@@ -4591,8 +4618,19 @@ pub fn strip_ansi(input: &[u8]) -> Vec<u8> {
 /// could switch it out of UTF-8: an ESC that a non-ASCII byte follows (the
 /// byte is kept) with any control that the ESC cancelled, every DOCS sequence
 /// (`ESC %`), a CSI that holds a byte from 80 up or that a C1 control cancels,
-/// and a CSI that sets, resets or restores DEC private mode 42.
+/// and a CSI that sets, resets or restores DEC private mode 42. The title
+/// string of GNU screen and tmux, `ESC k title ST`, is removed as a string
+/// too.
 pub fn strip_string_escapes(input: &[u8]) -> Vec<u8> {
+    let with_titles_as_strings;
+    let input = if screen_title_final_from(input, 0).is_some() {
+        let mut rewritten = input.to_vec();
+        read_screen_titles_as_apc(&mut rewritten);
+        with_titles_as_strings = rewritten;
+        with_titles_as_strings.as_slice()
+    } else {
+        input
+    };
     let mut sanitized = Vec::with_capacity(input.len());
     let mut idx = 0;
     while idx < input.len() {

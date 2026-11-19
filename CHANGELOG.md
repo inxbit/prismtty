@@ -2,6 +2,18 @@
 
 All notable changes to PrismTTY are documented here.
 
+## Unreleased
+
+### Security
+
+- Remove the window title string of GNU screen and tmux,
+  `ESC k title ESC \`, under `--sanitize`. Only those two read it as a
+  string, so it passed as a two-byte escape followed by text, and a remote
+  device could set the title of the pane PrismTTY ran in. It is now found,
+  carried across reads and dropped like an APC string, and
+  `strip_string_escapes` in the library removes it too. Without `--sanitize`
+  nothing changes.
+
 ## 1.3.6 - 2026-11-19
 
 ### Fixed

@@ -2607,3 +2607,21 @@ fn profiles_test_colors_a_phrase_that_spans_the_64k_chunk_boundary() {
         &stdout[stdout.len().saturating_sub(80)..]
     );
 }
+
+// GNU screen and tmux read `ESC k title ESC \` as the window title, which is
+// what --sanitize is there to keep a remote device from setting.
+#[test]
+fn sanitize_drops_the_screen_and_tmux_title_string() {
+    let config = config_that_paints_up_green();
+    let input = b"one \x1bktitle\x1b\\two\n";
+
+    for flags in [&["--sanitize"][..], &["--sanitize", "--strip-ansi"]] {
+        assert_eq!(
+            String::from_utf8_lossy(&filter_with_locale(config.path(), flags, &[], input)),
+            "one two\n",
+            "{flags:?}"
+        );
+    }
+    // Without --sanitize the wrapper stays transparent.
+    assert_eq!(filter_with_locale(config.path(), &[], &[], input), input);
+}
