@@ -673,6 +673,102 @@ esac
   }
 });
 
+test('formula installs the bash completions under every command name', () => {
+  // bash-completion loads a completion file on demand by the name of the
+  // command being completed, so `ptty <TAB>` and `ct <TAB>` need files named
+  // ptty and ct even though the prismtty file holds their completions.
+  const directory = mkdtempSync(`${tmpdir()}/prismtty-formula-`);
+  try {
+    for (const target of ['darwin-aarch64', 'darwin-x86_64', 'linux-x86_64']) {
+      writeFileSync(
+        `${directory}/prismtty-1.2.3-${target}.tar.gz.sha256`,
+        `${'a'.repeat(64)}  prismtty-1.2.3-${target}.tar.gz\n`,
+      );
+    }
+    const result = spawnSync('bash', ['scripts/generate-homebrew-formula.sh', `${directory}/prismtty.rb`, directory], {
+      encoding: 'utf8',
+      env: { ...process.env, PRISMTTY_VERSION: '1.2.3' },
+    });
+    assert.equal(result.status, 0, result.stderr);
+
+    const formula = read(`${directory}/prismtty.rb`);
+    assert.match(formula, /^\s*bash_completion\.install "completions\/prismtty\.bash" => "prismtty"$/m);
+    for (const command of ['ptty', 'ct']) {
+      assert.match(
+        formula,
+        new RegExp(`^\\s*bash_completion\\.install_symlink bash_completion/"prismtty" => "${command}"$`, 'm'),
+        `formula does not install a bash completion named ${command}`,
+      );
+    }
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('release packaging takes the binaries from the cargo target directory in use', () => {
+  // With CARGO_TARGET_DIR set, cargo builds there. The script copied from
+  // ./target/release regardless, so it packaged whatever an earlier build had
+  // left in the default directory, or failed.
+  const directory = mkdtempSync(`${tmpdir()}/prismtty-package-`);
+  const fakeBin = `${directory}/bin`;
+  const script = `${directory}/package-release.sh`;
+  const targetDir = `${directory}/elsewhere`;
+  try {
+    for (const path of ['bin', 'completions', 'profiles', 'elsewhere/release']) {
+      mkdirSync(`${directory}/${path}`, { recursive: true });
+    }
+    copyFileSync('scripts/package-release.sh', script);
+    chmodSync(script, 0o755);
+    for (const path of [
+      'LICENSE',
+      'README.md',
+      'completions/prismtty.bash',
+      'completions/prismtty.fish',
+      'completions/_prismtty',
+      'profiles/custom-router.example.yml',
+    ]) {
+      writeFileSync(`${directory}/${path}`, `${path}\n`);
+    }
+    for (const binary of ['prismtty', 'ptty', 'ct']) {
+      writeFileSync(`${targetDir}/release/${binary}`, `built in the target directory in use\n`);
+      chmodSync(`${targetDir}/release/${binary}`, 0o755);
+    }
+    writeFileSync(
+      `${fakeBin}/cargo`,
+      `#!/usr/bin/env bash
+set -euo pipefail
+case "$1" in
+  pkgid) printf '%s\n' "path+file:///fixture#1.2.3" ;;
+  build) ;;
+  *) exit 1 ;;
+esac
+`,
+    );
+    chmodSync(`${fakeBin}/cargo`, 0o755);
+
+    const result = spawnSync('bash', [script, 'darwin-aarch64'], {
+      cwd: directory,
+      env: {
+        ...process.env,
+        PATH: `${fakeBin}:${process.env.PATH}`,
+        SOURCE_DATE_EPOCH: '1700000000',
+        CARGO_TARGET_DIR: targetDir,
+      },
+      encoding: 'utf8',
+    });
+    assert.equal(result.status, 0, result.stderr || result.stdout);
+    const packaged = spawnSync(
+      'tar',
+      ['-xzOf', `${directory}/dist/prismtty-1.2.3-darwin-aarch64.tar.gz`, 'prismtty-1.2.3-darwin-aarch64/prismtty'],
+      { encoding: 'utf8' },
+    );
+    assert.equal(packaged.status, 0, packaged.stderr);
+    assert.equal(packaged.stdout, 'built in the target directory in use\n');
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test('privacy scan includes Cargo.lock in sensitive marker checks', () => {
   const script = read('scripts/privacy-scan.sh');
 
