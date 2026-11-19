@@ -68,8 +68,12 @@ impl IoTrace {
         let Ok(mut file) = inner.file.lock() else {
             return;
         };
-        let previous = inner.written.load(Ordering::Relaxed);
+        // Another session may be appending to the same file, so count what
+        // is in it, not only what this session wrote.
+        let on_disk = file.metadata().map_or(0, |metadata| metadata.len());
+        let previous = inner.written.load(Ordering::Relaxed).max(on_disk);
         if previous >= inner.limit {
+            inner.written.store(inner.limit, Ordering::Relaxed);
             return;
         }
         let line_len = line.len() as u64;
@@ -198,6 +202,28 @@ mod tests {
 
         let size = std::fs::metadata(&path).expect("trace metadata").len();
         assert!(size <= 128, "trace should stay within its byte limit");
+    }
+
+    // Two sessions can trace to one file. Each counted only its own lines,
+    // so together they wrote up to twice the limit.
+    #[test]
+    fn two_sessions_tracing_to_one_file_share_its_limit() {
+        let dir = tempfile::tempdir().expect("tempdir creates");
+        let path = dir.path().join("trace.log");
+
+        let first = super::IoTrace::open_with_limit(Some(&path), 256).expect("trace opens");
+        let second = super::IoTrace::open_with_limit(Some(&path), 256).expect("trace opens");
+        for _ in 0..100 {
+            first.log("OUT", b"some representative payload bytes");
+            second.log("OUT", b"some representative payload bytes");
+        }
+        drop((first, second));
+
+        let size = std::fs::metadata(&path).expect("trace metadata").len();
+        assert!(
+            size <= 256,
+            "two traces wrote {size} bytes past a 256 byte limit"
+        );
     }
 
     // The truncation marker must be the last thing in the file: once it is

@@ -362,6 +362,28 @@ fn generic_profile_colors_an_ipv6_zone_with_punctuation_as_one_address() {
     }
 }
 
+// An IPv6 address may end in a dotted IPv4 address: IPv4-mapped, NAT64, or
+// written out in full. Only the IPv4 tail was colored.
+#[test]
+fn generic_profile_colors_an_ipv6_address_with_an_ipv4_tail_as_one_address() {
+    for address in [
+        "::ffff:192.0.2.1",
+        "::192.0.2.1",
+        "2001:db8::192.0.2.33",
+        "0:0:0:0:0:ffff:192.0.2.1",
+        "::ffff:192.0.2.1/128",
+    ] {
+        let output = highlight_with_builtin("generic", &format!("via {address} ok\n"));
+        assert!(
+            output.starts_with(&format!("via \x1b[38;2;0;255;255m{address}\x1b[0m ")),
+            "{address}: {output:?}"
+        );
+    }
+    // No address in front of the dots: the IPv4 address stands alone.
+    let output = highlight_with_builtin("generic", "name::192.0.2.1\n");
+    assert_eq!(output, "name::\x1b[38;2;0;255;255m192.0.2.1\x1b[0m\n");
+}
+
 // Configuration-context prompts are prompts too, and PAN-OS names aggregate
 // interfaces `aeN` and `aeN.M`.
 #[test]
@@ -680,6 +702,41 @@ fn streaming_highlighter_keeps_alternate_screen_bypass_across_chunks() {
     assert!(output.contains("\x1b[38;2;77;166;255m192.0.2.1 down\x1b[0m"));
     assert!(output.contains("\x1b[38;2;0;255;255m198.51.100.11\x1b[0m"));
     assert!(!output.contains("\x1b[38;2;0;255;255m192.0.2.1"));
+}
+
+// In an interactive stream a foreground-only highlight stays open across the
+// spacing between two highlighted columns. Where the program's own rendition
+// draws blank cells with the foreground color (inverse, underline,
+// strike-through, overline) that left the spacing in the highlight color.
+#[test]
+fn interactive_highlight_does_not_color_spacing_the_program_draws_with_the_foreground() {
+    let config = PrismConfig::from_chromaterm_yaml(
+        "rules:\n  - description: up\n    regex: '\\bup\\b'\n    color: f#00ff00\n",
+    )
+    .expect("config parses");
+    let highlighter = Highlighter::from_config(config).expect("rules compile");
+    let green = "\x1b[38;2;0;255;0m";
+
+    for (on, off) in [("7", "27"), ("4", "24"), ("9", "29"), ("53", "55")] {
+        let mut streaming = new_interactive_streaming(highlighter.clone());
+        let mut output = streaming.push_str(&format!("\x1b[{on}mup   up\x1b[{off}m\n"));
+        output.push_str(&String::from_utf8(streaming.finish()).expect("utf8"));
+        assert!(
+            output.starts_with(&format!(
+                "\x1b[{on}m{green}up\x1b[39m   {green}up\x1b[{off}m"
+            )),
+            "SGR {on}: {output:?}"
+        );
+    }
+
+    // With no such attribute the highlight stays open across the spacing.
+    let mut streaming = new_interactive_streaming(highlighter.clone());
+    let mut output = streaming.push_str("up   up\n");
+    output.push_str(&String::from_utf8(streaming.finish()).expect("utf8"));
+    assert!(
+        output.starts_with(&format!("{green}up   up\n")),
+        "{output:?}"
+    );
 }
 
 #[test]
