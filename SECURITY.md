@@ -63,4 +63,6 @@ examples that preserve only the token shape needed to reproduce the issue.
   wrapped program pass through unchanged, exactly like `ssh` or `tmux`. When
   working against untrusted remote devices, `--sanitize` strips string-type
   escapes (window title, OSC 52 clipboard, DCS/SOS/PM/APC payloads) from
-  program output while leaving colors and cursor control intact.
+  program output while leaving colors and cursor control intact. That
+  includes the title string of GNU screen and tmux, `ESC k title ESC \`,
+  which only those two read as a string.
