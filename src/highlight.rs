@@ -3159,9 +3159,13 @@ fn emit_interactive_highlighted(
                         None => {
                             // A foreground-only overlay stays open across the
                             // spacing between highlighted columns; a style
-                            // that shows on blank cells must not paint it.
+                            // that shows on blank cells must not paint it,
+                            // and neither may the overlay's color where the
+                            // program's own rendition shows it there.
                             if active_style.as_ref().is_some_and(|style| {
-                                !is_interactive_spacing(*byte) || style_paints_blank_cells(style)
+                                !is_interactive_spacing(*byte)
+                                    || style_paints_blank_cells(style)
+                                    || native_sgr.draws_blank_cells_with_the_foreground()
                             }) {
                                 let style = active_style
                                     .take()
@@ -3393,6 +3397,17 @@ impl NativeSgrState {
 
     fn ansi_start(&self) -> Option<String> {
         self.rendition.ansi_start()
+    }
+
+    /// Whether the program's rendition draws on blank cells in the foreground
+    /// color: inverse, strike-through, overline, or an underline with no
+    /// color of its own.
+    fn draws_blank_cells_with_the_foreground(&self) -> bool {
+        let attributes = &self.rendition.attributes;
+        [7, 9, 53]
+            .iter()
+            .any(|group| attributes.contains_key(group))
+            || (attributes.contains_key(&4) && self.rendition.underline_color.is_none())
     }
 
     fn restore_after_interactive_style(&self, style: &Style) -> Vec<u8> {

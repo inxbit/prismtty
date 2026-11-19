@@ -2,6 +2,22 @@
 
 All notable changes to PrismTTY are documented here.
 
+## Unreleased
+
+### Fixed
+
+- Keep a highlight's color off the spacing between two highlighted columns
+  where the program draws blank cells in the foreground color. In an
+  interactive stream a foreground-only highlight stays open across spaces and
+  tabs; under the program's own inverse, underline, strike-through or
+  overline that showed as colored blocks or lines between the columns.
+- Color an IPv6 address that ends in a dotted IPv4 address as one address:
+  IPv4-mapped (`::ffff:` and an IPv4 address), NAT64, and the form written
+  out in full. Only the IPv4 tail was colored.
+- Hold two sessions that trace to the same `--trace-io` file to one 64 MiB
+  limit. Each counted only its own lines, so together they could write twice
+  the limit.
+
 ## 1.3.3 - 2026-11-19
 
 ### Fixed
