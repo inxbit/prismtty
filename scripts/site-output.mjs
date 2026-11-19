@@ -143,7 +143,11 @@ function runBinary(bin, profile, input) {
   try {
     mkdirSync(join(home, 'xdg'));
     mkdirSync(join(home, 'run'), { mode: 0o700 });
-    const result = spawnSync(bin, ['-R', '-p', profile], {
+    // An explicit config keeps the binary from reading the default ones,
+    // /etc/chromaterm included, which no environment variable moves.
+    const config = join(home, 'empty.yml');
+    writeFileSync(config, 'rules: []\n');
+    const result = spawnSync(bin, ['-R', '-c', config, '-p', profile], {
       input,
       encoding: 'utf8',
       env: { HOME: home, XDG_CONFIG_HOME: join(home, 'xdg'), PRISMTTY_RUNTIME_DIR: join(home, 'run') },

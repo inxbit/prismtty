@@ -2266,3 +2266,53 @@ fn nonblocking_terminal_output_does_not_end_stdin_mode() {
         "the burst did not reach the terminal; output ends with: {tail:?}"
     );
 }
+
+/// A wrapped session puts the terminal in raw mode, where LF no longer returns
+/// the cursor to the left edge. A diagnostic that ended in a bare LF left the
+/// lines after it starting mid-screen.
+#[test]
+fn diagnostics_in_a_raw_terminal_end_in_cr_lf() {
+    let home = tempfile::tempdir().expect("home");
+    let config = home.path().join("empty.yml");
+    std::fs::write(&config, "rules: []\n").expect("config writes");
+    let pair = native_pty_system()
+        .openpty(PtySize::default())
+        .expect("openpty");
+    let mut builder = CommandBuilder::new(env!("CARGO_BIN_EXE_ptty"));
+    builder.env_clear();
+    builder.env("HOME", home.path());
+    builder.env("PRISMTTY_RUNTIME_DIR", home.path().join("runtime"));
+    builder.env("PATH", "/usr/bin:/bin");
+    builder.args(["--show-profile", "--benchmark", "--profile", "generic"]);
+    builder.arg("--config");
+    builder.arg(&config);
+    builder.args(["--", "/bin/sh", "-c", "printf 'started\\n'"]);
+    let child = pair
+        .slave
+        .spawn_command(builder)
+        .expect("spawn interactive ptty");
+    drop(pair.slave);
+    let mut ptty = PtySession::new(child, &*pair.master);
+
+    let status = ptty.wait_for_exit(Duration::from_secs(10));
+    let output = ptty.capture().wait_until(Duration::from_secs(2), |out| {
+        contains_bytes(out, b"Processed ")
+    });
+
+    assert_eq!(status, Some(0), "{:?}", String::from_utf8_lossy(&output));
+    for line in [
+        &b"prismtty: profiles selected: generic\r\n"[..],
+        b"Benchmark results (time spent, match count):\r\n",
+    ] {
+        assert!(
+            contains_bytes(&output, line),
+            "{:?}",
+            String::from_utf8_lossy(&output)
+        );
+    }
+    let bare_lf = output
+        .iter()
+        .enumerate()
+        .any(|(idx, byte)| *byte == b'\n' && (idx == 0 || output[idx - 1] != b'\r'));
+    assert!(!bare_lf, "{:?}", String::from_utf8_lossy(&output));
+}

@@ -508,7 +508,7 @@ fn with_terminal_restored_for_job_control(
 /// unwritable stderr (EIO once the controlling terminal hangs up) cannot
 /// abort cleanup or kill the signal watcher before it reaps the child.
 fn warn(args: std::fmt::Arguments<'_>) {
-    let _ = writeln!(io::stderr(), "{args}");
+    super::diagnostic(args);
 }
 
 /// Runs `body`, catching a panic so it surfaces as a clear diagnostic instead

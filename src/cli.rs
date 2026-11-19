@@ -82,6 +82,37 @@ impl CliError {
     }
 }
 
+/// Writes one diagnostic line to standard error. Best effort: a closed stderr
+/// must not cost the highlighted output, and unlike `eprintln!` this never
+/// panics.
+///
+/// A wrapped session puts the terminal in raw mode, where LF no longer returns
+/// the cursor to the left edge, so a diagnostic that ended in a bare LF left
+/// the lines after it starting mid-screen. On a terminal that does not add the
+/// CR itself, the line ends in CR LF.
+fn diagnostic(message: std::fmt::Arguments<'_>) {
+    write_diagnostic_lines(format!("{message}\n"));
+}
+
+/// Writes whole diagnostic lines, each ending in LF, the way `diagnostic`
+/// writes one.
+fn write_diagnostic_lines(mut text: String) {
+    if stderr_leaves_lf_bare() {
+        text = text.replace('\n', "\r\n");
+    }
+    let _ = io::stderr().write_all(text.as_bytes());
+}
+
+fn stderr_leaves_lf_bare() -> bool {
+    use nix::sys::termios::{OutputFlags, tcgetattr};
+
+    tcgetattr(io::stderr()).is_ok_and(|terminal| {
+        !terminal
+            .output_flags
+            .contains(OutputFlags::OPOST | OutputFlags::ONLCR)
+    })
+}
+
 /// Exit status for output whose reader went away: 128 + SIGPIPE, what a
 /// filter killed by SIGPIPE reports, so `set -o pipefail` sees the same code.
 const BROKEN_PIPE_EXIT_STATUS: u8 = 141;
@@ -211,8 +242,11 @@ fn run_inner(args: Vec<OsString>) -> Result<ExitCode, CliError> {
             Ok(ExitCode::SUCCESS)
         }
         Action::ProfilesTest { profile, fixture } => {
-            let input =
-                read_bounded_regular_file(&fixture, MAX_PROFILE_TEST_FILE_BYTES, "fixture")?;
+            let input = read_bounded_regular_file(&fixture, MAX_PROFILE_TEST_FILE_BYTES, "fixture")
+                .map_err(|source| crate::config::ConfigError::Read {
+                    path: fixture.clone(),
+                    source,
+                })?;
             // The fixture is printed to the terminal like program output, so
             // the flags that remove escapes from that output apply to it too.
             let input = if options.strip_ansi {

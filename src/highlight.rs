@@ -1677,7 +1677,12 @@ impl StreamingHighlighter {
                     self.line_rewritten_in_place = false;
                     output.extend_from_slice(bytes);
                 }
-                Token::Ansi(bytes) if is_alternate_screen_disable(bytes) => {
+                // RIS resets the terminal, which puts it back on the normal
+                // screen too.
+                Token::Ansi(bytes)
+                    if is_alternate_screen_disable(bytes)
+                        || (self.alternate_screen && escape_final_byte(bytes) == Some(b'c')) =>
+                {
                     self.flush_highlightable(&mut highlightable, &mut output);
                     self.reset_interactive_overlay(&mut output);
                     self.native_sgr.apply_sequence(bytes);
@@ -2463,7 +2468,14 @@ fn compile_rule(
         .build(&bounded_pattern)
         .map_err(|source| HighlightError::Regex {
             description: escape_untrusted(&description),
-            source,
+            // The offset in `source` counts the limits in front. Compile the
+            // rule as written to report where it fails in the user's text.
+            source: RegexBuilder::new()
+                .multi_line(true)
+                .crlf(true)
+                .build(&rule.regex)
+                .err()
+                .unwrap_or(source),
         })?;
     let style = resolve_capture_references(&description, rule.style, &regex)?;
     Ok(CompiledRule {
@@ -2680,7 +2692,13 @@ fn match_rule(
         };
 
         let (next_search, skip) = next_match_search(start, end, last_match);
-        last_end = next_search;
+        // An empty match steps over the whole character at its end, not into
+        // it: a rule in UTF mode cannot be searched from inside a character.
+        last_end = if start >= end && end < visible.len() {
+            end + valid_utf8_char_width_at(visible, end).unwrap_or(1)
+        } else {
+            next_search
+        };
         if skip {
             continue;
         }

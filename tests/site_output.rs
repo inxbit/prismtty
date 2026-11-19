@@ -41,6 +41,10 @@ fn site_output_snapshots_match_the_binary() {
             .mode(0o700)
             .create(&runtime)
             .expect("runtime dir");
+        // An explicit config keeps the binary from reading the default ones,
+        // /etc/chromaterm included, which no environment variable moves.
+        let config = home.path().join("empty.yml");
+        fs::write(&config, "rules: []\n").expect("empty config");
         let output = Command::cargo_bin("prismtty")
             .expect("prismtty binary")
             .env_clear()
@@ -48,6 +52,8 @@ fn site_output_snapshots_match_the_binary() {
             .env("XDG_CONFIG_HOME", home.path().join("xdg"))
             .env("PRISMTTY_RUNTIME_DIR", &runtime)
             .args(["-R", "-p", profile])
+            .arg("--config")
+            .arg(&config)
             .write_stdin(input)
             .output()
             .expect("prismtty runs");

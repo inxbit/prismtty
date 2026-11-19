@@ -221,7 +221,7 @@ pub(crate) fn is_generic_profile_set(profiles: &[String]) -> bool {
 pub struct Profile {
     /// Profile name used on the command line and in configuration.
     pub name: String,
-    /// Parent profiles loaded before this profile.
+    /// Parent profiles. Their rules follow this profile's own.
     pub inherits: Vec<String>,
     /// Case-insensitive startup detection hints.
     pub detection: Vec<String>,

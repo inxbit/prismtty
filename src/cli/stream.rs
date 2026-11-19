@@ -171,7 +171,7 @@ pub(super) fn highlight_stream<R: Read, W: Write>(
     }
     session.push(writer, &trace, &first_chunk)?;
     if let Some(warning) = session.slow_rule_warning() {
-        let _ = writeln!(io::stderr(), "{warning}");
+        super::diagnostic(format_args!("{warning}"));
     }
     if let Some(reason) = should_flush_input_echo(
         input.interactive,
@@ -274,17 +274,16 @@ pub(super) fn highlight_stream<R: Read, W: Write>(
                     }
                 }
                 Err(error) => {
-                    let _ = writeln!(
-                        io::stderr(),
+                    super::diagnostic(format_args!(
                         "prismtty: reload ignored; keeping last known good configuration: {}",
                         escape_untrusted(&error.to_string())
-                    );
+                    ));
                 }
             }
         }
         session.push(writer, &trace, &chunk)?;
         if let Some(warning) = session.slow_rule_warning() {
-            let _ = writeln!(io::stderr(), "{warning}");
+            super::diagnostic(format_args!("{warning}"));
         }
         if let Some(reason) = should_flush_input_echo(
             input.interactive,
@@ -776,11 +775,10 @@ fn apply_automatic_profile_switch<W: Write>(
         Ok(ProfileSwitchOutcome::Unchanged | ProfileSwitchOutcome::Switched) => true,
         Ok(ProfileSwitchOutcome::Rejected) => false,
         Err(error) => {
-            let _ = writeln!(
-                io::stderr(),
+            super::diagnostic(format_args!(
                 "prismtty: automatic profile switch ignored; keeping last known good rules: {}",
                 escape_untrusted(&error.to_string())
-            );
+            ));
             false
         }
     };
@@ -824,7 +822,10 @@ fn new_streaming_highlighter(
 fn print_benchmark_report(report: Option<&BenchmarkReport>, input_bytes: usize, elapsed_secs: f64) {
     // Best effort, like every diagnostic: a closed stderr is not worth failing
     // a run whose output was already written.
-    let _ = write_benchmark_report(&mut io::stderr().lock(), report, input_bytes, elapsed_secs);
+    let mut text = Vec::new();
+    if write_benchmark_report(&mut text, report, input_bytes, elapsed_secs).is_ok() {
+        super::write_diagnostic_lines(String::from_utf8_lossy(&text).into_owned());
+    }
 }
 
 fn write_benchmark_report(

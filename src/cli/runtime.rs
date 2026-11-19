@@ -28,11 +28,10 @@ pub(super) fn register_for_reload() -> (Option<RuntimeRegistration>, Option<Relo
     match RuntimeRegistration::register() {
         Ok(registration) => (Some(registration), Some(ReloadWatcher::new())),
         Err(error) => {
-            let _ = writeln!(
-                io::stderr(),
+            super::diagnostic(format_args!(
                 "prismtty: live reload disabled for this session: {}",
                 escape_untrusted(&error.to_string())
-            );
+            ));
             (None, None)
         }
     }
@@ -353,12 +352,18 @@ fn ensure_private_runtime_file(file: &File, path: &Path) -> io::Result<()> {
 }
 
 fn process_is_alive(pid: u32) -> bool {
+    // A value that does not fit a `pid_t` is no process id. Cast, it would be
+    // negative, and a negative id asks about a process group or, for -1,
+    // about every process.
+    let Ok(pid) = libc::pid_t::try_from(pid) else {
+        return false;
+    };
     if pid == 0 {
         return false;
     }
     // SAFETY: kill with signal 0 has no memory-safety preconditions and only checks that the
     // process exists.
-    let result = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    let result = unsafe { libc::kill(pid, 0) };
     let errno = (result != 0)
         .then(|| io::Error::last_os_error().raw_os_error())
         .flatten();

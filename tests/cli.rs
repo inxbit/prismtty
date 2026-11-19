@@ -2440,3 +2440,115 @@ fn relative_xdg_config_home_is_ignored() {
         .success()
         .stdout("hello world\n");
 }
+
+// RIS (`ESC c`) resets the terminal, the alternate screen included. Output
+// after it is on the normal screen again, so it is highlighted again.
+#[test]
+fn a_full_reset_inside_the_alternate_screen_brings_highlighting_back() {
+    let config = config_that_paints_up_green();
+
+    let output = filter_with_locale(
+        config.path(),
+        &[],
+        &[],
+        b"\x1b[?1049hframe up\x1bcGi0/1 is up\n",
+    );
+
+    assert_eq!(
+        String::from_utf8_lossy(&output),
+        "\u{1b}[?1049hframe up\u{1b}cGi0/1 is \u{1b}[38;2;0;255;0mup\u{1b}[0m\n"
+    );
+}
+
+// 4294967295 is no process id. As a `pid_t` it is -1, and asking about -1
+// asks about every process, so the file counted as a live session for good.
+#[cfg(unix)]
+#[test]
+fn registration_prunes_a_pid_file_named_above_any_process_id() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let pid_dir = temp.path().join("runtime").join("pids.d");
+    fs::create_dir_all(&pid_dir).expect("pids.d creates");
+    for dir in [temp.path().join("runtime"), pid_dir.clone()] {
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).expect("mode sets");
+    }
+    fs::write(pid_dir.join("4294967295"), "").expect("pid file writes");
+
+    isolated("prismtty", temp.path())
+        .write_stdin("192.0.2.44 down\n")
+        .assert()
+        .success();
+
+    let left: Vec<_> = fs::read_dir(&pid_dir)
+        .expect("pids.d reads")
+        .map(|entry| entry.expect("entry reads").file_name())
+        .collect();
+    assert!(left.is_empty(), "the pid file survived: {left:?}");
+}
+
+// A rule that can match nothing is searched again one step further on. One
+// byte further is inside a multi-byte character, where a rule in UTF mode
+// cannot start: PCRE2 reports a bad offset, which was taken for a runaway
+// match, reported, and cost the rest of the word.
+#[test]
+fn a_utf_rule_that_can_match_nothing_survives_multibyte_text() {
+    let mut config = tempfile::NamedTempFile::new().expect("config");
+    writeln!(
+        config,
+        "rules:\n  - description: xs\n    regex: (*UTF)x*\n    color: f#00ff00"
+    )
+    .expect("write config");
+
+    let output = Command::cargo_bin("prismtty")
+        .expect("binary exists")
+        .args(["--rgb", "--no-auto-detect", "--config"])
+        .arg(config.path())
+        .write_stdin("caf\u{e9}xx \u{4e2d}\u{6587}x\n")
+        .output()
+        .expect("command runs");
+
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(String::from_utf8_lossy(&output.stderr), "");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "caf\u{e9}\u{1b}[38;2;0;255;0mxx\u{1b}[0m \u{4e2d}\u{6587}\u{1b}[38;2;0;255;0mx\u{1b}[0m\n"
+    );
+}
+
+// PrismTTY compiles each rule with its match limits in front. PCRE2 counted
+// those 40 characters into the offset of a compile error, so the offset
+// pointed nowhere in the rule the user wrote.
+#[test]
+fn a_rule_compile_error_reports_the_offset_in_the_rule_as_written() {
+    let mut config = tempfile::NamedTempFile::new().expect("config");
+    writeln!(
+        config,
+        "rules:\n  - description: bad\n    regex: ab(cd\n    color: f#00ff00"
+    )
+    .expect("write config");
+
+    Command::cargo_bin("prismtty")
+        .expect("binary exists")
+        .args(["--no-auto-detect", "--config"])
+        .arg(config.path())
+        .write_stdin("x\n")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("rule 'bad' failed to compile"))
+        .stderr(predicate::str::contains("offset 5:"));
+}
+
+#[test]
+fn profiles_test_names_the_fixture_it_cannot_read() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let missing = temp.path().join("missing-fixture.txt");
+
+    Command::cargo_bin("prismtty")
+        .expect("binary exists")
+        .args(["profiles", "test", "generic"])
+        .arg(&missing)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("missing-fixture.txt"));
+}
