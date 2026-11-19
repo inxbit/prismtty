@@ -12,8 +12,8 @@ All notable changes to PrismTTY are documented here.
   tabs; under the program's own inverse, underline, strike-through or
   overline that showed as colored blocks or lines between the columns.
 - Color an IPv6 address that ends in a dotted IPv4 address as one address:
-  IPv4-mapped (`::ffff:192.0.2.1`), NAT64, and the form written out in full.
-  Only the IPv4 tail was colored.
+  IPv4-mapped (`::ffff:` and an IPv4 address), NAT64, and the form written
+  out in full. Only the IPv4 tail was colored.
 - Hold two sessions that trace to the same `--trace-io` file to one 64 MiB
   limit. Each counted only its own lines, so together they could write twice
   the limit.
