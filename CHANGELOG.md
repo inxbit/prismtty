@@ -6,10 +6,6 @@ All notable changes to PrismTTY are documented here.
 
 ### Fixed
 
-- See a connection's teardown line however much output follows it in the
-  same read. Only the last 256 bytes of complete lines were searched, so
-  "Connection to X closed." followed by a screenful left the remote profile
-  selected.
 - Unwind both connections when two nested ones close in one read. The first
   teardown line ended its connection and the second was dropped, so local
   output kept the outer device's profile. Only a line that names its

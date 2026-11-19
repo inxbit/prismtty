@@ -3,9 +3,6 @@ use crate::profiles::{ProfileStore, is_generic_profile_set};
 const OUTPUT_WINDOW_LIMIT: usize = 64 * 1024;
 const INPUT_LINE_LIMIT: usize = 4096;
 const CLOSE_MARKER_WINDOW_LIMIT: usize = 256;
-/// Most bytes of lines one read completes that are searched for a teardown
-/// line: two of the stream's 8 KiB reads, far below `OUTPUT_WINDOW_LIMIT`.
-const COMPLETED_LINES_SEARCH_LIMIT: usize = 16 * 1024;
 const DETECTION_BYTE_INTERVAL: usize = 4096;
 const PROFILE_STACK_LIMIT: usize = 8;
 /// Lines typed after a remote command before its attempt expires: a user
@@ -294,9 +291,6 @@ impl ProfileRuntime {
             return None;
         }
 
-        // The lines this read completes begin where the window's unterminated
-        // last line began.
-        let unterminated_before = unterminated_tail_len(&self.output_window_lower);
         self.output_window.push_str(&text);
         self.output_window_lower
             .push_str(&text.to_ascii_lowercase());
@@ -305,21 +299,10 @@ impl ProfileRuntime {
         self.output_bytes_since_detection =
             self.output_bytes_since_detection.saturating_add(text.len());
 
-        // Search every line this read completed, however long they are
-        // together: a teardown line can be followed by a screenful of output
-        // in the same read. Never search less than the usual window, and no
-        // more than a read can bring: past that the window limit may have
-        // cut the start of the first line off, and what is left of a line
-        // must not be read as a whole one.
-        let completed_by_this_read = (unterminated_before + text.len())
-            .saturating_sub(unterminated_tail_len(&self.output_window_lower));
-        let searched = if completed_by_this_read <= COMPLETED_LINES_SEARCH_LIMIT {
-            CLOSE_MARKER_WINDOW_LIMIT.max(completed_by_this_read)
-        } else {
-            CLOSE_MARKER_WINDOW_LIMIT
-        };
-        let close_markers =
-            observed_close_markers(recent_complete_lines(&self.output_window_lower, searched));
+        let close_markers = observed_close_markers(recent_complete_lines(
+            &self.output_window_lower,
+            CLOSE_MARKER_WINDOW_LIMIT,
+        ));
         if !close_markers.is_empty() {
             let pending_match = self.pending_remote.as_ref().and_then(|pending| {
                 close_markers
@@ -1252,11 +1235,6 @@ fn is_line_terminator(character: char) -> bool {
     matches!(character, '\n' | '\r')
 }
 
-/// The length of the unterminated line `text` ends in, if it ends in one.
-fn unterminated_tail_len(text: &str) -> usize {
-    text.len() - text.rfind(is_line_terminator).map_or(0, |end| end + 1)
-}
-
 /// The most recent terminated lines of `text`, at most `limit` bytes.
 ///
 /// A trailing unterminated line is excluded: a read boundary can split
@@ -2161,29 +2139,6 @@ mod tests {
         );
     }
 
-    // A read can carry a teardown line and more than a screenful after it.
-    // Only the last 256 bytes of complete lines were searched for the marker.
-    #[test]
-    fn close_marker_is_seen_however_much_output_follows_it_in_the_read() {
-        let store = ProfileStore::builtin();
-        let mut runtime = ProfileRuntime::new(names(&["generic", "linux-unix"]));
-        runtime.observe_input(b"ssh router-a\r");
-        assert_eq!(
-            runtime.observe_output(b"--- JUNOS 22.4R3 Kernel 64-bit\n", &store),
-            Some(names(&["generic", "juniper"]))
-        );
-
-        let output = format!(
-            "Connection to router-a closed.\r\n{}\r\nuser@laptop:~$ ",
-            "x".repeat(300)
-        );
-        assert_eq!(
-            runtime.observe_output(output.as_bytes(), &store),
-            Some(names(&["generic", "linux-unix"]))
-        );
-        assert_eq!(runtime.stack_len(), 0);
-    }
-
     // Leaving two nested connections at once puts both teardown lines in one
     // read. The first one popped its connection and the second was dropped.
     #[test]
@@ -2285,27 +2240,6 @@ mod tests {
         assert_eq!(runtime.stack_len(), 2);
 
         runtime.observe_output(b"logout\r\nConnection to router-a closed.\r\n", &store);
-        assert_eq!(runtime.active_profiles(), names(&["generic", "juniper"]));
-        assert_eq!(runtime.stack_len(), 1);
-    }
-
-    // The output window keeps the last 64 KiB. A read that overflows it loses
-    // the start of its first line, and what is left of that line is no line.
-    #[test]
-    fn a_line_cut_by_the_window_limit_is_not_a_close_marker() {
-        let store = ProfileStore::builtin();
-        let mut runtime = ProfileRuntime::new(names(&["generic", "linux-unix"]));
-        runtime.observe_input(b"ssh router-a\r");
-        assert_eq!(
-            runtime.observe_output(b"--- JUNOS 22.4R3 Kernel 64-bit\n", &store),
-            Some(names(&["generic", "juniper"]))
-        );
-
-        let prose = "status: ";
-        let line = "Connection to router-a closed.\n";
-        let filler = "y".repeat(super::OUTPUT_WINDOW_LIMIT - line.len() - 1);
-        let output = format!("{prose}{line}{filler}\n");
-        assert_eq!(runtime.observe_output(output.as_bytes(), &store), None);
         assert_eq!(runtime.active_profiles(), names(&["generic", "juniper"]));
         assert_eq!(runtime.stack_len(), 1);
     }
