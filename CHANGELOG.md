@@ -2,6 +2,17 @@
 
 All notable changes to PrismTTY are documented here.
 
+## Unreleased
+
+### Fixed
+
+- Install the bash completions for `ptty` and `ct` from the Homebrew
+  formula. bash-completion loads a file on demand by the name of the command
+  being completed, and only one named `prismtty` was installed.
+- Package release archives from the cargo target directory in use.
+  `scripts/package-release.sh` copied from `./target/release` even when
+  `CARGO_TARGET_DIR` sent the build elsewhere.
+
 ## 1.3.5 - 2026-11-19
 
 ### Fixed
