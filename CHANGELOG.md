@@ -2,6 +2,25 @@
 
 All notable changes to PrismTTY are documented here.
 
+## Unreleased
+
+### Fixed
+
+- See a connection's teardown line however much output follows it in the
+  same read. Only the last 256 bytes of complete lines were searched, so
+  "Connection to X closed." followed by a screenful left the remote profile
+  selected.
+- Unwind both connections when two nested ones close in one read. The first
+  teardown line ended its connection and the second was dropped, so local
+  output kept the outer device's profile. Only a line that names its
+  connection goes on to the next one.
+- Unwind a telnet connection the user closes at the `telnet>` prompt, which
+  prints "Connection closed." and not the "by foreign host" line.
+- Keep a vendor's detection in live sessions when a `profiles.d` profile
+  takes a built-in profile's name. A profile file cannot set the runtime
+  metadata that detection uses, so such a profile, written to change a
+  built-in's colors, was never selected inside a wrapped shell again.
+
 ## 1.3.4 - 2026-11-19
 
 ### Fixed
