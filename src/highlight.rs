@@ -1677,7 +1677,12 @@ impl StreamingHighlighter {
                     self.line_rewritten_in_place = false;
                     output.extend_from_slice(bytes);
                 }
-                Token::Ansi(bytes) if is_alternate_screen_disable(bytes) => {
+                // RIS resets the terminal, which puts it back on the normal
+                // screen too.
+                Token::Ansi(bytes)
+                    if is_alternate_screen_disable(bytes)
+                        || (self.alternate_screen && escape_final_byte(bytes) == Some(b'c')) =>
+                {
                     self.flush_highlightable(&mut highlightable, &mut output);
                     self.reset_interactive_overlay(&mut output);
                     self.native_sgr.apply_sequence(bytes);
@@ -2463,7 +2468,14 @@ fn compile_rule(
         .build(&bounded_pattern)
         .map_err(|source| HighlightError::Regex {
             description: escape_untrusted(&description),
-            source,
+            // The offset in `source` counts the limits in front. Compile the
+            // rule as written to report where it fails in the user's text.
+            source: RegexBuilder::new()
+                .multi_line(true)
+                .crlf(true)
+                .build(&rule.regex)
+                .err()
+                .unwrap_or(source),
         })?;
     let style = resolve_capture_references(&description, rule.style, &regex)?;
     Ok(CompiledRule {
@@ -2654,6 +2666,13 @@ fn match_rule(
         let (start, end) = match found {
             Ok(Some(matched)) => matched,
             Ok(None) => break,
+            // The step after an empty match landed inside a multi-byte
+            // character, where a rule in UTF mode cannot be searched. That is
+            // no runaway match: try the next byte.
+            Err(error) if error.code() == PCRE2_ERROR_BADUTFOFFSET => {
+                last_end += 1;
+                continue;
+            }
             Err(error) => {
                 // The rule exhausted its match budget at this starting
                 // position. Keep the first error for reporting, then resume
@@ -2702,6 +2721,10 @@ fn match_rule(
 
     (ranges, match_count, match_error)
 }
+
+/// PCRE2's error code for a search started inside a UTF-8 character, which
+/// only a rule in UTF mode reports.
+const PCRE2_ERROR_BADUTFOFFSET: i32 = -36;
 
 /// Returns where the search resumes after a match at `start..end`, and whether
 /// to skip that match. Same stepping as pcre2's own iterator: an empty match

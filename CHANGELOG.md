@@ -2,6 +2,36 @@
 
 All notable changes to PrismTTY are documented here.
 
+## Unreleased
+
+### Fixed
+
+- Highlight again after a full reset (`ESC c`) inside the alternate screen.
+  The reset puts the terminal back on the normal screen, but PrismTTY kept
+  reading later output as alternate-screen drawing and left it unhighlighted
+  for the rest of the session.
+- End diagnostics in CR LF on a terminal in raw mode. A wrapped session puts
+  the terminal in raw mode, where a bare LF does not return the cursor to the
+  left edge, so the `--show-profile` report, a rule warning or the
+  `--benchmark` report left the lines after it starting mid-screen. No CR
+  is added where the terminal adds it itself or would turn it into a
+  second LF.
+- Keep a rule in UTF mode (`(*UTF)`) that can match nothing working on
+  multi-byte text. The search resumed one byte after an empty match, inside
+  a character, which PCRE2 refuses: the rule was reported as stopped and the
+  rest of the word went unmatched. The search now moves on to the next byte.
+- Report where a rule fails to compile as an offset in the rule as written.
+  The offset counted the 40 characters of match limits PrismTTY compiles in
+  front of each rule.
+- Name the fixture when `profiles test` cannot read it.
+- Remove a pid file named above any process id. `4294967295` was read as -1,
+  which stands for every process, so it counted as a live session for
+  `--reload` and was never pruned.
+- Say in the `inherits` field docs that a profile's own rules come first and
+  its parents' rules after.
+- Correct the 1.3.2 entry below: past 16 KiB after a stray byte, the rest of
+  that line is dropped in default mode too.
+
 ## 1.3.2 - 2026-11-18
 
 ### Fixed
@@ -17,8 +47,10 @@ All notable changes to PrismTTY are documented here.
   `LC_ALL`, `LC_CTYPE` and `LANG` that is set names a UTF-8 codeset), such a
   string now ends at the end of its line. One stray byte then costs at most
   the rest of that line: in default mode the line passes through unchanged
-  and unhighlighted, and `--sanitize` removes the byte and the rest of the
-  line. The lines after it are shown and highlighted as usual.
+  and unhighlighted when no more than 16 KiB follow the byte on it, and what
+  follows the byte is dropped past that; `--sanitize` removes the byte and
+  the rest of the line. The lines after it are shown and highlighted as
+  usual.
   - Without a UTF-8 locale, an unset one included, nothing changes: the byte
     is the control an 8-bit terminal reads and the string runs to its
     terminator. The library also behaves as before.

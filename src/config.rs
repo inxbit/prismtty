@@ -132,7 +132,7 @@ struct RulesDoc {
 pub struct ProfileMetaDoc {
     /// Profile name used on the command line and in inheritance lists.
     pub name: String,
-    /// Parent profiles loaded before this profile.
+    /// Parent profiles. Their rules follow this profile's own.
     #[serde(default)]
     pub inherits: Vec<String>,
     /// Startup detection hints used for auto-detection.
