@@ -31,7 +31,10 @@ cargo build --locked --release --bins
 rm -rf "${stage}"
 mkdir -p "${stage}/completions" "${stage}/profiles"
 
-cp target/release/prismtty target/release/ptty target/release/ct "${stage}/"
+# Where the build above put the binaries: cargo builds in CARGO_TARGET_DIR
+# when it is set.
+release_dir="${CARGO_TARGET_DIR:-target}/release"
+cp "${release_dir}/prismtty" "${release_dir}/ptty" "${release_dir}/ct" "${stage}/"
 cp LICENSE README.md "${stage}/"
 cp completions/prismtty.bash completions/prismtty.fish completions/_prismtty "${stage}/completions/"
 cp profiles/custom-router.example.yml "${stage}/profiles/"

@@ -80,6 +80,10 @@ class Prismtty < Formula
   def install
     bin.install "prismtty", "ptty", "ct"
     bash_completion.install "completions/prismtty.bash" => "prismtty"
+    # bash-completion loads a file on demand by command name; ptty and ct
+    # share the prismtty one.
+    bash_completion.install_symlink bash_completion/"prismtty" => "ptty"
+    bash_completion.install_symlink bash_completion/"prismtty" => "ct"
     fish_completion.install "completions/prismtty.fish"
     # fish loads completions by command name; ptty and ct share prismtty.fish.
     fish_completion.install_symlink fish_completion/"prismtty.fish" => "ptty.fish"
