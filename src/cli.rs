@@ -273,7 +273,8 @@ fn run_inner(args: Vec<OsString>) -> Result<ExitCode, CliError> {
             while !rest.is_empty() {
                 // End each chunk at a line end, so a rule that matches across
                 // words is never handed half of a line. A line longer than a
-                // chunk is still cut.
+                // chunk is still cut, and a rule that matches across a line
+                // end can still lose a match at the end of a chunk.
                 let limit = rest.len().min(64 * 1024);
                 let end = rest[..limit]
                     .iter()

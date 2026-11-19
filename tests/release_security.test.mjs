@@ -625,8 +625,11 @@ esac
 `,
     );
     chmodSync(`${fakeBin}/cargo`, 0o755);
+    // The fixture's binaries are under ./target; a CARGO_TARGET_DIR inherited
+    // from the developer's shell would send the script elsewhere.
+    const { CARGO_TARGET_DIR: _inherited, ...inheritedEnv } = process.env;
     const env = {
-      ...process.env,
+      ...inheritedEnv,
       PATH: `${fakeBin}:${process.env.PATH}`,
       SOURCE_DATE_EPOCH: '1700000000',
       FAKE_CARGO_PKGID: 'path+file:///fixture#1.2.3',
