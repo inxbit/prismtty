@@ -2552,3 +2552,30 @@ fn profiles_test_names_the_fixture_it_cannot_read() {
         .failure()
         .stderr(predicate::str::contains("missing-fixture.txt"));
 }
+
+// A rule that is not in UTF mode may match a single byte of a multi-byte
+// character, also right after an empty match. The step that keeps UTF-mode
+// rules out of a character must not take such a match away.
+#[test]
+fn a_byte_mode_rule_still_matches_inside_a_character_after_an_empty_match() {
+    let mut config = tempfile::NamedTempFile::new().expect("config");
+    writeln!(
+        config,
+        "rules:\n  - description: mid\n    regex: '(?<=a)|\\xA9'\n    color: f#ff0000"
+    )
+    .expect("write config");
+
+    let output = Command::cargo_bin("prismtty")
+        .expect("binary exists")
+        .args(["--rgb", "--no-auto-detect", "--config"])
+        .arg(config.path())
+        .write_stdin("a\u{e9}\n")
+        .output()
+        .expect("command runs");
+
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "a\u{1b}[38;2;255;0;0m\u{e9}\u{1b}[0m\n"
+    );
+}

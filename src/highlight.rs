@@ -2666,6 +2666,13 @@ fn match_rule(
         let (start, end) = match found {
             Ok(Some(matched)) => matched,
             Ok(None) => break,
+            // The step after an empty match landed inside a multi-byte
+            // character, where a rule in UTF mode cannot be searched. That is
+            // no runaway match: try the next byte.
+            Err(error) if error.code() == PCRE2_ERROR_BADUTFOFFSET => {
+                last_end += 1;
+                continue;
+            }
             Err(error) => {
                 // The rule exhausted its match budget at this starting
                 // position. Keep the first error for reporting, then resume
@@ -2692,13 +2699,7 @@ fn match_rule(
         };
 
         let (next_search, skip) = next_match_search(start, end, last_match);
-        // An empty match steps over the whole character at its end, not into
-        // it: a rule in UTF mode cannot be searched from inside a character.
-        last_end = if start >= end && end < visible.len() {
-            end + valid_utf8_char_width_at(visible, end).unwrap_or(1)
-        } else {
-            next_search
-        };
+        last_end = next_search;
         if skip {
             continue;
         }
@@ -2720,6 +2721,10 @@ fn match_rule(
 
     (ranges, match_count, match_error)
 }
+
+/// PCRE2's error code for a search started inside a UTF-8 character, which
+/// only a rule in UTF mode reports.
+const PCRE2_ERROR_BADUTFOFFSET: i32 = -36;
 
 /// Returns where the search resumes after a match at `start..end`, and whether
 /// to skip that match. Same stepping as pcre2's own iterator: an empty match

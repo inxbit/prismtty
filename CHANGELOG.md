@@ -13,12 +13,13 @@ All notable changes to PrismTTY are documented here.
 - End diagnostics in CR LF on a terminal in raw mode. A wrapped session puts
   the terminal in raw mode, where a bare LF does not return the cursor to the
   left edge, so the `--show-profile` report, a rule warning or the
-  `--benchmark` report left the lines after it starting mid-screen.
+  `--benchmark` report left the lines after it starting mid-screen. No CR
+  is added where the terminal adds it itself or would turn it into a
+  second LF.
 - Keep a rule in UTF mode (`(*UTF)`) that can match nothing working on
   multi-byte text. The search resumed one byte after an empty match, inside
   a character, which PCRE2 refuses: the rule was reported as stopped and the
-  rest of the word went unmatched. An empty match now steps over the whole
-  character.
+  rest of the word went unmatched. The search now moves on to the next byte.
 - Report where a rule fails to compile as an offset in the rule as written.
   The offset counted the 40 characters of match limits PrismTTY compiles in
   front of each rule.

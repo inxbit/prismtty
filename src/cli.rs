@@ -104,13 +104,20 @@ fn write_diagnostic_lines(mut text: String) {
 }
 
 fn stderr_leaves_lf_bare() -> bool {
-    use nix::sys::termios::{OutputFlags, tcgetattr};
+    nix::sys::termios::tcgetattr(io::stderr())
+        .is_ok_and(|terminal| lf_needs_a_cr(terminal.output_flags))
+}
 
-    tcgetattr(io::stderr()).is_ok_and(|terminal| {
-        !terminal
-            .output_flags
-            .contains(OutputFlags::OPOST | OutputFlags::ONLCR)
-    })
+/// Whether a terminal with these output flags shows a bare LF without
+/// returning to the left edge, and passes on a CR written in front of it.
+fn lf_needs_a_cr(flags: nix::sys::termios::OutputFlags) -> bool {
+    use nix::sys::termios::OutputFlags;
+
+    if !flags.contains(OutputFlags::OPOST) {
+        return true;
+    }
+    // With OCRNL the terminal would turn the CR into a second LF.
+    !flags.intersects(OutputFlags::ONLCR | OutputFlags::OCRNL)
 }
 
 /// Exit status for output whose reader went away: 128 + SIGPIPE, what a
@@ -369,6 +376,27 @@ mod tests {
     fn stdin_mode_uses_interactive_highlighting_when_output_is_terminal() {
         assert!(super::stdin_mode_interactive_highlighting(true));
         assert!(!super::stdin_mode_interactive_highlighting(false));
+    }
+
+    #[test]
+    fn a_cr_goes_in_front_of_lf_only_where_the_terminal_keeps_both() {
+        use nix::sys::termios::OutputFlags;
+
+        // Raw mode: nothing is translated.
+        assert!(super::lf_needs_a_cr(OutputFlags::empty()));
+        assert!(super::lf_needs_a_cr(
+            OutputFlags::ONLCR | OutputFlags::OCRNL
+        ));
+        // The terminal adds the CR itself.
+        assert!(!super::lf_needs_a_cr(
+            OutputFlags::OPOST | OutputFlags::ONLCR
+        ));
+        // Processing is on but LF is left alone.
+        assert!(super::lf_needs_a_cr(OutputFlags::OPOST));
+        // The terminal would turn the CR into a second LF.
+        assert!(!super::lf_needs_a_cr(
+            OutputFlags::OPOST | OutputFlags::OCRNL
+        ));
     }
 
     #[test]
