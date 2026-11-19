@@ -69,7 +69,9 @@ impl IoTrace {
             return;
         };
         // Another session may be appending to the same file, so count what
-        // is in it, not only what this session wrote.
+        // is in it, not only what this session wrote. The marker below ends
+        // this session's trace only: the other one may still add a line that
+        // fits.
         let on_disk = file.metadata().map_or(0, |metadata| metadata.len());
         let previous = inner.written.load(Ordering::Relaxed).max(on_disk);
         if previous >= inner.limit {

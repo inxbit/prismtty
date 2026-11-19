@@ -381,6 +381,24 @@ fn generic_profile_colors_an_ipv6_address_with_an_ipv4_tail_as_one_address() {
             "{address}: {output:?}"
         );
     }
+    // `::` stands for at least one group, so five written groups are the most
+    // it can sit among in front of an IPv4 tail.
+    let address = format!("{}{}", "1:2:3:4::5:", "192.0.2.1");
+    let output = highlight_with_builtin("generic", &format!("{address}\n"));
+    assert_eq!(output, format!("\x1b[38;2;0;255;255m{address}\x1b[0m\n"));
+    for (groups, more) in [
+        ("1:2:3:4:5:", ":6:"),
+        ("1:2:3:4:5:6:", ":"),
+        ("1:", ":2:3:4:5:6:"),
+    ] {
+        let head = format!("{groups}{more}");
+        let output = highlight_with_builtin("generic", &format!("{head}192.0.2.1\n"));
+        assert_eq!(
+            output,
+            format!("{head}\x1b[38;2;0;255;255m192.0.2.1\x1b[0m\n"),
+            "{head}"
+        );
+    }
     // No address in front of the dots: the IPv4 address stands alone.
     let output = highlight_with_builtin("generic", "name::192.0.2.1\n");
     assert_eq!(output, "name::\x1b[38;2;0;255;255m192.0.2.1\x1b[0m\n");
