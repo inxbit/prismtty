@@ -2579,3 +2579,31 @@ fn a_byte_mode_rule_still_matches_inside_a_character_after_an_empty_match() {
         "a\u{1b}[38;2;255;0;0m\u{e9}\u{1b}[0m\n"
     );
 }
+
+// `profiles test` hands the fixture to the highlighter 64 KiB at a time. A
+// phrase that straddled that boundary was matched in two halves, so
+// `not connected` came out as a plain `not` and a green `connected`.
+#[test]
+fn profiles_test_colors_a_phrase_that_spans_the_64k_chunk_boundary() {
+    let mut fixture = b"ok line\n".repeat(8190);
+    fixture.extend_from_slice(b"pad\nport is not ");
+    assert_eq!(fixture.len(), 64 * 1024);
+    fixture.extend_from_slice(b"connected\n");
+    let mut file = tempfile::NamedTempFile::new().expect("temp file");
+    file.write_all(&fixture).expect("write fixture");
+
+    let output = Command::cargo_bin("prismtty")
+        .expect("binary exists")
+        .args(["--rgb", "profiles", "test", "generic"])
+        .arg(file.path())
+        .output()
+        .expect("command runs");
+
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.ends_with("port is \u{1b}[1;38;2;255;0;0mnot connected\u{1b}[0m\n"),
+        "{:?}",
+        &stdout[stdout.len().saturating_sub(80)..]
+    );
+}
