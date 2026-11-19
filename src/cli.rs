@@ -269,7 +269,19 @@ fn run_inner(args: Vec<OsString>) -> Result<ExitCode, CliError> {
             let mut streaming = StreamingHighlighter::new(highlighter);
             let stdout = io::stdout();
             let mut stdout = stdout.lock();
-            for chunk in input.chunks(64 * 1024) {
+            let mut rest = input.as_slice();
+            while !rest.is_empty() {
+                // End each chunk at a line end, so a rule that matches across
+                // words is never handed half of a line. A line longer than a
+                // chunk is still cut.
+                let limit = rest.len().min(64 * 1024);
+                let end = rest[..limit]
+                    .iter()
+                    .rposition(|byte| *byte == b'\n')
+                    .filter(|_| limit < rest.len())
+                    .map_or(limit, |line_end| line_end + 1);
+                let (chunk, later) = rest.split_at(end);
+                rest = later;
                 let rendered = streaming.push(chunk);
                 if let Some(rule) = streaming.first_rule_error() {
                     return Err(CliError::Usage(

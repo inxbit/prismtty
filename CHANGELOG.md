@@ -6,6 +6,10 @@ All notable changes to PrismTTY are documented here.
 
 ### Fixed
 
+- Color a phrase that spans the 64 KiB boundary in a `profiles test` fixture.
+  The fixture is highlighted 64 KiB at a time, and a rule that matches across
+  words, such as `not connected`, saw the two halves apart. Each piece now
+  ends at a line end.
 - Install the bash completions for `ptty` and `ct` from the Homebrew
   formula. bash-completion loads a file on demand by the name of the command
   being completed, and only one named `prismtty` was installed.
