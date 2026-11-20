@@ -172,3 +172,22 @@ test('zsh keeps filename completion wherever a file is a valid argument', { skip
   assert.equal(pressTab('prismtty subdir/t').line, 'prismtty subdir/tool ');
   assert.equal(pressTab('prismtty -- loc').line, 'prismtty -- local-script.sh ');
 });
+
+test('zsh completes a command found on PATH as the first word', { skip }, () => {
+  // The first word is the command to wrap. `fakecmd` exists only in a
+  // directory on PATH, not in the directory the line is typed in.
+  for (const command of ['prismtty', 'ct']) {
+    assert.equal(pressTab(`${command} fakec`).line, `${command} fakecmd `);
+  }
+  assert.equal(pressTab('prismtty -b fakec').line, 'prismtty -b fakecmd ');
+  assert.equal(pressTab('prismtty -- fakec').line, 'prismtty -- fakecmd ');
+  // Files and `profiles` are still offered next to it.
+  assert.deepEqual(pressTab('prismtty ').candidates, [
+    'config.yml',
+    'fakecmd',
+    'local-script.sh',
+    'notes.txt',
+    'profiles',
+    'subdir',
+  ]);
+});

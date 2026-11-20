@@ -171,6 +171,7 @@ _prismtty_first_word() {
     if [[ $words[CURRENT-1] != -- ]]; then
         _prismtty_commands "$@" && ret=0
     fi
+    _command_names -e "$@" && ret=0
     _default "$@" && ret=0
     return ret
 }
