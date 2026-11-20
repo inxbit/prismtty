@@ -785,3 +785,120 @@ test('release packaging maps macOS arm64 to the published target name', () => {
   assert.match(script, /"\$\{default_arch\}" == "arm64"/);
   assert.match(script, /default_arch="aarch64"/);
 });
+
+// The first bytes of an executable name its object format and its CPU. These
+// are enough of a header for the packaging script to tell the targets apart.
+const executableHeaders = {
+  'darwin-aarch64': Buffer.from([
+    0xcf, 0xfa, 0xed, 0xfe, 0x0c, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
+    0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+  ]),
+  'darwin-x86_64': Buffer.from([
+    0xcf, 0xfa, 0xed, 0xfe, 0x07, 0x00, 0x00, 0x01, 0x03, 0x00, 0x00, 0x00,
+    0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+  ]),
+  'linux-x86_64': Buffer.from([
+    0x7f, 0x45, 0x4c, 0x46, 0x02, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x03, 0x00, 0x3e, 0x00, 0x01, 0x00, 0x00, 0x00,
+  ]),
+};
+
+// Packages a fixture whose three binaries carry the given headers under the
+// given target label, and reports how the packaging script ended.
+function packageExecutables(target, builtFor) {
+  const directory = mkdtempSync(`${tmpdir()}/prismtty-package-`);
+  const fakeBin = `${directory}/bin`;
+  const script = `${directory}/package-release.sh`;
+  try {
+    for (const path of ['bin', 'completions', 'profiles', 'target/release']) {
+      mkdirSync(`${directory}/${path}`, { recursive: true });
+    }
+    copyFileSync('scripts/package-release.sh', script);
+    chmodSync(script, 0o755);
+    for (const path of [
+      'LICENSE',
+      'README.md',
+      'completions/prismtty.bash',
+      'completions/prismtty.fish',
+      'completions/_prismtty',
+      'profiles/custom-router.example.yml',
+    ]) {
+      writeFileSync(`${directory}/${path}`, `${path}\n`);
+    }
+    for (const [binary, builtTarget] of Object.entries(builtFor)) {
+      writeFileSync(`${directory}/target/release/${binary}`, executableHeaders[builtTarget]);
+      chmodSync(`${directory}/target/release/${binary}`, 0o755);
+    }
+    writeFileSync(
+      `${fakeBin}/cargo`,
+      `#!/usr/bin/env bash
+set -euo pipefail
+case "$1" in
+  pkgid) printf '%s\n' "path+file:///fixture#1.2.3" ;;
+  build) ;;
+  *) exit 1 ;;
+esac
+`,
+    );
+    chmodSync(`${fakeBin}/cargo`, 0o755);
+    const { CARGO_TARGET_DIR: _inherited, ...inheritedEnv } = process.env;
+    const result = spawnSync('bash', [script, target], {
+      cwd: directory,
+      env: {
+        ...inheritedEnv,
+        PATH: `${fakeBin}:${process.env.PATH}`,
+        SOURCE_DATE_EPOCH: '1700000000',
+      },
+      encoding: 'utf8',
+    });
+    const archive = `dist/prismtty-1.2.3-${target}.tar.gz`;
+    const listing = spawnSync('tar', ['-tzf', archive], { cwd: directory, encoding: 'utf8' });
+    return {
+      status: result.status,
+      stderr: result.stderr,
+      wroteArchive: listing.status === 0,
+      packagedAnything: readdirSync(directory).includes('dist'),
+    };
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+}
+
+test('release packaging accepts binaries built for the target it is asked to package', () => {
+  for (const target of ['darwin-aarch64', 'darwin-x86_64', 'linux-x86_64']) {
+    const result = packageExecutables(target, { prismtty: target, ptty: target, ct: target });
+    assert.equal(result.status, 0, `${target}: ${result.stderr}`);
+    assert.ok(result.wroteArchive, `${target}: no archive was written`);
+  }
+});
+
+test('release packaging refuses a binary built for another target and names it', () => {
+  // The script used to trust its label: it packaged whatever sat in the target
+  // directory, so an arm64 macOS binary could ship inside the Linux archive.
+  const result = packageExecutables('linux-x86_64', {
+    prismtty: 'linux-x86_64',
+    ptty: 'linux-x86_64',
+    ct: 'darwin-aarch64',
+  });
+  assert.notEqual(result.status, 0, 'a macOS arm64 ct was packaged as linux-x86_64');
+  assert.match(result.stderr, /target\/release\/ct is Mach-O arm64/);
+  assert.match(result.stderr, /linux-x86_64 needs ELF x86_64/);
+  assert.doesNotMatch(result.stderr, /target\/release\/(?:prismtty|ptty) is/);
+  assert.ok(!result.packagedAnything, 'a refused package still staged files under dist/');
+});
+
+test('release packaging tells the two macOS CPUs apart', () => {
+  const everyBinary = (target) => ({ prismtty: target, ptty: target, ct: target });
+
+  let result = packageExecutables('darwin-aarch64', everyBinary('darwin-x86_64'));
+  assert.notEqual(result.status, 0, 'x86_64 binaries were packaged as darwin-aarch64');
+  assert.match(result.stderr, /target\/release\/prismtty is Mach-O x86_64/);
+  assert.match(result.stderr, /darwin-aarch64 needs Mach-O arm64/);
+  assert.ok(!result.packagedAnything);
+
+  result = packageExecutables('darwin-x86_64', everyBinary('darwin-aarch64'));
+  assert.notEqual(result.status, 0, 'arm64 binaries were packaged as darwin-x86_64');
+  assert.match(result.stderr, /target\/release\/prismtty is Mach-O arm64/);
+  assert.match(result.stderr, /darwin-x86_64 needs Mach-O x86_64/);
+  assert.ok(!result.packagedAnything);
+});

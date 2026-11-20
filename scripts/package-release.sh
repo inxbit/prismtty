@@ -28,12 +28,52 @@ export SOURCE_DATE_EPOCH="${source_date_epoch}"
 
 cargo build --locked --release --bins
 
-rm -rf "${stage}"
-mkdir -p "${stage}/completions" "${stage}/profiles"
-
 # Where the build above put the binaries: cargo builds in CARGO_TARGET_DIR
 # when it is set.
 release_dir="${CARGO_TARGET_DIR:-target}/release"
+
+# The archive name promises an operating system and a CPU, so a binary that
+# says otherwise must not ship under it. Content that is neither ELF nor
+# 64-bit Mach-O is nothing cargo builds for these targets and is left alone.
+RELEASE_DIR="${release_dir}" TARGET_NAME="${target_name}" python3 - <<'PY'
+import os
+from pathlib import Path
+import struct
+
+EXPECTED = {
+    "darwin-aarch64": "Mach-O arm64",
+    "darwin-x86_64": "Mach-O x86_64",
+    "linux-x86_64": "ELF x86_64",
+}
+ELF_MACHINES = {0x3E: "x86_64", 0xB7: "aarch64"}
+MACH_O_CPUS = {0x01000007: "x86_64", 0x0100000C: "arm64"}
+
+
+def describe(header):
+    if header[:4] == b"\x7fELF" and len(header) >= 20:
+        byte_order = "<" if header[5] == 1 else ">"
+        (machine,) = struct.unpack_from(f"{byte_order}H", header, 18)
+        return f"ELF {ELF_MACHINES.get(machine, hex(machine))}"
+    if header[:4] == b"\xcf\xfa\xed\xfe" and len(header) >= 8:
+        (cpu,) = struct.unpack_from("<I", header, 4)
+        return f"Mach-O {MACH_O_CPUS.get(cpu, hex(cpu))}"
+    if header[:4] in (b"\xca\xfe\xba\xbe", b"\xca\xfe\xba\xbf"):
+        return "Mach-O universal"
+    return None
+
+
+target = os.environ["TARGET_NAME"]
+for name in ("prismtty", "ptty", "ct"):
+    path = Path(os.environ["RELEASE_DIR"]) / name
+    with path.open("rb") as binary:
+        found = describe(binary.read(20))
+    if found is not None and found != EXPECTED[target]:
+        raise SystemExit(f"{path} is {found}, but {target} needs {EXPECTED[target]}")
+PY
+
+rm -rf "${stage}"
+mkdir -p "${stage}/completions" "${stage}/profiles"
+
 cp "${release_dir}/prismtty" "${release_dir}/ptty" "${release_dir}/ct" "${stage}/"
 cp LICENSE README.md "${stage}/"
 cp completions/prismtty.bash completions/prismtty.fish completions/_prismtty "${stage}/completions/"
