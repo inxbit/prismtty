@@ -147,6 +147,9 @@ ptty /bin/zsh
 From inside that shell, run normal `ssh`, `telnet`, or console-wrapper commands.
 PrismTTY dynamically switches profiles from observed login banners and prompts,
 then keeps the selected remote profile locked for the session.
+If a connection attempt fails with a message PrismTTY does not recognize and a
+device prompt follows it, a later close line that names an outer host can leave
+the remote profile active.
 
 Use stdin mode for noninteractive output from files or pipes:
 
