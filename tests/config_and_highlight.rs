@@ -682,6 +682,162 @@ rules:
     }
 }
 
+// xterm's XTPUSHSGR (`CSI # {`, also spelled `CSI # p`, with or without
+// parameters that select attributes) saves the rendition on a stack, as DECSC
+// saves it with the cursor. A push made while the highlight is drawn saved
+// the highlight color, and the pop brought it back onto text the rule never
+// matched.
+#[test]
+fn stream_ends_highlight_before_xtpushsgr_saves_the_rendition() {
+    let yaml = r##"
+rules:
+  - description: bad status
+    regex: (?i)\berror\b
+    color: f#ff0000
+"##;
+    let config = PrismConfig::from_chromaterm_yaml(yaml).expect("chromaterm config loads");
+    let highlighter = Highlighter::from_config(config).expect("rules compile");
+
+    for (interactive, chunks, saved) in [
+        (
+            false,
+            &["disk error\x1b[#{ tail\x1b[#} more\n"][..],
+            "error\x1b[0m\x1b[#{",
+        ),
+        (
+            false,
+            &["disk error\x1b[#p tail\x1b[#q more\n"][..],
+            "error\x1b[0m\x1b[#p",
+        ),
+        (
+            false,
+            &["disk error\x1b[30;31#{ tail\x1b[#} more\n"][..],
+            "error\x1b[0m\x1b[30;31#{",
+        ),
+        (
+            false,
+            &["disk error\u{9b}#{ tail\u{9b}#} more\n"][..],
+            "error\x1b[0m\u{9b}#{",
+        ),
+        (
+            false,
+            &["disk error\x1b[1\x00;4#\n{ tail\x1b[#} more\n"][..],
+            "error\x1b[0m\x1b[1\x00;4#\n{",
+        ),
+        (
+            false,
+            &["disk error\x1b[", "#", "{ tail\x1b[#} more\n"][..],
+            "error\x1b[0m\x1b[#{",
+        ),
+        (
+            true,
+            &["disk error\x1b[#{ tail\x1b[#} more\n"][..],
+            "error\x1b[39m\x1b[#{",
+        ),
+        (
+            true,
+            &["disk error ", "\x1b[#{tail\x1b[#} more\n"][..],
+            "error \x1b[39m\x1b[#{",
+        ),
+        (
+            true,
+            &["disk error ", "\x1b[1;4#ptail\x1b[#q more\n"][..],
+            "error \x1b[39m\x1b[1;4#p",
+        ),
+    ] {
+        let mut streaming = if interactive {
+            new_interactive_streaming(highlighter.clone())
+        } else {
+            StreamingHighlighter::new(highlighter.clone())
+        };
+        let mut output = String::new();
+        for chunk in chunks {
+            output.push_str(&streaming.push_str(chunk));
+        }
+        output.push_str(&String::from_utf8(streaming.finish()).expect("valid utf8"));
+
+        assert!(
+            output.contains(saved),
+            "the highlight must end before {chunks:?} saves the rendition: {output:?}"
+        );
+    }
+}
+
+/// The foreground each visible glyph of `output` is drawn in, on a terminal
+/// that keeps a stack for XTPUSHSGR and XTPOPSGR and on one that ignores
+/// both.
+fn drawn_foregrounds(output: &str, keeps_a_stack: bool) -> Vec<(char, Option<String>)> {
+    let mut foreground = None;
+    let mut stack = Vec::new();
+    let mut drawn = Vec::new();
+    let mut rest = output;
+    while let Some(ch) = rest.chars().next() {
+        if let Some(sequence) = rest.strip_prefix("\x1b[") {
+            let end = sequence
+                .find(|ch: char| ('\x40'..='\x7e').contains(&ch))
+                .expect("the CSI has a final byte");
+            let (body, after) = sequence.split_at(end + 1);
+            match body {
+                "#{" if keeps_a_stack => stack.push(foreground.clone()),
+                "#}" if keeps_a_stack => foreground = stack.pop().expect("a push came first"),
+                "0m" | "39m" => foreground = None,
+                _ if body.ends_with('m') => foreground = Some(body.to_string()),
+                _ => {}
+            }
+            rest = after;
+            continue;
+        }
+        if !ch.is_whitespace() {
+            drawn.push((ch, foreground.clone()));
+        }
+        rest = &rest[ch.len_utf8()..];
+    }
+    drawn
+}
+
+// With the program drawing in green and a match right before the push, the
+// push must save green: the text after the pop is the program's, on a
+// terminal that keeps the stack and on one that ignores both sequences.
+#[test]
+fn text_after_an_xtpopsgr_is_drawn_in_the_color_the_program_pushed() {
+    let config = PrismConfig::from_chromaterm_yaml(
+        "rules:\n  - description: bad status\n    regex: 'ERROR'\n    color: f#ff0000\n",
+    )
+    .expect("config parses");
+    let highlighter = Highlighter::from_config(config).expect("rules compile");
+    let red = Some("38;2;255;0;0m".to_string());
+    let green = Some("32m".to_string());
+    let input = "\x1b[32mERROR\x1b[#{ one\x1b[#} two\n";
+
+    for interactive in [false, true] {
+        for chunks in [&[input][..], &["\x1b[32mERROR", "\x1b[#{ one\x1b[#} two\n"]] {
+            let mut streaming = if interactive {
+                new_interactive_streaming(highlighter.clone())
+            } else {
+                StreamingHighlighter::new(highlighter.clone())
+            };
+            let mut output = String::new();
+            for chunk in chunks {
+                output.push_str(&streaming.push_str(chunk));
+            }
+            output.push_str(&String::from_utf8(streaming.finish()).expect("valid utf8"));
+
+            for keeps_a_stack in [true, false] {
+                let expected = "ERROR"
+                    .chars()
+                    .map(|ch| (ch, red.clone()))
+                    .chain("onetwo".chars().map(|ch| (ch, green.clone())))
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    drawn_foregrounds(&output, keeps_a_stack),
+                    expected,
+                    "interactive {interactive}, stack {keeps_a_stack}, {chunks:?}: {output:?}"
+                );
+            }
+        }
+    }
+}
+
 #[test]
 fn preserves_composed_native_sgr_after_highlighted_prompt_time() {
     let yaml = r##"
@@ -745,6 +901,153 @@ fn streaming_highlighter_keeps_alternate_screen_bypass_across_chunks() {
     assert!(output.contains("\x1b[38;2;77;166;255m192.0.2.1 down\x1b[0m"));
     assert!(output.contains("\x1b[38;2;0;255;255m198.51.100.11\x1b[0m"));
     assert!(!output.contains("\x1b[38;2;0;255;255m192.0.2.1"));
+}
+
+// A terminal runs a C0 control it meets inside a CSI, ignores DEL there, and
+// goes on reading the sequence, so `CSI ? 10 NUL 49 h` still switches to the
+// alternate screen and `CSI ? 10 NUL 49 l` still switches back. Missing the
+// first colored a full-screen program's frame; missing the second left
+// highlighting off for the rest of the session.
+#[test]
+fn alternate_screen_switch_with_a_control_inside_it_is_still_read() {
+    let config = PrismConfig::from_chromaterm_yaml(
+        "rules:\n  - description: up\n    regex: '\\bup\\b'\n    color: f#00ff00\n",
+    )
+    .expect("config parses");
+    let highlighter = Highlighter::from_config(config).expect("rules compile");
+    let green_up = "\x1b[38;2;0;255;0mup\x1b[0m";
+
+    for control in ["\x00", "\n", "\x7f", "\r", "\x07"] {
+        for (enable, disable) in [
+            (format!("\x1b[?10{control}49h"), "\x1b[?1049l".to_string()),
+            ("\x1b[?1049h".to_string(), format!("\x1b[?10{control}49l")),
+            (
+                format!("\x1b[{control}?1049{control}h"),
+                format!("\x1b[?{control}1049l"),
+            ),
+            (
+                format!("\u{9b}?25;10{control}47h"),
+                format!("\u{9b}?10{control}47;25l"),
+            ),
+        ] {
+            let input = format!("link up\n{enable}frame up\n{disable}after up\n");
+            // Nothing but the color is added, and none inside the frame.
+            let expected =
+                format!("link {green_up}\n{enable}frame up\n{disable}after {green_up}\n");
+
+            for split in 0..=input.len() {
+                let mut streaming = StreamingHighlighter::new(highlighter.clone());
+                let mut output = streaming.push(&input.as_bytes()[..split]);
+                output.extend(streaming.push(&input.as_bytes()[split..]));
+                output.extend(streaming.finish());
+                assert_eq!(
+                    String::from_utf8_lossy(&output),
+                    expected,
+                    "{input:?} pushed in two parts, split at {split}"
+                );
+            }
+        }
+    }
+
+    // CAN and SUB cancel the sequence, so neither switch happens.
+    for cancel in ["\x18", "\x1a"] {
+        for (input, expected) in [
+            (
+                format!("link up\n\x1b[?1049{cancel}hframe up\n"),
+                format!("link {green_up}\n\x1b[?1049{cancel}hframe {green_up}\n"),
+            ),
+            (
+                format!("\x1b[?1049hframe up\n\x1b[?1049{cancel}lstill up\n"),
+                format!("\x1b[?1049hframe up\n\x1b[?1049{cancel}lstill up\n"),
+            ),
+        ] {
+            for split in 0..=input.len() {
+                let mut streaming = StreamingHighlighter::new(highlighter.clone());
+                let mut output = streaming.push(&input.as_bytes()[..split]);
+                output.extend(streaming.push(&input.as_bytes()[split..]));
+                output.extend(streaming.finish());
+                assert_eq!(
+                    String::from_utf8_lossy(&output),
+                    expected,
+                    "{input:?} pushed in two parts, split at {split}"
+                );
+            }
+        }
+    }
+}
+
+// An interactive stream does not hold a trailing word back on the alternate
+// screen, where a full-screen program draws, and holds it again once the
+// program has left.
+#[test]
+fn interactive_alternate_screen_switch_with_a_control_inside_it_is_still_read() {
+    let config = PrismConfig::from_chromaterm_yaml(
+        "rules:\n  - description: up\n    regex: '\\bup\\b'\n    color: f#00ff00\n",
+    )
+    .expect("config parses");
+    let highlighter = Highlighter::from_config(config).expect("rules compile");
+
+    for control in ["\x00", "\n", "\x7f"] {
+        let mut streaming = new_interactive_streaming(highlighter.clone());
+        let enter = format!("\x1b[?10{control}49hPID USER Command");
+        assert_eq!(streaming.push_str(&enter), enter, "{control:?}");
+        let leave = format!("\x1b[?10{control}49l");
+        assert_eq!(streaming.push_str(&leave), leave, "{control:?}");
+        assert_eq!(
+            streaming.push_str("word"),
+            "",
+            "{control:?}: a trailing word is held back again"
+        );
+        assert_eq!(streaming.finish(), b"word", "{control:?}");
+    }
+}
+
+// A terminal ignores a private-mode sequence that holds a second private
+// marker or an intermediate byte: it stays on the screen it was on. Taking
+// the first mode of such a sequence as the switch to the alternate screen
+// stopped highlighting on the screen the terminal still showed.
+#[test]
+fn malformed_private_mode_sequence_does_not_switch_screens() {
+    let config = PrismConfig::from_chromaterm_yaml(
+        "rules:\n  - description: up\n    regex: '\\bup\\b'\n    color: f#00ff00\n",
+    )
+    .expect("config parses");
+    let highlighter = Highlighter::from_config(config).expect("rules compile");
+    let green_up = "\x1b[38;2;0;255;0mup\x1b[0m";
+
+    for sequence in [
+        "\x1b[?10\x0049;?1h",
+        "\x1b[?1049;?1h",
+        "\x1b[?1049;!h",
+        "\x1b[?1049 h",
+        "\x1b[?47$h",
+        "\x1b[?1;1047>h",
+        "\u{9b}?1049;?1h",
+    ] {
+        let input = format!("{sequence}frame up\nnext up\n");
+        let expected = format!("{sequence}frame {green_up}\nnext {green_up}\n");
+        for split in 0..=input.len() {
+            let mut streaming = StreamingHighlighter::new(highlighter.clone());
+            let mut output = streaming.push(&input.as_bytes()[..split]);
+            output.extend(streaming.push(&input.as_bytes()[split..]));
+            output.extend(streaming.finish());
+            assert_eq!(
+                String::from_utf8_lossy(&output),
+                expected,
+                "{input:?} pushed in two parts, split at {split}"
+            );
+        }
+    }
+
+    // The same sequences do not switch back either: the frame stays as the
+    // program drew it.
+    for sequence in ["\x1b[?1049;?1l", "\x1b[?1049;!l", "\x1b[?10\x0049 l"] {
+        let input = format!("\x1b[?1049hframe up\n{sequence}still up\n");
+        let mut streaming = StreamingHighlighter::new(highlighter.clone());
+        let mut output = streaming.push(input.as_bytes());
+        output.extend(streaming.finish());
+        assert_eq!(String::from_utf8_lossy(&output), input);
+    }
 }
 
 // In an interactive stream a foreground-only highlight stays open across the

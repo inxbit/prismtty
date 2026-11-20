@@ -186,7 +186,9 @@ connection-close markers pop back to the previous profile.
 
 Interactive mode is designed to preserve shell line editing and typed command
 echo, including zsh prompts that use decorative Unicode prompt markers such as
-`╰─○`, `❯`, or `➜`.
+`╰─○`, `❯`, or `➜`. Output that stops on a byte that could begin a UTF-8
+character, such as a Latin-1 `é` (byte `E9`), is held: the byte is shown when
+more output arrives or the output ends.
 
 Use stdin mode for noninteractive output from files or pipes:
 

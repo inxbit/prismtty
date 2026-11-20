@@ -8,6 +8,7 @@ use crate::config::{CaptureRef, PrismConfig, RuleSpec, RuleStyle};
 use crate::style::{ColorMode, Style};
 use crate::terminal_text::escape_untrusted;
 use pcre2::bytes::{Regex, RegexBuilder};
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::Arc;
@@ -2941,19 +2942,8 @@ fn contains_alternate_screen_enable_tokens(tokens: &[Token]) -> bool {
 }
 
 fn alternate_screen_command(bytes: &[u8]) -> Option<bool> {
-    let introducer = csi_introducer_len(bytes)?;
-    if bytes.get(introducer) != Some(&b'?') {
-        return None;
-    }
-    let body_start = introducer + 1;
-    let final_byte = *bytes.last()?;
-    let enable = match final_byte {
-        b'h' => true,
-        b'l' => false,
-        _ => return None,
-    };
-    let body = &bytes[body_start..bytes.len().saturating_sub(1)];
-    let has_alternate_screen_mode = body
+    let (modes, enable) = private_mode_sequence(bytes)?;
+    let has_alternate_screen_mode = modes
         .split(|byte| *byte == b';')
         .any(|mode| matches!(mode, b"47" | b"1047" | b"1049"));
     has_alternate_screen_mode.then_some(enable)
@@ -2968,9 +2958,7 @@ fn contains_cursor_positioning_sequence_tokens(tokens: &[Token]) -> bool {
 
 fn contains_bracketed_paste_disable_tokens(tokens: &[Token]) -> bool {
     tokens.iter().any(|token| match token {
-        Token::Ansi(bytes) => {
-            csi_introducer_len(bytes).is_some_and(|introducer| &bytes[introducer..] == b"?2004l")
-        }
+        Token::Ansi(bytes) => csi_body(bytes).is_some_and(|body| *body == *b"?2004l"),
         Token::Text(_) => false,
     })
 }
@@ -3034,6 +3022,26 @@ fn escape_final_byte(bytes: &[u8]) -> Option<u8> {
 
 fn is_csi_sequence(bytes: &[u8]) -> bool {
     csi_introducer_len(bytes).is_some()
+}
+
+/// What follows the introducer of the CSI sequence `bytes`, as a terminal
+/// reads it: it runs a C0 control it meets inside a CSI and ignores DEL, and
+/// goes on with the sequence, so neither is part of it. CAN and SUB cancel
+/// the sequence and stay, as a last byte that is no final byte. `None` when
+/// `bytes` is not a CSI sequence.
+fn csi_body(bytes: &[u8]) -> Option<Cow<'_, [u8]>> {
+    let body = &bytes[csi_introducer_len(bytes)?..];
+    let is_run_or_ignored = |byte: &u8| matches!(byte, 0x00..=0x17 | 0x19 | 0x1c..=0x1f | 0x7f);
+    Some(if body.iter().any(is_run_or_ignored) {
+        Cow::Owned(
+            body.iter()
+                .copied()
+                .filter(|byte| !is_run_or_ignored(byte))
+                .collect(),
+        )
+    } else {
+        Cow::Borrowed(body)
+    })
 }
 
 fn visible_bytes(tokens: &[Token]) -> Vec<u8> {
@@ -3253,16 +3261,33 @@ fn fills_blank_cells_with(bytes: &[u8], style: &Style) -> bool {
 }
 
 /// Reports whether `bytes` makes the terminal save the current rendition:
-/// DECSC or CSI s, or setting mode 1048 or 1049. A highlight left active there
-/// would be saved with it and come back with the restore, on text it never
-/// matched.
+/// DECSC or CSI s, XTPUSHSGR, or setting mode 1048 or 1049. A highlight left
+/// active there would be saved with it and come back with the restore, on
+/// text it never matched.
 fn saves_rendition(bytes: &[u8]) -> bool {
     saves_cursor(bytes)
+        || pushes_rendition(bytes)
         || private_mode_sequence(bytes).is_some_and(|(modes, set)| {
             set && modes
                 .split(|byte| *byte == b';')
                 .any(|mode| matches!(mode, b"1048" | b"1049"))
         })
+}
+
+/// Reports whether `bytes` is xterm's XTPUSHSGR (`CSI Ps ; Ps # {`, also
+/// spelled `CSI Ps ; Ps # p`), which saves the rendition, or the attributes
+/// its parameters select, on a stack. The stack itself is not tracked: a
+/// terminal without it ignores the push and the pop.
+fn pushes_rendition(bytes: &[u8]) -> bool {
+    csi_body(bytes).is_some_and(|body| {
+        body.strip_suffix(b"#{")
+            .or_else(|| body.strip_suffix(b"#p"))
+            .is_some_and(|parameters| {
+                parameters
+                    .iter()
+                    .all(|byte| byte.is_ascii_digit() || *byte == b';')
+            })
+    })
 }
 
 /// Reports whether `bytes` is index (`ESC D`), next line (`ESC E`) or reverse
@@ -3418,42 +3443,53 @@ impl NativeSgrState {
 /// Reports whether `bytes` saves the cursor and its rendition: DECSC
 /// (`ESC 7`), or `CSI s` with no parameters (SCOSC).
 fn saves_cursor(bytes: &[u8]) -> bool {
-    escape_final_byte(bytes) == Some(b'7')
-        || csi_introducer_len(bytes).is_some_and(|introducer| &bytes[introducer..] == b"s")
+    escape_final_byte(bytes) == Some(b'7') || csi_body(bytes).is_some_and(|body| *body == *b"s")
 }
 
 /// Reports whether `bytes` restores the cursor and its rendition: DECRC
 /// (`ESC 8`), or `CSI u` with no parameters (SCORC).
 fn restores_cursor(bytes: &[u8]) -> bool {
-    escape_final_byte(bytes) == Some(b'8')
-        || csi_introducer_len(bytes).is_some_and(|introducer| &bytes[introducer..] == b"u")
+    escape_final_byte(bytes) == Some(b'8') || csi_body(bytes).is_some_and(|body| *body == *b"u")
 }
 
 /// Reports whether `bytes` is DECSTR (`CSI ! p`), which xterm runs whatever
 /// parameters come before the `!`.
 fn is_soft_terminal_reset(bytes: &[u8]) -> bool {
-    csi_introducer_len(bytes).is_some_and(|introducer| {
-        bytes[introducer..]
-            .strip_suffix(b"!p")
-            .is_some_and(|parameters| {
-                parameters
-                    .iter()
-                    .all(|byte| byte.is_ascii_digit() || *byte == b';')
-            })
+    csi_body(bytes).is_some_and(|body| {
+        body.strip_suffix(b"!p").is_some_and(|parameters| {
+            parameters
+                .iter()
+                .all(|byte| byte.is_ascii_digit() || *byte == b';')
+        })
     })
 }
 
 /// The modes of a DEC private mode set (`CSI ? Pm h`) or reset (`CSI ? Pm l`)
-/// and whether it sets them.
-fn private_mode_sequence(bytes: &[u8]) -> Option<(&[u8], bool)> {
-    let introducer = csi_introducer_len(bytes)?;
-    let (final_byte, body) = bytes[introducer..].split_last()?;
+/// and whether it sets them. A terminal ignores the whole sequence once it
+/// meets a second private marker or an intermediate byte, so only digits and
+/// `;` may stand between the `?` and the final byte.
+fn private_mode_sequence(bytes: &[u8]) -> Option<(Cow<'_, [u8]>, bool)> {
+    let body = csi_body(bytes)?;
+    let (final_byte, modes) = body.strip_prefix(b"?")?.split_last()?;
     let set = match final_byte {
         b'h' => true,
         b'l' => false,
         _ => return None,
     };
-    Some((body.strip_prefix(b"?")?, set))
+    if !modes
+        .iter()
+        .all(|byte| byte.is_ascii_digit() || *byte == b';')
+    {
+        return None;
+    }
+    let modes = 1..=modes.len();
+    Some((
+        match body {
+            Cow::Borrowed(body) => Cow::Borrowed(&body[modes]),
+            Cow::Owned(body) => Cow::Owned(body[modes].to_vec()),
+        },
+        set,
+    ))
 }
 
 /// The colors and attributes that SGR sequences have set.
@@ -9117,6 +9153,184 @@ rules:
             b"ab"
         );
         assert!(ranges[0].is_sgr);
+    }
+
+    // A terminal runs a C0 control it meets inside a CSI, ignores DEL there,
+    // and goes on reading the sequence, so the classifiers that compare what
+    // follows the introducer must read past both. CAN and SUB cancel the
+    // sequence instead: it then names nothing.
+    #[test]
+    fn csi_classifiers_read_past_controls_inside_the_sequence() {
+        for control in [0x00u8, 0x07, b'\n', b'\r', 0x1f, 0x7f] {
+            let with = |parts: &[&[u8]]| parts.join(&control);
+            assert_eq!(
+                super::alternate_screen_command(&with(&[b"\x1b[?10", b"49h"])),
+                Some(true),
+                "{control:#04x}"
+            );
+            assert_eq!(
+                super::alternate_screen_command(&with(&[b"\x1b[", b"?", b"47", b"l"])),
+                Some(false),
+                "{control:#04x}"
+            );
+            assert_eq!(
+                super::alternate_screen_command(&with(&[b"\x9b?25;10", b"47h"])),
+                Some(true),
+                "{control:#04x}"
+            );
+            assert!(super::saves_rendition(&with(&[b"\x1b[", b"s"])));
+            assert!(super::saves_rendition(&with(&[b"\x1b[?10", b"48h"])));
+            assert!(super::saves_rendition(&with(&[
+                b"\xc2\x9b?104",
+                b"9",
+                b"h"
+            ])));
+            assert!(!super::saves_rendition(&with(&[b"\x1b[?10", b"48l"])));
+            assert!(super::restores_cursor(&with(&[b"\x1b[", b"u"])));
+            assert!(super::is_soft_terminal_reset(&with(&[
+                b"\x1b[1", b"!", b"p"
+            ])));
+            assert!(super::contains_bracketed_paste_disable_tokens(&[
+                super::Token::Ansi(with(&[b"\x1b[?20", b"04l"]))
+            ]));
+
+            // The rendition saved on the way into the alternate screen comes
+            // back on the way out, and DECSTR still resets it.
+            for (input, expected) in [
+                (
+                    with(&[b"\x1b[33m\x1b[?10", b"49h\x1b[31m\x1b[?1049", b"l"]),
+                    Some("\x1b[33m"),
+                ),
+                (
+                    with(&[b"\x1b[33m\x1b[", b"s\x1b[31m\x1b[", b"u"]),
+                    Some("\x1b[33m"),
+                ),
+                (with(&[b"\x1b[33m\x1b[", b"!p"]), None),
+            ] {
+                let mut state = NativeSgrState::default();
+                for token in super::tokenize_ansi(&input) {
+                    if let super::Token::Ansi(sequence) = token {
+                        state.apply_sequence(&sequence);
+                    }
+                }
+                assert_eq!(
+                    state.ansi_start().as_deref(),
+                    expected,
+                    "after {input:02x?}"
+                );
+            }
+        }
+
+        for cancel in [0x18u8, 0x1a] {
+            let cancelled = |sequence: &[u8]| [sequence, &[cancel]].concat();
+            assert_eq!(
+                super::alternate_screen_command(&cancelled(b"\x1b[?1049")),
+                None
+            );
+            assert!(!super::saves_rendition(&cancelled(b"\x1b[?1049")));
+            assert!(!super::saves_rendition(&cancelled(b"\x1b[")));
+            assert!(!super::restores_cursor(&cancelled(b"\x1b[")));
+            assert!(!super::is_soft_terminal_reset(&cancelled(b"\x1b[!")));
+        }
+    }
+
+    // A terminal ignores a private-mode sequence once it meets a second
+    // private marker or an intermediate byte, so such a sequence sets and
+    // resets nothing: no screen switch, no saved rendition.
+    #[test]
+    fn malformed_private_mode_sequences_name_no_mode() {
+        for sequence in [
+            b"\x1b[?1049;?1h".as_slice(),
+            b"\x1b[?10\x0049;?1h",
+            b"\x1b[?1049;!h",
+            b"\x1b[?1049 h",
+            b"\x1b[?1048$h",
+            b"\x1b[?1;1047>l",
+            b"\x1b[??1049h",
+            b"\x9b?47;?1l",
+            b"\xc2\x9b?1048:1h",
+        ] {
+            assert_eq!(
+                super::alternate_screen_command(sequence),
+                None,
+                "{sequence:02x?}"
+            );
+            assert!(!super::saves_rendition(sequence), "{sequence:02x?}");
+            assert_eq!(
+                super::private_mode_sequence(sequence),
+                None,
+                "{sequence:02x?}"
+            );
+        }
+
+        for (input, expected) in [
+            // The malformed save is ignored, so the restore brings back the
+            // rendition that nothing saved: the default one.
+            (
+                b"\x1b[33m\x1b[?1048;?1h\x1b[31m\x1b[?1048l".as_slice(),
+                None,
+            ),
+            (b"\x1b[33m\x1b[?1049;!h\x1b[31m\x1b[?1049l", None),
+            // The malformed restore is ignored too.
+            (
+                b"\x1b[33m\x1b[?1048h\x1b[31m\x1b[?1048;?1l",
+                Some("\x1b[31m"),
+            ),
+        ] {
+            let mut state = NativeSgrState::default();
+            for token in super::tokenize_ansi(input) {
+                if let super::Token::Ansi(sequence) = token {
+                    state.apply_sequence(&sequence);
+                }
+            }
+            assert_eq!(
+                state.ansi_start().as_deref(),
+                expected,
+                "after {input:02x?}"
+            );
+        }
+
+        // Well-formed sequences still name their modes.
+        assert_eq!(
+            super::alternate_screen_command(b"\x1b[?25;1049h"),
+            Some(true)
+        );
+        assert_eq!(super::alternate_screen_command(b"\x1b[?;47l"), Some(false));
+        assert!(super::saves_rendition(b"\x1b[?1048;25h"));
+    }
+
+    // XTPUSHSGR saves the rendition, with or without parameters, in either
+    // spelling and behind any CSI introducer. The pop, the palette stack
+    // (`CSI # P`), DECSTR and a private-marker form save nothing.
+    #[test]
+    fn xtpushsgr_is_a_rendition_save() {
+        for push in [
+            b"\x1b[#{".as_slice(),
+            b"\x1b[#p",
+            b"\x1b[1;4;30;31#{",
+            b"\x1b[;#p",
+            b"\x9b#{",
+            b"\xc2\x9b#{",
+            b"\x1b\x00[#{",
+            b"\x1b[1\x00;4#\n{",
+        ] {
+            assert!(super::saves_rendition(push), "{push:02x?}");
+        }
+        for other in [
+            b"\x1b[#}".as_slice(),
+            b"\x1b[#q",
+            b"\x1b[#P",
+            b"\x1b[#Q",
+            b"\x1b[#|",
+            b"\x1b[!p",
+            b"\x1b[?#{",
+            b"\x1b[1 #{",
+            b"\x1b[#\x18",
+            b"\x1b[{",
+            b"\x1b[p",
+        ] {
+            assert!(!super::saves_rendition(other), "{other:02x?}");
+        }
     }
 
     #[test]
