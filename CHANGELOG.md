@@ -2,6 +2,14 @@
 
 All notable changes to PrismTTY are documented here.
 
+## Unreleased
+
+### Fixed
+
+- `prismtty profiles test` with both `--sanitize` and `--strip-ansi` drops a
+  GNU screen or tmux title string whole, as the stream does. It printed the
+  title's text; no escape survived, so no title could be set.
+
 ## 1.3.7 - 2026-11-19
 
 ### Security

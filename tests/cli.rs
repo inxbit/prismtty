@@ -2625,3 +2625,23 @@ fn sanitize_drops_the_screen_and_tmux_title_string() {
     // Without --sanitize the wrapper stays transparent.
     assert_eq!(filter_with_locale(config.path(), &[], &[], input), input);
 }
+
+// `profiles test` prints a fixture as the stream would. With both flags the
+// stream drops the title string whole; the fixture kept the title's text.
+#[test]
+fn profiles_test_drops_the_title_string_with_both_flags() {
+    let mut fixture = tempfile::NamedTempFile::new().expect("fixture");
+    fixture
+        .write_all(b"one \x1bktitle\x1b\\two\n")
+        .expect("write fixture");
+
+    let output = Command::cargo_bin("prismtty")
+        .expect("binary exists")
+        .args(["--sanitize", "--strip-ansi", "profiles", "test", "generic"])
+        .arg(fixture.path())
+        .output()
+        .expect("command runs");
+
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "one two\n");
+}
