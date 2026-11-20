@@ -115,8 +115,24 @@ docker run --rm --platform linux/amd64 \
   --env HOST_OWNER="$(id -u):$(id -g)" \
   "${image}" bash -c "${build}"
 
-bash scripts/check-glibc-floor.sh "${glibc_floor}" \
-  "dist/${package}/prismtty" "dist/${package}/ptty" "dist/${package}/ct"
+# What ships is the tarball, so everything below reads the executables out of
+# it. A member that is missing, or was stored without its execute bit, fails
+# here and not on a user's machine.
+(cd dist && shasum -a 256 -c "${package}.tar.gz.sha256")
+shipped="$(mktemp -d)"
+trap 'rm -rf "${shipped}"' EXIT
+tar -xzf "dist/${package}.tar.gz" -C "${shipped}"
+executables=()
+for name in prismtty ptty ct; do
+  executable="${shipped}/${package}/${name}"
+  if [[ -L "${executable}" || ! -f "${executable}" || ! -x "${executable}" ]]; then
+    printf 'dist/%s.tar.gz does not hold an executable %s\n' "${package}" "${name}" >&2
+    exit 1
+  fi
+  executables+=("${executable}")
+done
+
+bash scripts/check-glibc-floor.sh "${glibc_floor}" "${executables[@]}"
 
 # The bare image, without the network: the binaries have to start on a stock
 # system of that age with nothing added to it.
@@ -143,6 +159,6 @@ done
 CONTAINER
 )"
 docker run --rm --network none --platform linux/amd64 \
-  --volume "${PWD}/dist/${package}:/package:ro" \
+  --volume "${shipped}/${package}:/package:ro" \
   --env VERSION="${version}" \
   "${image}" bash -c "${smoke}"

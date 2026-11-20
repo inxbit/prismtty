@@ -220,8 +220,17 @@ const scriptValue = (name) => {
 
 // Runs the Linux packaging script with stand-ins for the host tools it calls.
 // The stand-in for docker records each call and plays the build container by
-// writing the staged binaries the real one would leave behind.
-function packageForLinux({ binaries, rustc = 'rustc 1.85.0 (fixture)', smokeStatus = '0' }) {
+// leaving behind what the real one does: the staged binaries, the tarball and
+// its checksum file. `archived` and `notExecutable` make the tarball differ
+// from the staged binaries.
+function packageForLinux({
+  binaries,
+  archived = binaries,
+  notExecutable = [],
+  staleChecksum = false,
+  rustc = 'rustc 1.85.0 (fixture)',
+  smokeStatus = '0',
+}) {
   const directory = mkdtempSync(`${tmpdir()}/prismtty-linux-package-`);
   const fakeBin = `${directory}/bin`;
   try {
@@ -233,6 +242,12 @@ function packageForLinux({ binaries, rustc = 'rustc 1.85.0 (fixture)', smokeStat
     writeFileSync(`${directory}/Cargo.toml`, '[package]\nname = "prismtty"\nversion = "1.2.3"\nrust-version = "1.85"\n');
     for (const [name, contents] of Object.entries(binaries)) {
       writeFileSync(`${directory}/built-${name}`, contents);
+    }
+    mkdirSync(`${directory}/archive/prismtty-1.2.3-linux-x86_64`, { recursive: true });
+    for (const [name, contents] of Object.entries(archived)) {
+      const member = `${directory}/archive/prismtty-1.2.3-linux-x86_64/${name}`;
+      writeFileSync(member, contents);
+      chmodSync(member, notExecutable.includes(name) ? 0o644 : 0o755);
     }
     const tools = {
       uname: 'case "$1" in -s) echo Linux ;; -m) echo x86_64 ;; esac',
@@ -250,6 +265,11 @@ case "$1" in
     for name in prismtty ptty ct; do
       cp "built-$name" "dist/prismtty-1.2.3-linux-x86_64/$name"
     done
+    tar -czf dist/prismtty-1.2.3-linux-x86_64.tar.gz -C archive prismtty-1.2.3-linux-x86_64
+    (cd dist && shasum -a 256 prismtty-1.2.3-linux-x86_64.tar.gz > prismtty-1.2.3-linux-x86_64.tar.gz.sha256)
+    if [[ -n "$FAKE_STALE_CHECKSUM" ]]; then
+      printf 'changed after the checksum was written' >> dist/prismtty-1.2.3-linux-x86_64.tar.gz
+    fi
     ;;
 esac`,
     };
@@ -265,6 +285,7 @@ esac`,
         SOURCE_DATE_EPOCH: '1700000000',
         FAKE_RUSTC: rustc,
         FAKE_SMOKE_STATUS: smokeStatus,
+        FAKE_STALE_CHECKSUM: staleChecksum ? 'yes' : '',
       },
       encoding: 'utf8',
     });
@@ -399,4 +420,43 @@ test('the build container can read the checkout and write only to dist', () => {
     3,
     'the checkout, dist and the toolchain are the only volumes',
   );
+});
+
+test('the Linux archive is measured and run from the tarball, not from what the build left beside it', () => {
+  // The staged copies need a newer glibc here and the archived ones do not:
+  // what ships passes.
+  let result = packageForLinux({
+    binaries: everyBinary(builtOnANewerSystem),
+    archived: everyBinary(builtOnTheBaseline),
+  });
+  assert.equal(result.status, 0, result.stderr);
+  const smoke = result.calls.find((call) => call.includes(' --network none '));
+  assert.match(smoke, / --volume \S+\/prismtty-1\.2\.3-linux-x86_64:\/package:ro /);
+  assert.doesNotMatch(smoke, /\/dist\/prismtty-1\.2\.3-linux-x86_64:\/package/);
+
+  // The other way round, what ships is refused.
+  result = packageForLinux({
+    binaries: everyBinary(builtOnTheBaseline),
+    archived: { ...everyBinary(builtOnTheBaseline), ct: builtOnANewerSystem },
+  });
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /\/ct needs glibc 2\.39, above the floor/);
+});
+
+test('the Linux archive is refused when a binary is missing from it or lost its execute bit', () => {
+  const { ct: _missing, ...withoutCt } = everyBinary(builtOnTheBaseline);
+  let result = packageForLinux({ binaries: everyBinary(builtOnTheBaseline), archived: withoutCt });
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /prismtty-1\.2\.3-linux-x86_64\.tar\.gz does not hold an executable ct$/m);
+  assert.ok(!result.calls.some((call) => call.includes(' --network none ')), 'the smoke test did not run');
+
+  result = packageForLinux({ binaries: everyBinary(builtOnTheBaseline), notExecutable: ['ptty'] });
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /prismtty-1\.2\.3-linux-x86_64\.tar\.gz does not hold an executable ptty$/m);
+});
+
+test('the Linux archive is refused when it does not match its checksum file', () => {
+  const result = packageForLinux({ binaries: everyBinary(builtOnTheBaseline), staleChecksum: true });
+  assert.notEqual(result.status, 0);
+  assert.ok(!result.calls.some((call) => call.includes(' --network none ')), 'the smoke test did not run');
 });
