@@ -24,8 +24,8 @@ use crate::config::{
     MAX_PROFILE_TEST_FILE_BYTES, PrismConfig, load_profile_file, read_bounded_regular_file,
 };
 use crate::highlight::{
-    Highlighter, RuleMatchError, StreamingHighlighter, set_terminal_reads_utf8, strip_ansi,
-    strip_string_escapes,
+    Highlighter, RuleMatchError, StreamingHighlighter, read_screen_titles_as_apc,
+    set_terminal_reads_utf8, strip_ansi, strip_string_escapes,
 };
 use crate::terminal_text::escape_untrusted;
 
@@ -256,6 +256,10 @@ fn run_inner(args: Vec<OsString>) -> Result<ExitCode, CliError> {
                 })?;
             // The fixture is printed to the terminal like program output, so
             // the flags that remove escapes from that output apply to it too.
+            let mut input = input;
+            if options.sanitize {
+                read_screen_titles_as_apc(&mut input);
+            }
             let input = if options.strip_ansi {
                 strip_ansi(&input)
             } else if options.sanitize {
