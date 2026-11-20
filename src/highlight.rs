@@ -2942,13 +2942,7 @@ fn contains_alternate_screen_enable_tokens(tokens: &[Token]) -> bool {
 }
 
 fn alternate_screen_command(bytes: &[u8]) -> Option<bool> {
-    let body = csi_body(bytes)?;
-    let (final_byte, modes) = body.strip_prefix(b"?")?.split_last()?;
-    let enable = match final_byte {
-        b'h' => true,
-        b'l' => false,
-        _ => return None,
-    };
+    let (modes, enable) = private_mode_sequence(bytes)?;
     let has_alternate_screen_mode = modes
         .split(|byte| *byte == b';')
         .any(|mode| matches!(mode, b"47" | b"1047" | b"1049"));
@@ -3471,7 +3465,9 @@ fn is_soft_terminal_reset(bytes: &[u8]) -> bool {
 }
 
 /// The modes of a DEC private mode set (`CSI ? Pm h`) or reset (`CSI ? Pm l`)
-/// and whether it sets them.
+/// and whether it sets them. A terminal ignores the whole sequence once it
+/// meets a second private marker or an intermediate byte, so only digits and
+/// `;` may stand between the `?` and the final byte.
 fn private_mode_sequence(bytes: &[u8]) -> Option<(Cow<'_, [u8]>, bool)> {
     let body = csi_body(bytes)?;
     let (final_byte, modes) = body.strip_prefix(b"?")?.split_last()?;
@@ -3480,6 +3476,12 @@ fn private_mode_sequence(bytes: &[u8]) -> Option<(Cow<'_, [u8]>, bool)> {
         b'l' => false,
         _ => return None,
     };
+    if !modes
+        .iter()
+        .all(|byte| byte.is_ascii_digit() || *byte == b';')
+    {
+        return None;
+    }
     let modes = 1..=modes.len();
     Some((
         match body {
@@ -9230,6 +9232,71 @@ rules:
             assert!(!super::restores_cursor(&cancelled(b"\x1b[")));
             assert!(!super::is_soft_terminal_reset(&cancelled(b"\x1b[!")));
         }
+    }
+
+    // A terminal ignores a private-mode sequence once it meets a second
+    // private marker or an intermediate byte, so such a sequence sets and
+    // resets nothing: no screen switch, no saved rendition.
+    #[test]
+    fn malformed_private_mode_sequences_name_no_mode() {
+        for sequence in [
+            b"\x1b[?1049;?1h".as_slice(),
+            b"\x1b[?10\x0049;?1h",
+            b"\x1b[?1049;!h",
+            b"\x1b[?1049 h",
+            b"\x1b[?1048$h",
+            b"\x1b[?1;1047>l",
+            b"\x1b[??1049h",
+            b"\x9b?47;?1l",
+            b"\xc2\x9b?1048:1h",
+        ] {
+            assert_eq!(
+                super::alternate_screen_command(sequence),
+                None,
+                "{sequence:02x?}"
+            );
+            assert!(!super::saves_rendition(sequence), "{sequence:02x?}");
+            assert_eq!(
+                super::private_mode_sequence(sequence),
+                None,
+                "{sequence:02x?}"
+            );
+        }
+
+        for (input, expected) in [
+            // The malformed save is ignored, so the restore brings back the
+            // rendition that nothing saved: the default one.
+            (
+                b"\x1b[33m\x1b[?1048;?1h\x1b[31m\x1b[?1048l".as_slice(),
+                None,
+            ),
+            (b"\x1b[33m\x1b[?1049;!h\x1b[31m\x1b[?1049l", None),
+            // The malformed restore is ignored too.
+            (
+                b"\x1b[33m\x1b[?1048h\x1b[31m\x1b[?1048;?1l",
+                Some("\x1b[31m"),
+            ),
+        ] {
+            let mut state = NativeSgrState::default();
+            for token in super::tokenize_ansi(input) {
+                if let super::Token::Ansi(sequence) = token {
+                    state.apply_sequence(&sequence);
+                }
+            }
+            assert_eq!(
+                state.ansi_start().as_deref(),
+                expected,
+                "after {input:02x?}"
+            );
+        }
+
+        // Well-formed sequences still name their modes.
+        assert_eq!(
+            super::alternate_screen_command(b"\x1b[?25;1049h"),
+            Some(true)
+        );
+        assert_eq!(super::alternate_screen_command(b"\x1b[?;47l"), Some(false));
+        assert!(super::saves_rendition(b"\x1b[?1048;25h"));
     }
 
     // XTPUSHSGR saves the rendition, with or without parameters, in either

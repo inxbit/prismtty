@@ -1002,6 +1002,54 @@ fn interactive_alternate_screen_switch_with_a_control_inside_it_is_still_read() 
     }
 }
 
+// A terminal ignores a private-mode sequence that holds a second private
+// marker or an intermediate byte: it stays on the screen it was on. Taking
+// the first mode of such a sequence as the switch to the alternate screen
+// stopped highlighting on the screen the terminal still showed.
+#[test]
+fn malformed_private_mode_sequence_does_not_switch_screens() {
+    let config = PrismConfig::from_chromaterm_yaml(
+        "rules:\n  - description: up\n    regex: '\\bup\\b'\n    color: f#00ff00\n",
+    )
+    .expect("config parses");
+    let highlighter = Highlighter::from_config(config).expect("rules compile");
+    let green_up = "\x1b[38;2;0;255;0mup\x1b[0m";
+
+    for sequence in [
+        "\x1b[?10\x0049;?1h",
+        "\x1b[?1049;?1h",
+        "\x1b[?1049;!h",
+        "\x1b[?1049 h",
+        "\x1b[?47$h",
+        "\x1b[?1;1047>h",
+        "\u{9b}?1049;?1h",
+    ] {
+        let input = format!("{sequence}frame up\nnext up\n");
+        let expected = format!("{sequence}frame {green_up}\nnext {green_up}\n");
+        for split in 0..=input.len() {
+            let mut streaming = StreamingHighlighter::new(highlighter.clone());
+            let mut output = streaming.push(&input.as_bytes()[..split]);
+            output.extend(streaming.push(&input.as_bytes()[split..]));
+            output.extend(streaming.finish());
+            assert_eq!(
+                String::from_utf8_lossy(&output),
+                expected,
+                "{input:?} pushed in two parts, split at {split}"
+            );
+        }
+    }
+
+    // The same sequences do not switch back either: the frame stays as the
+    // program drew it.
+    for sequence in ["\x1b[?1049;?1l", "\x1b[?1049;!l", "\x1b[?10\x0049 l"] {
+        let input = format!("\x1b[?1049hframe up\n{sequence}still up\n");
+        let mut streaming = StreamingHighlighter::new(highlighter.clone());
+        let mut output = streaming.push(input.as_bytes());
+        output.extend(streaming.finish());
+        assert_eq!(String::from_utf8_lossy(&output), input);
+    }
+}
+
 // In an interactive stream a foreground-only highlight stays open across the
 // spacing between two highlighted columns. Where the program's own rendition
 // draws blank cells with the foreground color (inverse, underline,
