@@ -384,3 +384,19 @@ test('the README states the glibc floor the Linux archive is held to', () => {
     assert.ok(readme.includes(library), `README.md names ${library}`);
   }
 });
+
+test('the build container can read the checkout and write only to dist', () => {
+  // Package scripts and cargo build scripts run as root in the container, and
+  // the host goes on to run scripts from the same checkout. Mounted read-only,
+  // nothing in it can have been changed by then.
+  const result = packageForLinux({ binaries: everyBinary(builtOnTheBaseline) });
+  assert.equal(result.status, 0, result.stderr);
+  const build = result.calls.find((call) => call.startsWith('run ') && !call.includes(' --network none '));
+  assert.match(build, / --volume [^ :]+:\/work:ro /);
+  assert.match(build, / --volume [^ :]+\/dist:\/work\/dist /);
+  assert.equal(
+    [...build.matchAll(/ --volume /g)].length,
+    3,
+    'the checkout, dist and the toolchain are the only volumes',
+  );
+});

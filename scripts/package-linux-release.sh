@@ -93,17 +93,20 @@ fetch apt-get "${apt_options[@]}" install --yes --no-install-recommends \
 
 export PATH="/opt/rust/bin:${PATH}"
 export CARGO_HTTP_CAINFO=/host/ca-certificates.crt
-# cargo keeps its downloads and its output inside the container; only dist/
-# is written to the checkout. The crates are downloaded first, so the build
-# itself needs no network.
+# cargo keeps its downloads and its output inside the container. The crates
+# are downloaded first, so the build itself needs no network.
 export CARGO_HOME=/tmp/cargo-home CARGO_TARGET_DIR=/tmp/cargo-target
 fetch cargo fetch --locked
 export CARGO_NET_OFFLINE=true
 bash scripts/package-release.sh "${TARGET_NAME}"
 CONTAINER
 )"
+# Package scripts and build scripts run as root in the container, and this
+# script goes on to run more of the checkout afterwards. The container gets
+# the checkout read-only; dist is the one place it can write.
+mkdir -p dist
 docker run --rm --platform linux/amd64 \
-  --volume "${PWD}:/work" --workdir /work \
+  --volume "${PWD}:/work:ro" --volume "${PWD}/dist:/work/dist" --workdir /work \
   --volume "${toolchain}:/opt/rust:ro" \
   --mount "type=bind,source=${ca_certificates},target=/host/ca-certificates.crt,readonly" \
   --env SNAPSHOT="${snapshot}" \
