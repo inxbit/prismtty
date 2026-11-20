@@ -3267,16 +3267,33 @@ fn fills_blank_cells_with(bytes: &[u8], style: &Style) -> bool {
 }
 
 /// Reports whether `bytes` makes the terminal save the current rendition:
-/// DECSC or CSI s, or setting mode 1048 or 1049. A highlight left active there
-/// would be saved with it and come back with the restore, on text it never
-/// matched.
+/// DECSC or CSI s, XTPUSHSGR, or setting mode 1048 or 1049. A highlight left
+/// active there would be saved with it and come back with the restore, on
+/// text it never matched.
 fn saves_rendition(bytes: &[u8]) -> bool {
     saves_cursor(bytes)
+        || pushes_rendition(bytes)
         || private_mode_sequence(bytes).is_some_and(|(modes, set)| {
             set && modes
                 .split(|byte| *byte == b';')
                 .any(|mode| matches!(mode, b"1048" | b"1049"))
         })
+}
+
+/// Reports whether `bytes` is xterm's XTPUSHSGR (`CSI Ps ; Ps # {`, also
+/// spelled `CSI Ps ; Ps # p`), which saves the rendition, or the attributes
+/// its parameters select, on a stack. The stack itself is not tracked: a
+/// terminal without it ignores the push and the pop.
+fn pushes_rendition(bytes: &[u8]) -> bool {
+    csi_body(bytes).is_some_and(|body| {
+        body.strip_suffix(b"#{")
+            .or_else(|| body.strip_suffix(b"#p"))
+            .is_some_and(|parameters| {
+                parameters
+                    .iter()
+                    .all(|byte| byte.is_ascii_digit() || *byte == b';')
+            })
+    })
 }
 
 /// Reports whether `bytes` is index (`ESC D`), next line (`ESC E`) or reverse
@@ -9205,6 +9222,40 @@ rules:
             assert!(!super::saves_rendition(&cancelled(b"\x1b[")));
             assert!(!super::restores_cursor(&cancelled(b"\x1b[")));
             assert!(!super::is_soft_terminal_reset(&cancelled(b"\x1b[!")));
+        }
+    }
+
+    // XTPUSHSGR saves the rendition, with or without parameters, in either
+    // spelling and behind any CSI introducer. The pop, the palette stack
+    // (`CSI # P`), DECSTR and a private-marker form save nothing.
+    #[test]
+    fn xtpushsgr_is_a_rendition_save() {
+        for push in [
+            b"\x1b[#{".as_slice(),
+            b"\x1b[#p",
+            b"\x1b[1;4;30;31#{",
+            b"\x1b[;#p",
+            b"\x9b#{",
+            b"\xc2\x9b#{",
+            b"\x1b\x00[#{",
+            b"\x1b[1\x00;4#\n{",
+        ] {
+            assert!(super::saves_rendition(push), "{push:02x?}");
+        }
+        for other in [
+            b"\x1b[#}".as_slice(),
+            b"\x1b[#q",
+            b"\x1b[#P",
+            b"\x1b[#Q",
+            b"\x1b[#|",
+            b"\x1b[!p",
+            b"\x1b[?#{",
+            b"\x1b[1 #{",
+            b"\x1b[#\x18",
+            b"\x1b[{",
+            b"\x1b[p",
+        ] {
+            assert!(!super::saves_rendition(other), "{other:02x?}");
         }
     }
 

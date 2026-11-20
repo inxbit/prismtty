@@ -682,6 +682,162 @@ rules:
     }
 }
 
+// xterm's XTPUSHSGR (`CSI # {`, also spelled `CSI # p`, with or without
+// parameters that select attributes) saves the rendition on a stack, as DECSC
+// saves it with the cursor. A push made while the highlight is drawn saved
+// the highlight color, and the pop brought it back onto text the rule never
+// matched.
+#[test]
+fn stream_ends_highlight_before_xtpushsgr_saves_the_rendition() {
+    let yaml = r##"
+rules:
+  - description: bad status
+    regex: (?i)\berror\b
+    color: f#ff0000
+"##;
+    let config = PrismConfig::from_chromaterm_yaml(yaml).expect("chromaterm config loads");
+    let highlighter = Highlighter::from_config(config).expect("rules compile");
+
+    for (interactive, chunks, saved) in [
+        (
+            false,
+            &["disk error\x1b[#{ tail\x1b[#} more\n"][..],
+            "error\x1b[0m\x1b[#{",
+        ),
+        (
+            false,
+            &["disk error\x1b[#p tail\x1b[#q more\n"][..],
+            "error\x1b[0m\x1b[#p",
+        ),
+        (
+            false,
+            &["disk error\x1b[30;31#{ tail\x1b[#} more\n"][..],
+            "error\x1b[0m\x1b[30;31#{",
+        ),
+        (
+            false,
+            &["disk error\u{9b}#{ tail\u{9b}#} more\n"][..],
+            "error\x1b[0m\u{9b}#{",
+        ),
+        (
+            false,
+            &["disk error\x1b[1\x00;4#\n{ tail\x1b[#} more\n"][..],
+            "error\x1b[0m\x1b[1\x00;4#\n{",
+        ),
+        (
+            false,
+            &["disk error\x1b[", "#", "{ tail\x1b[#} more\n"][..],
+            "error\x1b[0m\x1b[#{",
+        ),
+        (
+            true,
+            &["disk error\x1b[#{ tail\x1b[#} more\n"][..],
+            "error\x1b[39m\x1b[#{",
+        ),
+        (
+            true,
+            &["disk error ", "\x1b[#{tail\x1b[#} more\n"][..],
+            "error \x1b[39m\x1b[#{",
+        ),
+        (
+            true,
+            &["disk error ", "\x1b[1;4#ptail\x1b[#q more\n"][..],
+            "error \x1b[39m\x1b[1;4#p",
+        ),
+    ] {
+        let mut streaming = if interactive {
+            new_interactive_streaming(highlighter.clone())
+        } else {
+            StreamingHighlighter::new(highlighter.clone())
+        };
+        let mut output = String::new();
+        for chunk in chunks {
+            output.push_str(&streaming.push_str(chunk));
+        }
+        output.push_str(&String::from_utf8(streaming.finish()).expect("valid utf8"));
+
+        assert!(
+            output.contains(saved),
+            "the highlight must end before {chunks:?} saves the rendition: {output:?}"
+        );
+    }
+}
+
+/// The foreground each visible glyph of `output` is drawn in, on a terminal
+/// that keeps a stack for XTPUSHSGR and XTPOPSGR and on one that ignores
+/// both.
+fn drawn_foregrounds(output: &str, keeps_a_stack: bool) -> Vec<(char, Option<String>)> {
+    let mut foreground = None;
+    let mut stack = Vec::new();
+    let mut drawn = Vec::new();
+    let mut rest = output;
+    while let Some(ch) = rest.chars().next() {
+        if let Some(sequence) = rest.strip_prefix("\x1b[") {
+            let end = sequence
+                .find(|ch: char| ('\x40'..='\x7e').contains(&ch))
+                .expect("the CSI has a final byte");
+            let (body, after) = sequence.split_at(end + 1);
+            match body {
+                "#{" if keeps_a_stack => stack.push(foreground.clone()),
+                "#}" if keeps_a_stack => foreground = stack.pop().expect("a push came first"),
+                "0m" | "39m" => foreground = None,
+                _ if body.ends_with('m') => foreground = Some(body.to_string()),
+                _ => {}
+            }
+            rest = after;
+            continue;
+        }
+        if !ch.is_whitespace() {
+            drawn.push((ch, foreground.clone()));
+        }
+        rest = &rest[ch.len_utf8()..];
+    }
+    drawn
+}
+
+// With the program drawing in green and a match right before the push, the
+// push must save green: the text after the pop is the program's, on a
+// terminal that keeps the stack and on one that ignores both sequences.
+#[test]
+fn text_after_an_xtpopsgr_is_drawn_in_the_color_the_program_pushed() {
+    let config = PrismConfig::from_chromaterm_yaml(
+        "rules:\n  - description: bad status\n    regex: 'ERROR'\n    color: f#ff0000\n",
+    )
+    .expect("config parses");
+    let highlighter = Highlighter::from_config(config).expect("rules compile");
+    let red = Some("38;2;255;0;0m".to_string());
+    let green = Some("32m".to_string());
+    let input = "\x1b[32mERROR\x1b[#{ one\x1b[#} two\n";
+
+    for interactive in [false, true] {
+        for chunks in [&[input][..], &["\x1b[32mERROR", "\x1b[#{ one\x1b[#} two\n"]] {
+            let mut streaming = if interactive {
+                new_interactive_streaming(highlighter.clone())
+            } else {
+                StreamingHighlighter::new(highlighter.clone())
+            };
+            let mut output = String::new();
+            for chunk in chunks {
+                output.push_str(&streaming.push_str(chunk));
+            }
+            output.push_str(&String::from_utf8(streaming.finish()).expect("valid utf8"));
+
+            for keeps_a_stack in [true, false] {
+                let expected = "ERROR"
+                    .chars()
+                    .map(|ch| (ch, red.clone()))
+                    .chain("onetwo".chars().map(|ch| (ch, green.clone())))
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    drawn_foregrounds(&output, keeps_a_stack),
+                    expected,
+                    "interactive {interactive}, stack {keeps_a_stack}, {chunks:?}: {output:?}"
+                );
+            }
+        }
+    }
+}
+
 #[test]
 fn preserves_composed_native_sgr_after_highlighted_prompt_time() {
     let yaml = r##"
