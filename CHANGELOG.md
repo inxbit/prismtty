@@ -37,6 +37,15 @@ All notable changes to PrismTTY are documented here.
   boundary. The README notes that a trailing byte that could begin a UTF-8
   character is shown with the next output or at the end of output.
 
+### Release and QA
+
+- The Linux release archive is built on glibc 2.34 (AlmaLinux 9, image
+  pinned by digest) instead of the release runner's 2.39, which the 1.3.7
+  binaries required. One script builds it, measures the glibc it needs and
+  runs the three binaries on a stock system of that age; pull request CI and
+  the release workflow both call it, so a tag never builds the archive in a
+  way a pull request has not already run.
+
 ## 1.3.7 - 2026-11-19
 
 ### Security
