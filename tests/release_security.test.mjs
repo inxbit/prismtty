@@ -902,3 +902,60 @@ test('release packaging tells the two macOS CPUs apart', () => {
   assert.match(result.stderr, /darwin-x86_64 needs Mach-O x86_64/);
   assert.ok(!result.packagedAnything);
 });
+
+// Files that carry a recognizable executable header, some with the right CPU
+// number, without being something the target can run.
+Object.assign(executableHeaders, {
+  'linux-x86_64 non-PIE, GNU/Linux ABI': Buffer.from('7f454c4602010103000000000000000002003e00', 'hex'),
+  'FreeBSD x86_64': Buffer.from('7f454c4602010109000000000000000002003e00', 'hex'),
+  'x32 (32-bit ELF for x86_64)': Buffer.from('7f454c4601010100000000000000000002003e00', 'hex'),
+  'big-endian ELF': Buffer.from('7f454c460202010000000000000000000002003e', 'hex'),
+  'truncated ELF': Buffer.from('7f454c4602', 'hex'),
+  'big-endian 64-bit Mach-O': Buffer.from('feedfacf010000120000000000000002', 'hex'),
+  '32-bit Mach-O': Buffer.from('cefaedfe070000000300000002000000', 'hex'),
+  'big-endian 32-bit Mach-O': Buffer.from('feedface000000120000000000000002', 'hex'),
+});
+
+test('release packaging accepts both kinds of Linux x86_64 executable', () => {
+  // The position-independent kind is what cargo builds; a fixed-address one
+  // marked with the GNU/Linux ABI is the same target.
+  for (const kind of ['linux-x86_64', 'linux-x86_64 non-PIE, GNU/Linux ABI']) {
+    const result = packageExecutables('linux-x86_64', { prismtty: kind, ptty: kind, ct: kind });
+    assert.equal(result.status, 0, `${kind}: ${result.stderr}`);
+    assert.ok(result.wroteArchive, `${kind}: no archive was written`);
+  }
+});
+
+test('release packaging refuses an ELF file that is not a 64-bit Linux executable', () => {
+  // FreeBSD and the x32 ABI use the x86_64 machine number too, so the machine
+  // number alone let them into the linux-x86_64 archive.
+  for (const [kind, said] of [
+    ['FreeBSD x86_64', /target\/release\/ct is ELF x86_64 \(OS\/ABI 9\)/],
+    ['x32 (32-bit ELF for x86_64)', /target\/release\/ct is ELF x86_64 \(not 64-bit\)/],
+    ['big-endian ELF', /target\/release\/ct is ELF x86_64 \(big-endian\)/],
+    ['truncated ELF', /target\/release\/ct is ELF \(truncated\)/],
+  ]) {
+    const result = packageExecutables('linux-x86_64', {
+      prismtty: 'linux-x86_64',
+      ptty: 'linux-x86_64',
+      ct: kind,
+    });
+    assert.notEqual(result.status, 0, `${kind} was packaged as linux-x86_64`);
+    assert.match(result.stderr, said, kind);
+    assert.match(result.stderr, /linux-x86_64 needs ELF x86_64$/m, kind);
+    assert.ok(!result.packagedAnything, kind);
+  }
+});
+
+test('release packaging refuses every Mach-O file that is not the 64-bit kind for its CPU', () => {
+  // Older and big-endian Mach-O files have other magic numbers. They used to
+  // count as "neither format" and were packaged under any label.
+  for (const kind of ['big-endian 64-bit Mach-O', '32-bit Mach-O', 'big-endian 32-bit Mach-O']) {
+    for (const target of ['linux-x86_64', 'darwin-aarch64', 'darwin-x86_64']) {
+      const result = packageExecutables(target, { prismtty: kind, ptty: kind, ct: kind });
+      assert.notEqual(result.status, 0, `${kind} was packaged as ${target}`);
+      assert.match(result.stderr, /target\/release\/prismtty is Mach-O /, `${kind} as ${target}`);
+      assert.ok(!result.packagedAnything, `${kind} as ${target}`);
+    }
+  }
+});

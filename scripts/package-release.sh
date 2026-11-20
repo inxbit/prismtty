@@ -33,8 +33,9 @@ cargo build --locked --release --bins
 release_dir="${CARGO_TARGET_DIR:-target}/release"
 
 # The archive name promises an operating system and a CPU, so a binary that
-# says otherwise must not ship under it. Content that is neither ELF nor
-# 64-bit Mach-O is nothing cargo builds for these targets and is left alone.
+# says otherwise must not ship under it. A universal Mach-O is refused under
+# both macOS labels: each archive is for one CPU. Content that is neither ELF
+# nor Mach-O is nothing cargo builds for these targets and is left alone.
 RELEASE_DIR="${release_dir}" TARGET_NAME="${target_name}" python3 - <<'PY'
 import os
 from pathlib import Path
@@ -47,17 +48,47 @@ EXPECTED = {
 }
 ELF_MACHINES = {0x3E: "x86_64", 0xB7: "aarch64"}
 MACH_O_CPUS = {0x01000007: "x86_64", 0x0100000C: "arm64"}
+# Every Mach-O magic number, with its byte order and what sets it apart from
+# the 64-bit little-endian kind the macOS targets use.
+MACH_O_MAGICS = {
+    b"\xcf\xfa\xed\xfe": ("<", ""),
+    b"\xfe\xed\xfa\xcf": (">", " (big-endian)"),
+    b"\xce\xfa\xed\xfe": ("<", " (32-bit)"),
+    b"\xfe\xed\xfa\xce": (">", " (32-bit, big-endian)"),
+}
+UNIVERSAL_MAGICS = (
+    b"\xca\xfe\xba\xbe",
+    b"\xca\xfe\xba\xbf",
+    b"\xbe\xba\xfe\xca",
+    b"\xbf\xba\xfe\xca",
+)
 
 
 def describe(header):
-    if header[:4] == b"\x7fELF" and len(header) >= 20:
+    magic = header[:4]
+    if magic == b"\x7fELF":
+        if len(header) < 20:
+            return "ELF (truncated)"
         byte_order = "<" if header[5] == 1 else ">"
         (machine,) = struct.unpack_from(f"{byte_order}H", header, 18)
-        return f"ELF {ELF_MACHINES.get(machine, hex(machine))}"
-    if header[:4] == b"\xcf\xfa\xed\xfe" and len(header) >= 8:
-        (cpu,) = struct.unpack_from("<I", header, 4)
-        return f"Mach-O {MACH_O_CPUS.get(cpu, hex(cpu))}"
-    if header[:4] in (b"\xca\xfe\xba\xbe", b"\xca\xfe\xba\xbf"):
+        kind = f"ELF {ELF_MACHINES.get(machine, hex(machine))}"
+        # The machine number is not enough: the x32 ABI and other systems
+        # such as FreeBSD use the x86_64 number too. A Linux executable is
+        # 64-bit, little-endian and marked for the System V or GNU/Linux ABI.
+        if header[4] != 2:
+            kind += " (not 64-bit)"
+        if header[5] != 1:
+            kind += " (big-endian)"
+        if header[7] not in (0, 3):
+            kind += f" (OS/ABI {header[7]})"
+        return kind
+    if magic in MACH_O_MAGICS:
+        if len(header) < 8:
+            return "Mach-O (truncated)"
+        byte_order, variant = MACH_O_MAGICS[magic]
+        (cpu,) = struct.unpack_from(f"{byte_order}I", header, 4)
+        return f"Mach-O {MACH_O_CPUS.get(cpu, hex(cpu))}{variant}"
+    if magic in UNIVERSAL_MAGICS:
         return "Mach-O universal"
     return None
 
