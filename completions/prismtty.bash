@@ -50,8 +50,9 @@ _prismtty_wrapped_command() {
                 while [[ -n "${rest}" ]]; do
                     case "${rest:0:1}" in
                         p|c)
-                            # The value is the rest of this word, or the next word.
-                            [[ ${#rest} -eq 1 ]] && (( i += 1 ))
+                            # The value is the rest of this word, or the next
+                            # word unless Bash split `-o=value`.
+                            [[ ${#rest} -eq 1 && "${COMP_WORDS[i]}" != "=" ]] && (( i += 1 ))
                             break
                             ;;
                     esac

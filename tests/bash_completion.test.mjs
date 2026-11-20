@@ -202,3 +202,19 @@ test('Bash keeps filename completion wherever a file is a valid argument', () =>
     );
   }
 });
+
+test('Bash reads a short option value that it split off at an equals sign', () => {
+  // `-c=config.yml` is one argument to PrismTTY. Bash 4 and later hand it to
+  // the completion as `-c`, `=`, `config.yml`; the value was taken for the
+  // wrapped command and nothing of PrismTTY was offered after it.
+  withCompletionDirectory((complete) => {
+    for (const command of commandNames) {
+      assert.deepEqual(complete(command, ['-c', '=', 'config.yml', '--sa']), ['--sanitize'], command);
+      assert.deepEqual(complete(command, ['-bc', '=', 'config.yml', 'profiles', 'sh']), ['show'], command);
+      assert.deepEqual(complete(command, ['-p', '=', 'cisco', '-c', '=', 'config.yml', '--sa']), ['--sanitize'], command);
+      // The same argument as Bash 3 passes it, and with the wrapped command after it.
+      assert.deepEqual(complete(command, ['-c=config.yml', '--sa']), ['--sanitize'], command);
+      assert.deepEqual(complete(command, ['-c', '=', 'config.yml', 'ssh', '--sa']), [], command);
+    }
+  });
+});
