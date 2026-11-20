@@ -3472,15 +3472,22 @@ fn is_soft_terminal_reset(bytes: &[u8]) -> bool {
 
 /// The modes of a DEC private mode set (`CSI ? Pm h`) or reset (`CSI ? Pm l`)
 /// and whether it sets them.
-fn private_mode_sequence(bytes: &[u8]) -> Option<(Vec<u8>, bool)> {
+fn private_mode_sequence(bytes: &[u8]) -> Option<(Cow<'_, [u8]>, bool)> {
     let body = csi_body(bytes)?;
-    let (final_byte, body) = body.split_last()?;
+    let (final_byte, modes) = body.strip_prefix(b"?")?.split_last()?;
     let set = match final_byte {
         b'h' => true,
         b'l' => false,
         _ => return None,
     };
-    Some((body.strip_prefix(b"?")?.to_vec(), set))
+    let modes = 1..=modes.len();
+    Some((
+        match body {
+            Cow::Borrowed(body) => Cow::Borrowed(&body[modes]),
+            Cow::Owned(body) => Cow::Owned(body[modes].to_vec()),
+        },
+        set,
+    ))
 }
 
 /// The colors and attributes that SGR sequences have set.
