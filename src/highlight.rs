@@ -8,6 +8,7 @@ use crate::config::{CaptureRef, PrismConfig, RuleSpec, RuleStyle};
 use crate::style::{ColorMode, Style};
 use crate::terminal_text::escape_untrusted;
 use pcre2::bytes::{Regex, RegexBuilder};
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::Arc;
@@ -2941,19 +2942,14 @@ fn contains_alternate_screen_enable_tokens(tokens: &[Token]) -> bool {
 }
 
 fn alternate_screen_command(bytes: &[u8]) -> Option<bool> {
-    let introducer = csi_introducer_len(bytes)?;
-    if bytes.get(introducer) != Some(&b'?') {
-        return None;
-    }
-    let body_start = introducer + 1;
-    let final_byte = *bytes.last()?;
+    let body = csi_body(bytes)?;
+    let (final_byte, modes) = body.strip_prefix(b"?")?.split_last()?;
     let enable = match final_byte {
         b'h' => true,
         b'l' => false,
         _ => return None,
     };
-    let body = &bytes[body_start..bytes.len().saturating_sub(1)];
-    let has_alternate_screen_mode = body
+    let has_alternate_screen_mode = modes
         .split(|byte| *byte == b';')
         .any(|mode| matches!(mode, b"47" | b"1047" | b"1049"));
     has_alternate_screen_mode.then_some(enable)
@@ -2968,9 +2964,7 @@ fn contains_cursor_positioning_sequence_tokens(tokens: &[Token]) -> bool {
 
 fn contains_bracketed_paste_disable_tokens(tokens: &[Token]) -> bool {
     tokens.iter().any(|token| match token {
-        Token::Ansi(bytes) => {
-            csi_introducer_len(bytes).is_some_and(|introducer| &bytes[introducer..] == b"?2004l")
-        }
+        Token::Ansi(bytes) => csi_body(bytes).is_some_and(|body| *body == *b"?2004l"),
         Token::Text(_) => false,
     })
 }
@@ -3034,6 +3028,26 @@ fn escape_final_byte(bytes: &[u8]) -> Option<u8> {
 
 fn is_csi_sequence(bytes: &[u8]) -> bool {
     csi_introducer_len(bytes).is_some()
+}
+
+/// What follows the introducer of the CSI sequence `bytes`, as a terminal
+/// reads it: it runs a C0 control it meets inside a CSI and ignores DEL, and
+/// goes on with the sequence, so neither is part of it. CAN and SUB cancel
+/// the sequence and stay, as a last byte that is no final byte. `None` when
+/// `bytes` is not a CSI sequence.
+fn csi_body(bytes: &[u8]) -> Option<Cow<'_, [u8]>> {
+    let body = &bytes[csi_introducer_len(bytes)?..];
+    let is_run_or_ignored = |byte: &u8| matches!(byte, 0x00..=0x17 | 0x19 | 0x1c..=0x1f | 0x7f);
+    Some(if body.iter().any(is_run_or_ignored) {
+        Cow::Owned(
+            body.iter()
+                .copied()
+                .filter(|byte| !is_run_or_ignored(byte))
+                .collect(),
+        )
+    } else {
+        Cow::Borrowed(body)
+    })
 }
 
 fn visible_bytes(tokens: &[Token]) -> Vec<u8> {
@@ -3418,42 +3432,38 @@ impl NativeSgrState {
 /// Reports whether `bytes` saves the cursor and its rendition: DECSC
 /// (`ESC 7`), or `CSI s` with no parameters (SCOSC).
 fn saves_cursor(bytes: &[u8]) -> bool {
-    escape_final_byte(bytes) == Some(b'7')
-        || csi_introducer_len(bytes).is_some_and(|introducer| &bytes[introducer..] == b"s")
+    escape_final_byte(bytes) == Some(b'7') || csi_body(bytes).is_some_and(|body| *body == *b"s")
 }
 
 /// Reports whether `bytes` restores the cursor and its rendition: DECRC
 /// (`ESC 8`), or `CSI u` with no parameters (SCORC).
 fn restores_cursor(bytes: &[u8]) -> bool {
-    escape_final_byte(bytes) == Some(b'8')
-        || csi_introducer_len(bytes).is_some_and(|introducer| &bytes[introducer..] == b"u")
+    escape_final_byte(bytes) == Some(b'8') || csi_body(bytes).is_some_and(|body| *body == *b"u")
 }
 
 /// Reports whether `bytes` is DECSTR (`CSI ! p`), which xterm runs whatever
 /// parameters come before the `!`.
 fn is_soft_terminal_reset(bytes: &[u8]) -> bool {
-    csi_introducer_len(bytes).is_some_and(|introducer| {
-        bytes[introducer..]
-            .strip_suffix(b"!p")
-            .is_some_and(|parameters| {
-                parameters
-                    .iter()
-                    .all(|byte| byte.is_ascii_digit() || *byte == b';')
-            })
+    csi_body(bytes).is_some_and(|body| {
+        body.strip_suffix(b"!p").is_some_and(|parameters| {
+            parameters
+                .iter()
+                .all(|byte| byte.is_ascii_digit() || *byte == b';')
+        })
     })
 }
 
 /// The modes of a DEC private mode set (`CSI ? Pm h`) or reset (`CSI ? Pm l`)
 /// and whether it sets them.
-fn private_mode_sequence(bytes: &[u8]) -> Option<(&[u8], bool)> {
-    let introducer = csi_introducer_len(bytes)?;
-    let (final_byte, body) = bytes[introducer..].split_last()?;
+fn private_mode_sequence(bytes: &[u8]) -> Option<(Vec<u8>, bool)> {
+    let body = csi_body(bytes)?;
+    let (final_byte, body) = body.split_last()?;
     let set = match final_byte {
         b'h' => true,
         b'l' => false,
         _ => return None,
     };
-    Some((body.strip_prefix(b"?")?, set))
+    Some((body.strip_prefix(b"?")?.to_vec(), set))
 }
 
 /// The colors and attributes that SGR sequences have set.
@@ -9117,6 +9127,85 @@ rules:
             b"ab"
         );
         assert!(ranges[0].is_sgr);
+    }
+
+    // A terminal runs a C0 control it meets inside a CSI, ignores DEL there,
+    // and goes on reading the sequence, so the classifiers that compare what
+    // follows the introducer must read past both. CAN and SUB cancel the
+    // sequence instead: it then names nothing.
+    #[test]
+    fn csi_classifiers_read_past_controls_inside_the_sequence() {
+        for control in [0x00u8, 0x07, b'\n', b'\r', 0x1f, 0x7f] {
+            let with = |parts: &[&[u8]]| parts.join(&control);
+            assert_eq!(
+                super::alternate_screen_command(&with(&[b"\x1b[?10", b"49h"])),
+                Some(true),
+                "{control:#04x}"
+            );
+            assert_eq!(
+                super::alternate_screen_command(&with(&[b"\x1b[", b"?", b"47", b"l"])),
+                Some(false),
+                "{control:#04x}"
+            );
+            assert_eq!(
+                super::alternate_screen_command(&with(&[b"\x9b?25;10", b"47h"])),
+                Some(true),
+                "{control:#04x}"
+            );
+            assert!(super::saves_rendition(&with(&[b"\x1b[", b"s"])));
+            assert!(super::saves_rendition(&with(&[b"\x1b[?10", b"48h"])));
+            assert!(super::saves_rendition(&with(&[
+                b"\xc2\x9b?104",
+                b"9",
+                b"h"
+            ])));
+            assert!(!super::saves_rendition(&with(&[b"\x1b[?10", b"48l"])));
+            assert!(super::restores_cursor(&with(&[b"\x1b[", b"u"])));
+            assert!(super::is_soft_terminal_reset(&with(&[
+                b"\x1b[1", b"!", b"p"
+            ])));
+            assert!(super::contains_bracketed_paste_disable_tokens(&[
+                super::Token::Ansi(with(&[b"\x1b[?20", b"04l"]))
+            ]));
+
+            // The rendition saved on the way into the alternate screen comes
+            // back on the way out, and DECSTR still resets it.
+            for (input, expected) in [
+                (
+                    with(&[b"\x1b[33m\x1b[?10", b"49h\x1b[31m\x1b[?1049", b"l"]),
+                    Some("\x1b[33m"),
+                ),
+                (
+                    with(&[b"\x1b[33m\x1b[", b"s\x1b[31m\x1b[", b"u"]),
+                    Some("\x1b[33m"),
+                ),
+                (with(&[b"\x1b[33m\x1b[", b"!p"]), None),
+            ] {
+                let mut state = NativeSgrState::default();
+                for token in super::tokenize_ansi(&input) {
+                    if let super::Token::Ansi(sequence) = token {
+                        state.apply_sequence(&sequence);
+                    }
+                }
+                assert_eq!(
+                    state.ansi_start().as_deref(),
+                    expected,
+                    "after {input:02x?}"
+                );
+            }
+        }
+
+        for cancel in [0x18u8, 0x1a] {
+            let cancelled = |sequence: &[u8]| [sequence, &[cancel]].concat();
+            assert_eq!(
+                super::alternate_screen_command(&cancelled(b"\x1b[?1049")),
+                None
+            );
+            assert!(!super::saves_rendition(&cancelled(b"\x1b[?1049")));
+            assert!(!super::saves_rendition(&cancelled(b"\x1b[")));
+            assert!(!super::restores_cursor(&cancelled(b"\x1b[")));
+            assert!(!super::is_soft_terminal_reset(&cancelled(b"\x1b[!")));
+        }
     }
 
     #[test]
