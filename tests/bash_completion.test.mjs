@@ -218,3 +218,27 @@ test('Bash reads a short option value that it split off at an equals sign', () =
     }
   });
 });
+
+test('Bash keeps an option waiting for its value across a redirection', () => {
+  // In `prismtty --profile </dev/null generic`, `generic` is the profile. The
+  // redirection was taken for the value and `generic` for the wrapped command.
+  withCompletionDirectory((complete) => {
+    for (const command of commandNames) {
+      for (const words of [
+        ['--profile', '<', '/dev/null', 'generic', '--sa'],
+        ['-p', '<', '/dev/null', 'generic', '--sa'],
+        ['-Rp', '2', '>', '/dev/null', 'generic', '--sa'],
+        ['--config', '>', 'log', 'config.yml', '-p', 'cisco', '--sa'],
+      ]) {
+        assert.deepEqual(complete(command, words), ['--sanitize'], `${command} ${words.join(' ')}`);
+      }
+      assert.deepEqual(
+        complete(command, ['--profile', '<', '/dev/null', 'generic', 'profiles', 'sh']),
+        ['show'],
+        command,
+      );
+      // The word after the value still starts the wrapped command.
+      assert.deepEqual(complete(command, ['--profile', '<', '/dev/null', 'generic', 'ssh', '--sa']), [], command);
+    }
+  });
+});
