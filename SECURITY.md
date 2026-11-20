@@ -59,10 +59,19 @@ examples that preserve only the token shape needed to reproduce the issue.
   removes the byte and the rest of that line. In any other locale, or with
   none set, the string runs to its terminator and everything after an
   unterminated one is withheld.
-- By default PrismTTY is a transparent wrapper: escape sequences from the
-  wrapped program pass through unchanged, exactly like `ssh` or `tmux`. When
+- By default PrismTTY passes the escape sequences of the wrapped program
+  through as they are, within limits. A string control (OSC, DCS, SOS, PM or
+  APC) that is still open after 16 KiB is dropped from its introducer through
+  its terminator, even when it does end later, so a large sixel or inline
+  image does not reach the terminal. In a UTF-8 locale the same limit applies
+  to the stray raw byte above: when the byte and the rest of its line come to
+  16 KiB or more, both are dropped and only the line end is kept. When
   working against untrusted remote devices, `--sanitize` strips string-type
   escapes (window title, OSC 52 clipboard, DCS/SOS/PM/APC payloads) from
   program output while leaving colors and cursor control intact. That
   includes the title string of GNU screen and tmux, `ESC k title ESC \`,
-  which only those two read as a string.
+  which only those two read as a string. If an ESC is followed by C0 controls
+  and one of PrismTTY's reads ends after 1 KiB or more of them, before the
+  byte that would introduce a string, `--sanitize` and `--strip-ansi` drop the
+  ESC and show the introducer and the payload as text; with the ESC gone, the
+  terminal runs no string control.
