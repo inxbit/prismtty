@@ -1,14 +1,14 @@
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 #[cfg(unix)]
-use std::os::unix::io::AsRawFd;
+use std::os::unix::io::{AsRawFd, RawFd};
 
 #[cfg(unix)]
 use nix::libc;
@@ -22,11 +22,18 @@ pub(super) struct IoTrace {
 /// keeps a long-running or noisy session from filling the disk.
 const MAX_TRACE_FILE_BYTES: u64 = 64 * 1024 * 1024;
 
+/// How long one trace line waits for another session that is writing to the
+/// same file before it is written without the file lock.
+const TRACE_LOCK_WAIT: Duration = Duration::from_millis(50);
+
 struct TraceInner {
     file: Mutex<File>,
     start: Instant,
     written: AtomicU64,
     limit: u64,
+    /// Set once the file lock could not be taken, so a lock that another
+    /// session holds for good costs this one a single wait.
+    without_file_lock: AtomicBool,
 }
 
 impl IoTrace {
@@ -44,6 +51,7 @@ impl IoTrace {
                     start: Instant::now(),
                     written: AtomicU64::new(written),
                     limit,
+                    without_file_lock: AtomicBool::new(false),
                 }))
             }
             None => None,
@@ -69,9 +77,18 @@ impl IoTrace {
             return;
         };
         // Another session may be appending to the same file, so count what
-        // is in it, not only what this session wrote. The marker below ends
-        // this session's trace only: the other one may still add a line that
-        // fits.
+        // is in it, not only what this session wrote, and hold the file lock
+        // from the count to the write.
+        #[cfg(unix)]
+        let _file_lock = if inner.without_file_lock.load(Ordering::Relaxed) {
+            None
+        } else {
+            let file_lock = TraceFileLock::acquire(&file);
+            inner
+                .without_file_lock
+                .store(file_lock.is_none(), Ordering::Relaxed);
+            file_lock
+        };
         let on_disk = file.metadata().map_or(0, |metadata| metadata.len());
         let previous = inner.written.load(Ordering::Relaxed).max(on_disk);
         if previous >= inner.limit {
@@ -80,13 +97,20 @@ impl IoTrace {
         }
         let line_len = line.len() as u64;
         if previous.saturating_add(line_len) > inner.limit {
-            // The marker is terminal: whether or not it fits, the trace is
-            // closed at the limit so no shorter line lands below it.
+            // The marker is terminal for every session: the file is filled
+            // up to the limit, with the marker last when it fits, so the
+            // count above closes the trace for the others too and no shorter
+            // line lands below the marker.
             let marker = format!("---- trace truncated at {} bytes ----\n", inner.limit);
             let remaining = (inner.limit - previous) as usize;
-            if remaining >= marker.len() {
-                let _ = file.write_all(marker.as_bytes());
+            let mut end = vec![b'-'; remaining.checked_sub(marker.len()).unwrap_or(remaining)];
+            if let Some(last) = end.last_mut() {
+                *last = b'\n';
             }
+            if remaining >= marker.len() {
+                end.extend_from_slice(marker.as_bytes());
+            }
+            let _ = file.write_all(&end);
             inner.written.store(inner.limit, Ordering::Relaxed);
             return;
         }
@@ -94,6 +118,49 @@ impl IoTrace {
             return;
         }
         inner.written.store(previous + line_len, Ordering::Relaxed);
+    }
+}
+
+/// An advisory lock on the trace file, held from the count of its bytes to
+/// the write of one line and released on drop, so two sessions tracing to one
+/// file cannot both take the last bytes below the limit.
+#[cfg(unix)]
+struct TraceFileLock(RawFd);
+
+#[cfg(unix)]
+impl TraceFileLock {
+    /// Waits no longer than [`TRACE_LOCK_WAIT`]: the trace is written from
+    /// the read loop, and a session stopped while it holds the lock must not
+    /// stall another one.
+    fn acquire(file: &File) -> Option<Self> {
+        let fd = file.as_raw_fd();
+        let deadline = Instant::now() + TRACE_LOCK_WAIT;
+        loop {
+            // SAFETY: `fd` is the open descriptor owned by `file`; flock only
+            // changes the lock on its open file description.
+            if unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+                return Some(Self(fd));
+            }
+            let busy = matches!(
+                io::Error::last_os_error().kind(),
+                io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+            );
+            if !busy || Instant::now() >= deadline {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for TraceFileLock {
+    fn drop(&mut self) {
+        // SAFETY: the lock is only held while the `File` it was taken on is
+        // borrowed by `IoTrace::log`, so the descriptor is still open.
+        unsafe {
+            libc::flock(self.0, libc::LOCK_UN);
+        }
     }
 }
 
@@ -259,6 +326,161 @@ mod tests {
         assert!(
             contents.ends_with(marker),
             "marker must be the last line: {contents:?}"
+        );
+    }
+
+    // Each session ended its own trace only: after one wrote the marker,
+    // another still added the lines that fitted below it and then a marker of
+    // its own, and so did a session started later on the same file.
+    #[cfg(unix)]
+    #[test]
+    fn truncation_closes_the_trace_for_every_session() {
+        let dir = tempfile::tempdir().expect("tempdir creates");
+        let path = dir.path().join("trace.log");
+        let marker = "---- trace truncated at 210 bytes ----\n";
+
+        // Three 37-byte lines (111), then a line too long to fit. An 18-byte
+        // line and a second 39-byte marker would both still fit below 210.
+        let first = super::IoTrace::open_with_limit(Some(&path), 210).expect("trace opens");
+        let second = super::IoTrace::open_with_limit(Some(&path), 210).expect("trace opens");
+        for _ in 0..3 {
+            first.log("OUT", b"payload");
+        }
+        first.log("OUT", &[b'x'; 200]);
+        second.log("IN", b"a");
+        second.log("OUT", &[b'y'; 200]);
+        first.log("IN", b"a");
+        let third = super::IoTrace::open_with_limit(Some(&path), 210).expect("trace opens");
+        third.log("IN", b"a");
+        third.log("OUT", &[b'z'; 200]);
+        drop((first, second, third));
+
+        let contents = std::fs::read_to_string(&path).expect("trace reads");
+        assert_eq!(
+            contents.matches(marker).count(),
+            1,
+            "marker must appear exactly once: {contents:?}"
+        );
+        assert!(
+            contents.ends_with(marker),
+            "marker must be the last line: {contents:?}"
+        );
+        assert_eq!(contents.len(), 210, "{contents:?}");
+        assert_eq!(
+            contents.matches(" OUT 70 61 79 6c 6f 61 64\n").count(),
+            3,
+            "{contents:?}"
+        );
+        assert!(!contents.contains(" IN "), "{contents:?}");
+    }
+
+    // With less room left than the marker needs, the first session used to
+    // stop without a trace of it, and the next one went on writing.
+    #[cfg(unix)]
+    #[test]
+    fn truncation_without_room_for_the_marker_still_closes_the_trace() {
+        let dir = tempfile::tempdir().expect("tempdir creates");
+        let path = dir.path().join("trace.log");
+
+        // Three 37-byte lines (111) leave 29 bytes: less than the 39-byte
+        // marker, more than an 18-byte line.
+        let first = super::IoTrace::open_with_limit(Some(&path), 140).expect("trace opens");
+        let second = super::IoTrace::open_with_limit(Some(&path), 140).expect("trace opens");
+        for _ in 0..3 {
+            first.log("OUT", b"payload");
+        }
+        first.log("OUT", &[b'x'; 200]);
+        second.log("IN", b"a");
+        let third = super::IoTrace::open_with_limit(Some(&path), 140).expect("trace opens");
+        third.log("IN", b"a");
+        drop((first, second, third));
+
+        let contents = std::fs::read_to_string(&path).expect("trace reads");
+        assert_eq!(contents.len(), 140, "{contents:?}");
+        assert!(contents.ends_with('\n'), "{contents:?}");
+        assert!(!contents.contains("truncated"), "{contents:?}");
+        assert!(!contents.contains(" IN "), "{contents:?}");
+    }
+
+    // The lock keeps a second session out while one counts and writes, and a
+    // session that cannot get it gives up after a bounded wait.
+    #[cfg(unix)]
+    #[test]
+    fn trace_file_lock_excludes_another_session_and_never_waits_long() {
+        let dir = tempfile::tempdir().expect("tempdir creates");
+        let path = dir.path().join("trace.log");
+        let first = super::open_trace_file(&path).expect("trace opens");
+        let second = super::open_trace_file(&path).expect("trace opens");
+
+        let held = super::TraceFileLock::acquire(&first).expect("free lock is taken");
+        let started = std::time::Instant::now();
+        assert!(super::TraceFileLock::acquire(&second).is_none());
+        let waited = started.elapsed();
+        assert!(waited >= super::TRACE_LOCK_WAIT, "gave up after {waited:?}");
+        assert!(
+            waited < std::time::Duration::from_secs(5),
+            "waited {waited:?}"
+        );
+
+        drop(held);
+        assert!(super::TraceFileLock::acquire(&second).is_some());
+    }
+
+    // A session stopped while it holds the lock must not stop another one
+    // from tracing, or from running: the line is written without the lock,
+    // and later lines do not wait for it again.
+    #[cfg(unix)]
+    #[test]
+    fn trace_goes_on_when_another_session_keeps_the_file_lock() {
+        let dir = tempfile::tempdir().expect("tempdir creates");
+        let path = dir.path().join("trace.log");
+        let stopped = super::open_trace_file(&path).expect("trace opens");
+        let _held = super::TraceFileLock::acquire(&stopped).expect("free lock is taken");
+
+        let trace = super::IoTrace::open_with_limit(Some(&path), 4096).expect("trace opens");
+        trace.log("OUT", b"payload");
+        let started = std::time::Instant::now();
+        for _ in 0..40 {
+            trace.log("OUT", b"payload");
+        }
+        let later_lines = started.elapsed();
+        drop(trace);
+
+        let contents = std::fs::read_to_string(&path).expect("trace reads");
+        assert_eq!(
+            contents.matches(" OUT 70 61 79 6c 6f 61 64\n").count(),
+            41,
+            "{contents:?}"
+        );
+        assert!(
+            later_lines < 40 * super::TRACE_LOCK_WAIT,
+            "40 lines took {later_lines:?}: each one waited for the lock"
+        );
+    }
+
+    // A line that ends exactly at the limit is still written, and nothing
+    // follows it.
+    #[cfg(unix)]
+    #[test]
+    fn a_line_that_ends_at_the_limit_is_the_last_one() {
+        let dir = tempfile::tempdir().expect("tempdir creates");
+        let path = dir.path().join("trace.log");
+
+        let first = super::IoTrace::open_with_limit(Some(&path), 111).expect("trace opens");
+        let second = super::IoTrace::open_with_limit(Some(&path), 111).expect("trace opens");
+        for _ in 0..3 {
+            first.log("OUT", b"payload");
+        }
+        second.log("IN", b"a");
+        first.log("IN", b"a");
+        drop((first, second));
+
+        let contents = std::fs::read_to_string(&path).expect("trace reads");
+        assert_eq!(contents.len(), 111, "{contents:?}");
+        assert_eq!(
+            contents.matches(" OUT 70 61 79 6c 6f 61 64\n").count(),
+            3,
+            "{contents:?}"
         );
     }
 
