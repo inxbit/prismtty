@@ -96,7 +96,16 @@ jobs:
         run: node --test tests/*.test.mjs
 
       - name: Package
+        if: matrix.target_name != 'linux-x86_64'
         run: bash scripts/package-release.sh "${{ matrix.target_name }}"
+
+      - name: Package for Linux
+        # The script builds in an older userland, measures the glibc floor and
+        # runs the binaries. The pull request CI runs it too, so nothing here
+        # happens for the first time on a tag.
+        if: matrix.target_name == 'linux-x86_64'
+        timeout-minutes: 45
+        run: bash scripts/package-linux-release.sh
 
       - name: Upload artifact
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2

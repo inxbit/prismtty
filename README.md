@@ -132,7 +132,8 @@ Each release archive contains the binaries, license/readme files, example
 profiles, and shell completions. Its `.tar.gz.sha256` checksum is a separate
 file next to it on the release page. The binaries load PCRE2 at run time: from
 Homebrew (`brew install pcre2`) on macOS, and from the system `libpcre2-8` on
-Linux.
+Linux. The Linux binaries are built and tested on glibc 2.34 (AlmaLinux 9) and
+need the system's `libpcre2-8.so.0` and `libgcc_s.so.1`.
 
 ### Build Locally
 
