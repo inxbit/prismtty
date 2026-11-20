@@ -14,7 +14,11 @@ _prismtty() {
     fi
 
     local context curcontext="$curcontext" state line
-    _arguments "${_arguments_options[@]}" : \
+    local -a prismtty_words
+    prismtty_words=("${words[@]}")
+    local -i prismtty_current=$CURRENT
+    local prismtty_subcommand
+    _arguments "${_arguments_options[@]}" -A "-*" : \
 '--trace-io=[Append hex-encoded PTY input/output diagnostics (records all keystrokes, including passwords)]:FILE:_files' \
 '*-p+[Force a profile; repeat to enable several]:NAME:_default' \
 '*--profile=[Force a profile; repeat to enable several]:NAME:_default' \
@@ -39,16 +43,17 @@ _prismtty() {
 '--sanitize[Strip window-title, clipboard (OSC 52), and other OSC/DCS string escapes from program output]' \
 '--show-profile[Print selected profiles to stderr]' \
 '--local-echo[Locally echo typed printable keys for no-echo device sessions (also echoes secrets typed at hidden prompts)]' \
-'::command:_default' \
-":: :_prismtty_commands" \
+": :_prismtty_first_word" \
 "*::: :->prismtty" \
 && ret=0
     case $state in
     (prismtty)
-        words=($line[2] "${words[@]}")
+        prismtty_subcommand=${(Q)line[1]}
+        [[ $prismtty_words[prismtty_current-CURRENT-1] == -- ]] && prismtty_subcommand=
+        words=($line[1] "${words[@]}")
         (( CURRENT += 1 ))
-        curcontext="${curcontext%:*:*}:prismtty-command-$line[2]:"
-        case $line[2] in
+        curcontext="${curcontext%:*:*}:prismtty-command-$line[1]:"
+        case $prismtty_subcommand in
             (profiles)
 _arguments "${_arguments_options[@]}" : \
 ":: :_prismtty__subcmd__profiles_commands" \
@@ -85,11 +90,23 @@ _arguments "${_arguments_options[@]}" : \
     ;;
 esac
 ;;
+            (*)
+_normal && ret=0
+;;
         esac
     ;;
 esac
 }
 
+(( $+functions[_prismtty_first_word] )) ||
+_prismtty_first_word() {
+    local ret=1
+    if [[ $words[CURRENT-1] != -- ]]; then
+        _prismtty_commands "$@" && ret=0
+    fi
+    _default "$@" && ret=0
+    return ret
+}
 (( $+functions[_prismtty_commands] )) ||
 _prismtty_commands() {
     local commands; commands=(

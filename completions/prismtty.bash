@@ -6,6 +6,70 @@ _prismtty_compgen() {
     done < <(compgen "$@")
 }
 
+# Finds where PrismTTY's own words end. Returns 0 when the word under the
+# cursor belongs to the wrapped command: COMPREPLY stays empty there and Bash
+# falls back to its default completion. Otherwise returns 1 and sets
+# _prismtty_subcommand_at to the index of the `profiles` subcommand word, or to
+# COMP_CWORD when there is none.
+_prismtty_wrapped_command() {
+    local i=1 word rest
+    _prismtty_subcommand_at=${COMP_CWORD}
+    while (( i < COMP_CWORD )); do
+        word="${COMP_WORDS[i]}"
+        if [[ -n "${word}" && -z "${word//[:=]/}" ]]; then
+            # Bash 4 and later split words at `=` and `:`; this piece and the
+            # next one belong to the word before them.
+            (( i += 2 ))
+            continue
+        fi
+        if [[ -n "${word}" && -z "${word//[0-9]/}" && "${COMP_WORDS[i+1]}" == [\<\>]* ]]; then
+            # A file descriptor in front of a redirection.
+            (( i += 1 ))
+            continue
+        fi
+        if [[ -n "${word}" && -z "${word//[<>&|]/}" ]]; then
+            # A redirection and its target.
+            (( i += 2 ))
+            continue
+        fi
+        case "${word}" in
+            --)
+                return 0
+                ;;
+            --trace-io|--profile|--config)
+                # The value is the next word, unless Bash split `--option=value`.
+                [[ "${COMP_WORDS[i+1]}" == "=" ]] || (( i += 1 ))
+                (( i += 1 ))
+                ;;
+            --*)
+                (( i += 1 ))
+                ;;
+            -?*)
+                rest="${word#-}"
+                (( i += 1 ))
+                while [[ -n "${rest}" ]]; do
+                    case "${rest:0:1}" in
+                        p|c)
+                            # The value is the rest of this word, or the next word.
+                            [[ ${#rest} -eq 1 ]] && (( i += 1 ))
+                            break
+                            ;;
+                    esac
+                    rest="${rest:1}"
+                done
+                ;;
+            profiles)
+                _prismtty_subcommand_at=${i}
+                return 1
+                ;;
+            *)
+                return 0
+                ;;
+        esac
+    done
+    return 1
+}
+
 _prismtty() {
     local i cur prev opts cmd
     COMPREPLY=()
@@ -18,7 +82,10 @@ _prismtty() {
     cmd=""
     opts=""
 
-    for i in "${COMP_WORDS[@]:0:COMP_CWORD}"
+    local _prismtty_subcommand_at
+    _prismtty_wrapped_command && return 0
+
+    for i in "${COMP_WORDS[0]}" "${COMP_WORDS[@]:_prismtty_subcommand_at:COMP_CWORD-_prismtty_subcommand_at}"
     do
         case "${cmd},${i}" in
             ",$1")
@@ -170,7 +237,10 @@ _ptty() {
     cmd=""
     opts=""
 
-    for i in "${COMP_WORDS[@]:0:COMP_CWORD}"
+    local _prismtty_subcommand_at
+    _prismtty_wrapped_command && return 0
+
+    for i in "${COMP_WORDS[0]}" "${COMP_WORDS[@]:_prismtty_subcommand_at:COMP_CWORD-_prismtty_subcommand_at}"
     do
         case "${cmd},${i}" in
             ",$1")
@@ -322,7 +392,10 @@ _ct() {
     cmd=""
     opts=""
 
-    for i in "${COMP_WORDS[@]:0:COMP_CWORD}"
+    local _prismtty_subcommand_at
+    _prismtty_wrapped_command && return 0
+
+    for i in "${COMP_WORDS[0]}" "${COMP_WORDS[@]:_prismtty_subcommand_at:COMP_CWORD-_prismtty_subcommand_at}"
     do
         case "${cmd},${i}" in
             ",$1")
