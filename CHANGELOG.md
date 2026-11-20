@@ -9,6 +9,33 @@ All notable changes to PrismTTY are documented here.
 - `prismtty profiles test` with both `--sanitize` and `--strip-ansi` drops a
   GNU screen or tmux title string whole, as the stream does. It printed the
   title's text; no escape survived, so no title could be set.
+- A C0 control or DEL inside a CSI no longer hides the sequence. The switch
+  to and from the alternate screen is read with such a byte inside it:
+  before, a full-screen program's frame was colored, or highlighting stayed
+  off after the program left. `CSI s` with one no longer saves the highlight
+  color. A private-mode sequence that holds a second `?` or an intermediate
+  byte, which a terminal ignores, is no longer taken as a screen switch or
+  as a rendition save.
+- A highlight ends before xterm's XTPUSHSGR (`CSI # {`, `CSI # p`) saves the
+  rendition and starts again after it, so the pop no longer brings the
+  highlight color back onto text that did not match. The xterm stack itself
+  is not tracked.
+- With `--trace-io` in several sessions on one file, the first session that
+  cannot fit a line fills the file to its limit, with a line of dashes and
+  then the truncation marker (dashes only when the marker does not fit), and
+  a session that finds the file at its limit adds nothing. Each session
+  checks the size and writes under a lock on the file; while the sessions
+  get that lock, nothing follows the marker and the limit is not passed. A
+  session that cannot take the lock within 50 ms writes without it from then
+  on, and one of its lines can still land below another session's marker.
+
+### Documentation
+
+- `SECURITY.md` states the 16 KiB limit on string controls in the default
+  mode, where it said escapes pass through unchanged, and what the filtered
+  modes show after an ESC followed by 1 KiB of C0 controls and a read
+  boundary. The README notes that a trailing byte that could begin a UTF-8
+  character is shown with the next output or at the end of output.
 
 ## 1.3.7 - 2026-11-19
 
