@@ -16,8 +16,9 @@ import test from 'node:test';
 const read = (path) => readFileSync(path, 'utf8');
 
 // Builds the part of an ELF file the dynamic loader reads before it starts a
-// program: for each shared library, the symbol versions the program needs.
-function elfNeeding(versionsByLibrary) {
+// program: for each shared library, the symbol versions the program needs,
+// and optionally the note that says which x86-64 level the CPU must have.
+function elfNeeding(versionsByLibrary, { isaNeeded, programHeaders = true } = {}) {
   const strings = [Buffer.from([0])];
   let stringsLength = 1;
   const offsetOf = (text) => {
@@ -57,22 +58,54 @@ function elfNeeding(versionsByLibrary) {
     header.writeUInt32LE(info, 44);
     return header;
   };
-  const stringTableOffset = 64;
+  // One GNU property note: "x86 ISA needed", a bit per x86-64 level.
+  const property = Buffer.alloc(isaNeeded === undefined ? 0 : 32);
+  if (isaNeeded !== undefined) {
+    property.writeUInt32LE(4, 0);
+    property.writeUInt32LE(16, 4);
+    property.writeUInt32LE(5, 8);
+    property.write('GNU\0', 12, 'latin1');
+    property.writeUInt32LE(0xc0008002, 16);
+    property.writeUInt32LE(4, 20);
+    property.writeUInt32LE(isaNeeded, 24);
+  }
+  const segmentCount = programHeaders ? (isaNeeded === undefined ? 1 : 2) : 0;
+  const stringTableOffset = 64 + 56 * segmentCount;
   const versionNeedsOffset = stringTableOffset + stringTable.length;
-  const sectionTableOffset = versionNeedsOffset + versionNeeds.length;
+  const padding = Buffer.alloc((8 - ((versionNeedsOffset + versionNeeds.length) % 8)) % 8);
+  const propertyOffset = versionNeedsOffset + versionNeeds.length + padding.length;
+  const sectionTableOffset = propertyOffset + property.length;
+
+  const programHeader = (type, offset, size) => {
+    const segment = Buffer.alloc(56);
+    segment.writeUInt32LE(type, 0);
+    segment.writeBigUInt64LE(BigInt(offset), 8);
+    segment.writeBigUInt64LE(BigInt(size), 32);
+    return segment;
+  };
+  const segments = [
+    programHeader(1, 0, sectionTableOffset),
+    programHeader(0x6474e553, propertyOffset, property.length),
+  ].slice(0, segmentCount);
 
   const header = Buffer.alloc(64);
   Buffer.from([0x7f, 0x45, 0x4c, 0x46, 2, 1, 1]).copy(header);
   header.writeUInt16LE(3, 16);
   header.writeUInt16LE(62, 18);
+  header.writeBigUInt64LE(BigInt(segmentCount ? 64 : 0), 0x20);
   header.writeBigUInt64LE(BigInt(sectionTableOffset), 0x28);
+  header.writeUInt16LE(56, 0x36);
+  header.writeUInt16LE(segmentCount, 0x38);
   header.writeUInt16LE(64, 0x3a);
   header.writeUInt16LE(3, 0x3c);
 
   return Buffer.concat([
     header,
+    ...segments,
     stringTable,
     versionNeeds,
+    padding,
+    property,
     sectionHeader(0, 0, 0, 0, 0),
     sectionHeader(3, stringTableOffset, stringTable.length, 0, 0),
     sectionHeader(0x6ffffffe, versionNeedsOffset, versionNeeds.length, 1, libraries.length),
@@ -142,6 +175,40 @@ test('the glibc floor check fails closed on anything it cannot measure', () => {
   assert.match(result.stderr, /prismtty: cannot read its glibc requirement: .*GLIBC_ABI_DT_RELR/);
 
   assert.equal(spawnSync('bash', ['scripts/check-glibc-floor.sh', '2.34']).status, 2);
+});
+
+test('the check fails when an executable needs more than a baseline x86-64 CPU', () => {
+  // A distribution built for x86-64-v2 marks what it links, and the loader of
+  // glibc 2.33 and later refuses to start a marked program on a CPU or a
+  // virtual machine that only offers the baseline.
+  const versions = { 'libc.so.6': ['GLIBC_2.2.5', 'GLIBC_2.34'] };
+  let result = checkFloor('2.34', {
+    prismtty: elfNeeding(versions, { isaNeeded: 0b0001 }),
+    ptty: elfNeeding(versions),
+  });
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /\/prismtty: x86 ISA needed: baseline$/m);
+  assert.match(result.stdout, /\/ptty: x86 ISA needed: none stated$/m);
+
+  result = checkFloor('2.34', {
+    prismtty: elfNeeding(versions, { isaNeeded: 0b0001 }),
+    ct: elfNeeding(versions, { isaNeeded: 0b0011 }),
+  });
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /\/ct needs x86-64-v2, above baseline x86-64$/m);
+  assert.doesNotMatch(result.stderr, /prismtty needs x86-64/);
+
+  result = checkFloor('2.34', { ct: elfNeeding(versions, { isaNeeded: 0b1110 }) });
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /\/ct needs x86-64-v2, x86-64-v3, x86-64-v4, above baseline x86-64$/m);
+});
+
+test('the check fails closed on a file with nothing for the loader to map', () => {
+  const result = checkFloor('2.34', {
+    prismtty: elfNeeding({ 'libc.so.6': ['GLIBC_2.34'] }, { programHeaders: false }),
+  });
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /prismtty: cannot read its CPU requirement: no program headers/);
 });
 
 const linuxScript = 'scripts/package-linux-release.sh';
@@ -224,8 +291,22 @@ test('the Linux archive is built, measured and smoke-tested in one pinned image'
   assert.match(build, / --env SOURCE_DATE_EPOCH=1700000000 /);
   assert.match(build, / --volume \/fixture\/toolchain:\/opt\/rust:ro /);
   assert.match(build, /scripts\/package-release\.sh "\$\{TARGET_NAME\}"/);
+  // The packages come from the archive as it was at one moment, so a rebuild
+  // of the same commit installs the same compiler and libraries.
+  const snapshot = scriptValue('snapshot');
+  assert.match(snapshot, /^\d{8}T\d{6}Z$/);
+  assert.match(build, new RegExp(` --env SNAPSHOT=${snapshot} `));
+  assert.deepEqual(
+    [...build.matchAll(/deb (\S+) /g)].map((match) => match[1]),
+    Array(3).fill('https://snapshot.ubuntu.com/ubuntu/${SNAPSHOT}'),
+    'every package source is the dated snapshot',
+  );
+  assert.match(build, /cat > \/etc\/apt\/sources\.list </);
   // Each download is bounded and retried, and the build runs without network.
-  assert.match(build, /fetch dnf .*--setopt=timeout=\d+ --setopt=retries=\d+ install /);
+  assert.match(build, /fetch apt-get "\$\{apt_options\[@\]\}" update /);
+  assert.match(build, /fetch apt-get "\$\{apt_options\[@\]\}" install /);
+  assert.match(build, /-o Acquire::Retries=\d+ /);
+  assert.match(build, /-o Acquire::https::Timeout=\d+ /);
   assert.ok(
     build.indexOf('fetch cargo fetch --locked') < build.indexOf('export CARGO_NET_OFFLINE=true')
       && build.indexOf('export CARGO_NET_OFFLINE=true') < build.indexOf('scripts/package-release.sh'),

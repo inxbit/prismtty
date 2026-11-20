@@ -8,11 +8,20 @@ set -euo pipefail
 #
 # A binary runs on the glibc it was linked against and on newer ones, so the
 # build happens in an older userland than the CI runner's:
-# docker.io/library/almalinux:9.9-20261116, glibc 2.34. The digest names its
-# multi-platform index.
-image="docker.io/library/almalinux@sha256:02df05719ef287ebd0df0a1eedb9172a00bd70703aed7b25660e426b8e0d6047"
+# docker.io/library/ubuntu:jammy-20261110, Ubuntu 22.04 with glibc 2.35. The
+# digest names its multi-platform index. Ubuntu builds for every x86-64 CPU;
+# a distribution built for x86-64-v2 would mark the binaries as needing it.
+image="docker.io/library/ubuntu@sha256:9abcaffc92a5279fff3a6a41635c0800ea33e528425fb389658806476e7defde"
+# The compiler and libraries come from the Ubuntu archive as it was at this
+# moment, so a rebuild of the same commit installs the same packages.
+snapshot="20261115T000000Z"
+# The newest glibc the binaries may require. The check below measures what
+# they do require; it can be lower than the glibc they were linked against.
 glibc_floor="2.34"
 target_name="linux-x86_64"
+# The bare image has no CA certificates. apt and cargo check the hosts they
+# download from against the host's.
+ca_certificates="/etc/ssl/certs/ca-certificates.crt"
 
 # The container borrows the host's Rust toolchain, so the host has to be able
 # to run it and it has to be the version every release build uses.
@@ -66,10 +75,24 @@ fetch() {
   return 1
 }
 
-fetch dnf --assumeyes --setopt=timeout=30 --setopt=retries=3 install \
-  gcc pcre2-devel pkgconf-pkg-config python3 perl-Digest-SHA
+cat > /etc/apt/sources.list <<SOURCES
+deb https://snapshot.ubuntu.com/ubuntu/${SNAPSHOT} jammy main
+deb https://snapshot.ubuntu.com/ubuntu/${SNAPSHOT} jammy-updates main
+deb https://snapshot.ubuntu.com/ubuntu/${SNAPSHOT} jammy-security main
+SOURCES
+apt_options=(
+  -o Acquire::https::CaInfo=/host/ca-certificates.crt
+  -o Acquire::Retries=3
+  -o Acquire::http::Timeout=30
+  -o Acquire::https::Timeout=30
+)
+export DEBIAN_FRONTEND=noninteractive
+fetch apt-get "${apt_options[@]}" update
+fetch apt-get "${apt_options[@]}" install --yes --no-install-recommends \
+  gcc libc6-dev pkg-config libpcre2-dev python3 perl
 
 export PATH="/opt/rust/bin:${PATH}"
+export CARGO_HTTP_CAINFO=/host/ca-certificates.crt
 # cargo keeps its downloads and its output inside the container; only dist/
 # is written to the checkout. The crates are downloaded first, so the build
 # itself needs no network.
@@ -82,6 +105,8 @@ CONTAINER
 docker run --rm --platform linux/amd64 \
   --volume "${PWD}:/work" --workdir /work \
   --volume "${toolchain}:/opt/rust:ro" \
+  --mount "type=bind,source=${ca_certificates},target=/host/ca-certificates.crt,readonly" \
+  --env SNAPSHOT="${snapshot}" \
   --env SOURCE_DATE_EPOCH="${source_date_epoch}" \
   --env TARGET_NAME="${target_name}" \
   --env HOST_OWNER="$(id -u):$(id -g)" \
