@@ -35,8 +35,9 @@ All notable changes to PrismTTY are documented here.
   word zsh offers commands found on PATH next to files and `profiles`. Known
   limits: completion offers nothing of PrismTTY, and the command still runs
   as typed, after a quoted option such as `'-b'` in both shells, and in Bash
-  after a config file named `=` or, on Bash 4 and later, one whose name ends
-  in `:`.
+  after a redirection between an option and its value, after an empty
+  attached value such as `-p=`, and after a config file named `=` or, on
+  Bash 4 and later, one whose name ends in `:`.
 
 ### Documentation
 
