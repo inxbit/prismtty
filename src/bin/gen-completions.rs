@@ -33,7 +33,7 @@ const BASH_WRAPPED_COMMAND_HELPER: &str = r#"# Finds where PrismTTY's own words 
 # _prismtty_subcommand_at to the index of the `profiles` subcommand word, or to
 # COMP_CWORD when there is none.
 _prismtty_wrapped_command() {
-    local i=1 word rest value=""
+    local i=1 word rest
     _prismtty_subcommand_at=${COMP_CWORD}
     while (( i < COMP_CWORD )); do
         word="${COMP_WORDS[i]}"
@@ -53,19 +53,13 @@ _prismtty_wrapped_command() {
             (( i += 2 ))
             continue
         fi
-        if [[ -n "${value}" ]]; then
-            # The value of the option before it, past any redirection.
-            value=""
-            (( i += 1 ))
-            continue
-        fi
         case "${word}" in
             --)
                 return 0
                 ;;
             LONG_VALUE_OPTIONS)
                 # The value is the next word, unless Bash split `--option=value`.
-                [[ "${COMP_WORDS[i+1]}" == "=" ]] || value="pending"
+                [[ "${COMP_WORDS[i+1]}" == "=" ]] || (( i += 1 ))
                 (( i += 1 ))
                 ;;
             --*)
@@ -79,7 +73,7 @@ _prismtty_wrapped_command() {
                         SHORT_VALUE_OPTIONS)
                             # The value is the rest of this word, or the next
                             # word unless Bash split `-o=value`.
-                            [[ ${#rest} -eq 1 && "${COMP_WORDS[i]}" != "=" ]] && value="pending"
+                            [[ ${#rest} -eq 1 && "${COMP_WORDS[i]}" != "=" ]] && (( i += 1 ))
                             break
                             ;;
                     esac
