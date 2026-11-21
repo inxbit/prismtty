@@ -485,6 +485,14 @@ test('every bounded download is killed if it outlives its time limit', () => {
   assert.doesNotMatch(script, /timeout \d/);
 });
 
+test('a package list that fails to download fails the update', () => {
+  // apt-get update exits 0 when one pocket's list could not be fetched and
+  // goes on with what it has, so the pinned snapshot would be only partly
+  // used. --error-on=any makes that a failure the retry sees.
+  const script = read(linuxScript);
+  assert.match(script, /apt-get "\$\{apt_options\[@\]\}" update --error-on=any\n/);
+});
+
 // A program that answers the smoke test's three questions the way a healthy
 // binary does, unless told otherwise.
 const smokeStandIn = ({ versionStatus = 0, line = '\\033[38;5;51m192.0.2.1\\033[0m down' } = {}) => `case "$1" in

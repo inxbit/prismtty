@@ -88,7 +88,9 @@ apt_options=(
   -o Acquire::https::Timeout=30
 )
 export DEBIAN_FRONTEND=noninteractive
-fetch apt-get "${apt_options[@]}" update
+# Without --error-on=any a pocket whose list could not be fetched is a
+# warning, and the build would go on with part of the snapshot.
+fetch apt-get "${apt_options[@]}" update --error-on=any
 fetch apt-get "${apt_options[@]}" install --yes --no-install-recommends \
   gcc libc6-dev pkg-config libpcre2-dev python3 perl
 
