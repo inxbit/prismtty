@@ -2,7 +2,7 @@
 
 All notable changes to PrismTTY are documented here.
 
-## Unreleased
+## 1.3.10 - 2026-11-21
 
 ### Fixed
 
