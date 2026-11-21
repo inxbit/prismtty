@@ -388,3 +388,52 @@ fn iterative_inheritance_preserves_cycle_diagnostics() {
         Ok(_) => panic!("cycle should not resolve"),
     }
 }
+
+/// Byte ranges that `profile` paints with `color`, joined where they touch.
+fn colored_ranges(profile: &str, input: &str, color: Rgb) -> Vec<(usize, usize)> {
+    let mut ranges: Vec<(usize, usize)> = spans_for(profile, input)
+        .iter()
+        .filter(|span| span.style.foreground == Some(color))
+        .map(|span| (span.start, span.end))
+        .collect();
+    ranges.sort_unstable();
+    let mut joined: Vec<(usize, usize)> = Vec::new();
+    for (start, end) in ranges {
+        match joined.last_mut() {
+            Some(last) if start <= last.1 => last.1 = last.1.max(end),
+            _ => joined.push((start, end)),
+        }
+    }
+    joined
+}
+
+fn range_of(input: &str, text: &str) -> (usize, usize) {
+    let start = input.find(text).expect("text is in the input");
+    (start, start + text.len())
+}
+
+// `connect to host` is how ssh and telnet word a failed connection. The verb
+// elsewhere, and the state `connected`, keep their color.
+#[test]
+fn connect_to_host_is_not_a_good_state() {
+    for line in [
+        "ssh: connect to host 192.0.2.1 port 22: Connection refused\n",
+        "ssh: connect\tto  host sw1 port 22: Operation timed out\n",
+    ] {
+        assert_eq!(colored_ranges("generic", line, GREEN), vec![], "{line:?}");
+    }
+    for (line, word) in [
+        ("CONNECT 56000\n", "CONNECT"),
+        ("port is connected\n", "connected"),
+        ("Connected to host sw1.\n", "Connected"),
+        ("status: connect\n", "connect"),
+        ("cannot connect to hosts in vrf blue\n", "connect"),
+        ("connect to hostname sw1\n", "connect"),
+    ] {
+        assert_eq!(
+            colored_ranges("generic", line, GREEN),
+            vec![range_of(line, word)],
+            "{line:?}"
+        );
+    }
+}
