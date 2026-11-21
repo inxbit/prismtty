@@ -78,6 +78,24 @@ jobs:
       # instead of a release tag that cannot be moved or deleted.
       - run: cargo package --locked
 
+  linux-release:
+    # The release workflow only runs once a tag exists, and a tag cannot be
+    # moved. This job builds the Linux release archive the same way on every
+    # pull request, so a change that breaks it or raises its glibc floor fails
+    # here first.
+    name: Linux release archive
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # stable toolchain
+        with:
+          toolchain: 1.85.0
+      - name: Package for Linux
+        timeout-minutes: 45
+        run: bash scripts/package-linux-release.sh
+
   test:
     name: Test
     runs-on: ${{ matrix.os }}
