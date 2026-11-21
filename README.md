@@ -151,7 +151,7 @@ The project builds these user-facing binaries:
 Release packages can be built with:
 
 ```sh
-scripts/package-release.sh darwin-aarch64
+scripts/package-release.sh
 ```
 
 The release workflow generates a Homebrew formula from the actual release
