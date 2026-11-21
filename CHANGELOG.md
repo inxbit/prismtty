@@ -2,14 +2,14 @@
 
 All notable changes to PrismTTY are documented here.
 
-## Unreleased
+## 1.3.9 - 2026-11-21
 
 ### Release and QA
 
 - The Linux release archive is built on Ubuntu 22.04 (image pinned by
   digest, packages from a dated archive snapshot) instead of the release
-  runner. Its binaries require glibc 2.34, where the 1.3.7 binaries required
-  2.39, and any x86-64 CPU. One script builds the archive, measures both
+  runner. Its binaries require glibc 2.34, where the binaries up to 1.3.8
+  required 2.39, and any x86-64 CPU. One script builds the archive, measures both
   requirements and runs the three binaries on a stock Ubuntu 22.04; pull
   request CI and the release workflow both call it, so a tag never builds the
   archive in a way a pull request has not already run.
