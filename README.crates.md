@@ -77,6 +77,10 @@ brew install inxbit/tap/prismtty
 The Homebrew formula installs `prismtty`, `ptty`, `ct`, bundled profiles, and
 shell completions. It also installs the required PCRE2 runtime dependency.
 
+If another package already owns `ct` in the Homebrew prefix, the formula leaves
+its own `ct` unlinked under `libexec` and says so at the end of the install;
+`prismtty` and `ptty` are linked as usual.
+
 ### Cargo
 
 Install from crates.io:
