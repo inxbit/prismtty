@@ -38,6 +38,15 @@ All notable changes to PrismTTY are documented here.
   after a redirection between an option and its value, after an empty
   attached value such as `-p=`, and after a config file named `=` or, on
   Bash 4 and later, one whose name ends in `:`.
+- `sftp` and `mysql` started by name from the local shell no longer switch
+  the session to the Cisco profile: while such a client runs, its own prompt
+  (`sftp> `, `mysql> `) is not read as a device prompt. Limits: a device
+  whose own prompt is `sftp> ` or `mysql> ` is not detected by its prompt
+  after such a command, and the memory of the client is not cleared at a
+  local prompt PrismTTY does not recognize.
+- `connect` is no longer green in `connect to host`, the wording of a failed
+  ssh or telnet connection. The verb elsewhere and `connected` keep their
+  color.
 
 ### Documentation
 
@@ -46,6 +55,9 @@ All notable changes to PrismTTY are documented here.
   modes show after an ESC followed by 1 KiB of C0 controls and a read
   boundary. The README notes that a trailing byte that could begin a UTF-8
   character is shown with the next output or at the end of output.
+- The README says that after a connection failure PrismTTY does not
+  recognize, a later close line naming an outer host can leave the remote
+  profile active.
 
 ### Release and QA
 
