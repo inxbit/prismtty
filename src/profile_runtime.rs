@@ -41,6 +41,32 @@ impl ClosePolicy {
     }
 }
 
+/// A program started by name from the local shell whose own prompt has the
+/// shape of a device prompt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LocalClient {
+    Sftp,
+    Mysql,
+}
+
+impl LocalClient {
+    fn from_command(command: &str) -> Option<Self> {
+        match command {
+            "sftp" => Some(Self::Sftp),
+            "mysql" => Some(Self::Mysql),
+            _ => None,
+        }
+    }
+
+    /// The first word of every line the client asks for input on.
+    fn prompt(self) -> &'static str {
+        match self {
+            Self::Sftp => "sftp>",
+            Self::Mysql => "mysql>",
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct RemoteAttempt {
     policy: ClosePolicy,
@@ -114,6 +140,9 @@ pub(crate) struct ProfileRuntime {
     input_line: String,
     input_line_reliable: bool,
     unreliable_remote_attempt: Option<RemoteAttempt>,
+    /// The client last started by name at the local shell. Its prompt is not
+    /// a device's until the local prompt, a connection or an attempt follows.
+    local_client: Option<LocalClient>,
     input_escape_state: InputEscapeState,
     pending_remote: Option<RemoteAttempt>,
     pending_remote_lines: u8,
@@ -137,6 +166,7 @@ impl ProfileRuntime {
             input_line: String::new(),
             input_line_reliable: true,
             unreliable_remote_attempt: None,
+            local_client: None,
             input_escape_state: InputEscapeState::None,
             pending_remote: None,
             pending_remote_lines: 0,
@@ -394,6 +424,18 @@ impl ProfileRuntime {
         }
         self.output_bytes_since_detection = 0;
 
+        // A client started by name at the local shell is over once the local
+        // prompt waits again. This pass may still hold its last prompt line.
+        let local_client = self.local_client;
+        if local_client.is_some()
+            && self.at_local_baseline(store)
+            && store
+                .active_specific_profile(&self.active_profiles)
+                .is_some_and(|profile| self.waiting_at_prompt(store, profile))
+        {
+            self.local_client = None;
+        }
+
         // Gate on the evidence from before this read, so a read carrying a
         // banner and a prompt can never block that banner's own switch.
         let banner_and_prompt = self.active_evidence == ActiveEvidence::BannerAndPrompt;
@@ -468,9 +510,19 @@ impl ProfileRuntime {
         }
 
         if has_remote_hint || active_profile.is_none() || at_local_baseline {
-            if let Some(profile) =
-                store.prompt_transition_profile(&detected, &self.output_window, active_profile)
-            {
+            // The lines a local client asks for input on are its own prompt,
+            // whatever their shape.
+            let prompt_profile = match local_client {
+                Some(client) => store.prompt_transition_profile(
+                    &detected,
+                    &without_prompt_lines(&self.output_window, client.prompt()),
+                    active_profile,
+                ),
+                None => {
+                    store.prompt_transition_profile(&detected, &self.output_window, active_profile)
+                }
+            };
+            if let Some(profile) = prompt_profile {
                 // Without a remote hint, only a prompt waiting for input (the
                 // unterminated last line) is trusted on first sight; a
                 // prompt-shaped line in local output must repeat.
@@ -570,6 +622,23 @@ impl ProfileRuntime {
             Some(attempt) => self.arm_remote_attempt(attempt),
             None => self.age_pending_remote(),
         }
+        self.remember_local_client();
+    }
+
+    /// `sftp` or `mysql` started by name where the local baseline's profiles
+    /// are active and no connection is open.
+    fn remember_local_client(&mut self) {
+        if !self.stack.is_empty() || self.active_profiles != self.baseline_profiles {
+            return;
+        }
+        if let Some(client) = self
+            .input_line
+            .split_whitespace()
+            .next()
+            .and_then(LocalClient::from_command)
+        {
+            self.local_client = Some(client);
+        }
     }
 
     /// Where the local baseline's profiles are active (the local shell or a
@@ -602,6 +671,7 @@ impl ProfileRuntime {
         self.baseline_locked = true;
         self.clear_output_window();
         self.clear_pending_prompt();
+        self.local_client = None;
     }
 
     fn should_detect_profiles(&self, text: &str) -> bool {
@@ -720,6 +790,7 @@ impl ProfileRuntime {
             .pop()
             .map(|frame| frame.profiles)
             .unwrap_or_else(|| self.baseline_profiles.clone());
+        self.local_client = None;
         if next == self.active_profiles {
             None
         } else {
@@ -768,6 +839,7 @@ impl ProfileRuntime {
         remote_attempt: RemoteAttempt,
         unresolved_detection: bool,
     ) {
+        self.local_client = None;
         if self.stack.len() >= PROFILE_STACK_LIMIT {
             // The first frame is the route back to the local baseline. Preserve
             // it and collapse the oldest interior nesting level instead.
@@ -1233,6 +1305,13 @@ fn recent_chars(text: &str, limit: usize) -> &str {
 /// lines must still be seen as complete.
 fn is_line_terminator(character: char) -> bool {
     matches!(character, '\n' | '\r')
+}
+
+/// `text` without the lines whose first word is `prompt`.
+fn without_prompt_lines(text: &str, prompt: &str) -> String {
+    text.split_inclusive(is_line_terminator)
+        .filter(|line| line.split_whitespace().next() != Some(prompt))
+        .collect()
 }
 
 /// The most recent terminated lines of `text`, at most `limit` bytes.
@@ -1992,6 +2071,152 @@ mod tests {
             runtime.observe_output(b"fw\r\nFW-EDGE # ", &store),
             Some(names(&["generic", "fortinet"]))
         );
+    }
+
+    // `sftp> ` and `mysql> ` have the shape of a device prompt. Started by
+    // name from the local shell, the client is known, and its prompt is its
+    // own: the local shell used to become a Cisco session and stay one.
+    #[test]
+    fn local_sftp_and_mysql_prompts_are_not_device_prompts() {
+        let store = ProfileStore::builtin();
+        for (launch, banner, prompt, command, leave) in [
+            ("sftp host", "Connected to host.", "sftp> ", "ls", "bye"),
+            (
+                "mysql -u root",
+                "Welcome to the MySQL monitor.  Commands end with ; or \\g.",
+                "mysql> ",
+                "show databases;",
+                "quit",
+            ),
+        ] {
+            let mut runtime = ProfileRuntime::new(names(&["generic", "linux-unix"]));
+            assert_eq!(runtime.observe_output(b"user@laptop:~$ ", &store), None);
+            runtime.observe_input(format!("{launch}\r").as_bytes());
+            assert_eq!(
+                runtime.observe_output(
+                    format!("{launch}\r\n{banner}\r\n{prompt}").as_bytes(),
+                    &store
+                ),
+                None,
+                "{launch}"
+            );
+            for _ in 0..2 {
+                runtime.observe_input(format!("{command}\r").as_bytes());
+                assert_eq!(
+                    runtime.observe_output(
+                        format!("{command}\r\nfirst  second\r\n{prompt}").as_bytes(),
+                        &store
+                    ),
+                    None,
+                    "{launch}"
+                );
+            }
+            assert_eq!(runtime.active_profiles(), names(&["generic", "linux-unix"]));
+            assert_eq!(runtime.stack_len(), 0, "{launch}");
+
+            runtime.observe_input(format!("{leave}\r").as_bytes());
+            assert_eq!(
+                runtime.observe_output(format!("{leave}\r\nuser@laptop:~$ ").as_bytes(), &store),
+                None,
+                "{launch}"
+            );
+            assert_eq!(runtime.active_profiles(), names(&["generic", "linux-unix"]));
+            assert_eq!(runtime.stack_len(), 0, "{launch}");
+            assert_eq!(runtime.local_client, None, "{launch}");
+
+            // The local shell still finds a device behind a wrapper command.
+            runtime.observe_input(b"fw\r");
+            assert_eq!(
+                runtime.observe_output(b"fw\r\nFW-EDGE # ", &store),
+                Some(names(&["generic", "fortinet"])),
+                "{launch}"
+            );
+        }
+    }
+
+    // The same prompt from a device still counts: a host named like the
+    // client and reached with a typed ssh, and any other prompt while the
+    // client is remembered.
+    #[test]
+    fn a_remembered_local_client_hides_only_its_own_prompt() {
+        let store = ProfileStore::builtin();
+
+        let mut runtime = ProfileRuntime::new(names(&["generic", "linux-unix"]));
+        runtime.observe_input(b"ssh mysql\r");
+        assert_eq!(runtime.local_client, None);
+        assert_eq!(runtime.observe_output(b"\r\nmysql> ", &store), None);
+        runtime.observe_input(b"\r");
+        assert_eq!(
+            runtime.observe_output(b"\r\nmysql> ", &store),
+            Some(names(&["generic", "cisco"]))
+        );
+        runtime.accept_transition();
+        runtime.observe_input(b"exit\r");
+        assert_eq!(
+            runtime.observe_output(b"exit\r\nConnection to mysql closed.\r\n", &store),
+            Some(names(&["generic", "linux-unix"]))
+        );
+
+        // A local prompt the profile does not recognize never ends the
+        // client, so it is still remembered when a device is reached.
+        let mut runtime = ProfileRuntime::new(names(&["generic", "linux-unix"]));
+        runtime.observe_input(b"mysql\r");
+        assert_eq!(
+            runtime.observe_output(
+                b"mysql\r\nERROR 2002 (HY000): Can't connect to local MySQL server\r\n\xe2\x9d\xaf ",
+                &store
+            ),
+            None
+        );
+        assert_eq!(runtime.local_client, Some(super::LocalClient::Mysql));
+        runtime.observe_input(b"sw\r");
+        assert_eq!(runtime.observe_output(b"sw\r\nsw1#", &store), None);
+        runtime.observe_input(b"show clock\r");
+        assert_eq!(
+            runtime.observe_output(b"show clock\r\n12:00:00.000 UTC\r\nsw1#", &store),
+            Some(names(&["generic", "cisco"]))
+        );
+        assert_eq!(
+            runtime.local_client, None,
+            "a new connection ends the client"
+        );
+    }
+
+    #[test]
+    fn a_local_client_is_remembered_only_from_its_own_name_at_the_local_shell() {
+        let store = ProfileStore::builtin();
+        for (line, client) in [
+            ("sftp host", Some(super::LocalClient::Sftp)),
+            ("  sftp -P 2222 user@host", Some(super::LocalClient::Sftp)),
+            ("mysql", Some(super::LocalClient::Mysql)),
+            ("sudo mysql", None),
+            ("mysqldump db", None),
+            ("man sftp", None),
+            ("SFTP host", None),
+        ] {
+            let mut runtime = ProfileRuntime::new(names(&["generic", "linux-unix"]));
+            runtime.observe_input(format!("{line}\r").as_bytes());
+            assert_eq!(runtime.local_client, client, "{line:?}");
+        }
+
+        // An edited line is not known, and a typed ssh is a connection.
+        let mut runtime = ProfileRuntime::new(names(&["generic", "linux-unix"]));
+        runtime.observe_input(b"sft\tp host\r");
+        assert_eq!(runtime.local_client, None);
+        runtime.observe_input(b"mysql\r");
+        runtime.observe_input(b"ssh sw1\r");
+        assert_eq!(runtime.local_client, None);
+
+        // Inside a connection the shell is not the local one.
+        let mut runtime = ProfileRuntime::new(names(&["generic", "linux-unix"]));
+        runtime.observe_input(b"ssh router-a\r");
+        assert_eq!(
+            runtime.observe_output(b"--- JUNOS 22.4R3 Kernel 64-bit\r\nuser@router-a> ", &store),
+            Some(names(&["generic", "juniper"]))
+        );
+        runtime.accept_transition();
+        runtime.observe_input(b"mysql\r");
+        assert_eq!(runtime.local_client, None);
     }
 
     // Neighbor tables (LLDP/CDP) print other vendors' banners as command

@@ -153,7 +153,7 @@ The project builds these user-facing binaries:
 Release packages can be built with:
 
 ```sh
-scripts/package-release.sh darwin-aarch64
+scripts/package-release.sh
 ```
 
 The release workflow generates a Homebrew formula from the actual release
@@ -185,6 +185,9 @@ output such as interface descriptions cannot churn the profile in the middle of
 the session. Nested remote sessions are still supported: a typed remote-jump
 command arms the next strong banner or repeated prompt to push a new profile, and
 connection-close markers pop back to the previous profile.
+If a connection attempt fails with a message PrismTTY does not recognize and a
+device prompt follows it, a later close line that names an outer host can leave
+the remote profile active.
 
 Interactive mode is designed to preserve shell line editing and typed command
 echo, including zsh prompts that use decorative Unicode prompt markers such as

@@ -2,7 +2,7 @@
 
 All notable changes to PrismTTY are documented here.
 
-## Unreleased
+## 1.3.8 - 2026-11-21
 
 ### Fixed
 
@@ -28,6 +28,25 @@ All notable changes to PrismTTY are documented here.
   get that lock, nothing follows the marker and the limit is not passed. A
   session that cannot take the lock within 50 ms writes without it from then
   on, and one of its lines can still land below another session's marker.
+- Shell completion stops at the wrapped command. Bash no longer offers
+  PrismTTY's options or `profiles` after `--` or the first command word, and
+  zsh offers the `profiles` subcommands right after `profiles` and hands a
+  wrapped command's words to that command's own completion. At the first
+  word zsh offers commands found on PATH next to files and `profiles`. Known
+  limits: completion offers nothing of PrismTTY, and the command still runs
+  as typed, after a quoted option such as `'-b'` in both shells, and in Bash
+  after a redirection between an option and its value, after an empty
+  attached value such as `-p=`, and after a config file named `=` or, on
+  Bash 4 and later, one whose name ends in `:`.
+- `sftp` and `mysql` started by name from the local shell no longer switch
+  the session to the Cisco profile: while such a client runs, its own prompt
+  (`sftp> `, `mysql> `) is not read as a device prompt. Limits: a device
+  whose own prompt is `sftp> ` or `mysql> ` is not detected by its prompt
+  after such a command, and the memory of the client is not cleared at a
+  local prompt PrismTTY does not recognize.
+- `connect` is no longer green in `connect to host`, the wording of a failed
+  ssh or telnet connection. The verb elsewhere and `connected` keep their
+  color.
 
 ### Documentation
 
@@ -36,6 +55,18 @@ All notable changes to PrismTTY are documented here.
   modes show after an ESC followed by 1 KiB of C0 controls and a read
   boundary. The README notes that a trailing byte that could begin a UTF-8
   character is shown with the next output or at the end of output.
+- The README says that after a connection failure PrismTTY does not
+  recognize, a later close line naming an outer host can leave the remote
+  profile active.
+
+### Release and QA
+
+- Release packaging refuses a binary that is not an executable for the
+  target it is asked to package. The object format and the CPU must match,
+  and a Linux binary must be 64-bit, little-endian and marked for the System
+  V or GNU/Linux ABI, so a macOS, FreeBSD or x32 binary cannot ship in the
+  Linux archive and one Mac CPU's binary cannot ship under the other's name.
+  A universal Mach-O is refused under both macOS names.
 
 ### Release and QA
 
