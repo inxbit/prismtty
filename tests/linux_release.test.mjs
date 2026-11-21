@@ -230,6 +230,7 @@ function packageForLinux({
   staleChecksum = false,
   rustc = 'rustc 1.85.0 (fixture)',
   smokeStatus = '0',
+  standIn = '',
 }) {
   const directory = mkdtempSync(`${tmpdir()}/prismtty-linux-package-`);
   const fakeBin = `${directory}/bin`;
@@ -252,14 +253,25 @@ function packageForLinux({
     const tools = {
       uname: 'case "$1" in -s) echo Linux ;; -m) echo x86_64 ;; esac',
       rustc: 'case "$1" in --version) echo "$FAKE_RUSTC" ;; --print) echo /fixture/toolchain ;; esac',
-      timeout: 'shift\nexec "$@"',
+      timeout: 'while [[ "$1" == -* ]]; do shift; done\nshift\nexec "$@"',
       docker: `call="$*"
 printf '%s\\n' "\${call//$'\\n'/ }" >> docker.log
 case "$1" in
   pull) ;;
   run)
     if [[ " $* " == *" --network none "* ]]; then
-      exit "$FAKE_SMOKE_STATUS"
+      if [[ -z "$FAKE_STAND_IN" ]]; then
+        exit "$FAKE_SMOKE_STATUS"
+      fi
+      mkdir -p package
+      for name in prismtty ptty ct; do
+        printf '#!/usr/bin/env bash\n%s\n' "$FAKE_STAND_IN" > "package/$name"
+        chmod +x "package/$name"
+      done
+      smoke="\${@: -1}"
+      status=0
+      VERSION=1.2.3 bash -c "\${smoke//\\/package\\//$PWD/package/}" || status=$?
+      exit "$status"
     fi
     mkdir -p dist/prismtty-1.2.3-linux-x86_64
     for name in prismtty ptty ct; do
@@ -286,6 +298,7 @@ esac`,
         FAKE_RUSTC: rustc,
         FAKE_SMOKE_STATUS: smokeStatus,
         FAKE_STALE_CHECKSUM: staleChecksum ? 'yes' : '',
+        FAKE_STAND_IN: standIn,
       },
       encoding: 'utf8',
     });
@@ -328,11 +341,13 @@ test('the Linux archive is built, measured and smoke-tested in one pinned image'
   assert.match(build, /fetch apt-get "\$\{apt_options\[@\]\}" install /);
   assert.match(build, /-o Acquire::Retries=\d+ /);
   assert.match(build, /-o Acquire::https::Timeout=\d+ /);
-  assert.ok(
-    build.indexOf('fetch cargo fetch --locked') < build.indexOf('export CARGO_NET_OFFLINE=true')
-      && build.indexOf('export CARGO_NET_OFFLINE=true') < build.indexOf('scripts/package-release.sh'),
-    'the crates are fetched before an offline build',
-  );
+  const fetchAt = build.indexOf('fetch cargo fetch --locked --target x86_64-unknown-linux-gnu');
+  const offlineAt = build.indexOf('export CARGO_NET_OFFLINE=true');
+  const packageAt = build.indexOf('bash scripts/package-release.sh');
+  assert.notEqual(fetchAt, -1, 'the crates for the release target are fetched');
+  assert.notEqual(offlineAt, -1, 'the build is taken offline');
+  assert.notEqual(packageAt, -1, 'the packaging script runs');
+  assert.ok(fetchAt < offlineAt && offlineAt < packageAt, 'the crates are fetched before an offline build');
   // The smoke test starts from the bare image, without the network, so it
   // only passes when a stock system of that age can run the binaries.
   assert.match(smoke, /^run /);
@@ -459,4 +474,56 @@ test('the Linux archive is refused when it does not match its checksum file', ()
   const result = packageForLinux({ binaries: everyBinary(builtOnTheBaseline), staleChecksum: true });
   assert.notEqual(result.status, 0);
   assert.ok(!result.calls.some((call) => call.includes(' --network none ')), 'the smoke test did not run');
+});
+
+test('every bounded download is killed if it outlives its time limit', () => {
+  // Without --kill-after, timeout sends one signal that a stalled program may
+  // ignore, and then waits for it.
+  const script = read(linuxScript);
+  assert.match(script, /timeout --kill-after=\d+ \d+ docker pull /);
+  assert.match(script, /timeout --kill-after=\d+ \d+ "\$@"/);
+  assert.doesNotMatch(script, /timeout \d/);
+});
+
+// A program that answers the smoke test's three questions the way a healthy
+// binary does, unless told otherwise.
+const smokeStandIn = ({ versionStatus = 0, line = '\\033[38;5;51m192.0.2.1\\033[0m down' } = {}) => `case "$1" in
+  --version) echo "prismtty 1.2.3"; exit ${versionStatus} ;;
+  --profile) cat > /dev/null; printf '${line}\\n' ;;
+  --) exit 7 ;;
+esac`;
+const smokeTest = (standIn) => packageForLinux({ binaries: everyBinary(builtOnTheBaseline), standIn });
+
+test('the smoke test fails when a binary prints its version and then fails', () => {
+  assert.equal(smokeTest(smokeStandIn()).status, 0);
+
+  const result = smokeTest(smokeStandIn({ versionStatus: 3 }));
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /prismtty --version failed or did not print prismtty 1\.2\.3/);
+});
+
+test('the smoke test wants a foreground color on the address itself', () => {
+  for (const line of [
+    '\\033[31m192.0.2.1\\033[0m down',
+    '\\033[1;38;2;10;20;30m192.0.2.1\\033[0m down',
+    '\\033[48;5;31;92m192.0.2.1\\033[0m down',
+    '\\033[48;2;31;32;33;4;38;5;51m192.0.2.1\\033[0m down',
+  ]) {
+    const result = smokeTest(smokeStandIn({ line }));
+    assert.equal(result.status, 0, `${line}: ${result.stderr}`);
+  }
+  // Some escape sequence in front of the address is not enough: a reset, an
+  // attribute or a background color leaves the address uncolored.
+  for (const line of [
+    '192.0.2.1 down',
+    '\\033[0m192.0.2.1 \\033[31mdown\\033[0m',
+    '\\033[1m192.0.2.1\\033[0m down',
+    '\\033[48;5;31m192.0.2.1\\033[0m down',
+    '\\033[48;2;31;32;33m192.0.2.1\\033[0m down',
+    '\\033[31m\\033[0m192.0.2.1 down',
+  ]) {
+    const result = smokeTest(smokeStandIn({ line }));
+    assert.notEqual(result.status, 0, `${line} passed as a colored address`);
+    assert.match(result.stderr, /prismtty --profile generic failed or did not color the address/, line);
+  }
 });

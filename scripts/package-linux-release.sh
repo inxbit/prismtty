@@ -41,10 +41,10 @@ package="prismtty-${version}-${target_name}"
 source_date_epoch="${SOURCE_DATE_EPOCH:-$(git log -1 --format=%ct HEAD)}"
 
 # Every fetch is bounded and retried: a stalled registry or mirror costs
-# minutes, not the job.
+# minutes, not the job. A fetch that ignores the time limit is killed.
 pulled=""
 for attempt in 1 2 3; do
-  if timeout 600 docker pull --platform linux/amd64 "${image}"; then
+  if timeout --kill-after=30 600 docker pull --platform linux/amd64 "${image}"; then
     pulled="yes"
     break
   fi
@@ -56,8 +56,9 @@ if [[ -z "${pulled}" ]]; then
   exit 1
 fi
 
-build="$(
-  cat <<'CONTAINER'
+# The scripts for the containers are read as they stand, not through a command
+# substitution: Bash 3.2 misjudges where one ends when the text holds a `case`.
+IFS= read -r -d '' build <<'CONTAINER' || true
 set -euo pipefail
 trap 'chown -R "${HOST_OWNER}" dist 2>/dev/null || true' EXIT
 
@@ -65,7 +66,7 @@ trap 'chown -R "${HOST_OWNER}" dist 2>/dev/null || true' EXIT
 fetch() {
   local attempt
   for attempt in 1 2 3; do
-    if timeout 600 "$@"; then
+    if timeout --kill-after=30 600 "$@"; then
       return 0
     fi
     echo "attempt ${attempt} failed: $*"
@@ -96,11 +97,10 @@ export CARGO_HTTP_CAINFO=/host/ca-certificates.crt
 # cargo keeps its downloads and its output inside the container. The crates
 # are downloaded first, so the build itself needs no network.
 export CARGO_HOME=/tmp/cargo-home CARGO_TARGET_DIR=/tmp/cargo-target
-fetch cargo fetch --locked
+fetch cargo fetch --locked --target x86_64-unknown-linux-gnu
 export CARGO_NET_OFFLINE=true
 bash scripts/package-release.sh "${TARGET_NAME}"
 CONTAINER
-)"
 # Package scripts and build scripts run as root in the container, and this
 # script goes on to run more of the checkout afterwards. The container gets
 # the checkout read-only; dist is the one place it can write.
@@ -136,17 +136,43 @@ bash scripts/check-glibc-floor.sh "${glibc_floor}" "${executables[@]}"
 
 # The bare image, without the network: the binaries have to start on a stock
 # system of that age with nothing added to it.
-smoke="$(
-  cat <<'CONTAINER'
+IFS= read -r -d '' smoke <<'CONTAINER' || true
 set -euo pipefail
+
+# Whether the SGR parameters in $1 set a foreground color. The parameters of a
+# background color (48) are skipped: its palette index can look like one.
+sets_foreground() {
+  local -a parameters
+  IFS=';' read -r -a parameters <<< "$1"
+  local i=0
+  while (( i < ${#parameters[@]} )); do
+    case "${parameters[i]}" in
+      3[0-7] | 9[0-7] | 38)
+        return 0
+        ;;
+      48)
+        if [[ "${parameters[i+1]:-}" == 5 ]]; then
+          (( i += 2 ))
+        else
+          (( i += 4 ))
+        fi
+        ;;
+    esac
+    (( i += 1 ))
+  done
+  return 1
+}
+
+# The escape sequence directly in front of the address.
+styled_address=$'\033''\[([0-9;]*)m192\.0\.2\.1'
 for name in prismtty ptty ct; do
-  if [[ "$("/package/${name}" --version)" != "prismtty ${VERSION}" ]]; then
-    echo "${name} --version did not print prismtty ${VERSION}" >&2
+  if ! printed="$("/package/${name}" --version)" || [[ "${printed}" != "prismtty ${VERSION}" ]]; then
+    echo "${name} --version failed or did not print prismtty ${VERSION}" >&2
     exit 1
   fi
-  colored="$(printf '192.0.2.1 down\n' | "/package/${name}" --profile generic)"
-  if [[ "${colored}" != *$'\033['*"192.0.2.1"* ]]; then
-    echo "${name} --profile generic did not color its input" >&2
+  if ! colored="$(printf '192.0.2.1 down\n' | "/package/${name}" --profile generic)" \
+    || [[ ! "${colored}" =~ ${styled_address} ]] || ! sets_foreground "${BASH_REMATCH[1]}"; then
+    echo "${name} --profile generic failed or did not color the address" >&2
     exit 1
   fi
   status=0
@@ -157,7 +183,6 @@ for name in prismtty ptty ct; do
   fi
 done
 CONTAINER
-)"
 docker run --rm --network none --platform linux/amd64 \
   --volume "${shipped}/${package}:/package:ro" \
   --env VERSION="${version}" \
