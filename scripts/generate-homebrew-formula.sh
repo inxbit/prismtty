@@ -111,7 +111,8 @@ class Prismtty < Formula
   # Whether bin/ct in the Homebrew prefix belongs to something other than this
   # formula. Homebrew unlinks the old keg before an upgrade or a reinstall, so
   # its own link is normally gone by now; the test for it covers the cases
-  # where it is not.
+  # where it is not. The answer is about the machine the install runs on: a
+  # bottle would carry the answer of the machine that built it.
   def ct_owned_elsewhere?
     target = HOMEBREW_PREFIX/"bin/ct"
     if target.symlink?

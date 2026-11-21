@@ -13,9 +13,11 @@ All notable changes to PrismTTY are documented here.
   looks at the prefix when it is installed: with another `ct` there, its own
   goes under `libexec`, the completions it installs no longer claim the name,
   and the install ends with a note on how to reach it; with none, everything
-  is installed and linked as before. Not covered: the other package installed
+  is installed and linked as before. An install that already stopped at the
+  link step stays unlinked across the upgrade, as Homebrew keeps that state:
+  run `brew link prismtty` once. Not covered: the other package installed
   after PrismTTY (its link step then stops at PrismTTY's `ct`; the README
-  gives the three commands that sort it out), and a `ct` that appears or goes
+  gives the two commands that sort it out), and a `ct` that appears or goes
   away later, which takes a `brew reinstall`.
 
 ## 1.3.9 - 2026-11-21

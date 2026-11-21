@@ -60,11 +60,25 @@ function install(prepare) {
   const text = (path) => readFileSync(`${keg}/${path}`, 'utf8');
   return {
     run,
+    keg,
     present,
     text,
     caveats: run.stdout.match(/^caveats: (.*)$/m)?.[1],
     remove: () => rmSync(root, { recursive: true, force: true }),
   };
+}
+
+const hasZsh = spawnSync('zsh', ['--version']).status === 0;
+
+// The formula edits the completion files, so what it installs must still be
+// a script the shell accepts.
+function assertShellsAccept(keg, state) {
+  const bash = spawnSync('bash', ['-n', `${keg}/${BASH}`], { encoding: 'utf8' });
+  assert.equal(bash.status, 0, `${state}: bash rejects the installed completion: ${bash.stderr}`);
+  if (hasZsh) {
+    const zsh = spawnSync('zsh', ['-n', `${keg}/${ZSH}`], { encoding: 'utf8' });
+    assert.equal(zsh.status, 0, `${state}: zsh rejects the installed completion: ${zsh.stderr}`);
+  }
 }
 
 const ZSH = 'share/zsh/site-functions/_prismtty';
@@ -82,6 +96,7 @@ function assertCtLinked(result, state) {
   assert.match(result.text(BASH), /^\s*complete -F _ct .* ct$/m, state);
   assert.match(result.text(FISH), /^complete -c ct /m, state);
   assert.equal(result.caveats, 'nil', state);
+  assertShellsAccept(result.keg, state);
 }
 
 // Something else owns `ct`: PrismTTY's stays out of every linked directory,
@@ -101,6 +116,7 @@ function assertCtSetAside(result, state) {
   assert.match(result.text(FISH), /^complete -c ptty /m, state);
   assert.match(result.caveats, /opt\/prismtty\/libexec\/bin/, state);
   assert.match(result.caveats, /brew reinstall inxbit\/tap\/prismtty/, state);
+  assertShellsAccept(result.keg, state);
 }
 
 test('the formula links ct when nothing else in the prefix owns it', { skip: !hasRuby && 'ruby is not installed' }, () => {

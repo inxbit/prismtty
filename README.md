@@ -86,10 +86,12 @@ If another package already owns `ct` in the Homebrew prefix (the `chart-testing`
 and `coreos-ct` formulae install one), the formula leaves its own `ct` unlinked
 under `libexec`, keeps the name out of the completions it installs, and says so
 at the end of the install; `prismtty` and `ptty` are linked as usual. The choice
-is made when PrismTTY is installed: if the other package arrives later, its link
+is made when PrismTTY is installed. If the other package arrives later, its link
 step stops at PrismTTY's `ct`, and unlinking PrismTTY as Homebrew then suggests
-removes all three commands. Run `brew unlink prismtty`, link the other package,
-then `brew reinstall inxbit/tap/prismtty`.
+removes all three commands; run `brew link --overwrite` for the other package
+instead, then `brew reinstall inxbit/tap/prismtty`. If an earlier PrismTTY
+install stopped at the link step, run `brew link prismtty` after upgrading:
+Homebrew keeps a formula unlinked across an upgrade or a reinstall.
 
 ### Cargo
 
