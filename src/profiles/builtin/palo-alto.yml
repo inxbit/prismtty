@@ -17,7 +17,7 @@ profile:
     runtime_prompt: palo_alto_user_at_host
 rules:
   - description: PAN-OS prompt
-    regex: '(?m)^[A-Za-z0-9_.-]+@[^>#\n]+[>#]'
+    regex: '(?m)^[A-Za-z0-9_.-]+@[^>#\r\n]+[>#]'
     color: f#00bfff
   - description: PAN-OS interface
     regex: '(?i)\b(ethernet\d+/\d+(\.\d+)?|ae\d+(\.\d+)?|tunnel\.\d+|loopback\.\d+)\b'
