@@ -240,10 +240,11 @@ fn raw_c1_string_ends_at_line_end(width: usize) -> bool {
 
 /// Whether `bytes` is a CSI sequence the terminal does not run: one opened by
 /// the raw C1 byte `9B` on a terminal that is known to read UTF-8. There the
-/// byte is an invalid one and the rest is text, so the sequence sets no color
-/// and saves, restores and resets nothing. Taking it for the program's
-/// rendition would make the bytes written to end a highlight a live control
-/// the program never sent. The UTF-8 form `C2 9B` is not such a sequence.
+/// byte is an invalid one and the rest is text, so the sequence sets no color,
+/// switches no screen and saves, restores and resets nothing. Taking it for
+/// the program's rendition would make the bytes written to end a highlight a
+/// live control the program never sent. The UTF-8 form `C2 9B` is not such a
+/// sequence.
 ///
 /// A decoding switch that the program sends and PrismTTY passes on (`ESC % @`
 /// or DEC private mode 42) does not change the answer: the terminal may
@@ -2965,6 +2966,9 @@ fn contains_alternate_screen_enable_tokens(tokens: &[Token]) -> bool {
 }
 
 fn alternate_screen_command(bytes: &[u8]) -> Option<bool> {
+    if is_raw_c1_csi_the_terminal_does_not_run(bytes) {
+        return None;
+    }
     let (modes, enable) = private_mode_sequence(bytes)?;
     let has_alternate_screen_mode = modes
         .split(|byte| *byte == b';')
@@ -9340,6 +9344,111 @@ rules:
                 ]
                 .concat(),
                 "interactive stream, terminal reads UTF-8: {reads_utf8}, {input:02x?}"
+            );
+        }
+        super::TERMINAL_READS_UTF8_IN_THIS_THREAD.with(|switch| switch.set(None));
+    }
+
+    // A terminal that reads UTF-8 does not switch screens for a raw `9B`
+    // sequence, so the stream stays on the screen it was on: a filter stream
+    // goes on highlighting after an inert `9B ? 1049 h`, and stays off after
+    // a real switch that only an inert `9B ? 1049 l` follows. An 8-bit
+    // terminal runs both, and the 7-bit and `C2 9B` forms switch as before.
+    #[test]
+    fn screen_switch_is_followed_only_for_controls_the_terminal_runs() {
+        let config = PrismConfig::from_chromaterm_yaml(
+            "rules:\n  - description: state\n    regex: 'error'\n    color: f#ff0000\n",
+        )
+        .expect("config parses");
+        let highlighter = Highlighter::from_config(config).expect("rule compiles");
+        const PLAIN: &[u8] = b"error";
+        const COLORED: &[u8] = b"\x1b[38;2;255;0;0merror\x1b[0m";
+
+        for (enter, leave, reads_utf8, second, third) in [
+            (
+                b"\x9b?1049h".as_slice(),
+                b"".as_slice(),
+                true,
+                COLORED,
+                COLORED,
+            ),
+            (b"\x9b?1049h", b"", false, PLAIN, PLAIN),
+            (b"\x9b?47h", b"", true, COLORED, COLORED),
+            (b"\x9b?47h", b"", false, PLAIN, PLAIN),
+            (b"\x1b[?1049h", b"", true, PLAIN, PLAIN),
+            (b"\x1b[?1049h", b"", false, PLAIN, PLAIN),
+            (b"\xc2\x9b?1049h", b"", true, PLAIN, PLAIN),
+            (b"\xc2\x9b?1049h", b"", false, PLAIN, PLAIN),
+            (b"\x1b[?1049h", b"\x9b?1049l", true, PLAIN, PLAIN),
+            (b"\x1b[?1049h", b"\x9b?1049l", false, PLAIN, COLORED),
+            (b"\x1b[?1049h", b"\x1b[?1049l", true, PLAIN, COLORED),
+            (b"\x1b[?1049h", b"\x1b[?1049l", false, PLAIN, COLORED),
+        ] {
+            super::TERMINAL_READS_UTF8_IN_THIS_THREAD.with(|switch| switch.set(Some(reads_utf8)));
+            let input = [
+                b"first error\n".as_slice(),
+                enter,
+                b"second error\n",
+                leave,
+                b"third error\n",
+            ]
+            .concat();
+            let expected = [
+                b"first ".as_slice(),
+                COLORED,
+                b"\n",
+                enter,
+                b"second ",
+                second,
+                b"\n",
+                leave,
+                b"third ",
+                third,
+                b"\n",
+            ]
+            .concat();
+
+            // As read, and as `--sanitize` hands it on.
+            for prepared in [input.clone(), super::strip_string_escapes(&input)] {
+                let mut filter = StreamingHighlighter::new(highlighter.clone());
+                let mut output = filter.push(&prepared);
+                output.extend(filter.finish());
+                assert_eq!(
+                    output, expected,
+                    "terminal reads UTF-8: {reads_utf8}, {input:02x?}"
+                );
+            }
+        }
+
+        // An interactive stream highlights on either screen, but passes a
+        // read that moves the cursor through unhighlighted on the normal one.
+        for (enter, reads_utf8, positioned) in [
+            (b"\x9b?1049h".as_slice(), true, PLAIN),
+            (
+                b"\x9b?1049h",
+                false,
+                b"\x1b[38;2;255;0;0merror\n\x1b[39m".as_slice(),
+            ),
+            (b"\x1b[?1049h", true, b"\x1b[38;2;255;0;0merror\n\x1b[39m"),
+            (b"\x1b[?1049h", false, b"\x1b[38;2;255;0;0merror\n\x1b[39m"),
+        ] {
+            super::TERMINAL_READS_UTF8_IN_THIS_THREAD.with(|switch| switch.set(Some(reads_utf8)));
+            let mut interactive = StreamingHighlighter::new_interactive(highlighter.clone());
+            let mut output = interactive.push(&[b"first\n".as_slice(), enter].concat());
+            output.extend(interactive.push(b"\x1b[5Gsecond error\n"));
+            output.extend(interactive.finish());
+            let line_end: &[u8] = if positioned == PLAIN { b"\n" } else { b"" };
+            assert_eq!(
+                output,
+                [
+                    b"first\n".as_slice(),
+                    enter,
+                    b"\x1b[5Gsecond ",
+                    positioned,
+                    line_end,
+                ]
+                .concat(),
+                "terminal reads UTF-8: {reads_utf8}, {enter:02x?}"
             );
         }
         super::TERMINAL_READS_UTF8_IN_THIS_THREAD.with(|switch| switch.set(None));
