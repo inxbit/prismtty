@@ -41,7 +41,7 @@ profile:
     runtime_prompt: unix_user_at_host_path
 rules:
   - description: Unix prompt
-    regex: '(?m)^([A-Za-z0-9_.-]+)(@)([A-Za-z0-9_.-]+)(:[^#$\n]*)?([#$])'
+    regex: '(?m)^([A-Za-z0-9_.-]+)(@)([A-Za-z0-9_.-]+)(:[^#$\r\n]*)?([#$])'
     color: f#ffffff
   - description: root user
     regex: '\broot\b'
