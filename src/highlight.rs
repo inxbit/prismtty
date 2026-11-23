@@ -4196,8 +4196,13 @@ pub(crate) fn incomplete_sanitize_start(bytes: &[u8]) -> Option<usize> {
     let mut run_start = 0;
     let escape = resume_top_level_escape_scan(bytes, TopLevelScanStop::default(), &mut |stop| {
         let start = stop.control_start;
+        // A cut-off character is at most three bytes. Looking at no more
+        // keeps a run of raw C1 controls, which look like the rest of a
+        // character, from being walked back over at every control.
+        let near = start.saturating_sub(3);
         if (previous.cancellation_root.is_none() || start > previous.idx)
-            && incomplete_utf8_start(&bytes[..start]).is_none_or(|cut_off| cut_off > previous.idx)
+            && incomplete_utf8_start(&bytes[near..start])
+                .is_none_or(|cut_off| near + cut_off > previous.idx)
         {
             run_start = start;
         }
@@ -6479,6 +6484,33 @@ rules:
                 "{units} units"
             );
         }
+    }
+
+    // The first scan looks at the bytes in front of each control for a
+    // cut-off character. A character is at most four bytes, so that look must
+    // not walk back over a whole run of bytes that only look like the rest of
+    // one, as raw C1 controls do: a read full of them would cost its length
+    // once per control. A worker thread keeps a regression from hanging.
+    #[test]
+    fn sanitize_split_looks_back_a_bounded_distance_at_each_control() {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut splits = Vec::new();
+            for unit in [
+                b"\x9b\x9c".as_slice(),
+                b"\x9b\x80\x9c",
+                b"\x1b[\x80\x80\x80\x9c",
+            ] {
+                let mut read = unit.repeat(4 * 1024 * 1024 / unit.len());
+                read.push(b'm');
+                splits.push(super::incomplete_sanitize_start(&read));
+            }
+            let _ = sender.send(splits);
+        });
+        let splits = receiver
+            .recv_timeout(std::time::Duration::from_secs(60))
+            .expect("4 MiB of raw C1 controls should be split within 60s");
+        assert_eq!(splits, [None, None, None]);
     }
 
     // Past its pass cap the split falls back to a control it noted on the
