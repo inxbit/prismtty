@@ -481,6 +481,21 @@ fn unix_prompt_rule_does_not_match_across_a_carriage_return() {
     );
 }
 
+// The PAN-OS prompt rule read the host part up to the next line feed in the
+// same way, so a `user@host` cut off by a carriage return was colored through
+// to a `>` or `#` further on.
+#[test]
+fn pan_os_prompt_rule_does_not_match_across_a_carriage_return() {
+    assert_eq!(
+        highlight_with_builtin("palo-alto", "adm@fw\rx> y\n"),
+        "adm@fw\rx> y\n"
+    );
+    assert_eq!(
+        highlight_with_builtin("palo-alto", "adm@fw\radm@fw> y\n"),
+        "adm@fw\r\x1b[38;2;0;191;255madm@fw>\x1b[0m y\n"
+    );
+}
+
 // `exclusive` keeps later rules off a match. It must not keep the rule's own
 // capture groups off it: group 1 lies inside group 0, which is styled first.
 #[test]
