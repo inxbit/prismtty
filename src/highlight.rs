@@ -1942,6 +1942,13 @@ fn neutralize_prompt_echo_source_sgr(
 
         if let Some((start, end)) = remove_ranges.get(remove_idx).copied() {
             if idx == start {
+                // A terminal runs the C0 controls it meets inside the
+                // sequence, so they stay where it was.
+                output.extend(
+                    input[start..end]
+                        .iter()
+                        .filter(|byte| matches!(byte, 0x00..=0x17 | 0x19 | 0x1c..=0x1f)),
+                );
                 idx = end;
                 remove_idx += 1;
                 continue;
@@ -7711,6 +7718,40 @@ rules:
         let output =
             super::neutralize_prompt_echo_source_sgr(input, b"", super::ResetMode::Minimal);
         assert_eq!(output, b"R# \x1bP\x18\x1b[39mshow");
+    }
+
+    // A terminal runs a C0 control it meets inside a CSI and ignores DEL
+    // there. An SGR taken out of a prompt's command echo must leave those
+    // controls where it was: without the line feed the terminal shows one
+    // line where the source drew two.
+    #[test]
+    fn removed_prompt_echo_sgr_leaves_the_c0_controls_inside_it() {
+        let highlighter =
+            Highlighter::from_config(PrismConfig::default()).expect("empty config compiles");
+
+        for (source_sgr, kept) in [
+            (b"\x1b[3\n1m".as_slice(), b"\n".as_slice()),
+            (b"\x9b3\n1m", b"\n"),
+            (b"\xc2\x9b3\n1m", b"\n"),
+            (b"\x1b\r[3\n1\x07m", b"\r\n\x07"),
+            (b"\x1b[\x0e3\x7f1;\x001\x0fm", b"\x0e\x00\x0f"),
+        ] {
+            let mut input = b"host# show ".to_vec();
+            input.extend_from_slice(source_sgr);
+            input.extend_from_slice(b"run\n\x1b[0mnext\n");
+            let mut expected = b"host# \x1b[39mshow ".to_vec();
+            expected.extend_from_slice(kept);
+            expected.extend_from_slice(b"run\n\x1b[0mnext\n");
+
+            let mut streaming = StreamingHighlighter::new_interactive(highlighter.clone());
+            let mut output = streaming.push(&input);
+            output.extend(streaming.finish());
+
+            assert_eq!(
+                output, expected,
+                "controls inside {source_sgr:02x?} were not kept: {output:02x?}"
+            );
+        }
     }
 
     #[test]
