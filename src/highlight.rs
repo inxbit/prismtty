@@ -238,6 +238,16 @@ fn raw_c1_string_ends_at_line_end(width: usize) -> bool {
     width == 1 && terminal_reads_utf8()
 }
 
+/// Whether `bytes` is a CSI sequence the terminal does not run: one opened by
+/// the raw C1 byte `9B` on a terminal that is known to read UTF-8. There the
+/// byte is an invalid one and the rest is text, so the sequence sets no color
+/// and saves, restores and resets nothing. Taking it for the program's
+/// rendition would make the bytes written to end a highlight a live control
+/// the program never sent. The UTF-8 form `C2 9B` is not such a sequence.
+fn is_raw_c1_csi_the_terminal_does_not_run(bytes: &[u8]) -> bool {
+    bytes.first() == Some(&0x9b) && terminal_reads_utf8()
+}
+
 /// Incrementally tracks an incomplete terminal string control. Once the
 /// control exceeds the bounded carry budget, its payload is discarded until a
 /// BEL/ST terminator, a CAN/SUB cancellation, or an ESC that starts another
@@ -2073,7 +2083,8 @@ fn visible_byte_map_and_ansi_ranges(input: &[u8]) -> (Vec<VisibleByte>, Vec<Ansi
             } else {
                 ansi_sequence_end(input, idx)
             };
-            let is_sgr = sgr_parameters(&input[idx..end]).is_some();
+            let is_sgr = sgr_parameters(&input[idx..end]).is_some()
+                && !is_raw_c1_csi_the_terminal_does_not_run(&input[idx..end]);
             let ends_open_control = is_sgr
                 && ansi_ranges.last().is_some_and(|previous: &AnsiRange| {
                     previous.end == idx
@@ -3387,6 +3398,9 @@ struct NativeSgrState {
 
 impl NativeSgrState {
     fn apply_sequence(&mut self, bytes: &[u8]) {
+        if is_raw_c1_csi_the_terminal_does_not_run(bytes) {
+            return;
+        }
         match bytes {
             _ if escape_final_byte(bytes) == Some(b'c') => *self = Self::default(),
             _ if saves_cursor(bytes) => self.save(),
@@ -9127,6 +9141,177 @@ rules:
     fn raw_c1_csi_updates_terminal_state_checks() {
         assert_eq!(super::alternate_screen_command(b"\x9b?1049h"), Some(true));
         assert!(super::is_cursor_positioning_sequence(b"\x9b2H"));
+    }
+
+    // On a terminal that reads UTF-8 the raw byte `9B` is an invalid byte and
+    // what follows it is text, so no rendition is learned from it and none is
+    // written after a highlight: output that held no ESC must not gain a live
+    // SGR. An 8-bit terminal runs the same bytes, and there the rendition is
+    // restored as it is for the 7-bit form on either terminal. Each row is
+    // what the program sends before the highlighted words, which terminal
+    // reads it, and what a filter stream (after its `ESC [ 0 m`) and an
+    // interactive stream write to end a highlight.
+    #[test]
+    fn rendition_is_restored_after_a_highlight_only_from_controls_the_terminal_runs() {
+        let config = PrismConfig::from_chromaterm_yaml(
+            "rules:\n  - description: state\n    regex: 'up|down'\n    color: f#ff0000\n",
+        )
+        .expect("config parses");
+        let highlighter = Highlighter::from_config(config).expect("rule compiles");
+
+        for (program, reads_utf8, filter_restore, interactive_restore) in [
+            (b"\x9b8m".as_slice(), true, "", "\x1b[39m"),
+            (b"\x9b8m", false, "\x1b[8m", "\x1b[39m"),
+            (b"\x1b[8m", true, "\x1b[8m", "\x1b[39m"),
+            (b"\x1b[8m", false, "\x1b[8m", "\x1b[39m"),
+            (b"\x9b30m", true, "", "\x1b[39m"),
+            (b"\x9b30m", false, "\x1b[30m", "\x1b[30m"),
+            (b"\x1b[30m", true, "\x1b[30m", "\x1b[30m"),
+            (b"\x1b[30m", false, "\x1b[30m", "\x1b[30m"),
+            (b"\x9b30;40m", true, "", "\x1b[39m"),
+            (b"\x9b30;40m", false, "\x1b[30;40m", "\x1b[30m"),
+            // A restore, a reset or a screen switch the terminal does not run
+            // leaves it drawing in the color the program set last.
+            (b"\x1b[33m\x1b[s\x1b[31m\x9bu", true, "\x1b[31m", "\x1b[31m"),
+            (
+                b"\x1b[33m\x1b[s\x1b[31m\x9bu",
+                false,
+                "\x1b[33m",
+                "\x1b[33m",
+            ),
+            (b"\x1b[33m\x9b!p", true, "\x1b[33m", "\x1b[33m"),
+            (b"\x1b[33m\x9b!p", false, "", "\x1b[39m"),
+            (
+                b"\x1b[33m\x9b?1049h\x1b[31m\x9b?1049l",
+                true,
+                "\x1b[31m",
+                "\x1b[31m",
+            ),
+            (
+                b"\x1b[33m\x9b?1049h\x1b[31m\x9b?1049l",
+                false,
+                "\x1b[33m",
+                "\x1b[33m",
+            ),
+        ] {
+            super::TERMINAL_READS_UTF8_IN_THIS_THREAD.with(|switch| switch.set(Some(reads_utf8)));
+            let input = [b"x ".as_slice(), program, b" link up and down\n"].concat();
+            let expected_filter = [
+                b"x ".as_slice(),
+                program,
+                b" link \x1b[38;2;255;0;0mup\x1b[0m",
+                filter_restore.as_bytes(),
+                b" and \x1b[38;2;255;0;0mdown\x1b[0m",
+                filter_restore.as_bytes(),
+                b"\n",
+            ]
+            .concat();
+            let expected_interactive = [
+                b"x ".as_slice(),
+                program,
+                b" link \x1b[38;2;255;0;0mup ",
+                interactive_restore.as_bytes(),
+                b"and \x1b[38;2;255;0;0mdown\n",
+                interactive_restore.as_bytes(),
+            ]
+            .concat();
+
+            // As read, and as `--sanitize` hands it on.
+            for prepared in [input.clone(), super::strip_string_escapes(&input)] {
+                let mut filter = StreamingHighlighter::new(highlighter.clone());
+                let mut output = filter.push(&prepared);
+                output.extend(filter.finish());
+                assert_eq!(
+                    output, expected_filter,
+                    "filter stream, terminal reads UTF-8: {reads_utf8}, {input:02x?}"
+                );
+
+                let mut interactive = StreamingHighlighter::new_interactive(highlighter.clone());
+                let mut output = interactive.push(&prepared);
+                output.extend(interactive.finish());
+                assert_eq!(
+                    output, expected_interactive,
+                    "interactive stream, terminal reads UTF-8: {reads_utf8}, {input:02x?}"
+                );
+            }
+        }
+        super::TERMINAL_READS_UTF8_IN_THIS_THREAD.with(|switch| switch.set(None));
+    }
+
+    // The same holds when a whole buffer is highlighted in one call.
+    #[test]
+    fn whole_buffer_highlighting_restores_only_a_rendition_the_terminal_runs() {
+        let config = PrismConfig::from_chromaterm_yaml(
+            "rules:\n  - description: state\n    regex: 'up|down'\n    color: f#ff0000\n",
+        )
+        .expect("config parses");
+        let highlighter = Highlighter::from_config(config).expect("rule compiles");
+
+        for (program, reads_utf8, restore) in [
+            (b"\x9b8m".as_slice(), true, ""),
+            (b"\x9b8m", false, "\x1b[8m"),
+            (b"\x1b[8m", true, "\x1b[8m"),
+            (b"\x1b[8m", false, "\x1b[8m"),
+        ] {
+            super::TERMINAL_READS_UTF8_IN_THIS_THREAD.with(|switch| switch.set(Some(reads_utf8)));
+            let input = [b"x ".as_slice(), program, b" link up and down\n"].concat();
+            let expected = [
+                b"x ".as_slice(),
+                program,
+                b" link \x1b[38;2;255;0;0mup\x1b[0m",
+                restore.as_bytes(),
+                b" and \x1b[38;2;255;0;0mdown\x1b[0m",
+                restore.as_bytes(),
+                b"\n",
+            ]
+            .concat();
+            assert_eq!(
+                highlighter.highlight_bytes(&input),
+                expected,
+                "terminal reads UTF-8: {reads_utf8}, {input:02x?}"
+            );
+        }
+        super::TERMINAL_READS_UTF8_IN_THIS_THREAD.with(|switch| switch.set(None));
+    }
+
+    // A color after the prompt is taken out and the foreground reset before
+    // the typed command, so the command is not drawn in it. A raw `9B`
+    // sequence sets no color on a terminal that reads UTF-8: it stays, it
+    // does not count as a color left active, and no reset is written for it.
+    #[test]
+    fn prompt_color_is_neutralized_only_for_controls_the_terminal_runs() {
+        let highlighter =
+            Highlighter::from_config(PrismConfig::default()).expect("empty config compiles");
+
+        for (after_prompt, reads_utf8, full_resets, expected) in [
+            (
+                b"\x9b31mshow".as_slice(),
+                true,
+                false,
+                b"\x9b31mshow".as_slice(),
+            ),
+            (b"\x9b31mshow", true, true, b"\x9b31mshow"),
+            (b"\x9b31mshow", false, false, b"\x1b[39mshow"),
+            (b"\x9b31mshow", false, true, b"\x1b[0mshow"),
+            (b"\x1b[31mshow", true, false, b"\x1b[39mshow"),
+            (b"\x1b[31mshow", false, false, b"\x1b[39mshow"),
+            // The 7-bit color is still active where `9B 0 m` is not a reset.
+            (b"\x1b[31m\x9b0mshow", true, false, b"\x9b0m\x1b[39mshow"),
+            (b"\x1b[31m\x9b0mshow", false, false, b"\x1b[31m\x9b0mshow"),
+        ] {
+            super::TERMINAL_READS_UTF8_IN_THIS_THREAD.with(|switch| switch.set(Some(reads_utf8)));
+            let mut streaming = StreamingHighlighter::new_interactive(highlighter.clone());
+            streaming.set_no_minimal_resets(full_resets);
+            assert_eq!(streaming.push(b"FGT01 # "), b"FGT01 # ");
+
+            let mut output = streaming.push(after_prompt);
+            output.extend(streaming.finish());
+            assert_eq!(
+                output, expected,
+                "terminal reads UTF-8: {reads_utf8}, {after_prompt:02x?}"
+            );
+        }
+        super::TERMINAL_READS_UTF8_IN_THIS_THREAD.with(|switch| switch.set(None));
     }
 
     // The tokenizer accepts the UTF-8 encoding of C1 CSI (`C2 9B`) as a
