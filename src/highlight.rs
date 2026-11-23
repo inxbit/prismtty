@@ -25,7 +25,8 @@ const MAX_INCOMPLETE_NON_STRING_ESCAPE_BYTES: usize = 1024;
 /// previous split cut off. Scans after the first resume from a stop before
 /// their split instead of the start of the read, so stepping back over a run
 /// of controls costs about one scan of the run. Only crafted output steps
-/// back this often, and past the cap the read is carried whole.
+/// back this often, and past the cap one more scan checks a split in front
+/// of the run that the first scan noted, so the read is carried from there.
 const MAX_SANITIZE_SPLIT_PASSES: usize = 8;
 /// How far past a stop the top-level escape scan may have read to reach it:
 /// whether a character after an ESC is cut off depends on the three bytes
@@ -4090,11 +4091,13 @@ fn incomplete_top_level_escape_start(bytes: &[u8]) -> Option<usize> {
 }
 
 /// Where the top-level escape scan stops between two controls: the offset it
-/// reads on from and the first control of the cancellation chain it is in.
+/// reads on from, the first control of the cancellation chain it is in and
+/// the start of the control it has just read.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct TopLevelScanStop {
     idx: usize,
     cancellation_root: Option<usize>,
+    control_start: usize,
 }
 
 #[cfg(test)]
@@ -4121,6 +4124,7 @@ fn resume_top_level_escape_scan(
     let TopLevelScanStop {
         mut idx,
         mut cancellation_root,
+        control_start: _,
     } = from;
     while idx < bytes.len() {
         let start = next_stateful_control_start(bytes, idx)?;
@@ -4145,6 +4149,7 @@ fn resume_top_level_escape_scan(
         stop(TopLevelScanStop {
             idx,
             cancellation_root,
+            control_start: start,
         });
     }
     None
@@ -4174,9 +4179,29 @@ fn escape_is_incomplete_at(bytes: &[u8], start: usize) -> bool {
 /// state. So each split after the first resumes from the last such stop
 /// instead of rescanning the prefix from its start, and keeps every stop it
 /// makes for the next split to resume from.
+///
+/// A run of controls that each end in a character the next one cuts off is
+/// stepped back over one control per split, and crafted output can make the
+/// run longer than the splits allowed. The text in front of the run must not
+/// wait with it: a read is written up to its unfinished end, and a carry that
+/// reads keep adding to is dropped once it is oversized. So the first scan
+/// notes the last control that starts where cutting the read cannot leave a
+/// control open: no control is cancelled there, and the bytes in front of it
+/// do not end in a cut-off character, or end in one that began in text after
+/// the control before, which then ended without it. Past the allowed splits
+/// the read is split there, once a scan of the prefix has confirmed it.
 pub(crate) fn incomplete_sanitize_start(bytes: &[u8]) -> Option<usize> {
     let mut stops: Vec<TopLevelScanStop> = Vec::new();
+    let mut previous = TopLevelScanStop::default();
+    let mut run_start = 0;
     let escape = resume_top_level_escape_scan(bytes, TopLevelScanStop::default(), &mut |stop| {
+        let start = stop.control_start;
+        if (previous.cancellation_root.is_none() || start > previous.idx)
+            && incomplete_utf8_start(&bytes[..start]).is_none_or(|cut_off| cut_off > previous.idx)
+        {
+            run_start = start;
+        }
+        previous = stop;
         if stop.idx >= stops.last().map_or(0, |last| last.idx) + SANITIZE_SPLIT_STOP_SPACING {
             stops.push(stop);
         }
@@ -4187,7 +4212,13 @@ pub(crate) fn incomplete_sanitize_start(bytes: &[u8]) -> Option<usize> {
     if split == bytes.len() {
         return None;
     }
-    for _ in 1..MAX_SANITIZE_SPLIT_PASSES {
+    for pass in 1..=MAX_SANITIZE_SPLIT_PASSES {
+        if pass == MAX_SANITIZE_SPLIT_PASSES {
+            // Only crafted output keeps cutting off one more control. Carry
+            // the run without the text in front of it; the carry limit drops
+            // the run once it is oversized.
+            split = run_start;
+        }
         while stops
             .last()
             .is_some_and(|stop| stop.idx + TOP_LEVEL_SCAN_LOOKAHEAD > split)
@@ -4200,8 +4231,7 @@ pub(crate) fn incomplete_sanitize_start(bytes: &[u8]) -> Option<usize> {
             None => return Some(split),
         }
     }
-    // Only crafted output keeps cutting off one more control. Carrying all of
-    // it leaves nothing open, and the carry limit drops it once oversized.
+    // Carrying all of it leaves nothing open.
     Some(0)
 }
 
@@ -4224,7 +4254,23 @@ fn incomplete_sanitize_start_by_rescans(bytes: &[u8]) -> Option<usize> {
         }
         split = next;
     }
-    Some(0)
+    // Past the cap: the last control of the read that starts where no cut
+    // can leave a control open, if a scan of the prefix before it agrees.
+    let mut previous = TopLevelScanStop::default();
+    let mut run_start = 0;
+    resume_top_level_escape_scan(bytes, TopLevelScanStop::default(), &mut |stop| {
+        let start = stop.control_start;
+        if (previous.cancellation_root.is_none() || start > previous.idx)
+            && incomplete_utf8_start(&bytes[..start]).is_none_or(|cut_off| cut_off > previous.idx)
+        {
+            run_start = start;
+        }
+        previous = stop;
+    });
+    match incomplete_top_level_escape_start(&bytes[..run_start]) {
+        None => Some(run_start),
+        Some(_) => Some(0),
+    }
 }
 
 fn byte_is_inside_utf8_codepoint_or_prefix(bytes: &[u8], index: usize) -> bool {
@@ -6398,6 +6444,151 @@ rules:
                 check(input, &mut lens.into_iter().chain([input.len()]));
             }
         }
+    }
+
+    // Seven controls that each end in a character the split cut off, in front
+    // of an unfinished one, use up the split's passes. The split is then the
+    // start of the run, as it is for a shorter run, not the start of the
+    // read: the text in front of the run is not part of any control.
+    #[test]
+    fn sanitize_split_past_its_pass_cap_carries_the_run_without_the_text_before_it() {
+        for units in [6, 7, 8, 9, 100] {
+            let mut ending = b"\x1b[1\xe2\x80".repeat(units);
+            ending.extend_from_slice(b"\x1b[");
+
+            let mut read = b"visible\r\n".to_vec();
+            read.extend_from_slice(&ending);
+            assert_eq!(
+                super::incomplete_sanitize_start(&read),
+                Some(9),
+                "{units} units after text"
+            );
+
+            let mut read = b"\x1b[31mred\x1b[0m".to_vec();
+            read.extend_from_slice(&ending);
+            assert_eq!(
+                super::incomplete_sanitize_start(&read),
+                Some(12),
+                "{units} units after a control"
+            );
+
+            // With nothing in front, all of it is carried.
+            assert_eq!(
+                super::incomplete_sanitize_start(&ending),
+                Some(0),
+                "{units} units"
+            );
+        }
+    }
+
+    // Past its pass cap the split falls back to a control it noted on the
+    // first scan. Whatever the read holds, the bytes in front of that split
+    // must end with no control open, as they do in front of every other
+    // split, and the split must not be later than the one that stepping back
+    // without a cap reaches.
+    #[test]
+    fn sanitize_split_past_its_pass_cap_leaves_no_control_open_before_it() {
+        const FRAGMENTS: &[&[u8]] = &[
+            b"\x1b",
+            b"\x1b\x00",
+            b"\x1b\x1b",
+            b"\x18",
+            b"\r\n",
+            b"\x9b",
+            b"\x9d",
+            b"\x90",
+            b"\x9c",
+            b"\x8e",
+            b"\x84",
+            b"\xc2\x9b",
+            b"\xc2\x9d",
+            b"\xc2\x9c",
+            b"\xc2\x8e",
+            b"\x1b]0;title\x07",
+            b"\x1b]52;c;",
+            b"\x1bPq",
+            b"\x1b\\",
+            b"\x1b[",
+            b"\x1b[1",
+            b"\x1b[31m",
+            b"\x1b[0m",
+            b"\x9b2J",
+            b"\x1b(",
+            b"\x1b(B",
+            b"\x1bN",
+            b"\x1bc",
+            "\u{e9}".as_bytes(),
+            "\u{275c}".as_bytes(),
+            "\u{1f600}".as_bytes(),
+            b"\xc2",
+            b"\xe2",
+            b"\xe2\x9d",
+            b"\xe2\x80",
+            b"\xf0",
+            b"\xf0\x9f",
+            b"\xf0\x9f\x9c",
+            b"\x80",
+            b"\xa9",
+            b"\xff",
+            b"\xd3\xcf\xcf\xc2\xdd\xc5\xce\xc9\xc5",
+            b"\x1b\xf0\x9f\x9c",
+            b"\x1b[\xf0\x9f\x9c",
+            b"\x1b\xe2\x9d",
+            b"\x1b\xc2",
+            b"\x1b[1\xe2\x80",
+            b"\x9b\xf0\x9f\xc2",
+            b"\x1bN\xe2\x80",
+            b"\x1b]0;t\xe2\x9c",
+            b"a",
+            b" ",
+            b"router# show ip\n",
+        ];
+        // Where stepping back with no cap on its passes ends, and how many
+        // controls it steps back over.
+        let uncapped = |bytes: &[u8]| {
+            let escape = super::incomplete_top_level_escape_start(bytes).unwrap_or(bytes.len());
+            let utf8 = super::incomplete_utf8_start(bytes).unwrap_or(bytes.len());
+            let mut split = escape.min(utf8);
+            let mut steps = 0;
+            while let Some(start) = super::incomplete_top_level_escape_start(&bytes[..split]) {
+                split = start;
+                steps += 1;
+            }
+            (split, steps)
+        };
+
+        let mut seed = 0x0dd5_eed5_ca27_7a11_u64;
+        let mut below = |bound: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % bound as u64) as usize
+        };
+        let mut past_the_cap = 0;
+        for _ in 0..4000 {
+            let mut input = Vec::new();
+            for _ in 0..1 + below(12) {
+                let fragment = FRAGMENTS[below(FRAGMENTS.len())];
+                let repeats = if below(4) == 0 { 8 + below(40) } else { 1 };
+                for _ in 0..repeats {
+                    input.extend_from_slice(fragment);
+                }
+            }
+            let split = super::incomplete_sanitize_start(&input).unwrap_or(input.len());
+            let (uncapped_split, steps) = uncapped(&input);
+            if steps < super::MAX_SANITIZE_SPLIT_PASSES - 1 {
+                assert_eq!(split, uncapped_split, "{input:02x?}");
+                continue;
+            }
+            past_the_cap += 1;
+            assert_eq!(
+                super::incomplete_top_level_escape_start(&input[..split]),
+                None,
+                "split {split} of {input:02x?}"
+            );
+            assert!(split <= uncapped_split, "split {split} of {input:02x?}");
+        }
+        assert!(past_the_cap > 100, "{past_the_cap} inputs past the cap");
     }
 
     #[test]

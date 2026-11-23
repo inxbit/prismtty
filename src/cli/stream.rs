@@ -2895,6 +2895,317 @@ mod tests {
         }
     }
 
+    /// Ends of a read that the split steps back over one control at a time:
+    /// runs of controls that each end in a character the next one cuts off,
+    /// shorter and longer than the split's pass cap.
+    fn cut_off_character_endings() -> Vec<Vec<u8>> {
+        let mut endings: Vec<Vec<u8>> = [6, 7, 8, 40, 1000]
+            .into_iter()
+            .map(|units| {
+                let mut ending = b"\x1b[1\xe2\x80".repeat(units);
+                ending.extend_from_slice(b"\x1b[");
+                ending
+            })
+            .collect();
+        for group in [
+            b"\x1b\xf0\x9f\x9c".as_slice(),
+            b"\x1b[\xf0\x9f\x9c",
+            b"\x1b\xe2\x9d",
+            b"\x1b\xc2",
+        ] {
+            endings.push(group.repeat(40));
+        }
+        endings
+    }
+
+    fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+        haystack
+            .windows(needle.len())
+            .any(|window| window == needle)
+    }
+
+    // However many such controls a read ends with, the text in front of them
+    // is written at that read, in every mode, and only the controls wait for
+    // the next read. Carrying the text with them holds it back, and reads that
+    // keep ending the same way grow the carry until it is dropped whole.
+    #[test]
+    fn text_before_a_run_of_cut_off_characters_is_written_at_its_own_read() {
+        let body = b"visible text that the user should see\r\n".repeat(180);
+        // What the text ends with, right in front of the run.
+        let fronts: [&[u8]; 4] = [
+            b"",
+            b"\x1b[0m",
+            b"\xe2\x80",
+            // KOI8-R: every byte is a UTF-8 lead byte.
+            b"\xd3\xcf\xcf\xc2\xdd\xc5\xce\xc9\xc5",
+        ];
+        for ending in cut_off_character_endings() {
+            for front in fronts {
+                // CAN ends whatever the read before left unfinished.
+                let mut read = b"\x18".to_vec();
+                read.extend_from_slice(&body);
+                read.extend_from_slice(front);
+                let text_len = read.len();
+                read.extend_from_slice(&ending);
+                assert_eq!(
+                    super::incomplete_sanitize_start(&read),
+                    Some(text_len),
+                    "split of text, {front:02x?} and {} bytes of {:02x?}",
+                    ending.len(),
+                    &ending[..8]
+                );
+
+                for (strip_existing_ansi, sanitize) in
+                    [(false, false), (false, true), (true, false)]
+                {
+                    let mut state = super::ChunkFilterState::default();
+                    for round in 0..4 {
+                        let prepared =
+                            super::prepare_chunk(&read, strip_existing_ansi, sanitize, &mut state);
+                        assert!(
+                            contains_bytes(prepared.bytes(), &body),
+                            "read {round} of text, {front:02x?} and {} bytes of {:02x?} wrote \
+                             {} bytes without its text (strip {strip_existing_ansi}, sanitize \
+                             {sanitize})",
+                            ending.len(),
+                            &ending[..8],
+                            prepared.bytes().len()
+                        );
+                        assert!(
+                            state.carry == ending,
+                            "read {round} of text, {front:02x?} and {} bytes of {:02x?} carried \
+                             {} bytes (strip {strip_existing_ansi}, sanitize {sanitize})",
+                            ending.len(),
+                            &ending[..8],
+                            state.carry.len()
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    // The same reads through the whole pipeline: nothing is lost, whatever
+    // the mode, and the filtered output opens no string control and does not
+    // depend on where the reads fall.
+    #[test]
+    fn reads_that_keep_ending_in_cut_off_characters_lose_no_output() {
+        for ending in cut_off_character_endings() {
+            let reads: Vec<Vec<u8>> = (0..4)
+                .map(|read| {
+                    // CAN ends whatever the read before left unfinished.
+                    let mut bytes = b"\x18".to_vec();
+                    for line in 0.. {
+                        let text = format!("LINE-{read}-{line:03} visible text\r\n");
+                        if bytes.len() + text.len() + ending.len() > 8192 {
+                            break;
+                        }
+                        bytes.extend_from_slice(text.as_bytes());
+                    }
+                    bytes.resize(8192 - ending.len(), b'.');
+                    bytes.extend_from_slice(&ending);
+                    bytes
+                })
+                .chain([b"\x18tail line\r\n".to_vec()])
+                .collect();
+            let chunks: Vec<&[u8]> = reads.iter().map(Vec::as_slice).collect();
+            let input = reads.concat();
+            let lines = |bytes: &[u8]| bytes.windows(5).filter(|window| window == b"LINE-").count();
+            for pipeline in [
+                ChunkPipeline::Preserve,
+                ChunkPipeline::Sanitize,
+                ChunkPipeline::Strip,
+            ] {
+                let whole = run_chunk_pipeline(&[&input], pipeline);
+                let output = run_chunk_pipeline(&chunks, pipeline);
+                assert_eq!(
+                    lines(&output),
+                    lines(&input),
+                    "{pipeline:?} lines written of reads ending in {} bytes of {:02x?}",
+                    ending.len(),
+                    &ending[..8]
+                );
+                assert!(
+                    output == whole,
+                    "{pipeline:?} output of reads ending in {} bytes of {:02x?} is {} bytes, \
+                     not {}",
+                    ending.len(),
+                    &ending[..8],
+                    output.len(),
+                    whole.len()
+                );
+                if !matches!(pipeline, ChunkPipeline::Preserve) {
+                    assert_eq!(walk_vt_parser(&output, false).0, None, "{pipeline:?}");
+                }
+            }
+        }
+    }
+
+    // A string left unfinished behind such a run is still carried with it and
+    // dropped once it is oversized, without its payload or the text after it
+    // getting through as a string.
+    #[test]
+    fn oversized_string_behind_a_run_of_cut_off_characters_stays_inert() {
+        for units in [6, 7, 8, 40] {
+            let mut first = b"visible text that the user should see\r\n".repeat(100);
+            first.extend_from_slice(&b"\x1b[1\xe2\x80".repeat(units));
+            first.extend_from_slice(b"\x1b]52;c;");
+            first.extend_from_slice(&b"QUJD".repeat(1000));
+            let payload = b"QUJD".repeat(2000);
+            let reads: [&[u8]; 5] = [&first, &payload, &payload, &payload, b"\x07after\r\n"];
+            let input = reads.concat();
+            for pipeline in [ChunkPipeline::Sanitize, ChunkPipeline::Strip] {
+                let whole = run_chunk_pipeline(&[&input], pipeline);
+                let output = run_chunk_pipeline(&reads, pipeline);
+                assert_eq!(
+                    walk_vt_parser(&output, false).0,
+                    None,
+                    "{pipeline:?} {units} units"
+                );
+                assert!(
+                    !contains_bytes(&output, b"QUJD"),
+                    "{pipeline:?} {units} units"
+                );
+                assert!(
+                    contains_bytes(&output, b"should see\r\n") && output.ends_with(b"after\r\n"),
+                    "{pipeline:?} {units} units"
+                );
+                assert!(
+                    output == whole,
+                    "{pipeline:?} output of {units} units is {} bytes, not {}",
+                    output.len(),
+                    whole.len()
+                );
+            }
+        }
+    }
+
+    // A split in front of such a run is one more place where a read is cut
+    // in two and filtered in parts. Whatever stands in front of the run and
+    // whatever the next read brings, `--sanitize` and `--strip-ansi` give the
+    // bytes they give for one read, and no string control opens.
+    #[test]
+    fn filtered_output_does_not_depend_on_a_split_before_a_run_of_cut_off_characters() {
+        const FRONTS: &[&[u8]] = &[
+            b"visible text\r\n",
+            b"a",
+            b"\x1b[31m",
+            b"\x1b[0m",
+            b"\x1b[?25h",
+            b"\x1bc",
+            b"\x1b(B",
+            b"\x1b]0;title\x07",
+            b"\x9b2J",
+            b"\x18",
+            "\u{e9}".as_bytes(),
+            "\u{201d}".as_bytes(),
+            b"\xe2\x80",
+            b"\xc2",
+            b"\xf0\x9f",
+            b"\x80",
+            b"\xd3\xcf\xcf\xc2\xdd\xc5\xce\xc9\xc5",
+        ];
+        const UNITS: &[&[u8]] = &[
+            b"\x1b[1\xe2\x80",
+            // With `B2 h` after it, xterm reads a CSI that sets mode 42.
+            b"\x1b[?4\xc2",
+            b"\x1b\xc2",
+            b"\x1b\xe2\x9d",
+            b"\x1b\xf0\x9f\x9c",
+            b"\x1b[\xf0\x9f\x9c",
+            b"\x9b\xf0\x9f\xc2",
+            b"\x1bN\xe2\x80",
+            b"\x1b(\xe2\x80",
+            b"\x1b]0;t\xe2\x9c",
+        ];
+        const ENDS: &[&[u8]] = &[b"", b"\x1b[", b"\x1b", b"\x1b]52;c;QUJD", b"\x9b1", b"\xe2"];
+        const NEXT: &[&[u8]] = &[
+            b"\xb2h",
+            b"2h",
+            b"h",
+            b"0m",
+            b"\x80",
+            b"\x9d",
+            b"\x9c",
+            b"\x9d52;c;QUJD\x07",
+            b"]52;c;QUJD\x07",
+            b"\\",
+            b"\x07",
+            b"\x18",
+            b"\x1b[0m",
+            b"\x1b\\",
+            b" after\r\n",
+        ];
+
+        let mut rng = XorShift(0x5eed_ca22_1ed0_0c47);
+        for case in 0..3000 {
+            let mut input = Vec::new();
+            for _ in 0..rng.below(5) {
+                input.extend_from_slice(FRONTS[rng.below(FRONTS.len())]);
+            }
+            let unit = UNITS[rng.below(UNITS.len())];
+            input.extend_from_slice(&unit.repeat(5 + rng.below(40)));
+            input.extend_from_slice(ENDS[rng.below(ENDS.len())]);
+            let mut next = Vec::new();
+            for _ in 0..1 + rng.below(4) {
+                next.extend_from_slice(NEXT[rng.below(NEXT.len())]);
+            }
+            let whole = [input.as_slice(), next.as_slice()].concat();
+
+            for pipeline in [ChunkPipeline::Sanitize, ChunkPipeline::Strip] {
+                let expected = run_chunk_pipeline(&[&whole], pipeline);
+                let output = run_chunk_pipeline(&[&input, &next], pipeline);
+                assert_eq!(
+                    walk_vt_parser(&output, false).0,
+                    None,
+                    "case {case} {pipeline:?} opened a string control for {input:02x?} then \
+                     {next:02x?}: {output:02x?}"
+                );
+                assert_eq!(
+                    output, expected,
+                    "case {case} {pipeline:?} output of {input:02x?} then {next:02x?} depends on \
+                     the reads"
+                );
+            }
+        }
+    }
+
+    // Finding where the text ends in front of such a run must not rescan the
+    // read once per control. Reads of text and a long run are scanned at most
+    // twice, whole or in small parts: once for the split and, when the text
+    // holds no control to resume from, once more to check the text.
+    #[test]
+    fn sanitize_split_before_a_long_run_of_cut_off_characters_stays_linear() {
+        use crate::highlight::TOP_LEVEL_SCAN_BYTES;
+
+        for line in [
+            b"\x1b[32mvisible\x1b[0m text\r\n".as_slice(),
+            b"visible text\r\n",
+        ] {
+            let mut read = b"\x18".to_vec();
+            read.extend_from_slice(&line.repeat(150));
+            read.extend_from_slice(&b"\x1b[1\xe2\x80".repeat(900));
+            read.extend_from_slice(b"\x1b[");
+            let input = read.repeat(4);
+            for size in [64, 1000, read.len()] {
+                let mut state = super::ChunkFilterState::default();
+                let mut reassembled = 0;
+                TOP_LEVEL_SCAN_BYTES.with(|scanned| scanned.set(0));
+                for part in input.chunks(size) {
+                    reassembled += state.carry.len() + part.len();
+                    let prepared = super::prepare_chunk(part, false, true, &mut state);
+                    assert_eq!(walk_vt_parser(prepared.bytes(), false).0, None);
+                }
+                let scanned = TOP_LEVEL_SCAN_BYTES.with(std::cell::Cell::get);
+                assert!(
+                    scanned < 2 * reassembled,
+                    "splits of {reassembled} reassembled bytes in {size}-byte reads scanned \
+                     {scanned}"
+                );
+            }
+        }
+    }
+
     // The same guarantees with the UTF-8 switch on, where a raw C1 string ends
     // at its line end: however the reads fall, `--sanitize` and `--strip-ansi`
     // give the same bytes and never let a terminal open a string control, an
