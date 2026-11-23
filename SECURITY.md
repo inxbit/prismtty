@@ -59,6 +59,17 @@ examples that preserve only the token shape needed to reproduce the issue.
   removes the byte and the rest of that line. In any other locale, or with
   none set, the string runs to its terminator and everything after an
   unterminated one is withheld.
+- Whether the terminal reads UTF-8 is decided once, from the locale at
+  startup. In a UTF-8 locale PrismTTY treats a control sequence opened by a
+  raw byte `9B` as text for the whole run: it takes no color from it and
+  follows no screen switch in it, because a UTF-8 terminal does not run it.
+  A program that takes the terminal out of UTF-8 with `ESC % @` or DEC
+  private mode 42 and then uses raw `9B` sequences can therefore lose its
+  color after a highlight, and have its switch to or from the alternate
+  screen missed, on a terminal that honors that switch. `--sanitize` removes
+  both switches, so the terminal stays in UTF-8. Without a UTF-8 locale a raw
+  `9B` is read as the control an 8-bit terminal runs, and a color it sets is
+  written back in the 7-bit form after a highlight.
 - By default PrismTTY passes the escape sequences of the wrapped program
   through as they are, within limits. A string control (OSC, DCS, SOS, PM or
   APC) that is still open after 16 KiB is dropped from its introducer through
