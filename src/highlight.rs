@@ -244,6 +244,11 @@ fn raw_c1_string_ends_at_line_end(width: usize) -> bool {
 /// and saves, restores and resets nothing. Taking it for the program's
 /// rendition would make the bytes written to end a highlight a live control
 /// the program never sent. The UTF-8 form `C2 9B` is not such a sequence.
+///
+/// A decoding switch that the program sends and PrismTTY passes on (`ESC % @`
+/// or DEC private mode 42) does not change the answer: the terminal may
+/// ignore it, PrismTTY cannot tell, and the string scanners keep to the
+/// answer given at startup in the same way.
 fn is_raw_c1_csi_the_terminal_does_not_run(bytes: &[u8]) -> bool {
     bytes.first() == Some(&0x9b) && terminal_reads_utf8()
 }
@@ -9269,6 +9274,72 @@ rules:
                 highlighter.highlight_bytes(&input),
                 expected,
                 "terminal reads UTF-8: {reads_utf8}, {input:02x?}"
+            );
+        }
+        super::TERMINAL_READS_UTF8_IN_THIS_THREAD.with(|switch| switch.set(None));
+    }
+
+    // `ESC % @` and DEC private mode 42 can take xterm out of UTF-8, and
+    // without `--sanitize` both pass through. Whether the terminal reads
+    // UTF-8 is still decided once, at startup: the terminal may ignore the
+    // switch, and a switch that was honored once must not make the raw `9B`
+    // of all later output a live control. So after either switch a raw `9B`
+    // SGR is still not learned on a terminal that reads UTF-8, and on an
+    // 8-bit terminal it is learned as before.
+    #[test]
+    fn decoding_switch_passed_through_does_not_make_a_raw_c1_csi_learned() {
+        let config = PrismConfig::from_chromaterm_yaml(
+            "rules:\n  - description: state\n    regex: 'up|down'\n    color: f#ff0000\n",
+        )
+        .expect("config parses");
+        let highlighter = Highlighter::from_config(config).expect("rule compiles");
+
+        for (program, reads_utf8, filter_restore, interactive_restore) in [
+            (b"\x1b%@\x9b8m".as_slice(), true, "", "\x1b[39m"),
+            (b"\x1b%@\x9b8m", false, "\x1b[8m", "\x1b[39m"),
+            (b"\x1b%@\x9b30m", true, "", "\x1b[39m"),
+            (b"\x1b%@\x9b30m", false, "\x1b[30m", "\x1b[30m"),
+            (b"\x1b[?42h\x9b8m", true, "", "\x1b[39m"),
+            (b"\x1b[?42h\x9b8m", false, "\x1b[8m", "\x1b[39m"),
+            (b"\x1b[?42h\x9b30m", true, "", "\x1b[39m"),
+            (b"\x1b[?42h\x9b30m", false, "\x1b[30m", "\x1b[30m"),
+        ] {
+            super::TERMINAL_READS_UTF8_IN_THIS_THREAD.with(|switch| switch.set(Some(reads_utf8)));
+            let input = [b"x ".as_slice(), program, b" link up and down\n"].concat();
+
+            let mut filter = StreamingHighlighter::new(highlighter.clone());
+            let mut output = filter.push(&input);
+            output.extend(filter.finish());
+            assert_eq!(
+                output,
+                [
+                    b"x ".as_slice(),
+                    program,
+                    b" link \x1b[38;2;255;0;0mup\x1b[0m",
+                    filter_restore.as_bytes(),
+                    b" and \x1b[38;2;255;0;0mdown\x1b[0m",
+                    filter_restore.as_bytes(),
+                    b"\n",
+                ]
+                .concat(),
+                "filter stream, terminal reads UTF-8: {reads_utf8}, {input:02x?}"
+            );
+
+            let mut interactive = StreamingHighlighter::new_interactive(highlighter.clone());
+            let mut output = interactive.push(&input);
+            output.extend(interactive.finish());
+            assert_eq!(
+                output,
+                [
+                    b"x ".as_slice(),
+                    program,
+                    b" link \x1b[38;2;255;0;0mup ",
+                    interactive_restore.as_bytes(),
+                    b"and \x1b[38;2;255;0;0mdown\n",
+                    interactive_restore.as_bytes(),
+                ]
+                .concat(),
+                "interactive stream, terminal reads UTF-8: {reads_utf8}, {input:02x?}"
             );
         }
         super::TERMINAL_READS_UTF8_IN_THIS_THREAD.with(|switch| switch.set(None));
