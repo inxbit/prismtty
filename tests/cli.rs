@@ -940,6 +940,62 @@ fn raw_c1_filtering_contract_matches_strip_and_sanitize_modes() {
     }
 }
 
+// A file is read in blocks of 8192 bytes. Lines that put a run of controls,
+// each ending in a cut-off character, at the end of three blocks in a row
+// must not take the other lines of those blocks with them.
+#[test]
+fn reads_ending_in_runs_of_cut_off_characters_do_not_hide_their_text() {
+    let mut empty_config = tempfile::NamedTempFile::new().expect("empty config");
+    writeln!(empty_config, "rules: []").expect("write empty config");
+    let mut ending = b"\x1b[1\xe2\x80".repeat(7);
+    ending.extend_from_slice(b"\x1b[");
+    let mut input = Vec::new();
+    let mut lines = 0;
+    for block in 0..3 {
+        let end = input.len() + 8192 - ending.len();
+        loop {
+            let line = format!("LINE-{block}-{lines:04} visible text that the user should see\n");
+            if input.len() + line.len() > end {
+                break;
+            }
+            input.extend_from_slice(line.as_bytes());
+            lines += 1;
+        }
+        input.resize(end, b' ');
+        input.extend_from_slice(&ending);
+    }
+    input.extend_from_slice(b"tail line\n");
+    let mut file = tempfile::NamedTempFile::new().expect("input file");
+    file.write_all(&input).expect("write input");
+
+    for mode in [None, Some("--sanitize"), Some("--strip-ansi")] {
+        let output = StdCommand::new(assert_cmd::cargo::cargo_bin("prismtty"))
+            .args(mode)
+            .args(["--profile", "generic", "--config"])
+            .arg(empty_config.path())
+            .stdin(fs::File::open(file.path()).expect("open input"))
+            .output()
+            .expect("prismtty runs");
+
+        assert!(output.status.success(), "{mode:?}: {output:?}");
+        // The unfinished CSI at the end of a block takes the first byte of
+        // the next line as its final byte, so count the rest of each line.
+        let written = output
+            .stdout
+            .windows(13)
+            .filter(|window| window == b" visible text")
+            .count();
+        assert_eq!(
+            written,
+            lines,
+            "{mode:?} wrote {} of {} bytes",
+            output.stdout.len(),
+            input.len()
+        );
+        assert!(output.stdout.ends_with(b"ail line\n"), "{mode:?}");
+    }
+}
+
 // A terminal ends a string control at an ESC that does not start ST, so a
 // stray OSC introducer must not hold back or discard the output after it.
 #[test]
