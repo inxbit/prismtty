@@ -629,6 +629,18 @@ impl OversizedStringControlFilter {
         }
     }
 
+    /// Goes on to discard the string being tracked, up to where it ends. For
+    /// a caller that has dropped the buffer holding its start: what follows
+    /// is still its payload, and would be text without that start.
+    pub(crate) fn discard_tracked_string(&mut self) {
+        let mode = std::mem::take(&mut self.mode);
+        let OversizedStringControlMode::Tracking(tracked) = mode else {
+            self.mode = mode;
+            return;
+        };
+        self.mode = OversizedStringControlMode::Discarding(tracked.into_discarded());
+    }
+
     /// Consumes a new input chunk while an already-oversized control is open.
     /// The caller must pass only newly read bytes here, not a reassembled carry.
     /// A returned suffix begins immediately after the terminator/cancellation.

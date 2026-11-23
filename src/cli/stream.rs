@@ -899,6 +899,10 @@ fn prepare_chunk(
     state.carry.extend_from_slice(&combined[split..]);
     if state.carry.len() > MAX_INCOMPLETE_ESCAPE_BYTES {
         state.carry.clear();
+        // A string still open at the end of the carry can be under its own
+        // limit when other controls are carried in front of it. Its start is
+        // gone now, so the rest of it must not be read as new output.
+        state.oversized_string_controls.discard_tracked_string();
     }
     if strip_existing_ansi {
         AnsiChunk::new(strip_ansi(&combined[..split]))
@@ -3078,6 +3082,134 @@ mod tests {
                 );
             }
         }
+    }
+
+    // The carry is dropped once it is oversized. A string whose start is in
+    // it can still be under its own limit then, when a run of controls is
+    // carried in front of it. The rest of the string, up to where it ends,
+    // goes with its start: written without it, the payload would be text.
+    // So whatever the reads, a filtered mode writes none of the payload, and
+    // the default mode writes the string whole or not at all.
+    #[test]
+    fn string_whose_start_is_dropped_with_an_oversized_carry_is_dropped_to_its_end() {
+        let kinds: [(&[u8], &[u8]); 3] = [
+            (b"\x1b]52;c;", b"\x07"),
+            (b"\x1bP", b"\x1b\\"),
+            (b"\xc2\x9d52;c;", b"\x07"),
+        ];
+        for units in [12, 200, 1000] {
+            let run = b"\x1b[1\xe2\x80".repeat(units);
+            let mut first = b"safe\r\n".to_vec();
+            first.resize(8192 - run.len(), b'.');
+            first.extend_from_slice(&run);
+            for (introducer, terminator) in kinds {
+                // Over the limit of a string, under it, and under it with the
+                // input ending before the string does.
+                for (payload, ended) in [(3 * 8192, true), (14_000, true), (14_000, false)] {
+                    let mut rest = introducer.to_vec();
+                    rest.extend_from_slice(&b"Q".repeat(payload));
+                    if ended {
+                        rest.extend_from_slice(terminator);
+                        rest.extend_from_slice(b"after\r\n");
+                    }
+                    // Reads of 8192 bytes leave the longest string at exactly
+                    // its limit when the carry passes its own; the other
+                    // sizes fall around that.
+                    for size in [
+                        8192, 8191, 8193, 8185, 8132, 8000, 7000, 4096, 1024, 1000, 512,
+                    ] {
+                        let chunks: Vec<&[u8]> = [first.as_slice()]
+                            .into_iter()
+                            .chain(rest.chunks(size))
+                            .collect();
+                        for pipeline in [
+                            ChunkPipeline::Preserve,
+                            ChunkPipeline::Sanitize,
+                            ChunkPipeline::Strip,
+                        ] {
+                            let case = format!(
+                                "{pipeline:?}, {units} controls, {introducer:02x?} with {payload} \
+                                 bytes, ended {ended}, {size}-byte reads"
+                            );
+                            let output = run_chunk_pipeline(&chunks, pipeline);
+                            let written = output.iter().filter(|byte| **byte == b'Q').count();
+                            let whole = matches!(pipeline, ChunkPipeline::Preserve)
+                                && written == payload
+                                && contains_bytes(&output, introducer);
+                            assert!(
+                                written == 0 || whole,
+                                "{case}: {written} payload bytes written"
+                            );
+                            assert!(
+                                whole || !output.contains(&0x07),
+                                "{case}: terminator written"
+                            );
+                            assert!(output.starts_with(b"safe\r\n"), "{case}");
+                            assert!(!ended || output.ends_with(b"after\r\n"), "{case}");
+                            if !matches!(pipeline, ChunkPipeline::Preserve) {
+                                assert_eq!(walk_vt_parser(&output, false).0, None, "{case}");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // What that costs, pinned so that a change to it is a choice: a string
+    // under its own limit, behind a run long enough to take the carry over
+    // its limit with it, passes in one read and is dropped in small reads,
+    // and the bytes that `--sanitize` leaves of the run are dropped with it.
+    #[test]
+    fn string_under_its_limit_behind_a_long_run_is_dropped_only_when_the_carry_overflows() {
+        let mut string = b"\x1b]52;c;".to_vec();
+        string.extend_from_slice(&b"Q".repeat(14_000));
+        string.push(0x07);
+        let mut input = b"safe\r\n".to_vec();
+        input.extend_from_slice(&b"\x1b[1\xe2\x80".repeat(1000));
+        input.extend_from_slice(&string);
+        input.extend_from_slice(b"after\r\n");
+        let small_reads: Vec<&[u8]> = input.chunks(1024).collect();
+        let mut run_left_by_sanitize = b"safe\r\n".to_vec();
+        run_left_by_sanitize.extend_from_slice(&[0x80; 1000]);
+        run_left_by_sanitize.extend_from_slice(b"after\r\n");
+
+        assert!(run_chunk_pipeline(&[&input], ChunkPipeline::Preserve) == input);
+        assert!(run_chunk_pipeline(&[&input], ChunkPipeline::Sanitize) == run_left_by_sanitize);
+        assert_eq!(
+            run_chunk_pipeline(&[&input], ChunkPipeline::Strip),
+            b"safe\r\nafter\r\n"
+        );
+        for pipeline in [
+            ChunkPipeline::Preserve,
+            ChunkPipeline::Sanitize,
+            ChunkPipeline::Strip,
+        ] {
+            assert_eq!(
+                run_chunk_pipeline(&small_reads, pipeline),
+                b"safe\r\nafter\r\n",
+                "{pipeline:?}"
+            );
+        }
+
+        // A shorter run leaves room for the string, in any mode and any reads.
+        let mut input = b"safe\r\n".to_vec();
+        input.extend_from_slice(&b"\x1b[1\xe2\x80".repeat(12));
+        input.extend_from_slice(&string);
+        input.extend_from_slice(b"after\r\n");
+        let small_reads: Vec<&[u8]> = input.chunks(1024).collect();
+        for pipeline in [
+            ChunkPipeline::Preserve,
+            ChunkPipeline::Sanitize,
+            ChunkPipeline::Strip,
+        ] {
+            assert!(
+                run_chunk_pipeline(&small_reads, pipeline)
+                    == run_chunk_pipeline(&[&input], pipeline),
+                "{pipeline:?}"
+            );
+        }
+        assert!(run_chunk_pipeline(&small_reads, ChunkPipeline::Preserve) == input);
     }
 
     // A split in front of such a run is one more place where a read is cut
