@@ -272,8 +272,7 @@ prismtty --reload
 ```
 
 The next output chunk in each running PrismTTY session reloads the active config.
-`prismtty --reload` looks in the same directory, so it reaches only sessions
-started with the same `TMPDIR` (or the same `PRISMTTY_RUNTIME_DIR`).
+Only sessions watching the same runtime directory see the reload request.
 Set `PRISMTTY_RUNTIME_DIR` to override the runtime directory for tests or
 isolated sessions. An existing directory is used as it is; one that other users
 can write to is refused, which only disables live reload for that session.
