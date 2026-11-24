@@ -959,3 +959,162 @@ test('release packaging refuses every Mach-O file that is not the 64-bit kind fo
     }
   }
 });
+
+// A Mach-O file as far as the loader reads it to find the program's
+// libraries: the header and one load command per library.
+function machOLoading(target, libraries) {
+  const commands = libraries.map((library) => {
+    const command = Buffer.alloc(24 + 8 * Math.ceil((library.length + 1) / 8));
+    command.writeUInt32LE(0xc, 0);
+    command.writeUInt32LE(command.length, 4);
+    command.writeUInt32LE(24, 8);
+    command.write(library, 24, 'latin1');
+    return command;
+  });
+  const header = Buffer.alloc(32);
+  executableHeaders[target].copy(header, 0, 0, 16);
+  header.writeUInt32LE(commands.length, 16);
+  header.writeUInt32LE(commands.reduce((size, command) => size + command.length, 0), 20);
+  return Buffer.concat([header, ...commands]);
+}
+
+// The same for an ELF file: the program headers, the dynamic section and the
+// string table its DT_NEEDED entries point into. `dynamic: false` leaves the
+// dynamic section out, as in a statically linked program.
+function elfLoading(libraries, { dynamic = true, kind = 'linux-x86_64' } = {}) {
+  const strings = [Buffer.from([0])];
+  let stringsLength = 1;
+  const entry = (tag, value) => {
+    const bytes = Buffer.alloc(16);
+    bytes.writeBigInt64LE(BigInt(tag), 0);
+    bytes.writeBigUInt64LE(BigInt(value), 8);
+    return bytes;
+  };
+  const needed = libraries.map((library) => {
+    const offset = stringsLength;
+    strings.push(Buffer.from(`${library}\0`, 'latin1'));
+    stringsLength += library.length + 1;
+    return entry(1, offset);
+  });
+  const segmentCount = dynamic ? 2 : 1;
+  const dynamicOffset = 64 + 56 * segmentCount;
+  const dynamicSize = dynamic ? 16 * (needed.length + 2) : 0;
+  const stringsOffset = dynamicOffset + dynamicSize;
+  const segment = (type, offset, size) => {
+    const bytes = Buffer.alloc(56);
+    bytes.writeUInt32LE(type, 0);
+    bytes.writeBigUInt64LE(BigInt(offset), 8);
+    bytes.writeBigUInt64LE(BigInt(offset), 16);
+    bytes.writeBigUInt64LE(BigInt(size), 32);
+    return bytes;
+  };
+  const header = Buffer.alloc(64);
+  executableHeaders[kind].copy(header);
+  header.writeBigUInt64LE(64n, 0x20);
+  header.writeUInt16LE(56, 0x36);
+  header.writeUInt16LE(segmentCount, 0x38);
+  return Buffer.concat([
+    header,
+    segment(1, 0, stringsOffset + stringsLength),
+    ...(dynamic ? [segment(2, dynamicOffset, dynamicSize)] : []),
+    ...(dynamic ? [...needed, entry(5, stringsOffset), entry(0, 0)] : []),
+    ...strings,
+  ]);
+}
+
+const systemLibraries = {
+  'darwin-aarch64': ['/usr/lib/libiconv.2.dylib', '/usr/lib/libSystem.B.dylib'],
+  'darwin-x86_64': ['/usr/lib/libiconv.2.dylib', '/usr/lib/libSystem.B.dylib'],
+  'linux-x86_64': ['libgcc_s.so.1', 'libc.so.6'],
+};
+const pcre2Library = {
+  'darwin-aarch64': '/opt/homebrew/opt/pcre2/lib/libpcre2-8.0.dylib',
+  'darwin-x86_64': '/usr/local/opt/pcre2/lib/libpcre2-8.0.dylib',
+  'linux-x86_64': 'libpcre2-8.so.0',
+};
+const executableLoading = (target, libraries, options) =>
+  target === 'linux-x86_64' ? elfLoading(libraries, options) : machOLoading(target, libraries);
+
+test('release packaging accepts binaries that load PCRE2 from the system', () => {
+  for (const target of ['darwin-aarch64', 'darwin-x86_64', 'linux-x86_64']) {
+    const kind = `${target} loading PCRE2`;
+    executableHeaders[kind] = executableLoading(target, [pcre2Library[target], ...systemLibraries[target]]);
+    const result = packageExecutables(target, { prismtty: kind, ptty: kind, ct: kind });
+    assert.equal(result.status, 0, `${target}: ${result.stderr}`);
+    assert.ok(result.wroteArchive, `${target}: no archive was written`);
+  }
+});
+
+test('release packaging refuses a binary with PCRE2 built into it and names it', () => {
+  // When pkg-config does not find libpcre2-8, or PCRE2_SYS_STATIC is set, the
+  // build compiles the PCRE2 bundled with pcre2-sys into the binaries without
+  // a word. They pass every other check and never get a system PCRE2 update.
+  for (const target of ['darwin-aarch64', 'darwin-x86_64', 'linux-x86_64']) {
+    const dynamic = `${target} loading PCRE2`;
+    const bundled = `${target} with PCRE2 built in`;
+    executableHeaders[dynamic] = executableLoading(target, [pcre2Library[target], ...systemLibraries[target]]);
+    executableHeaders[bundled] = executableLoading(target, systemLibraries[target]);
+    const result = packageExecutables(target, { prismtty: dynamic, ptty: dynamic, ct: bundled });
+    assert.notEqual(result.status, 0, `${target}: a ct with PCRE2 built in was packaged`);
+    assert.match(result.stderr, /target\/release\/ct does not load libpcre2-8/, target);
+    assert.doesNotMatch(result.stderr, /target\/release\/(?:prismtty|ptty) does not load/, target);
+    assert.ok(!result.packagedAnything, `${target}: a refused package still staged files under dist/`);
+  }
+});
+
+test('release packaging refuses a PCRE2 that is not the one the README names', () => {
+  // Another library whose name only starts the same way, and on Linux another
+  // version of the library than the libpcre2-8.so.0 the README promises.
+  for (const [target, library] of [
+    ['darwin-aarch64', '/opt/homebrew/opt/pcre2/lib/libpcre2-16.0.dylib'],
+    ['darwin-aarch64', '/opt/homebrew/opt/pcre2/lib/libpcre2-8-extra.dylib'],
+    ['linux-x86_64', 'libpcre2-8.so.1'],
+    ['linux-x86_64', 'libpcre2-16.so.0'],
+  ]) {
+    const kind = `${target} loading ${library}`;
+    executableHeaders[kind] = executableLoading(target, [library, ...systemLibraries[target]]);
+    const result = packageExecutables(target, { prismtty: kind, ptty: kind, ct: kind });
+    assert.notEqual(result.status, 0, `${library} was accepted for ${target}`);
+    assert.match(result.stderr, /target\/release\/prismtty does not load libpcre2-8/, library);
+  }
+});
+
+test('release packaging refuses an executable whose libraries it cannot read', () => {
+  const linux = 'linux-x86_64';
+  const loadingPcre2 = [pcre2Library[linux], ...systemLibraries[linux]];
+  const cutShort = elfLoading(loadingPcre2);
+  const zeroSizedCommand = machOLoading('darwin-aarch64', [pcre2Library['darwin-aarch64']]);
+  zeroSizedCommand.writeUInt32LE(0, 36);
+  for (const [target, contents, said] of [
+    // A statically linked program has no dynamic section at all.
+    [linux, elfLoading(loadingPcre2, { dynamic: false }), /target\/release\/prismtty: cannot read the libraries it loads: no dynamic section/],
+    [linux, cutShort.subarray(0, cutShort.length - 20), /target\/release\/prismtty: cannot read the libraries it loads/],
+    // A whole header whose tables are missing.
+    [linux, cutShort.subarray(0, 64), /target\/release\/prismtty: cannot read the libraries it loads/],
+    ['darwin-aarch64', machOLoading('darwin-aarch64', [pcre2Library['darwin-aarch64']]).subarray(0, 32), /target\/release\/prismtty: cannot read the libraries it loads/],
+    ['darwin-aarch64', zeroSizedCommand, /target\/release\/prismtty: cannot read the libraries it loads/],
+  ]) {
+    const kind = `unreadable ${target} ${said}`;
+    executableHeaders[kind] = contents;
+    const result = packageExecutables(target, { prismtty: kind, ptty: kind, ct: kind });
+    assert.notEqual(result.status, 0, `${said} was packaged`);
+    assert.match(result.stderr, said);
+    assert.ok(!result.packagedAnything);
+  }
+});
+
+test('release packaging leaves a file that ends inside its header to the other checks', () => {
+  // Such a file cannot run, so it has no libraries to answer for. The header
+  // is the first 64 bytes of an ELF file and the first 32 of a Mach-O file.
+  for (const [target, length] of [
+    ['linux-x86_64', 63],
+    ['darwin-aarch64', 31],
+    ['darwin-x86_64', 31],
+  ]) {
+    const kind = `${target} cut off inside its header`;
+    executableHeaders[kind] = executableLoading(target, systemLibraries[target]).subarray(0, length);
+    const result = packageExecutables(target, { prismtty: kind, ptty: kind, ct: kind });
+    assert.equal(result.status, 0, `${target}: ${result.stderr}`);
+    assert.ok(result.wroteArchive, `${target}: no archive was written`);
+  }
+});
