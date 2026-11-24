@@ -2504,9 +2504,13 @@ fn relative_xdg_config_home_is_ignored() {
 #[test]
 fn empty_runtime_dir_variable_is_named_as_the_reason_reload_is_off() {
     let temp = tempfile::tempdir().expect("tempdir");
+    // The default runtime directory would be made under TMPDIR. An empty
+    // override is not taken as unset, so nothing may appear there either.
+    let system_temp = tempfile::tempdir().expect("tempdir");
 
     isolated("prismtty", temp.path())
         .current_dir(temp.path())
+        .env("TMPDIR", system_temp.path())
         .env("PRISMTTY_RUNTIME_DIR", "")
         .arg("--no-auto-detect")
         .write_stdin("hello\n")
@@ -2516,11 +2520,13 @@ fn empty_runtime_dir_variable_is_named_as_the_reason_reload_is_off() {
         .stderr(
             "prismtty: live reload disabled for this session: PRISMTTY_RUNTIME_DIR is set but empty (unset it or set it to a directory)\n",
         );
-    let left: Vec<_> = fs::read_dir(temp.path())
-        .expect("directory reads")
-        .map(|entry| entry.expect("entry reads").file_name())
-        .collect();
-    assert!(left.is_empty(), "something was created: {left:?}");
+    for dir in [temp.path(), system_temp.path()] {
+        let left: Vec<_> = fs::read_dir(dir)
+            .expect("directory reads")
+            .map(|entry| entry.expect("entry reads").file_name())
+            .collect();
+        assert!(left.is_empty(), "something was created: {left:?}");
+    }
 }
 
 // A relative HOME names a directory under wherever prismtty happens to run,
