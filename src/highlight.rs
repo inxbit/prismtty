@@ -4049,6 +4049,16 @@ fn streaming_split_at(chunk: &AnsiChunk) -> usize {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Bytes that `incomplete_utf8_start` walked back over on this thread.
+    /// The walk covers every trailing byte from 80 to BF, so a caller inside
+    /// a loop over the same buffer pays for that tail once per call; stream
+    /// tests sum the bytes to see that none does.
+    pub(crate) static UTF8_WALK_BACK_BYTES: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
 /// If `bytes` ends partway through a multibyte UTF-8 sequence, returns the
 /// index of that sequence's lead byte so the partial codepoint can be carried
 /// to the next chunk instead of being emitted and split by an SGR escape.
@@ -4061,6 +4071,8 @@ fn incomplete_utf8_start(bytes: &[u8]) -> Option<usize> {
         idx -= 1;
         continuations += 1;
     }
+    #[cfg(test)]
+    UTF8_WALK_BACK_BYTES.with(|walked| walked.set(walked.get() + continuations));
     let lead = *bytes.get(idx.checked_sub(1)?)?;
     let expected = match lead {
         0xc2..=0xdf => 2,
@@ -4616,7 +4628,7 @@ fn scan_single_shift_for_neutralization(bytes: &[u8], start: usize, mut idx: usi
         if let Some(width) = valid_utf8_char_width_at(bytes, idx) {
             return EscapeScan::Complete(idx + width);
         }
-        if incomplete_utf8_start(&bytes[idx..]) == Some(0) {
+        if is_partial_utf8_char_at_end(bytes, idx) {
             return incomplete_escape_scan_result(
                 bytes,
                 start,
