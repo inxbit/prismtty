@@ -2497,6 +2497,102 @@ fn relative_xdg_config_home_is_ignored() {
         .stdout("hello world\n");
 }
 
+// An empty PRISMTTY_RUNTIME_DIR was taken as the path "", which cannot be
+// created: the session ran without live reload, as it still does, but the
+// reason given was a bare "No such file or directory (os error 2)" that
+// named neither a path nor the variable.
+#[test]
+fn empty_runtime_dir_variable_is_named_as_the_reason_reload_is_off() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    // The default runtime directory would be made under TMPDIR. An empty
+    // override is not taken as unset, so nothing may appear there either.
+    let system_temp = tempfile::tempdir().expect("tempdir");
+
+    isolated("prismtty", temp.path())
+        .current_dir(temp.path())
+        .env("TMPDIR", system_temp.path())
+        .env("PRISMTTY_RUNTIME_DIR", "")
+        .arg("--no-auto-detect")
+        .write_stdin("hello\n")
+        .assert()
+        .success()
+        .stdout("hello\n")
+        .stderr(
+            "prismtty: live reload disabled for this session: PRISMTTY_RUNTIME_DIR is set but empty (unset it or set it to a directory)\n",
+        );
+    for dir in [temp.path(), system_temp.path()] {
+        let left: Vec<_> = fs::read_dir(dir)
+            .expect("directory reads")
+            .map(|entry| entry.expect("entry reads").file_name())
+            .collect();
+        assert!(left.is_empty(), "something was created: {left:?}");
+    }
+}
+
+// A relative HOME names a directory under wherever prismtty happens to run,
+// just as a relative XDG_CONFIG_HOME does, and was honoured all the same:
+// rules and profiles were loaded from the current directory. It is ignored
+// for these lookups now, as silently as a relative XDG_CONFIG_HOME is. An
+// absolute XDG_CONFIG_HOME still applies beside it.
+#[test]
+fn relative_home_is_ignored_for_config_and_profile_lookup() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let checkout = temp.path().join("checkout");
+    let planted_home = checkout.join("rel");
+    let planted = planted_home.join(".config").join("prismtty");
+    fs::create_dir_all(planted.join("profiles.d")).expect("planted dirs create");
+    fs::write(
+        planted.join("profiles.d").join("planted.yml"),
+        "profile:\n  name: planted\n  inherits: [generic]\nrules: []\n",
+    )
+    .expect("planted profile writes");
+    for config in [
+        planted_home.join(".chromaterm.yml"),
+        planted.join("config.yml"),
+    ] {
+        fs::write(
+            config,
+            "rules:\n  - description: planted\n    regex: world\n    color: f#00ff00\n",
+        )
+        .expect("planted config writes");
+    }
+    let xdg = temp.path().join("xdg");
+    fs::create_dir_all(xdg.join("prismtty").join("profiles.d")).expect("xdg dirs create");
+    fs::write(
+        xdg.join("prismtty").join("profiles.d").join("kept.yml"),
+        "profile:\n  name: kept\n  inherits: [generic]\nrules: []\n",
+    )
+    .expect("xdg profile writes");
+    let relative_home = |args: &[&str]| {
+        let mut cmd = Command::cargo_bin("prismtty").expect("binary exists");
+        cmd.current_dir(&checkout)
+            .env("HOME", "rel")
+            .env_remove("XDG_CONFIG_HOME")
+            .env("PRISMTTY_RUNTIME_DIR", temp.path().join("runtime"))
+            .args(args);
+        cmd
+    };
+
+    relative_home(&["profiles", "list"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("planted").not())
+        .stderr("");
+    relative_home(&[])
+        .write_stdin("hello world\n")
+        .assert()
+        .success()
+        .stdout("hello world\n")
+        .stderr("");
+    relative_home(&["profiles", "list"])
+        .env("XDG_CONFIG_HOME", &xdg)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("kept"))
+        .stdout(predicate::str::contains("planted").not())
+        .stderr("");
+}
+
 // RIS (`ESC c`) resets the terminal, the alternate screen included. Output
 // after it is on the normal screen again, so it is highlighted again.
 #[test]
@@ -2593,6 +2689,56 @@ fn a_rule_compile_error_reports_the_offset_in_the_rule_as_written() {
         .failure()
         .stderr(predicate::str::contains("rule 'bad' failed to compile"))
         .stderr(predicate::str::contains("offset 5:"));
+}
+
+// A configuration refused for a reason that is no rule's compile error says
+// so in its own words. It used to be shown as a rule named after the message
+// that "failed to compile", followed by a PCRE2 error at a made-up offset.
+#[test]
+fn a_refused_configuration_is_not_reported_as_a_rule_that_failed_to_compile() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let missing_capture = temp.path().join("missing-capture.yml");
+    fs::write(
+        &missing_capture,
+        "rules:\n  - regex: x\n    color:\n      1: bold\n",
+    )
+    .expect("config writes");
+    let too_much_pattern = temp.path().join("too-much-pattern.yml");
+    fs::write(
+        &too_much_pattern,
+        format!(
+            "rules:\n  - regex: '{}'\n    color: bold\n",
+            "a".repeat(300_000)
+        ),
+    )
+    .expect("config writes");
+
+    let output = isolated("prismtty", temp.path())
+        .args(["--no-auto-detect", "--config"])
+        .arg(&missing_capture)
+        .write_stdin("x\n")
+        .output()
+        .expect("command runs");
+    assert!(!output.status.success(), "{output:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr),
+        "prismtty: rule 1 references capture '1' that does not exist\n"
+    );
+
+    isolated("prismtty", temp.path())
+        .args(["--no-auto-detect", "--config"])
+        .arg(&too_much_pattern)
+        .write_stdin("x\n")
+        .assert()
+        .failure()
+        .stderr(predicate::str::starts_with(
+            "prismtty: configuration contains ",
+        ))
+        .stderr(predicate::str::ends_with(
+            " pattern bytes; limits are 512 rules and 262144 bytes\n",
+        ))
+        .stderr(predicate::str::contains("failed to compile").not())
+        .stderr(predicate::str::contains("PCRE2").not());
 }
 
 #[test]

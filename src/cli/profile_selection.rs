@@ -191,9 +191,9 @@ pub(super) fn profile_store() -> Result<ProfileStore, CliError> {
 
 fn default_config_paths() -> Vec<PathBuf> {
     let mut paths = Vec::new();
-    if let Some(base_dirs) = BaseDirs::new() {
-        paths.push(base_dirs.home_dir().join(".chromaterm.yml"));
-        paths.push(base_dirs.home_dir().join(".chromaterm.yaml"));
+    if let Some(home) = config_home_dir() {
+        paths.push(home.join(".chromaterm.yml"));
+        paths.push(home.join(".chromaterm.yaml"));
     }
     if let Some(config_dir) = config_base_dir() {
         paths.push(config_dir.join("chromaterm").join("chromaterm.yml"));
@@ -294,7 +294,16 @@ fn config_base_dir() -> Option<PathBuf> {
             return Some(path);
         }
     }
-    BaseDirs::new().map(|base_dirs| base_dirs.home_dir().join(".config"))
+    config_home_dir().map(|home| home.join(".config"))
+}
+
+/// The home directory that configuration is looked up under. A relative
+/// `HOME` is not taken for one, for the reason a relative `XDG_CONFIG_HOME`
+/// is not: it names a directory under wherever PrismTTY happens to run.
+fn config_home_dir() -> Option<PathBuf> {
+    BaseDirs::new()
+        .map(|base_dirs| base_dirs.home_dir().to_path_buf())
+        .filter(|home| home.is_absolute())
 }
 
 fn is_yaml(path: &Path) -> bool {

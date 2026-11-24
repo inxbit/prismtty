@@ -262,14 +262,17 @@ common vendor terms.
 ## Runtime Reload
 
 Long-running `ptty /bin/zsh` sessions register themselves in a small runtime
-directory under `/tmp` by default. Run this after editing `~/.chromaterm.yml` or
-files under `~/.config/prismtty/`:
+directory, by default `prismtty-<uid>` in the system temporary directory. That
+is `$TMPDIR` when it is set, as it normally is on macOS, where it points to a
+per-user directory under `/var/folders`; on Linux without `TMPDIR` it is `/tmp`.
+Run this after editing `~/.chromaterm.yml` or files under `~/.config/prismtty/`:
 
 ```sh
 prismtty --reload
 ```
 
 The next output chunk in each running PrismTTY session reloads the active config.
+Only sessions watching the same runtime directory see the reload request.
 Set `PRISMTTY_RUNTIME_DIR` to override the runtime directory for tests or
 isolated sessions. An existing directory is used as it is; one that other users
 can write to is refused, which only disables live reload for that session.
