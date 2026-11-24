@@ -3072,7 +3072,7 @@ fn alternate_screen_command(bytes: &[u8]) -> Option<bool> {
     let (modes, enable) = private_mode_sequence(bytes)?;
     let has_alternate_screen_mode = modes
         .split(|byte| *byte == b';')
-        .any(|mode| matches!(mode, b"47" | b"1047" | b"1049"));
+        .any(|mode| matches!(private_mode_number(mode), 47 | 1047 | 1049));
     has_alternate_screen_mode.then_some(enable)
 }
 
@@ -3397,7 +3397,7 @@ fn saves_rendition(bytes: &[u8]) -> bool {
         || private_mode_sequence(bytes).is_some_and(|(modes, set)| {
             set && modes
                 .split(|byte| *byte == b';')
-                .any(|mode| matches!(mode, b"1048" | b"1049"))
+                .any(|mode| matches!(private_mode_number(mode), 1048 | 1049))
         })
 }
 
@@ -3521,18 +3521,18 @@ impl NativeSgrState {
             _ => match private_mode_sequence(bytes) {
                 Some((modes, set)) => {
                     for mode in modes.split(|byte| *byte == b';') {
-                        match (mode, set) {
-                            (b"1048", true) => self.save(),
-                            (b"1048", false) => self.restore(),
-                            (b"1049", true) => {
+                        match (private_mode_number(mode), set) {
+                            (1048, true) => self.save(),
+                            (1048, false) => self.restore(),
+                            (1049, true) => {
                                 self.save();
                                 self.alternate_screen = true;
                             }
-                            (b"1049", false) => {
+                            (1049, false) => {
                                 self.alternate_screen = false;
                                 self.restore();
                             }
-                            (b"47" | b"1047", _) => self.alternate_screen = set,
+                            (47 | 1047, _) => self.alternate_screen = set,
                             _ => {}
                         }
                     }
@@ -3620,6 +3620,22 @@ fn private_mode_sequence(bytes: &[u8]) -> Option<(Cow<'_, [u8]>, bool)> {
         },
         set,
     ))
+}
+
+/// The number that the digits of one mode of `private_mode_sequence` spell,
+/// as a terminal reads it: `01049` is 1049. It is capped at 65535 as xterm
+/// caps a parameter, so a longer number is no other mode. Only the zeros in
+/// front and five digits behind them are looked at, however long the mode.
+fn private_mode_number(mode: &[u8]) -> u32 {
+    let zeros = mode.iter().take_while(|digit| **digit == b'0').count();
+    let digits = &mode[zeros..];
+    if digits.len() > 5 {
+        return 65_535;
+    }
+    digits
+        .iter()
+        .fold(0, |number, digit| number * 10 + u32::from(digit - b'0'))
+        .min(65_535)
 }
 
 /// The colors and attributes that SGR sequences have set.
@@ -10222,6 +10238,122 @@ rules:
             assert!(!super::saves_rendition(&cancelled(b"\x1b[")));
             assert!(!super::restores_cursor(&cancelled(b"\x1b[")));
             assert!(!super::is_soft_terminal_reset(&cancelled(b"\x1b[!")));
+        }
+    }
+
+    // A terminal reads a mode parameter as a number, so `01049` is mode 1049
+    // as `1049` is. Every place that looks for the screen and save modes has
+    // to read the spelling the same way, or a full-screen frame behind it is
+    // highlighted like scrolling text. A number too long to be one of them
+    // must not come out as one, and a raw C1 CSI on a UTF-8 terminal still
+    // names no mode.
+    #[test]
+    fn private_modes_are_read_as_numbers() {
+        for (sequence, enable) in [
+            (b"\x1b[?01049h".as_slice(), true),
+            (b"\x1b[?0047h", true),
+            (b"\x1b[?001047l", false),
+            (b"\x1b[?1049;025h", true),
+            (b"\x1b[?25;0001049l", false),
+            (b"\x1b[?0\x001049h", true),
+            (b"\x9b?01049h", true),
+            (b"\xc2\x9b?01047l", false),
+        ] {
+            assert_eq!(
+                super::alternate_screen_command(sequence),
+                Some(enable),
+                "{sequence:02x?}"
+            );
+        }
+        for sequence in [
+            b"\x1b[?01048h".as_slice(),
+            b"\x1b[?001049h",
+            b"\x1b[?1;01048h",
+        ] {
+            assert!(super::saves_rendition(sequence), "{sequence:02x?}");
+        }
+        for sequence in [
+            // 2^16, 2^32 and 2^64 more than 1049, 1048 and 47.
+            b"\x1b[?66585h".as_slice(),
+            b"\x1b[?4294968345h",
+            b"\x1b[?18446744073709552665h",
+            b"\x1b[?4294968344h",
+            b"\x1b[?65583h",
+            b"\x1b[?10490h",
+            b"\x1b[?104h",
+            b"\x1b[?h",
+            b"\x1b[?01049:1h",
+            b"\x1b[?01049$p",
+        ] {
+            assert_eq!(
+                super::alternate_screen_command(sequence),
+                None,
+                "{sequence:02x?}"
+            );
+            assert!(!super::saves_rendition(sequence), "{sequence:02x?}");
+        }
+
+        for (input, expected) in [
+            // Saved by 01048 and by 01049, restored by the same spelling.
+            (
+                b"\x1b[33m\x1b[?01048h\x1b[31m\x1b[?01048l".as_slice(),
+                Some("\x1b[33m"),
+            ),
+            (
+                b"\x1b[33m\x1b[?01049h\x1b[31m\x1b[?001049l",
+                Some("\x1b[33m"),
+            ),
+            // 0047 switches screens, and each screen keeps its own save.
+            (
+                b"\x1b[33m\x1b7\x1b[?0047h\x1b[31m\x1b7\x1b[?0047l\x1b8",
+                Some("\x1b[33m"),
+            ),
+        ] {
+            let mut state = NativeSgrState::default();
+            for token in super::tokenize_ansi(input) {
+                if let super::Token::Ansi(sequence) = token {
+                    state.apply_sequence(&sequence);
+                }
+            }
+            assert_eq!(
+                state.ansi_start().as_deref(),
+                expected,
+                "after {input:02x?}"
+            );
+        }
+
+        super::TERMINAL_READS_UTF8_IN_THIS_THREAD.with(|switch| switch.set(Some(true)));
+        let raw = super::alternate_screen_command(b"\x9b?01049h");
+        let encoded = super::alternate_screen_command(b"\xc2\x9b?01049h");
+        super::TERMINAL_READS_UTF8_IN_THIS_THREAD.with(|switch| switch.set(None));
+        assert_eq!((raw, encoded), (None, Some(true)));
+    }
+
+    // Whatever a stream does with its highlighting when the program
+    // switches screens, the spelling of the mode must not change it.
+    #[test]
+    fn alternate_screen_mode_with_leading_zeros_suspends_highlighting_like_the_plain_one() {
+        let config = PrismConfig::from_chromaterm_yaml(
+            "rules:\n  - description: error\n    regex: error\n    color: f#ff0000\n",
+        )
+        .expect("config parses");
+        let highlighter = Highlighter::from_config(config).expect("rule compiles");
+        for (plain, zeros) in [("1049", "01049"), ("1047", "001047"), ("47", "0047")] {
+            let stream = |mode: &str| {
+                let input =
+                    format!("error\n\x1b[?{mode}herror on the other screen\n\x1b[?{mode}lerror\n");
+                let mut streaming = StreamingHighlighter::new(highlighter.clone());
+                let mut output = streaming.push(input.as_bytes());
+                output.extend(streaming.finish());
+                String::from_utf8(output).expect("output is text")
+            };
+            let expected = stream(plain);
+            assert!(expected.contains("\x1b[38"), "{plain}: {expected:?}");
+            assert_eq!(
+                stream(zeros),
+                expected.replace(&format!("?{plain}"), &format!("?{zeros}")),
+                "{zeros}"
+            );
         }
     }
 
