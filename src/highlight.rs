@@ -110,15 +110,22 @@ impl RuleIdentityRegistry {
 /// Errors returned while compiling highlighting rules.
 #[derive(Debug, Error)]
 pub enum HighlightError {
-    /// A PCRE2 rule failed to compile, or the configuration was refused
-    /// before any rule was compiled: it holds too many rules or too much
-    /// pattern text, or a color names a capture group its pattern lacks.
+    /// A PCRE2 rule failed to compile, or the configuration was refused for
+    /// a reason that is no rule's compile error: it holds too many rules or
+    /// too much pattern text, or a color names a capture group its pattern
+    /// lacks.
+    ///
+    /// The two are told apart by `source`. A refused configuration carries a
+    /// PCRE2 match error with the code of an exceeded depth limit
+    /// (`PCRE2_ERROR_DEPTHLIMIT`), which compiling a rule never yields, and
+    /// is displayed as `description` alone. Every other value is displayed
+    /// as a rule that failed to compile, one built by hand included.
     Regex {
         /// Human-readable rule description. For a refused configuration, the
         /// whole message instead.
         description: String,
-        /// PCRE2 compilation error. For a refused configuration, a PCRE2
-        /// error that is not a compilation error and says nothing about it.
+        /// PCRE2 compilation error. For a refused configuration, the match
+        /// error described above, which says nothing about the refusal.
         source: pcre2::Error,
     },
 }
@@ -2551,24 +2558,33 @@ fn configuration_validation_error(message: String) -> HighlightError {
     // original Regex carrier so validation can reject unsafe configurations
     // without adding a semver-breaking enum variant. What marks the carrier
     // as a validation failure is a source that compiling a rule can never
-    // yield, whatever the rule: the error of a match, here PCRE2 refusing a
-    // subject that is not UTF-8. A compile error would not do, since a rule
-    // can be written to fail with any of them.
-    let source = RegexBuilder::new()
-        .utf(true)
-        .build("x")
-        .and_then(|regex| regex.is_match(b"\xff"))
-        .expect_err("PCRE2 refuses a subject that is not UTF-8 in UTF mode");
+    // yield, whatever the rule: the error of a match. A compile error would
+    // not do, since a rule can be written to fail with any of them.
     HighlightError::Regex {
         description: escape_untrusted(&message),
-        source,
+        source: validation_marker(),
     }
+}
+
+/// The PCRE2 code of the error that marks a validation failure,
+/// `PCRE2_ERROR_DEPTHLIMIT`.
+const VALIDATION_MARKER_CODE: i32 = -53;
+
+/// The source that marks a `HighlightError::Regex` as a validation failure.
+fn validation_marker() -> pcre2::Error {
+    // A match in byte mode with every option at its default, stopped by a
+    // backtracking depth limit of zero that the pattern sets for itself. It
+    // asks for nothing a PCRE2 build may have been made without.
+    RegexBuilder::new()
+        .build("(*LIMIT_DEPTH=0)x")
+        .and_then(|regex| regex.is_match(b"x"))
+        .expect_err("a depth limit of zero stops every match")
 }
 
 /// Whether `source` is the marker `configuration_validation_error` puts on a
 /// validation failure rather than the compile error of a rule.
 fn is_validation_marker(source: &pcre2::Error) -> bool {
-    matches!(source.kind(), pcre2::ErrorKind::Match)
+    matches!(source.kind(), pcre2::ErrorKind::Match) && source.code() == VALIDATION_MARKER_CODE
 }
 
 /// Resolves every styled capture reference to a group index, rejecting
@@ -5238,6 +5254,42 @@ rules:
         );
 
         assert_eq!(report.rules().len(), 2);
+    }
+
+    // The marker of a validation failure has to come out the same from every
+    // PCRE2 a build may link, so it is a plain byte-mode match error with a
+    // fixed code.
+    #[test]
+    fn validation_marker_is_a_depth_limit_match_error() {
+        let marker = super::validation_marker();
+
+        assert!(matches!(marker.kind(), pcre2::ErrorKind::Match), "{marker}");
+        assert_eq!(marker.code(), super::VALIDATION_MARKER_CODE);
+        assert_eq!(marker.offset(), None);
+        assert!(super::is_validation_marker(&marker));
+    }
+
+    // Unicode support is optional in PCRE2. A marker built with it would turn
+    // into a compile error on a library made without, and the refusal would
+    // be shown as a rule that failed to compile again. No test can link such
+    // a library, so this reads the construction itself.
+    #[test]
+    fn validation_marker_asks_for_no_optional_pcre2_feature() {
+        let source = include_str!("highlight.rs");
+        let start = source
+            .find("fn validation_marker() -> pcre2::Error {")
+            .expect("the marker function is defined");
+        let body = &source[start..];
+        let body = &body[..body.find("\n}\n").expect("the function ends")];
+        let lowered = body.to_ascii_lowercase();
+
+        for option in ["utf", "ucp", "jit", "\\p{", "\\x{"] {
+            assert!(
+                !lowered.contains(option),
+                "the marker uses {option:?}: {body}"
+            );
+        }
+        assert!(body.contains(".build(\"(*LIMIT_DEPTH=0)x\")"), "{body}");
     }
 
     #[test]

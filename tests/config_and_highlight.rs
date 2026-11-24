@@ -3091,6 +3091,37 @@ fn highlight_error_keeps_its_one_variant_and_two_fields() {
     let _: pcre2::Error = source;
 }
 
+// The variant is public, so a caller can build one by hand. Only the exact
+// source that marks a refused configuration is displayed as the description
+// alone; any other source, a genuine match error included, is displayed as a
+// rule that failed to compile, with the PCRE2 detail.
+#[test]
+fn a_hand_built_error_with_another_match_error_keeps_its_pcre2_detail() {
+    let match_error = |pattern: &str| {
+        pcre2::bytes::Regex::new(pattern)
+            .expect("pattern compiles")
+            .is_match(b"x")
+            .expect_err("the limit stops the match")
+    };
+
+    let error = prismtty::highlight::HighlightError::Regex {
+        description: "caller-supplied".to_string(),
+        source: match_error("(*LIMIT_MATCH=0)x"),
+    };
+    assert_eq!(
+        error.to_string(),
+        "rule 'caller-supplied' failed to compile: PCRE2: error matching: match limit exceeded"
+    );
+
+    // The marker itself is a depth-limit match error, as the variant's
+    // documentation says, so this one hand-built value reads as a refusal.
+    let error = prismtty::highlight::HighlightError::Regex {
+        description: "caller-supplied".to_string(),
+        source: match_error("(*LIMIT_DEPTH=0)x"),
+    };
+    assert_eq!(error.to_string(), "caller-supplied");
+}
+
 #[test]
 fn invalid_regex_errors_include_rule_description() {
     let yaml = r##"
