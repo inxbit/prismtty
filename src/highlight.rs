@@ -2578,7 +2578,17 @@ fn validation_marker() -> pcre2::Error {
     RegexBuilder::new()
         .build("(*LIMIT_DEPTH=0)x")
         .and_then(|regex| regex.is_match(b"x"))
-        .expect_err("a depth limit of zero stops every match")
+        .err()
+        // A PCRE2 that let this match through would leave no marker. A
+        // refusal can come up in a running session, at a reload or a profile
+        // switch, so it must not panic there: it falls back to an error
+        // every PCRE2 gives and is then shown as a rule that failed to
+        // compile.
+        .unwrap_or_else(|| {
+            RegexBuilder::new()
+                .build("(?<")
+                .expect_err("an unfinished group name is invalid PCRE2")
+        })
 }
 
 /// Whether `source` is the marker `configuration_validation_error` puts on a
