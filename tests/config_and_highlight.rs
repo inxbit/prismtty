@@ -3017,6 +3017,80 @@ fn streaming_highlighter_flushes_complete_prompts_without_waiting_for_newline() 
     assert!(output.contains("LAB-MX-01>"));
 }
 
+// A configuration can be refused for a reason that is not the compile error
+// of any rule: it holds too many rules or too much pattern text, or a color
+// names a capture group the pattern does not have. Such a failure was shown
+// as the compile error of a rule named after the message, with a pattern
+// offset that points nowhere.
+#[test]
+fn validation_failures_are_reported_in_their_own_words() {
+    let failure = |yaml: &str| {
+        let config = PrismConfig::from_chromaterm_yaml(yaml).expect("yaml parses");
+        Highlighter::from_config(config).expect_err("the configuration is refused")
+    };
+
+    assert_eq!(
+        failure(&format!(
+            "rules:\n  - regex: '{}'\n    color: bold\n",
+            "a".repeat(262_145)
+        ))
+        .to_string(),
+        "configuration contains 1 rules and 262145 pattern bytes; limits are 512 rules and 262144 bytes"
+    );
+    assert_eq!(
+        failure("rules:\n  - regex: x\n    color:\n      1: bold\n").to_string(),
+        "rule 1 references capture '1' that does not exist"
+    );
+    assert_eq!(
+        failure(
+            "rules:\n  - description: named rule\n    regex: (?<a>x)\n    color:\n      b: bold\n"
+        )
+        .to_string(),
+        "named rule references capture 'b' that does not exist"
+    );
+}
+
+// A rule that does fail to compile is still named with its PCRE2 error, also
+// when that error is the very one the validation failures used to borrow.
+#[test]
+fn a_rule_that_fails_to_compile_is_still_reported_with_its_pcre2_error() {
+    for regex in ["(?<", "(?<>x)"] {
+        let config = PrismConfig::from_chromaterm_yaml(&format!(
+            "rules:\n  - description: real\n    regex: '{regex}'\n    color: bold\n"
+        ))
+        .expect("yaml parses");
+        let error = Highlighter::from_config(config).expect_err("the rule does not compile");
+
+        assert_eq!(
+            error.to_string(),
+            "rule 'real' failed to compile: PCRE2: error compiling pattern at offset 3: subpattern name expected",
+            "{regex}"
+        );
+    }
+}
+
+// The error type is public: one variant with a description and a PCRE2
+// source, for a validation failure too. The binding below stops compiling if
+// a variant or a field is added, removed or renamed.
+#[test]
+fn highlight_error_keeps_its_one_variant_and_two_fields() {
+    let config =
+        PrismConfig::from_chromaterm_yaml("rules:\n  - regex: x\n    color:\n      1: bold\n")
+            .expect("yaml parses");
+    let error = Highlighter::from_config(config).expect_err("the configuration is refused");
+    assert!(std::error::Error::source(&error).is_some());
+
+    let prismtty::highlight::HighlightError::Regex {
+        description,
+        source,
+    } = error;
+    assert_eq!(
+        description,
+        "rule 1 references capture '1' that does not exist"
+    );
+    let _: pcre2::Error = source;
+}
+
 #[test]
 fn invalid_regex_errors_include_rule_description() {
     let yaml = r##"

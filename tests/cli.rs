@@ -2595,6 +2595,56 @@ fn a_rule_compile_error_reports_the_offset_in_the_rule_as_written() {
         .stderr(predicate::str::contains("offset 5:"));
 }
 
+// A configuration refused for a reason that is no rule's compile error says
+// so in its own words. It used to be shown as a rule named after the message
+// that "failed to compile", followed by a PCRE2 error at a made-up offset.
+#[test]
+fn a_refused_configuration_is_not_reported_as_a_rule_that_failed_to_compile() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let missing_capture = temp.path().join("missing-capture.yml");
+    fs::write(
+        &missing_capture,
+        "rules:\n  - regex: x\n    color:\n      1: bold\n",
+    )
+    .expect("config writes");
+    let too_much_pattern = temp.path().join("too-much-pattern.yml");
+    fs::write(
+        &too_much_pattern,
+        format!(
+            "rules:\n  - regex: '{}'\n    color: bold\n",
+            "a".repeat(300_000)
+        ),
+    )
+    .expect("config writes");
+
+    let output = isolated("prismtty", temp.path())
+        .args(["--no-auto-detect", "--config"])
+        .arg(&missing_capture)
+        .write_stdin("x\n")
+        .output()
+        .expect("command runs");
+    assert!(!output.status.success(), "{output:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr),
+        "prismtty: rule 1 references capture '1' that does not exist\n"
+    );
+
+    isolated("prismtty", temp.path())
+        .args(["--no-auto-detect", "--config"])
+        .arg(&too_much_pattern)
+        .write_stdin("x\n")
+        .assert()
+        .failure()
+        .stderr(predicate::str::starts_with(
+            "prismtty: configuration contains ",
+        ))
+        .stderr(predicate::str::ends_with(
+            " pattern bytes; limits are 512 rules and 262144 bytes\n",
+        ))
+        .stderr(predicate::str::contains("failed to compile").not())
+        .stderr(predicate::str::contains("PCRE2").not());
+}
+
 #[test]
 fn profiles_test_names_the_fixture_it_cannot_read() {
     let temp = tempfile::tempdir().expect("tempdir");

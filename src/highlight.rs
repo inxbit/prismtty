@@ -110,14 +110,35 @@ impl RuleIdentityRegistry {
 /// Errors returned while compiling highlighting rules.
 #[derive(Debug, Error)]
 pub enum HighlightError {
-    /// A PCRE2 rule failed to compile.
-    #[error("rule '{description}' failed to compile: {source}")]
+    /// A PCRE2 rule failed to compile, or the configuration was refused
+    /// before any rule was compiled: it holds too many rules or too much
+    /// pattern text, or a color names a capture group its pattern lacks.
     Regex {
-        /// Human-readable rule description.
+        /// Human-readable rule description. For a refused configuration, the
+        /// whole message instead.
         description: String,
-        /// PCRE2 compilation error.
+        /// PCRE2 compilation error. For a refused configuration, a PCRE2
+        /// error that is not a compilation error and says nothing about it.
         source: pcre2::Error,
     },
+}
+
+impl std::fmt::Display for HighlightError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self::Regex {
+            description,
+            source,
+        } = self;
+        if is_validation_marker(source) {
+            // The message is complete; the marker would only send the reader
+            // to a pattern offset that does not exist.
+            return formatter.write_str(description);
+        }
+        write!(
+            formatter,
+            "rule '{description}' failed to compile: {source}"
+        )
+    }
 }
 
 /// A bounded PCRE2 match failed while applying a compiled rule.
@@ -2528,14 +2549,26 @@ fn compile_rule(
 fn configuration_validation_error(message: String) -> HighlightError {
     // HighlightError was already a public exhaustive enum in 1.x. Reuse its
     // original Regex carrier so validation can reject unsafe configurations
-    // without adding a semver-breaking enum variant.
+    // without adding a semver-breaking enum variant. What marks the carrier
+    // as a validation failure is a source that compiling a rule can never
+    // yield, whatever the rule: the error of a match, here PCRE2 refusing a
+    // subject that is not UTF-8. A compile error would not do, since a rule
+    // can be written to fail with any of them.
     let source = RegexBuilder::new()
-        .build("(?<")
-        .expect_err("the validation sentinel is intentionally invalid PCRE2");
+        .utf(true)
+        .build("x")
+        .and_then(|regex| regex.is_match(b"\xff"))
+        .expect_err("PCRE2 refuses a subject that is not UTF-8 in UTF mode");
     HighlightError::Regex {
         description: escape_untrusted(&message),
         source,
     }
+}
+
+/// Whether `source` is the marker `configuration_validation_error` puts on a
+/// validation failure rather than the compile error of a rule.
+fn is_validation_marker(source: &pcre2::Error) -> bool {
+    matches!(source.kind(), pcre2::ErrorKind::Match)
 }
 
 /// Resolves every styled capture reference to a group index, rejecting
