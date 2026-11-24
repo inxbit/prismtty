@@ -20,6 +20,9 @@ rules:
   - description: bad operational state
     regex: '(?i)\b(password|abnormal(ly)?|down|los(t|s|ing)|err(or(s)?)?|den(y|ies|ied)|reject(ing|ed)?|drop(ped|s)?|fail(s|ed|ures?)?|not[ \t-]+(connect(ed)?|reachable)|disconnect(ed)?|unreachable|invalid|bad|notconnect|unusable|blocking|blocked|collision(s)?|unsynchronized|mismatch|runts|CRC|resets)\b'
     color: f#ff0000 bold
+  - description: negation matched without its next word
+    regex: '(?i)\bnot[ \t-]+\z'
+    color: f#ff0000 bold
   - description: warning state
     regex: '(?i)\b(warning(s)?|degraded|standby|learning|listening|passive)\b'
     color: f#ffff00
