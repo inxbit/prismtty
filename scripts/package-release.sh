@@ -36,6 +36,15 @@ release_dir="${CARGO_TARGET_DIR:-target}/release"
 # says otherwise must not ship under it. A universal Mach-O is refused under
 # both macOS labels: each archive is for one CPU. Content that is neither ELF
 # nor Mach-O is nothing cargo builds for these targets and is left alone.
+#
+# The binaries also have to load PCRE2 from the system, as the README says
+# and the Homebrew formula's dependency assumes. When pkg-config does not
+# find libpcre2-8, or PCRE2_SYS_STATIC is set, pcre2-sys compiles the copy it
+# bundles into them and says nothing; such a build runs, and never gets a
+# PCRE2 fix from the system. What a binary loads is read from what its loader
+# reads: the DT_NEEDED entries of an ELF file, the LC_LOAD_DYLIB commands of
+# a Mach-O file. A file that ends inside its own header is left alone: nothing
+# can run it, so it holds no PCRE2 of either kind.
 RELEASE_DIR="${release_dir}" TARGET_NAME="${target_name}" python3 - <<'PY'
 import os
 from pathlib import Path
@@ -93,13 +102,93 @@ def describe(header):
     return None
 
 
+ELF_HEADER_SIZE, MACH_O_HEADER_SIZE = 64, 32
+PT_LOAD, PT_DYNAMIC = 1, 2
+DT_NULL, DT_NEEDED, DT_STRTAB = 0, 1, 5
+LC_LOAD_DYLIB = 0xC
+
+
+def loaded_libraries(data):
+    """The libraries the loader has to find before it starts the program."""
+    if data[:4] == b"\x7fELF":
+        (segment_table,) = struct.unpack_from("<Q", data, 0x20)
+        entry_size, segment_count = struct.unpack_from("<HH", data, 0x36)
+        # Type, flags, file offset, address, physical address, size in the file.
+        segments = [
+            struct.unpack_from("<IIQQQQ", data, segment_table + index * entry_size)
+            for index in range(segment_count)
+        ]
+        dynamic = [segment for segment in segments if segment[0] == PT_DYNAMIC]
+        if not dynamic:
+            raise ValueError("no dynamic section")
+        _, _, offset, _, _, size = dynamic[0]
+        entries = []
+        for at in range(offset, offset + size, 16):
+            entries.append(struct.unpack_from("<qQ", data, at))
+            if entries[-1][0] == DT_NULL:
+                break
+        # The string table is named by its address; the loadable segments say
+        # where in the file that is.
+        (strings_address,) = [value for tag, value in entries if tag == DT_STRTAB]
+        (strings,) = [
+            file_offset + strings_address - address
+            for kind, _, file_offset, address, _, file_size in segments
+            if kind == PT_LOAD and address <= strings_address < address + file_size
+        ]
+        names = []
+        for tag, value in entries:
+            if tag == DT_NEEDED:
+                start = strings + value
+                names.append(data[start : data.index(b"\0", start)].decode("ascii"))
+        return names
+    (command_count,) = struct.unpack_from("<I", data, 16)
+    names = []
+    at = 32
+    for _ in range(command_count):
+        command, size = struct.unpack_from("<II", data, at)
+        if size < 8:
+            raise ValueError("a load command smaller than its own header")
+        if command == LC_LOAD_DYLIB:
+            (name,) = struct.unpack_from("<I", data, at + 8)
+            names.append(data[at + name : at + size].split(b"\0", 1)[0].decode("ascii"))
+        at += size
+    return names
+
+
 target = os.environ["TARGET_NAME"]
+
+
+def loads_pcre2(library):
+    if target == "linux-x86_64":
+        return library == "libpcre2-8.so.0"
+    name = library.rsplit("/", 1)[-1]
+    return name.startswith("libpcre2-8.") and name.endswith(".dylib")
+
+
 for name in ("prismtty", "ptty", "ct"):
     path = Path(os.environ["RELEASE_DIR"]) / name
     with path.open("rb") as binary:
         found = describe(binary.read(20))
     if found is not None and found != EXPECTED[target]:
         raise SystemExit(f"{path} is {found}, but {target} needs {EXPECTED[target]}")
+
+for name in ("prismtty", "ptty", "ct"):
+    path = Path(os.environ["RELEASE_DIR"]) / name
+    data = path.read_bytes()
+    if describe(data[:20]) is None:
+        continue
+    if len(data) < (ELF_HEADER_SIZE if data[:4] == b"\x7fELF" else MACH_O_HEADER_SIZE):
+        continue
+    try:
+        libraries = loaded_libraries(data)
+    except (ValueError, IndexError, UnicodeDecodeError, struct.error) as error:
+        raise SystemExit(f"{path}: cannot read the libraries it loads: {error}")
+    if not any(loads_pcre2(library) for library in libraries):
+        wanted = "libpcre2-8.so.0" if target == "linux-x86_64" else "libpcre2-8"
+        raise SystemExit(
+            f"{path} does not load {wanted} at run time, so it does not use the "
+            f"system's PCRE2. It loads {', '.join(libraries) or 'no library'}."
+        )
 PY
 
 rm -rf "${stage}"
