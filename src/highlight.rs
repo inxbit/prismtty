@@ -2747,6 +2747,9 @@ fn match_rule(
     };
     let mut last_end = 0;
     let mut last_match = None;
+    // Where the last byte that is not UTF-8 ends, once a rule in UTF mode
+    // has been refused for one.
+    let mut valid_tail = None;
 
     while last_end <= visible.len() {
         let found = match &mut locations {
@@ -2768,6 +2771,26 @@ fn match_rule(
             // no runaway match: try the next byte.
             Err(error) if error.code() == PCRE2_ERROR_BADUTFOFFSET => {
                 last_end += 1;
+                continue;
+            }
+            // A rule in UTF mode is not searched across a byte that is not
+            // UTF-8: PCRE2 checks the text from where the search starts to
+            // its end and refuses it. That is no fault of the rule, so it is
+            // not a match error. No search in front of the last such byte
+            // can succeed, so go on behind it. When the text from here on
+            // is valid, PCRE2 has read back over such a byte for a
+            // lookbehind: try the next byte.
+            Err(error) if PCRE2_ERROR_UTF8_INVALID.contains(&error.code()) => {
+                let valid_from = *valid_tail.get_or_insert_with(|| {
+                    let mut valid_from = last_end;
+                    while let Err(invalid) = std::str::from_utf8(&visible[valid_from..]) {
+                        let good = invalid.valid_up_to();
+                        let rest = visible.len() - valid_from - good;
+                        valid_from += good + invalid.error_len().unwrap_or(rest);
+                    }
+                    valid_from
+                });
+                last_end = valid_from.max(last_end + 1);
                 continue;
             }
             Err(error) => {
@@ -2822,6 +2845,11 @@ fn match_rule(
 /// PCRE2's error code for a search started inside a UTF-8 character, which
 /// only a rule in UTF mode reports.
 const PCRE2_ERROR_BADUTFOFFSET: i32 = -36;
+
+/// PCRE2's error codes for text that is not valid UTF-8, from
+/// `PCRE2_ERROR_UTF8_ERR21` to `PCRE2_ERROR_UTF8_ERR1`, which only a rule in
+/// UTF mode reports.
+const PCRE2_ERROR_UTF8_INVALID: std::ops::RangeInclusive<i32> = -23..=-3;
 
 /// Returns where the search resumes after a match at `start..end`, and whether
 /// to skip that match. Same stepping as pcre2's own iterator: an empty match
@@ -5457,6 +5485,221 @@ rules:
             .expect("failed rule recorded");
         assert_eq!(failed.description, "bounded pathological rule");
         assert_eq!(failed.count, 1, "failed rule must not be retried");
+    }
+
+    // A rule in UTF mode cannot be searched across a byte that is not UTF-8:
+    // PCRE2 refuses the text. One stray byte in the output is no fault of the
+    // rule, so it must not count as a match error and switch the rule off for
+    // the session. The rule goes on matching behind the last such byte of a
+    // read, as it did in the read that held the first one, and a rule that
+    // does run out of its match budget is still switched off.
+    #[test]
+    fn invalid_utf8_in_the_output_does_not_switch_a_utf_rule_off() {
+        let config = PrismConfig::from_chromaterm_yaml(
+            r##"
+rules:
+  - description: umlauts
+    regex: '(*UTF)[äöü]'
+    color: f#ff0000
+  - description: any character between x and y
+    regex: '(*UTF)x.y'
+    color: f#00ff00
+  - description: x behind an e acute
+    regex: '(*UTF)(?<=é)x'
+    color: f#ffff00
+  - description: bounded pathological rule
+    regex: '^(a+)+$'
+    color: f#0000ff
+"##,
+        )
+        .expect("config parses");
+        let highlighter = Highlighter::from_config(config).expect("rules compile");
+        // What a session that has seen nothing else writes for `text`.
+        let fresh = |text: &[u8]| StreamingHighlighter::new(highlighter.clone()).push(text);
+        let line = "\u{e4} x\u{e9}y \u{e9}x\n".as_bytes();
+        let colored = fresh(line);
+        assert_eq!(
+            colored
+                .windows(2)
+                .filter(|window| window == b"\x1b[")
+                .count(),
+            6,
+            "{colored:02x?}"
+        );
+
+        let mut streaming = StreamingHighlighter::new_with_benchmark(highlighter.clone());
+        assert_eq!(streaming.push(line), colored);
+        for invalid in [
+            b"caf\xe9 au lait\n".as_slice(),
+            b"noise \xff here\n",
+            b"cut \xe4\xb8 character\n",
+            b"\xc0\xaf overlong\n",
+            b"\x80\x80\x80\n",
+        ] {
+            assert_eq!(streaming.push(invalid), invalid);
+            assert_eq!(streaming.push(line), colored, "after {invalid:02x?}");
+            highlighter
+                .try_highlight_bytes(invalid)
+                .expect("invalid UTF-8 is not a match error");
+        }
+
+        // In the read that holds such bytes, the text behind the last one is
+        // searched and the text in front of it is not.
+        for front in [
+            "\u{f6} one \u{e9}x ".as_bytes(),
+            b"\xc3\xb6 one \xff \xc3\xbc two \xc3\xa9x ",
+        ] {
+            for invalid in [b"\xff".as_slice(), b"\xe9", b"\xe4\xb8", b"\xfe\xff\x80"] {
+                let read = [front, invalid, line].concat();
+                assert_eq!(
+                    streaming.push(&read),
+                    [front, invalid, &colored].concat(),
+                    "{read:02x?}"
+                );
+            }
+        }
+        // A lookbehind may not read back over the byte either.
+        assert_eq!(streaming.push(b"\xffx \xe9x\n"), b"\xffx \xe9x\n");
+        assert_eq!(streaming.push(line), colored);
+
+        let report = streaming.benchmark_report().expect("benchmark enabled");
+        assert!(report.first_rule_error().is_none());
+
+        let mut pathological = vec![b'a'; 8 * 1024];
+        pathological.extend_from_slice(b"!\n");
+        let _ = streaming.push(&pathological);
+        let _ = streaming.push(&pathological);
+        let failed = streaming
+            .benchmark_report()
+            .expect("benchmark enabled")
+            .first_rule_error()
+            .expect("failed rule recorded");
+        assert_eq!(failed.description, "bounded pathological rule");
+        assert_eq!(failed.count, 1, "failed rule must not be retried");
+        assert_eq!(streaming.push(line), colored);
+    }
+
+    // Text that is not UTF-8 is not an error of a UTF-mode rule for the
+    // library either: the call that reports match errors returns the text.
+    #[test]
+    fn fallible_highlight_call_returns_ok_for_a_utf_rule_on_text_that_is_not_utf8() {
+        let config = PrismConfig::from_chromaterm_yaml(
+            "rules:\n  - description: umlauts\n    regex: '(*UTF)[\u{e4}\u{f6}\u{fc}]'\n    color: f#ff0000\n",
+        )
+        .expect("config parses");
+        let highlighter = Highlighter::from_config(config).expect("rule compiles");
+
+        for input in [
+            b"caf\xe9 au lait\n".as_slice(),
+            b"\xc3\xa4 noise \xff here\n",
+            b"\xff",
+        ] {
+            assert_eq!(
+                highlighter
+                    .try_highlight_bytes(input)
+                    .expect("text that is not UTF-8 is not a match error"),
+                input,
+                "{input:02x?}"
+            );
+        }
+    }
+
+    // A rule in UTF mode that runs out of its match budget is switched off
+    // like any other rule, also in a session that has already met bytes that
+    // are not UTF-8 and in a read that holds one.
+    #[test]
+    fn utf_rule_that_exhausts_its_match_limit_is_still_switched_off() {
+        let config = PrismConfig::from_chromaterm_yaml(
+            r##"
+rules:
+  - description: bounded pathological utf rule
+    regex: '(*UTF)^(a+)+$'
+    color: f#ff0000
+  - description: healthy suffix
+    regex: '!'
+    color: f#00ff00
+"##,
+        )
+        .expect("config parses");
+        let highlighter = Highlighter::from_config(config).expect("rules compile");
+        let mut pathological = vec![b'a'; 8 * 1024];
+        pathological.extend_from_slice(b"!\n");
+
+        for front in [b"".as_slice(), b"noise \xff\n"] {
+            let mut streaming = StreamingHighlighter::new_with_benchmark(highlighter.clone());
+            assert_eq!(streaming.push(b"caf\xe9 au lait\n"), b"caf\xe9 au lait\n");
+            assert!(
+                streaming
+                    .benchmark_report()
+                    .expect("benchmark enabled")
+                    .first_rule_error()
+                    .is_none()
+            );
+
+            let read = [front, &pathological].concat();
+            let _ = streaming.push(&read);
+            let _ = streaming.push(&read);
+            let failed = streaming
+                .benchmark_report()
+                .expect("benchmark enabled")
+                .first_rule_error()
+                .expect("failed rule recorded");
+            assert_eq!(failed.description, "bounded pathological utf rule");
+            assert_eq!(failed.count, 1, "failed rule must not be retried");
+            assert!(
+                highlighter.try_highlight_bytes(&read).is_err(),
+                "the match limit is still reported"
+            );
+        }
+    }
+
+    // The search of a UTF-mode rule goes on behind a byte that is not UTF-8.
+    // A read that holds nothing else, or that ends in the middle of a
+    // character, has to end the search: each step moves on.
+    #[test]
+    fn utf_rule_search_ends_on_a_read_of_bytes_that_are_not_utf8() {
+        let config = PrismConfig::from_chromaterm_yaml(
+            r##"
+rules:
+  - description: any character
+    regex: '(*UTF).'
+    color: f#ff0000
+  - description: nothing or more
+    regex: '(*UTF)x*'
+    color: f#00ff00
+  - description: behind two characters
+    regex: '(*UTF)(?<=..)y'
+    color: f#0000ff
+  - description: line end
+    regex: '(*UTF)$'
+    color: f#ffff00
+"##,
+        )
+        .expect("config parses");
+        let highlighter = Highlighter::from_config(config).expect("rules compile");
+
+        for unit in [
+            b"\xff".as_slice(),
+            b"\xc3",
+            b"\xe2\x82",
+            b"\xa0",
+            b"\xf8\xa0",
+            b"\xff\n",
+            b"y\xff",
+        ] {
+            for input in [unit.to_vec(), unit.repeat(8192 / unit.len())] {
+                let mut report = super::BenchmarkReport::default();
+                let _ = highlighter.highlight_bytes_with_reset_mode(
+                    &input,
+                    Some(&mut report),
+                    super::ResetMode::Full,
+                );
+                assert!(report.first_rule_error().is_none(), "{unit:02x?}");
+                highlighter
+                    .try_highlight_bytes(&input)
+                    .expect("text that is not UTF-8 is not a match error");
+            }
+        }
     }
 
     #[test]
