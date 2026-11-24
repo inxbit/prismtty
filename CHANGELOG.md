@@ -2,6 +2,51 @@
 
 All notable changes to PrismTTY are documented here.
 
+## 1.3.11 - 2026-11-23
+
+### Security
+
+- In a UTF-8 locale, a control sequence opened by a raw byte `9B` is no
+  longer taken for the program's own. A UTF-8 terminal does not run it: the
+  byte is an invalid one and the rest is text. PrismTTY learned a rendition
+  from it all the same, and the bytes it writes to end a highlight then
+  restored that rendition as a live `ESC [ ... m` the program never sent:
+  `x <9B>8m link up` got `ESC[8m` (conceal) after each highlight. Such a
+  sequence now sets no color, is not treated as a color when a prompt echo
+  is neutralized, and switches no screen (an inert raw `9B ?1049h` used to
+  turn highlighting off for everything after it). The 7-bit form, the
+  two-byte form `C2 9B` and every non-UTF-8 locale are unchanged. Whether
+  the terminal reads UTF-8 stays decided once, at startup; `SECURITY.md`
+  says what that costs when a program switches the terminal out of UTF-8.
+- Output that ends a read in a long run of cut-off escape sequences is no
+  longer dropped. The scan that finds where to cut a read gives up after
+  eight passes; a read that ended in more than eight cut-off controls in a
+  row was carried whole, text included, and thrown away once the carry
+  passed 16 KiB. A crafted 24,586-byte input holding 1,063 lines came out as
+  one line, in default mode, with `--sanitize` and with `--strip-ansi`. The
+  read is now cut in front of the run, so the text before it is written.
+- When that carry passes 16 KiB while a string control (OSC, DCS, SOS, PM or
+  APC) is still open, the rest of the string is discarded up to its
+  terminator. Before, the introducer went with the carry and the payload and
+  its BEL were written as text, also with `--sanitize` and `--strip-ansi`.
+  Not covered: in default mode a string under its own 16 KiB limit that
+  directly follows such a run is dropped in some read splits and passed when
+  it arrives in one read.
+
+### Fixed
+
+- A C0 control inside a color sequence that PrismTTY removes from a prompt's
+  command echo is kept. A terminal runs such a control where it stands; the
+  whole sequence was removed as one unit, so for `host# show ESC[3 LF 1m run`
+  the line feed was lost and the terminal showed one line where the source
+  drew two.
+- The built-in Unix prompt rule (`linux-unix`) and PAN-OS prompt rule
+  (`palo-alto`) stop at a carriage return, as they already did at a line
+  feed. A `user@host:` followed by a carriage return was colored through to
+  a `#`, `$` or `>` later in the same read. For the Unix rule this was also
+  slow: 16 MiB of repeated `a@a:` lines ending in a carriage return took
+  4.7 s and now take 0.8 s.
+
 ## 1.3.10 - 2026-11-21
 
 ### Fixed
