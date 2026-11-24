@@ -2497,6 +2497,70 @@ fn relative_xdg_config_home_is_ignored() {
         .stdout("hello world\n");
 }
 
+// A relative HOME names a directory under wherever prismtty happens to run,
+// just as a relative XDG_CONFIG_HOME does, and was honoured all the same:
+// rules and profiles were loaded from the current directory. It is ignored
+// for these lookups now, as silently as a relative XDG_CONFIG_HOME is. An
+// absolute XDG_CONFIG_HOME still applies beside it.
+#[test]
+fn relative_home_is_ignored_for_config_and_profile_lookup() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let checkout = temp.path().join("checkout");
+    let planted_home = checkout.join("rel");
+    let planted = planted_home.join(".config").join("prismtty");
+    fs::create_dir_all(planted.join("profiles.d")).expect("planted dirs create");
+    fs::write(
+        planted.join("profiles.d").join("planted.yml"),
+        "profile:\n  name: planted\n  inherits: [generic]\nrules: []\n",
+    )
+    .expect("planted profile writes");
+    for config in [
+        planted_home.join(".chromaterm.yml"),
+        planted.join("config.yml"),
+    ] {
+        fs::write(
+            config,
+            "rules:\n  - description: planted\n    regex: world\n    color: f#00ff00\n",
+        )
+        .expect("planted config writes");
+    }
+    let xdg = temp.path().join("xdg");
+    fs::create_dir_all(xdg.join("prismtty").join("profiles.d")).expect("xdg dirs create");
+    fs::write(
+        xdg.join("prismtty").join("profiles.d").join("kept.yml"),
+        "profile:\n  name: kept\n  inherits: [generic]\nrules: []\n",
+    )
+    .expect("xdg profile writes");
+    let relative_home = |args: &[&str]| {
+        let mut cmd = Command::cargo_bin("prismtty").expect("binary exists");
+        cmd.current_dir(&checkout)
+            .env("HOME", "rel")
+            .env_remove("XDG_CONFIG_HOME")
+            .env("PRISMTTY_RUNTIME_DIR", temp.path().join("runtime"))
+            .args(args);
+        cmd
+    };
+
+    relative_home(&["profiles", "list"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("planted").not())
+        .stderr("");
+    relative_home(&[])
+        .write_stdin("hello world\n")
+        .assert()
+        .success()
+        .stdout("hello world\n")
+        .stderr("");
+    relative_home(&["profiles", "list"])
+        .env("XDG_CONFIG_HOME", &xdg)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("kept"))
+        .stdout(predicate::str::contains("planted").not())
+        .stderr("");
+}
+
 // RIS (`ESC c`) resets the terminal, the alternate screen included. Output
 // after it is on the normal screen again, so it is highlighted again.
 #[test]
