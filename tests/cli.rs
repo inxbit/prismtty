@@ -2497,6 +2497,32 @@ fn relative_xdg_config_home_is_ignored() {
         .stdout("hello world\n");
 }
 
+// An empty PRISMTTY_RUNTIME_DIR was taken as the path "", which cannot be
+// created: the session ran without live reload, as it still does, but the
+// reason given was a bare "No such file or directory (os error 2)" that
+// named neither a path nor the variable.
+#[test]
+fn empty_runtime_dir_variable_is_named_as_the_reason_reload_is_off() {
+    let temp = tempfile::tempdir().expect("tempdir");
+
+    isolated("prismtty", temp.path())
+        .current_dir(temp.path())
+        .env("PRISMTTY_RUNTIME_DIR", "")
+        .arg("--no-auto-detect")
+        .write_stdin("hello\n")
+        .assert()
+        .success()
+        .stdout("hello\n")
+        .stderr(
+            "prismtty: live reload disabled for this session: PRISMTTY_RUNTIME_DIR is set but empty (unset it or set it to a directory)\n",
+        );
+    let left: Vec<_> = fs::read_dir(temp.path())
+        .expect("directory reads")
+        .map(|entry| entry.expect("entry reads").file_name())
+        .collect();
+    assert!(left.is_empty(), "something was created: {left:?}");
+}
+
 // A relative HOME names a directory under wherever prismtty happens to run,
 // just as a relative XDG_CONFIG_HOME does, and was honoured all the same:
 // rules and profiles were loaded from the current directory. It is ignored

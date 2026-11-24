@@ -263,6 +263,14 @@ fn ensure_private_runtime_dir(dir: &Path) -> io::Result<()> {
 /// could plant `pids.d` or a `reload` marker in it.
 #[cfg(unix)]
 fn ensure_user_runtime_dir(dir: &Path) -> io::Result<()> {
+    if dir.as_os_str().is_empty() {
+        // An empty value names no directory. Looked up, it fails with an
+        // error that has no path to show and does not mention the variable.
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "PRISMTTY_RUNTIME_DIR is set but empty (unset it or set it to a directory)",
+        ));
+    }
     let metadata = match fs::symlink_metadata(dir) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
@@ -473,6 +481,22 @@ mod tests {
             .expect("pid file registers");
 
         assert_eq!(mode(&runtime), 0o700);
+    }
+
+    // An empty override is no directory at all. Both the session and the
+    // reload request say so instead of passing on the error of a path lookup
+    // that has no path to name.
+    #[cfg(unix)]
+    #[test]
+    fn empty_user_supplied_runtime_dir_is_refused_by_name() {
+        let expected = "PRISMTTY_RUNTIME_DIR is set but empty (unset it or set it to a directory)";
+
+        let error = super::register_pid_file("".as_ref(), super::DirOrigin::Override, 42)
+            .expect_err("an empty path is refused");
+        assert_eq!(error.to_string(), expected);
+        let error = super::request_reload_in_dir("".as_ref(), super::DirOrigin::Override, |_| true)
+            .expect_err("an empty path is refused");
+        assert_eq!(error.to_string(), expected);
     }
 
     // An unusable TMPDIR used to surface as a bare "Permission denied" with
