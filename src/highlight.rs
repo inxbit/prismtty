@@ -3093,9 +3093,8 @@ fn alternate_screen_command(bytes: &[u8]) -> Option<bool> {
         return None;
     }
     let (modes, enable) = private_mode_sequence(bytes)?;
-    let has_alternate_screen_mode = modes
-        .split(|byte| *byte == b';')
-        .any(|mode| matches!(private_mode_number(mode), 47 | 1047 | 1049));
+    let has_alternate_screen_mode =
+        private_mode_numbers(&modes).any(|mode| matches!(mode, 47 | 1047 | 1049));
     has_alternate_screen_mode.then_some(enable)
 }
 
@@ -3418,9 +3417,7 @@ fn saves_rendition(bytes: &[u8]) -> bool {
     saves_cursor(bytes)
         || pushes_rendition(bytes)
         || private_mode_sequence(bytes).is_some_and(|(modes, set)| {
-            set && modes
-                .split(|byte| *byte == b';')
-                .any(|mode| matches!(private_mode_number(mode), 1048 | 1049))
+            set && private_mode_numbers(&modes).any(|mode| matches!(mode, 1048 | 1049))
         })
 }
 
@@ -3543,8 +3540,8 @@ impl NativeSgrState {
             }
             _ => match private_mode_sequence(bytes) {
                 Some((modes, set)) => {
-                    for mode in modes.split(|byte| *byte == b';') {
-                        match (private_mode_number(mode), set) {
+                    for mode in private_mode_numbers(&modes) {
+                        match (mode, set) {
                             (1048, true) => self.save(),
                             (1048, false) => self.restore(),
                             (1049, true) => {
@@ -3645,20 +3642,35 @@ fn private_mode_sequence(bytes: &[u8]) -> Option<(Cow<'_, [u8]>, bool)> {
     ))
 }
 
-/// The number that the digits of one mode of `private_mode_sequence` spell,
-/// as a terminal reads it: `01049` is 1049. It is capped at 65535 as xterm
-/// caps a parameter, so a longer number is no other mode. Only the zeros in
-/// front and five digits behind them are looked at, however long the mode.
+/// The modes of `private_mode_sequence` as the numbers xterm reads. It keeps
+/// `XTERM_MAX_CSI_PARAMETERS` of them; past those it ignores each `;` and
+/// reads the digits on into the last one, so a later parameter is no mode of
+/// its own: behind 29 others, `1;01049` is 101049 and `10;49` is 1049.
+fn private_mode_numbers(modes: &[u8]) -> impl Iterator<Item = u32> + '_ {
+    modes
+        .splitn(XTERM_MAX_CSI_PARAMETERS, |byte| *byte == b';')
+        .map(private_mode_number)
+}
+
+/// The number that the digits of one mode spell, as a terminal reads it:
+/// `01049` is 1049. A `;` among them, which only the last mode that xterm
+/// keeps can hold, is skipped. The number is capped at 65535 as xterm caps a
+/// parameter, so a longer number is no other mode. Only the zeros in front
+/// and six digits behind them are looked at, however long the mode.
 fn private_mode_number(mode: &[u8]) -> u32 {
-    let zeros = mode.iter().take_while(|digit| **digit == b'0').count();
-    let digits = &mode[zeros..];
-    if digits.len() > 5 {
-        return 65_535;
-    }
-    digits
+    let mut digits = mode
         .iter()
-        .fold(0, |number, digit| number * 10 + u32::from(digit - b'0'))
-        .min(65_535)
+        .filter(|byte| **byte != b';')
+        .skip_while(|digit| **digit == b'0');
+    let number = digits
+        .by_ref()
+        .take(5)
+        .fold(0, |number, digit| number * 10 + u32::from(digit - b'0'));
+    if digits.next().is_some() {
+        65_535
+    } else {
+        number.min(65_535)
+    }
 }
 
 /// The colors and attributes that SGR sequences have set.
@@ -10431,6 +10443,126 @@ rules:
         let encoded = super::alternate_screen_command(b"\xc2\x9b?01049h");
         super::TERMINAL_READS_UTF8_IN_THIS_THREAD.with(|switch| switch.set(None));
         assert_eq!((raw, encoded), (None, Some(true)));
+    }
+
+    // xterm keeps 30 parameters. Past them it ignores each `;` and reads the
+    // digits on into the 30th, so a 31st parameter is not a mode of its own:
+    // behind 29 others, `1;01049` is 101049, which is no mode, and `10;49`
+    // is 1049. Reading a 31st parameter as a mode would switch screens, and
+    // save or restore the rendition, where the terminal does neither.
+    #[test]
+    fn private_modes_past_the_thirtieth_run_on_into_it() {
+        let sequence = |front: usize, modes: &str, last: char| {
+            format!("\x1b[?{}{modes}{last}", "0;".repeat(front)).into_bytes()
+        };
+        for (modes, switches) in [
+            ("1;01049", false),
+            ("1;1049", false),
+            ("1049;5", false),
+            ("1049;0", false),
+            ("25;1047", false),
+            ("3;47", false),
+            ("0;1049", true),
+            (";1049", true),
+            ("0;0;0;01049", true),
+            ("10;49", true),
+            ("1;0;4;9", true),
+            ("104;7", true),
+            ("4;7", true),
+            ("1049", true),
+            ("1049;", true),
+            ("01049;;", true),
+        ] {
+            assert_eq!(
+                super::alternate_screen_command(&sequence(29, modes, 'h')),
+                switches.then_some(true),
+                "29 parameters, then {modes}"
+            );
+            assert_eq!(
+                super::alternate_screen_command(&sequence(29, modes, 'l')),
+                switches.then_some(false),
+                "29 parameters, then {modes}"
+            );
+        }
+        // In front of the 30th, each parameter is a mode of its own.
+        for (front, modes) in [(28, "1049;5"), (0, "1049;1;2"), (28, "47;1;01049")] {
+            assert_eq!(
+                super::alternate_screen_command(&sequence(front, modes, 'h')),
+                Some(true),
+                "{front} parameters, then {modes}"
+            );
+        }
+
+        for (modes, saves) in [
+            ("1;01048", false),
+            ("1048;5", false),
+            ("1;01049", false),
+            ("0;1048", true),
+            ("10;48", true),
+            ("1048", true),
+        ] {
+            assert_eq!(
+                super::saves_rendition(&sequence(29, modes, 'h')),
+                saves,
+                "29 parameters, then {modes}"
+            );
+        }
+
+        let rendition = |input: &[u8]| {
+            let mut state = NativeSgrState::default();
+            for token in super::tokenize_ansi(input) {
+                if let super::Token::Ansi(sequence) = token {
+                    state.apply_sequence(&sequence);
+                }
+            }
+            state.ansi_start()
+        };
+        let stream = |save: &str, restore: &str| {
+            [
+                b"\x1b[33m".as_slice(),
+                &sequence(29, save, 'h'),
+                b"\x1b[31m",
+                &sequence(29, restore, 'l'),
+            ]
+            .concat()
+        };
+        for (save, restore, expected) in [
+            // Nothing is saved and nothing restored: the last color stays.
+            ("1;01048", "1;01048", Some("\x1b[31m")),
+            ("1;01049", "1;01049", Some("\x1b[31m")),
+            // A real save is not restored by a 31st parameter.
+            ("1048", "1;01048", Some("\x1b[31m")),
+            // Digits that run on into mode 1048 save and restore.
+            ("10;48", "0;1048", Some("\x1b[33m")),
+            ("1049", "104;9", Some("\x1b[33m")),
+        ] {
+            assert_eq!(
+                rendition(&stream(save, restore)).as_deref(),
+                expected,
+                "saved by {save}, restored by {restore}"
+            );
+        }
+
+        // The stream behind a 31st parameter is not on another screen.
+        let config = PrismConfig::from_chromaterm_yaml(
+            "rules:\n  - description: up\n    regex: '\\bup\\b'\n    color: f#00ff00\n",
+        )
+        .expect("config parses");
+        let highlighter = Highlighter::from_config(config).expect("rule compiles");
+        let colors = |modes: &str| {
+            let mut input = b"before up\n".to_vec();
+            input.extend_from_slice(&sequence(29, modes, 'h'));
+            input.extend_from_slice(b"frame up\n");
+            let mut streaming = StreamingHighlighter::new(highlighter.clone());
+            let mut output = streaming.push(&input);
+            output.extend(streaming.finish());
+            output
+                .windows(4)
+                .filter(|window| window == b"\x1b[38")
+                .count()
+        };
+        assert_eq!(colors("1;01049"), colors("1;0"));
+        assert_eq!(colors("10;49"), colors("1049"));
     }
 
     // Whatever a stream does with its highlighting when the program
