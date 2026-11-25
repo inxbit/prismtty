@@ -1364,3 +1364,18 @@ test('releases are listed where drafts can be seen, before anything is uploaded'
     /- name: Publish release\n(?: {8}.*\n)* {10}draft: false\n/,
   );
 });
+
+// The steps that publish run in a protected environment, so a tag alone does
+// not publish: the environment's reviewer has to approve the job, and the
+// registry accepts only a token minted for that environment. No other job
+// names an environment, so nothing else waits for an approval.
+test('only the publishing job runs in the protected release environment', () => {
+  const workflow = read('.github/workflows/release.yml');
+  const publication = jobBody(workflow, 'release-publish');
+
+  assert.match(publication, /\n {4}environment: release\n/);
+  assert.equal(workflow.split(/\n\s+environment:/).length - 1, 1);
+  for (const step of ['Attest release artifacts', 'Publish release', 'Publish crate']) {
+    assert.ok(publication.includes(`- name: ${step}`), `${step} is in the publishing job`);
+  }
+});
