@@ -1118,3 +1118,249 @@ test('release packaging leaves a file that ends inside its header to the other c
     assert.ok(result.wroteArchive, `${target}: no archive was written`);
   }
 });
+
+// Stands in for curl against the GitHub release listing: page N of the
+// listing is the file N.json in FAKE_RELEASE_PAGES, and a page that has no
+// file is an empty list. Every request is logged.
+function writeFakeReleaseListing(directory) {
+  const path = `${directory}/curl`;
+  writeFileSync(
+    path,
+    `#!/usr/bin/env bash
+set -euo pipefail
+output=""
+url=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --output)
+      output="$2"
+      shift 2
+      ;;
+    --write-out | --header | --retry)
+      shift 2
+      ;;
+    --*)
+      shift
+      ;;
+    *)
+      url="$1"
+      shift
+      ;;
+  esac
+done
+printf '%s\\n' "$url" >> "$FAKE_RELEASE_PAGES/requests.log"
+page="\${url##*&page=}"
+if [[ -f "$FAKE_RELEASE_PAGES/$page.json" ]]; then
+  cp "$FAKE_RELEASE_PAGES/$page.json" "$output"
+else
+  printf '[]' > "$output"
+fi
+printf '%s' "$FAKE_CURL_STATUS"
+`,
+  );
+  chmodSync(path, 0o755);
+}
+
+// Runs the step that checks the releases GitHub already holds for the tag
+// against the artifacts about to be published. `pages` is the release
+// listing, one array of releases per page.
+function verifyExistingReleases(pages, { status = '200' } = {}) {
+  const workflow = read('.github/workflows/release.yml');
+  const directory = mkdtempSync(`${tmpdir()}/prismtty-existing-release-`);
+  const artifactDirectory = `${directory}/validated-release/release-artifacts`;
+  const fakeBin = `${directory}/bin`;
+  const listing = `${directory}/listing`;
+  try {
+    mkdirSync(artifactDirectory, { recursive: true });
+    mkdirSync(fakeBin);
+    mkdirSync(listing);
+    writeFakeReleaseListing(fakeBin);
+    writeFileSync(`${artifactDirectory}/one.txt`, 'one\n');
+    writeFileSync(`${artifactDirectory}/two.txt`, 'two\n');
+    writeFileSync(`${directory}/validated-release/release-artifacts.manifest`, 'one.txt\ntwo.txt\n');
+    pages.forEach((page, index) => {
+      writeFileSync(`${listing}/${index + 1}.json`, typeof page === 'string' ? page : JSON.stringify(page));
+    });
+    const result = runStep(workflow, 'Verify every GitHub release for the tag, drafts included', {
+      RUNNER_TEMP: directory,
+      GITHUB_REF_NAME: 'v1.2.3',
+      GITHUB_REPOSITORY: 'inxbit/prismtty',
+      GH_TOKEN: 'test-token',
+      PATH: `${fakeBin}:${process.env.PATH}`,
+      FAKE_RELEASE_PAGES: listing,
+      FAKE_CURL_STATUS: status,
+    });
+    const requests = read(`${listing}/requests.log`).split('\n').filter(Boolean);
+    return { status: result.status, stderr: result.stderr, stdout: result.stdout, requests };
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+}
+
+const digestOf = (contents) => `sha256:${createHash('sha256').update(contents).digest('hex')}`;
+const release = (assets, fields = {}) => ({ id: 7, tag_name: 'v1.2.3', draft: false, assets, ...fields });
+const otherRelease = (number) => ({
+  id: 1000 + number,
+  tag_name: `v0.0.${number}`,
+  draft: false,
+  assets: [{ name: 'unexpected.txt', digest: digestOf('other\n') }],
+});
+
+test('every listed release for the tag must hold an exact matching subset of the assets', () => {
+  let result = verifyExistingReleases([[release([{ name: 'one.txt', digest: digestOf('one\n') }])]]);
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+  assert.deepEqual(result.requests, [
+    'https://api.github.com/repos/inxbit/prismtty/releases?per_page=100&page=1',
+  ]);
+
+  result = verifyExistingReleases([[release([{ name: 'unexpected.txt', digest: digestOf('one\n') }])]]);
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /unexpected release asset/);
+
+  result = verifyExistingReleases([[release([{ name: 'one.txt', digest: `sha256:${'0'.repeat(64)}` }])]]);
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /digest mismatch/);
+
+  // No release for the tag yet: nothing to compare. Releases of other tags
+  // are not this run's business.
+  result = verifyExistingReleases([[]]);
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+  result = verifyExistingReleases([[otherRelease(1), otherRelease(2)]]);
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+});
+
+test('a draft release for the tag is held to the same asset check', () => {
+  // GitHub answers the lookup by tag only for a published release, so a
+  // draft passed the earlier check unseen, and the upload step then added the
+  // artifacts to it and published it with whatever it already held.
+  let result = verifyExistingReleases([
+    [release([{ name: 'notes.txt', digest: digestOf('notes\n') }], { draft: true })],
+  ]);
+  assert.notEqual(result.status, 0, 'a draft holding an extra asset passed');
+  assert.match(result.stderr, /unexpected release asset: notes\.txt/);
+
+  result = verifyExistingReleases([
+    [release([{ name: 'one.txt', digest: `sha256:${'0'.repeat(64)}` }], { draft: true })],
+  ]);
+  assert.notEqual(result.status, 0, 'a draft holding an altered asset passed');
+  assert.match(result.stderr, /digest mismatch/);
+
+  // What an upload that died half-way leaves behind: the rerun goes on.
+  result = verifyExistingReleases([
+    [release([{ name: 'one.txt', digest: digestOf('one\n') }], { draft: true })],
+  ]);
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+});
+
+test('an empty asset left by a failed upload does not block the rerun', () => {
+  // An upload that GitHub answers with an error can leave the name behind in
+  // the release with nothing in it. The upload step replaces an asset of the
+  // same name, so the rerun has to get that far.
+  const leftover = (fields = {}) => ({ name: 'one.txt', state: 'starter', size: 0, digest: null, ...fields });
+  for (const draft of [true, false]) {
+    const result = verifyExistingReleases([
+      [release([leftover(), { name: 'two.txt', state: 'uploaded', size: 4, digest: digestOf('two\n') }], { draft })],
+    ]);
+    assert.equal(result.status, 0, result.stderr || result.stdout);
+  }
+
+  // Only that: a name outside the artifacts, a finished upload, or anything
+  // that holds bytes or a digest is still held to the rule.
+  for (const [asset, said] of [
+    [leftover({ name: 'notes.txt' }), /unexpected release asset: notes\.txt/],
+    [leftover({ state: 'uploaded' }), /digest mismatch for one\.txt/],
+    [leftover({ size: 4 }), /digest mismatch for one\.txt/],
+    [leftover({ digest: `sha256:${'0'.repeat(64)}` }), /digest mismatch for one\.txt/],
+    [{ name: 'one.txt', digest: null }, /digest mismatch for one\.txt/],
+  ]) {
+    const result = verifyExistingReleases([[release([asset], { draft: true })]]);
+    assert.notEqual(result.status, 0, `${JSON.stringify(asset)} passed`);
+    assert.match(result.stderr, said);
+  }
+});
+
+test('a release for the tag that does not list its assets is refused', () => {
+  for (const assets of [undefined, null, 'one.txt', { name: 'one.txt' }]) {
+    const result = verifyExistingReleases([[release(assets, { draft: true })]]);
+    assert.notEqual(result.status, 0, `assets ${JSON.stringify(assets)} passed`);
+    assert.match(result.stderr, /release 7 for v1\.2\.3 does not list its assets/);
+  }
+  // A release of another tag is not read that far.
+  const result = verifyExistingReleases([[{ id: 9, tag_name: 'v0.0.1', draft: true }]]);
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+});
+
+test('more than one release for the tag is refused', () => {
+  const result = verifyExistingReleases([
+    [
+      release([{ name: 'one.txt', digest: digestOf('one\n') }]),
+      release([], { id: 8, draft: true }),
+    ],
+  ]);
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /2 releases carry the tag v1\.2\.3: published release 7, draft release 8/);
+});
+
+test('the release listing is read to its last page', () => {
+  const fullPage = Array.from({ length: 100 }, (_, index) => otherRelease(index));
+  let result = verifyExistingReleases([
+    fullPage,
+    [release([{ name: 'unexpected.txt', digest: digestOf('one\n') }], { draft: true })],
+  ]);
+  assert.notEqual(result.status, 0, 'a release on the second page was not checked');
+  assert.match(result.stderr, /unexpected release asset/);
+  assert.deepEqual(
+    result.requests.map((url) => url.replace(/^.*&page=/, '')),
+    ['1', '2'],
+  );
+
+  // A full last page is followed by one more request, which comes back empty.
+  result = verifyExistingReleases([fullPage]);
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+  assert.equal(result.requests.length, 2);
+
+  // A listing that never ends is given up on, not followed forever.
+  result = verifyExistingReleases(Array(101).fill(fullPage));
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /more than 10000 releases/);
+  assert.equal(result.requests.length, 100);
+});
+
+test('a release listing that cannot be read fails the release', () => {
+  // The repository is there, so a listing that is not served is an error.
+  // Only on the lookup by tag does 404 mean that no release exists yet.
+  for (const status of ['404', '401', '500']) {
+    const result = verifyExistingReleases([[]], { status });
+    assert.notEqual(result.status, 0, `HTTP ${status} passed`);
+    assert.match(result.stderr, new RegExp(`GitHub release listing failed with HTTP ${status}`));
+  }
+  for (const body of ['{"message":"Not Found"}', '[7]', 'not json']) {
+    const result = verifyExistingReleases([body]);
+    assert.notEqual(result.status, 0, `${body} passed`);
+  }
+});
+
+test('releases are listed where drafts can be seen, before anything is uploaded', () => {
+  const workflow = read('.github/workflows/release.yml');
+  const step = '- name: Verify every GitHub release for the tag, drafts included';
+  const publication = jobBody(workflow, 'release-publish');
+
+  // GitHub lists draft releases only for a token that may write.
+  assert.equal(workflow.split(step).length - 1, 1);
+  assert.ok(publication.includes(step), 'the listing is read in the publishing job');
+  assert.match(publication, /permissions:\n\s+contents: write\n/);
+  for (const later of ['Seal exact release artifact set', 'Attest release artifacts', 'Publish release']) {
+    assert.ok(
+      publication.indexOf(step) < publication.indexOf(`- name: ${later}`),
+      `the listing is read before the step ${later}`,
+    );
+  }
+  // The lookup by tag stays as the early check on a published release.
+  assert.ok(
+    jobBody(workflow, 'release-validation').includes('- name: Verify existing GitHub release assets'),
+  );
+  assert.match(
+    publication,
+    /- name: Publish release\n(?: {8}.*\n)* {10}draft: false\n/,
+  );
+});

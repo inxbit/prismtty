@@ -400,6 +400,128 @@ jobs:
           name: validated-release-artifacts
           path: ${{ runner.temp }}/validated-release
 
+      - name: Verify every GitHub release for the tag, drafts included
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          bundle_dir="${RUNNER_TEMP}/validated-release"
+          EXPECTED_TAG="$GITHUB_REF_NAME" python3 - \
+            "${bundle_dir}/release-artifacts.manifest" "${bundle_dir}/release-artifacts" \
+            "${RUNNER_TEMP}/github-releases.json" <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import subprocess
+          import sys
+
+          # The upload step below finds a release for this tag by listing the
+          # releases, drafts included, then adds to the one it finds and
+          # publishes it. The earlier check asks for the release by its tag,
+          # and GitHub answers that only for a published one, so every
+          # release is listed here and held to the same rule. GitHub lists
+          # drafts only for a token that may write to the repository, which
+          # is why this runs in the publishing job.
+          PER_PAGE = 100
+          MOST_PAGES = 100
+
+          manifest_path, artifact_dir, response_path = map(Path, sys.argv[1:])
+          expected_tag = os.environ["EXPECTED_TAG"]
+
+
+          def listed(page):
+              url = (
+                  f"https://api.github.com/repos/{os.environ['GITHUB_REPOSITORY']}"
+                  f"/releases?per_page={PER_PAGE}&page={page}"
+              )
+              status = subprocess.run(
+                  [
+                      "curl", "--silent", "--show-error", "--location",
+                      "--retry", "3", "--retry-all-errors",
+                      "--header", "Accept: application/vnd.github+json",
+                      "--header", f"Authorization: Bearer {os.environ['GH_TOKEN']}",
+                      "--header", "X-GitHub-Api-Version: 2022-11-28",
+                      "--output", str(response_path), "--write-out", "%{http_code}",
+                      url,
+                  ],
+                  check=True,
+                  stdout=subprocess.PIPE,
+                  encoding="utf-8",
+              ).stdout
+              if status != "200":
+                  raise SystemExit(
+                      f"GitHub release listing failed with HTTP {status}.\n"
+                      f"{response_path.read_text(encoding='utf-8', errors='replace')}"
+                  )
+              with response_path.open(encoding="utf-8") as response_file:
+                  releases = json.load(response_file)
+              if not isinstance(releases, list) or not all(
+                  isinstance(release, dict) for release in releases
+              ):
+                  raise SystemExit("GitHub release listing is not a list of releases")
+              return releases
+
+
+          matching = []
+          for page in range(1, MOST_PAGES + 1):
+              releases = listed(page)
+              matching += [
+                  release for release in releases if release.get("tag_name") == expected_tag
+              ]
+              if len(releases) < PER_PAGE:
+                  break
+          else:
+              raise SystemExit(f"GitHub lists more than {PER_PAGE * MOST_PAGES} releases")
+          if len(matching) > 1:
+              raise SystemExit(
+                  f"{len(matching)} releases carry the tag {expected_tag}: "
+                  + ", ".join(
+                      f"{'draft' if release.get('draft') else 'published'} "
+                      f"release {release.get('id')}"
+                      for release in matching
+                  )
+              )
+
+          expected_names = [
+              line for line in manifest_path.read_text(encoding="utf-8").splitlines() if line
+          ]
+          if len(expected_names) != len(set(expected_names)):
+              raise SystemExit("release artifact manifest contains duplicate names")
+          expected = set(expected_names)
+          for release in matching:
+              assets = release.get("assets")
+              if not isinstance(assets, list):
+                  raise SystemExit(
+                      f"release {release.get('id')} for {expected_tag} does not list its assets"
+                  )
+              seen = set()
+              for asset in assets:
+                  name = asset.get("name")
+                  if not isinstance(name, str) or name in seen:
+                      raise SystemExit(f"duplicate or invalid release asset: {name!r}")
+                  seen.add(name)
+                  if name not in expected:
+                      raise SystemExit(f"unexpected release asset: {name}")
+                  # An upload that failed can leave its name in the release
+                  # with nothing behind it: not uploaded, no bytes, no digest.
+                  # The upload step deletes an asset of the same name before
+                  # it uploads, so this one is its to replace.
+                  if (
+                      asset.get("state") != "uploaded"
+                      and asset.get("size") == 0
+                      and asset.get("digest") is None
+                  ):
+                      continue
+                  local_digest = hashlib.sha256((artifact_dir / name).read_bytes()).hexdigest()
+                  remote_digest = asset.get("digest")
+                  if remote_digest != f"sha256:{local_digest}":
+                      raise SystemExit(
+                          f"release asset digest mismatch for {name}: "
+                          f"remote={remote_digest!r} local='sha256:{local_digest}'"
+                      )
+          PY
+
       - name: Seal exact release artifact set
         id: release-artifacts
         run: |
@@ -441,6 +563,7 @@ jobs:
         uses: softprops/action-gh-release@8a0cd651e5b2365bd640854a3fa5dfc70e4875f3 # v3.0.4
         with:
           tag_name: ${{ github.ref_name }}
+          draft: false
           overwrite_files: true
           fail_on_unmatched_files: true
           files: ${{ steps.release-artifacts.outputs.paths }}
