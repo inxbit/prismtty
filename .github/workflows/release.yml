@@ -379,6 +379,10 @@ jobs:
     runs-on: ubuntu-24.04
     needs: release-validation
     if: startsWith(github.ref, 'refs/tags/')
+    # A tag alone does not publish. The environment has a required reviewer
+    # and accepts only `v*` tags, and the registry's trusted publisher is tied
+    # to it, so a commit that drops this line cannot publish the crate.
+    environment: release
     permissions:
       contents: write
       id-token: write
