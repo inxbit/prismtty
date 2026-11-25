@@ -904,6 +904,8 @@ struct CompiledRule {
     identity: RuleIdentity,
     description: String,
     regex: Regex,
+    /// Whether what the rule matches depends on where its search starts.
+    search_start_matters: bool,
     style: CompiledStyle,
     exclusive: bool,
 }
@@ -2548,6 +2550,9 @@ fn compile_rule(
         identity,
         description,
         regex,
+        search_start_matters: SEARCH_START_ITEMS
+            .iter()
+            .any(|item| rule.regex.contains(item)),
         style,
         exclusive: rule.exclusive,
     })
@@ -2780,6 +2785,16 @@ fn match_rule(
             // can succeed, so go on behind it. When the text from here on
             // is valid, PCRE2 has read back over such a byte for a
             // lookbehind: try the next byte.
+            //
+            // A rule whose match depends on where its search starts would
+            // match right behind the byte what it matches nowhere else in
+            // the middle of a read, so it is not searched there.
+            Err(error)
+                if PCRE2_ERROR_UTF8_INVALID.contains(&error.code())
+                    && rule.search_start_matters =>
+            {
+                break;
+            }
             Err(error) if PCRE2_ERROR_UTF8_INVALID.contains(&error.code()) => {
                 let valid_from = *valid_tail.get_or_insert_with(|| {
                     let mut valid_from = last_end;
@@ -2845,6 +2860,14 @@ fn match_rule(
 /// PCRE2's error code for a search started inside a UTF-8 character, which
 /// only a rule in UTF mode reports.
 const PCRE2_ERROR_BADUTFOFFSET: i32 = -36;
+
+/// What in the text of a rule makes its match depend on where the search
+/// starts: `\G` is true there, `(*NOTEMPTY_ATSTART)` refuses an empty match
+/// there, and after `(*COMMIT)` a failure ends the search for every later
+/// start. Text that only looks like one of these, such as an escaped
+/// backslash in front of a `G`, counts too: that errs on the side of not
+/// searching behind an invalid byte.
+const SEARCH_START_ITEMS: [&str; 3] = ["\\G", "NOTEMPTY_ATSTART", "(*COMMIT"];
 
 /// PCRE2's error codes for text that is not valid UTF-8, from
 /// `PCRE2_ERROR_UTF8_ERR21` to `PCRE2_ERROR_UTF8_ERR1`, which only a rule in
@@ -5727,6 +5750,87 @@ rules:
                     .try_highlight_bytes(&input)
                     .expect("text that is not UTF-8 is not a match error");
             }
+        }
+    }
+
+    // Going on behind a byte that is not UTF-8 starts a search in the middle
+    // of the read. A rule whose match depends on where its search starts
+    // would then match there and nowhere else like it: `\G` is true at that
+    // point, an empty match is refused there, and a `(*COMMIT)` that an
+    // earlier part of the read would have reached is not. Such a rule gets
+    // no color in a read that holds such a byte, and stays switched on.
+    #[test]
+    fn utf_rule_that_depends_on_its_search_start_is_not_searched_behind_an_invalid_byte() {
+        for (regex, invalid_reads, valid_read) in [
+            (
+                r"(*UTF)\Gx",
+                [b"\xffx\n".as_slice(), b"\xff x\n", b"x\xffx\n"].as_slice(),
+                b"xx ax\n".as_slice(),
+            ),
+            (
+                r"(*UTF)\Gfoo\Kbar",
+                [b"\xfffoobar\n".as_slice(), b"noise \xff\nfoobar\n"].as_slice(),
+                b"foobar afoobar\n",
+            ),
+            (
+                r"(*UTF)(*NOTEMPTY_ATSTART)(?:|foo)",
+                [b"\xfffoo foo\n".as_slice(), b"\xff foo\n"].as_slice(),
+                b"foo foo\n",
+            ),
+            (
+                r"(*UTF)x(*COMMIT)y",
+                [b"xa \xff xy\n".as_slice(), b"\xffxy\n"].as_slice(),
+                b"xy xa xy\n",
+            ),
+            (
+                r"(*UTF)(*NO_START_OPT)(*COMMIT)x",
+                [b"\xffx\n".as_slice(), b"a\xff x\n"].as_slice(),
+                b"x ax\n",
+            ),
+        ] {
+            let config = PrismConfig::from_chromaterm_yaml(&format!(
+                "rules:\n  - description: start\n    regex: '{regex}'\n    color: f#ff0000\n  \
+                 - description: plain\n    regex: '(*UTF)z'\n    color: f#00ff00\n"
+            ))
+            .expect("config parses");
+            let highlighter = Highlighter::from_config(config).expect("rules compile");
+            let colored = StreamingHighlighter::new(highlighter.clone()).push(valid_read);
+            assert!(
+                colored.windows(2).any(|window| window == b"\x1b["),
+                "{regex}: {colored:02x?}"
+            );
+
+            let mut streaming = StreamingHighlighter::new_with_benchmark(highlighter.clone());
+            for invalid in invalid_reads {
+                assert_eq!(
+                    &streaming.push(invalid),
+                    invalid,
+                    "{regex} on {invalid:02x?}"
+                );
+                highlighter
+                    .try_highlight_bytes(invalid)
+                    .expect("text that is not UTF-8 is not a match error");
+                assert_eq!(
+                    streaming.push(valid_read),
+                    colored,
+                    "{regex} after {invalid:02x?}"
+                );
+            }
+            assert!(
+                streaming
+                    .benchmark_report()
+                    .expect("benchmark enabled")
+                    .first_rule_error()
+                    .is_none(),
+                "{regex}"
+            );
+            // A rule beside it that does not depend on its search start is
+            // still searched behind the byte.
+            let behind = streaming.push(b"z \xff z\n");
+            assert!(
+                behind.starts_with(b"z \xff \x1b["),
+                "{regex}: {behind:02x?}"
+            );
         }
     }
 
