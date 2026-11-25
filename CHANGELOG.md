@@ -2,6 +2,87 @@
 
 All notable changes to PrismTTY are documented here.
 
+## 1.3.12 - 2026-11-25
+
+### Security
+
+- A relative home directory is ignored when PrismTTY looks for its
+  configuration and profiles, as a relative `XDG_CONFIG_HOME` already was.
+  With `HOME=somedir`, `~/.chromaterm.yml` and `~/.config/prismtty/profiles.d`
+  were read from the current directory. Now every home-derived location is
+  skipped, silently; an absolute `XDG_CONFIG_HOME`, `/etc/chromaterm` and
+  `-c` still apply. This also covers a relative home returned by the account
+  database when `HOME` is unset or empty.
+- After a single shift (`ESC N`, `ESC O` or their C1 forms), each C0 control
+  made the escape scanner walk back over the bytes it had buffered. A crafted
+  50 MiB input took 147 s and now takes 0.86 s; the output is the same in
+  default mode, with `--sanitize` and with `--strip-ansi`.
+
+### Fixed
+
+- A `not` that is drawn before its next word is drawn in the bad-state
+  color. `status not connected` cut between `not ` and `connected`, by the
+  end of a read or because `connected` was held back as the last word of a
+  read, was drawn as a plain `not` and a green `connected`; the phrase is
+  red when it arrives whole. The built-in bad-state rule now also matches a
+  `not` followed by blanks or hyphens at the end of the text being matched.
+  The green `connected` after it stays, and nothing changes about when text
+  is drawn. The rule cannot see why the text ended, so a `not` is red
+  wherever it ends a matched piece, whatever follows: a read that ends right
+  after it or inside the next word (`file not ` then `found`), a last line
+  without a line end, and on a terminal a line that ends in `not ` or
+  `not-`. At a shell prompt that includes a pasted multi-line command with a
+  line ending there, and a long command that wraps right after the letters
+  `not`, also inside a word such as `notable`. On 2.7 MB of manual pages
+  with 2,432 such phrases, 2 are red from a file and 14 in a terminal burst.
+  The generic profile keeps its nine rules; its pattern text grows by 15
+  bytes, which counts toward the 262,144-byte limit shared with your own
+  rules.
+- One invalid byte in the output no longer switches a `(*UTF)` rule off for
+  the rest of the session. PCRE2 refuses a subject that is not UTF-8, and a
+  rule that fails is switched off; a stray byte from line noise or a binary
+  file did that to every UTF-mode rule. The rule now stays on, and in the
+  read that holds the byte the search goes on behind the last invalid byte.
+  A rule whose match depends on where the search starts (its text contains
+  `\G`, `NOTEMPTY_ATSTART` or `(*COMMIT`) is not searched behind the byte,
+  so it cannot color what it does not match. For such input there is no
+  "stopped after a match error" warning, `--benchmark` counts no match
+  error, and the library's fallible calls return `Ok`. A match-limit error
+  still switches a rule off. This does not make UTF-mode rules work on
+  output that is mostly not UTF-8; byte-mode rules, the default, are the
+  choice there.
+- The alternate-screen and save modes (47, 1047, 1048, 1049) are read as
+  numbers, so `CSI ? 01049 h` is the switch. The parameter list follows
+  xterm's 30 slots: past the 30th, digits run on into it across semicolons.
+- A configuration refused for a reason that is not a regex (too many rules
+  or pattern bytes; a color naming a capture group its pattern lacks) is
+  reported in its own words. It was printed as a rule that failed to
+  compile, with the message as the rule's name and an invented PCRE2 error.
+  Real compile errors are unchanged. `HighlightError` keeps its one variant
+  and two fields.
+- `PRISMTTY_RUNTIME_DIR` set to an empty value is named as the reason live
+  reload is off for the session, instead of "No such file or directory".
+
+### Documentation
+
+- Both READMEs name the system temporary directory as the default place of
+  the runtime directory (`$TMPDIR` when set, `/tmp` on Linux without it),
+  and say that only sessions watching the same runtime directory see a
+  reload request.
+
+### Release and QA
+
+- `scripts/package-release.sh` refuses a binary that does not load the
+  system's PCRE2. The README says the release binaries load PCRE2 at run
+  time; when `pkg-config` does not find `libpcre2-8`, `pcre2-sys` builds its
+  bundled copy in without a word, and such a build passed every check.
+- The release workflow checks draft releases for the tag before it
+  publishes. The existing check asks for the published release by tag and
+  cannot see a draft; the publish action reuses an existing draft and
+  publishes what it holds. A second step in the publish job lists every
+  release for the tag and holds each to the same rule: every asset named in
+  the manifest, with the manifest's digest.
+
 ## 1.3.11 - 2026-11-23
 
 ### Security
