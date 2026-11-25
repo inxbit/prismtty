@@ -3612,6 +3612,66 @@ mod tests {
         }
     }
 
+    // A single shift waits for its character past any C0 controls. Checking
+    // at each of them whether the character is cut off must not walk back
+    // over the rest of the buffer: with a tail of bytes from 80 to BF behind
+    // the controls, a read would cost its length once per control, on every
+    // scan of it. The walk is counted in bytes, so a busy machine cannot
+    // fail the test, and compared with the bytes each read can leave buffered.
+    #[test]
+    fn single_shift_before_c0_controls_does_not_walk_back_over_the_buffer_per_control() {
+        use crate::highlight::UTF8_WALK_BACK_BYTES;
+
+        let mut cases: Vec<(String, Vec<Vec<u8>>)> = Vec::new();
+        for shift in [b"\x1bN".as_slice(), b"\x1bO", b"\x8e", b"\xc2\x8f"] {
+            let mut read = shift.to_vec();
+            read.resize(4096, 0x00);
+            read.resize(8192, 0xa0);
+            cases.push((format!("{shift:02x?} whole reads"), vec![read.clone(); 4]));
+
+            // One byte at a time behind a first read: the rest of the tail.
+            let mut drip = vec![read];
+            drip.extend(std::iter::repeat_n(vec![0xa0], 300));
+            cases.push((format!("{shift:02x?} one-byte reads"), drip));
+
+            // A string opened at the end of the read keeps the shift and
+            // its controls carried in front of the string's payload.
+            let mut carried = b"\x07".to_vec();
+            carried.extend_from_slice(shift);
+            carried.resize(8192 - 2, 0x00);
+            carried.extend_from_slice(b"\x1b]");
+            carried.resize(2 * 8192, 0xa0);
+            let reads = carried.chunks(8192).map(<[u8]>::to_vec).collect();
+            cases.push((format!("{shift:02x?} with a string carried"), reads));
+        }
+
+        for (name, reads) in &cases {
+            let chunks: Vec<&[u8]> = reads.iter().map(Vec::as_slice).collect();
+            // What can be buffered when each read is scanned, summed.
+            let buffered: usize = (1..=chunks.len())
+                .map(|read| {
+                    chunks[..read]
+                        .iter()
+                        .map(|chunk| chunk.len())
+                        .sum::<usize>()
+                })
+                .sum();
+            for pipeline in [
+                ChunkPipeline::Preserve,
+                ChunkPipeline::Sanitize,
+                ChunkPipeline::Strip,
+            ] {
+                UTF8_WALK_BACK_BYTES.with(|walked| walked.set(0));
+                let _ = run_chunk_pipeline(&chunks, pipeline);
+                let walked = UTF8_WALK_BACK_BYTES.with(std::cell::Cell::get);
+                assert!(
+                    walked <= 2 * buffered,
+                    "{pipeline:?}, {name}: walked back over {walked} bytes for {buffered} buffered"
+                );
+            }
+        }
+    }
+
     // The same guarantees with the UTF-8 switch on, where a raw C1 string ends
     // at its line end: however the reads fall, `--sanitize` and `--strip-ansi`
     // give the same bytes and never let a terminal open a string control, an

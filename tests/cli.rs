@@ -2668,6 +2668,60 @@ fn a_utf_rule_that_can_match_nothing_survives_multibyte_text() {
     );
 }
 
+// PCRE2 refuses to search text that is not UTF-8 with a rule in UTF mode.
+// A stray byte in the output was taken for a runaway match: the rule was
+// reported and switched off. It is neither: nothing is reported, and the
+// rule colors what stands behind the byte.
+#[test]
+fn a_utf_rule_is_not_reported_for_output_that_is_not_utf8() {
+    let mut config = tempfile::NamedTempFile::new().expect("config");
+    writeln!(
+        config,
+        "rules:\n  - description: umlauts\n    regex: (*UTF)[\u{e4}\u{f6}\u{fc}]\n    color: f#00ff00"
+    )
+    .expect("write config");
+
+    let output = Command::cargo_bin("prismtty")
+        .expect("binary exists")
+        .args(["--rgb", "--no-auto-detect", "--config"])
+        .arg(config.path())
+        .write_stdin(b"\xc3\xb6 caf\xe9 \xc3\xa4\nnoise \xff\n\xc3\xbc\n".as_slice())
+        .output()
+        .expect("command runs");
+
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(String::from_utf8_lossy(&output.stderr), "");
+    assert_eq!(
+        output.stdout,
+        b"\xc3\xb6 caf\xe9 \xc3\xa4\nnoise \xff\n\x1b[38;2;0;255;0m\xc3\xbc\x1b[0m\n"
+    );
+}
+
+// Nor is such output counted against the rule: `--benchmark` lists the rule
+// with its matches and no match error.
+#[test]
+fn benchmark_counts_no_match_error_for_output_that_is_not_utf8() {
+    let mut config = tempfile::NamedTempFile::new().expect("config");
+    writeln!(
+        config,
+        "rules:\n  - description: umlauts\n    regex: (*UTF)[\u{e4}\u{f6}\u{fc}]\n    color: f#00ff00"
+    )
+    .expect("write config");
+
+    let output = Command::cargo_bin("prismtty")
+        .expect("binary exists")
+        .args(["--benchmark", "--no-auto-detect", "--config"])
+        .arg(config.path())
+        .write_stdin(b"caf\xe9 \xc3\xa4\nnoise \xff\n\xc3\xbc\n".as_slice())
+        .output()
+        .expect("command runs");
+
+    assert!(output.status.success(), "{output:?}");
+    let report = String::from_utf8_lossy(&output.stderr);
+    assert!(report.contains("umlauts"), "{report}");
+    assert!(!report.contains("match error"), "{report}");
+}
+
 // PrismTTY compiles each rule with its match limits in front. PCRE2 counted
 // those 40 characters into the offset of a compile error, so the offset
 // pointed nowhere in the rule the user wrote.

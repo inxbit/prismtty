@@ -904,6 +904,8 @@ struct CompiledRule {
     identity: RuleIdentity,
     description: String,
     regex: Regex,
+    /// Whether what the rule matches depends on where its search starts.
+    search_start_matters: bool,
     style: CompiledStyle,
     exclusive: bool,
 }
@@ -2548,6 +2550,9 @@ fn compile_rule(
         identity,
         description,
         regex,
+        search_start_matters: SEARCH_START_ITEMS
+            .iter()
+            .any(|item| rule.regex.contains(item)),
         style,
         exclusive: rule.exclusive,
     })
@@ -2747,6 +2752,9 @@ fn match_rule(
     };
     let mut last_end = 0;
     let mut last_match = None;
+    // Where the last byte that is not UTF-8 ends, once a rule in UTF mode
+    // has been refused for one.
+    let mut valid_tail = None;
 
     while last_end <= visible.len() {
         let found = match &mut locations {
@@ -2768,6 +2776,36 @@ fn match_rule(
             // no runaway match: try the next byte.
             Err(error) if error.code() == PCRE2_ERROR_BADUTFOFFSET => {
                 last_end += 1;
+                continue;
+            }
+            // A rule in UTF mode is not searched across a byte that is not
+            // UTF-8: PCRE2 checks the text from where the search starts to
+            // its end and refuses it. That is no fault of the rule, so it is
+            // not a match error. No search in front of the last such byte
+            // can succeed, so go on behind it. When the text from here on
+            // is valid, PCRE2 has read back over such a byte for a
+            // lookbehind: try the next byte.
+            //
+            // A rule whose match depends on where its search starts would
+            // match right behind the byte what it matches nowhere else in
+            // the middle of a read, so it is not searched there.
+            Err(error)
+                if PCRE2_ERROR_UTF8_INVALID.contains(&error.code())
+                    && rule.search_start_matters =>
+            {
+                break;
+            }
+            Err(error) if PCRE2_ERROR_UTF8_INVALID.contains(&error.code()) => {
+                let valid_from = *valid_tail.get_or_insert_with(|| {
+                    let mut valid_from = last_end;
+                    while let Err(invalid) = std::str::from_utf8(&visible[valid_from..]) {
+                        let good = invalid.valid_up_to();
+                        let rest = visible.len() - valid_from - good;
+                        valid_from += good + invalid.error_len().unwrap_or(rest);
+                    }
+                    valid_from
+                });
+                last_end = valid_from.max(last_end + 1);
                 continue;
             }
             Err(error) => {
@@ -2822,6 +2860,19 @@ fn match_rule(
 /// PCRE2's error code for a search started inside a UTF-8 character, which
 /// only a rule in UTF mode reports.
 const PCRE2_ERROR_BADUTFOFFSET: i32 = -36;
+
+/// What in the text of a rule makes its match depend on where the search
+/// starts: `\G` is true there, `(*NOTEMPTY_ATSTART)` refuses an empty match
+/// there, and after `(*COMMIT)` a failure ends the search for every later
+/// start. Text that only looks like one of these, such as an escaped
+/// backslash in front of a `G`, counts too: that errs on the side of not
+/// searching behind an invalid byte.
+const SEARCH_START_ITEMS: [&str; 3] = ["\\G", "NOTEMPTY_ATSTART", "(*COMMIT"];
+
+/// PCRE2's error codes for text that is not valid UTF-8, from
+/// `PCRE2_ERROR_UTF8_ERR21` to `PCRE2_ERROR_UTF8_ERR1`, which only a rule in
+/// UTF mode reports.
+const PCRE2_ERROR_UTF8_INVALID: std::ops::RangeInclusive<i32> = -23..=-3;
 
 /// Returns where the search resumes after a match at `start..end`, and whether
 /// to skip that match. Same stepping as pcre2's own iterator: an empty match
@@ -3042,9 +3093,8 @@ fn alternate_screen_command(bytes: &[u8]) -> Option<bool> {
         return None;
     }
     let (modes, enable) = private_mode_sequence(bytes)?;
-    let has_alternate_screen_mode = modes
-        .split(|byte| *byte == b';')
-        .any(|mode| matches!(mode, b"47" | b"1047" | b"1049"));
+    let has_alternate_screen_mode =
+        private_mode_numbers(&modes).any(|mode| matches!(mode, 47 | 1047 | 1049));
     has_alternate_screen_mode.then_some(enable)
 }
 
@@ -3367,9 +3417,7 @@ fn saves_rendition(bytes: &[u8]) -> bool {
     saves_cursor(bytes)
         || pushes_rendition(bytes)
         || private_mode_sequence(bytes).is_some_and(|(modes, set)| {
-            set && modes
-                .split(|byte| *byte == b';')
-                .any(|mode| matches!(mode, b"1048" | b"1049"))
+            set && private_mode_numbers(&modes).any(|mode| matches!(mode, 1048 | 1049))
         })
 }
 
@@ -3492,19 +3540,19 @@ impl NativeSgrState {
             }
             _ => match private_mode_sequence(bytes) {
                 Some((modes, set)) => {
-                    for mode in modes.split(|byte| *byte == b';') {
+                    for mode in private_mode_numbers(&modes) {
                         match (mode, set) {
-                            (b"1048", true) => self.save(),
-                            (b"1048", false) => self.restore(),
-                            (b"1049", true) => {
+                            (1048, true) => self.save(),
+                            (1048, false) => self.restore(),
+                            (1049, true) => {
                                 self.save();
                                 self.alternate_screen = true;
                             }
-                            (b"1049", false) => {
+                            (1049, false) => {
                                 self.alternate_screen = false;
                                 self.restore();
                             }
-                            (b"47" | b"1047", _) => self.alternate_screen = set,
+                            (47 | 1047, _) => self.alternate_screen = set,
                             _ => {}
                         }
                     }
@@ -3592,6 +3640,37 @@ fn private_mode_sequence(bytes: &[u8]) -> Option<(Cow<'_, [u8]>, bool)> {
         },
         set,
     ))
+}
+
+/// The modes of `private_mode_sequence` as the numbers xterm reads. It keeps
+/// `XTERM_MAX_CSI_PARAMETERS` of them; past those it ignores each `;` and
+/// reads the digits on into the last one, so a later parameter is no mode of
+/// its own: behind 29 others, `1;01049` is 101049 and `10;49` is 1049.
+fn private_mode_numbers(modes: &[u8]) -> impl Iterator<Item = u32> + '_ {
+    modes
+        .splitn(XTERM_MAX_CSI_PARAMETERS, |byte| *byte == b';')
+        .map(private_mode_number)
+}
+
+/// The number that the digits of one mode spell, as a terminal reads it:
+/// `01049` is 1049. A `;` among them, which only the last mode that xterm
+/// keeps can hold, is skipped. The number is capped at 65535 as xterm caps a
+/// parameter, so a longer number is no other mode. Only the zeros in front
+/// and six digits behind them are looked at, however long the mode.
+fn private_mode_number(mode: &[u8]) -> u32 {
+    let mut digits = mode
+        .iter()
+        .filter(|byte| **byte != b';')
+        .skip_while(|digit| **digit == b'0');
+    let number = digits
+        .by_ref()
+        .take(5)
+        .fold(0, |number, digit| number * 10 + u32::from(digit - b'0'));
+    if digits.next().is_some() {
+        65_535
+    } else {
+        number.min(65_535)
+    }
 }
 
 /// The colors and attributes that SGR sequences have set.
@@ -4021,6 +4100,16 @@ fn streaming_split_at(chunk: &AnsiChunk) -> usize {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Bytes that `incomplete_utf8_start` walked back over on this thread.
+    /// The walk covers every trailing byte from 80 to BF, so a caller inside
+    /// a loop over the same buffer pays for that tail once per call; stream
+    /// tests sum the bytes to see that none does.
+    pub(crate) static UTF8_WALK_BACK_BYTES: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
 /// If `bytes` ends partway through a multibyte UTF-8 sequence, returns the
 /// index of that sequence's lead byte so the partial codepoint can be carried
 /// to the next chunk instead of being emitted and split by an SGR escape.
@@ -4033,6 +4122,8 @@ fn incomplete_utf8_start(bytes: &[u8]) -> Option<usize> {
         idx -= 1;
         continuations += 1;
     }
+    #[cfg(test)]
+    UTF8_WALK_BACK_BYTES.with(|walked| walked.set(walked.get() + continuations));
     let lead = *bytes.get(idx.checked_sub(1)?)?;
     let expected = match lead {
         0xc2..=0xdf => 2,
@@ -4588,7 +4679,7 @@ fn scan_single_shift_for_neutralization(bytes: &[u8], start: usize, mut idx: usi
         if let Some(width) = valid_utf8_char_width_at(bytes, idx) {
             return EscapeScan::Complete(idx + width);
         }
-        if incomplete_utf8_start(&bytes[idx..]) == Some(0) {
+        if is_partial_utf8_char_at_end(bytes, idx) {
             return incomplete_escape_scan_result(
                 bytes,
                 start,
@@ -5457,6 +5548,302 @@ rules:
             .expect("failed rule recorded");
         assert_eq!(failed.description, "bounded pathological rule");
         assert_eq!(failed.count, 1, "failed rule must not be retried");
+    }
+
+    // A rule in UTF mode cannot be searched across a byte that is not UTF-8:
+    // PCRE2 refuses the text. One stray byte in the output is no fault of the
+    // rule, so it must not count as a match error and switch the rule off for
+    // the session. The rule goes on matching behind the last such byte of a
+    // read, as it did in the read that held the first one, and a rule that
+    // does run out of its match budget is still switched off.
+    #[test]
+    fn invalid_utf8_in_the_output_does_not_switch_a_utf_rule_off() {
+        let config = PrismConfig::from_chromaterm_yaml(
+            r##"
+rules:
+  - description: umlauts
+    regex: '(*UTF)[äöü]'
+    color: f#ff0000
+  - description: any character between x and y
+    regex: '(*UTF)x.y'
+    color: f#00ff00
+  - description: x behind an e acute
+    regex: '(*UTF)(?<=é)x'
+    color: f#ffff00
+  - description: bounded pathological rule
+    regex: '^(a+)+$'
+    color: f#0000ff
+"##,
+        )
+        .expect("config parses");
+        let highlighter = Highlighter::from_config(config).expect("rules compile");
+        // What a session that has seen nothing else writes for `text`.
+        let fresh = |text: &[u8]| StreamingHighlighter::new(highlighter.clone()).push(text);
+        let line = "\u{e4} x\u{e9}y \u{e9}x\n".as_bytes();
+        let colored = fresh(line);
+        assert_eq!(
+            colored
+                .windows(2)
+                .filter(|window| window == b"\x1b[")
+                .count(),
+            6,
+            "{colored:02x?}"
+        );
+
+        let mut streaming = StreamingHighlighter::new_with_benchmark(highlighter.clone());
+        assert_eq!(streaming.push(line), colored);
+        for invalid in [
+            b"caf\xe9 au lait\n".as_slice(),
+            b"noise \xff here\n",
+            b"cut \xe4\xb8 character\n",
+            b"\xc0\xaf overlong\n",
+            b"\x80\x80\x80\n",
+        ] {
+            assert_eq!(streaming.push(invalid), invalid);
+            assert_eq!(streaming.push(line), colored, "after {invalid:02x?}");
+            highlighter
+                .try_highlight_bytes(invalid)
+                .expect("invalid UTF-8 is not a match error");
+        }
+
+        // In the read that holds such bytes, the text behind the last one is
+        // searched and the text in front of it is not.
+        for front in [
+            "\u{f6} one \u{e9}x ".as_bytes(),
+            b"\xc3\xb6 one \xff \xc3\xbc two \xc3\xa9x ",
+        ] {
+            for invalid in [b"\xff".as_slice(), b"\xe9", b"\xe4\xb8", b"\xfe\xff\x80"] {
+                let read = [front, invalid, line].concat();
+                assert_eq!(
+                    streaming.push(&read),
+                    [front, invalid, &colored].concat(),
+                    "{read:02x?}"
+                );
+            }
+        }
+        // A lookbehind may not read back over the byte either.
+        assert_eq!(streaming.push(b"\xffx \xe9x\n"), b"\xffx \xe9x\n");
+        assert_eq!(streaming.push(line), colored);
+
+        let report = streaming.benchmark_report().expect("benchmark enabled");
+        assert!(report.first_rule_error().is_none());
+
+        let mut pathological = vec![b'a'; 8 * 1024];
+        pathological.extend_from_slice(b"!\n");
+        let _ = streaming.push(&pathological);
+        let _ = streaming.push(&pathological);
+        let failed = streaming
+            .benchmark_report()
+            .expect("benchmark enabled")
+            .first_rule_error()
+            .expect("failed rule recorded");
+        assert_eq!(failed.description, "bounded pathological rule");
+        assert_eq!(failed.count, 1, "failed rule must not be retried");
+        assert_eq!(streaming.push(line), colored);
+    }
+
+    // Text that is not UTF-8 is not an error of a UTF-mode rule for the
+    // library either: the call that reports match errors returns the text.
+    #[test]
+    fn fallible_highlight_call_returns_ok_for_a_utf_rule_on_text_that_is_not_utf8() {
+        let config = PrismConfig::from_chromaterm_yaml(
+            "rules:\n  - description: umlauts\n    regex: '(*UTF)[\u{e4}\u{f6}\u{fc}]'\n    color: f#ff0000\n",
+        )
+        .expect("config parses");
+        let highlighter = Highlighter::from_config(config).expect("rule compiles");
+
+        for input in [
+            b"caf\xe9 au lait\n".as_slice(),
+            b"\xc3\xa4 noise \xff here\n",
+            b"\xff",
+        ] {
+            assert_eq!(
+                highlighter
+                    .try_highlight_bytes(input)
+                    .expect("text that is not UTF-8 is not a match error"),
+                input,
+                "{input:02x?}"
+            );
+        }
+    }
+
+    // A rule in UTF mode that runs out of its match budget is switched off
+    // like any other rule, also in a session that has already met bytes that
+    // are not UTF-8 and in a read that holds one.
+    #[test]
+    fn utf_rule_that_exhausts_its_match_limit_is_still_switched_off() {
+        let config = PrismConfig::from_chromaterm_yaml(
+            r##"
+rules:
+  - description: bounded pathological utf rule
+    regex: '(*UTF)^(a+)+$'
+    color: f#ff0000
+  - description: healthy suffix
+    regex: '!'
+    color: f#00ff00
+"##,
+        )
+        .expect("config parses");
+        let highlighter = Highlighter::from_config(config).expect("rules compile");
+        let mut pathological = vec![b'a'; 8 * 1024];
+        pathological.extend_from_slice(b"!\n");
+
+        for front in [b"".as_slice(), b"noise \xff\n"] {
+            let mut streaming = StreamingHighlighter::new_with_benchmark(highlighter.clone());
+            assert_eq!(streaming.push(b"caf\xe9 au lait\n"), b"caf\xe9 au lait\n");
+            assert!(
+                streaming
+                    .benchmark_report()
+                    .expect("benchmark enabled")
+                    .first_rule_error()
+                    .is_none()
+            );
+
+            let read = [front, &pathological].concat();
+            let _ = streaming.push(&read);
+            let _ = streaming.push(&read);
+            let failed = streaming
+                .benchmark_report()
+                .expect("benchmark enabled")
+                .first_rule_error()
+                .expect("failed rule recorded");
+            assert_eq!(failed.description, "bounded pathological utf rule");
+            assert_eq!(failed.count, 1, "failed rule must not be retried");
+            assert!(
+                highlighter.try_highlight_bytes(&read).is_err(),
+                "the match limit is still reported"
+            );
+        }
+    }
+
+    // The search of a UTF-mode rule goes on behind a byte that is not UTF-8.
+    // A read that holds nothing else, or that ends in the middle of a
+    // character, has to end the search: each step moves on.
+    #[test]
+    fn utf_rule_search_ends_on_a_read_of_bytes_that_are_not_utf8() {
+        let config = PrismConfig::from_chromaterm_yaml(
+            r##"
+rules:
+  - description: any character
+    regex: '(*UTF).'
+    color: f#ff0000
+  - description: nothing or more
+    regex: '(*UTF)x*'
+    color: f#00ff00
+  - description: behind two characters
+    regex: '(*UTF)(?<=..)y'
+    color: f#0000ff
+  - description: line end
+    regex: '(*UTF)$'
+    color: f#ffff00
+"##,
+        )
+        .expect("config parses");
+        let highlighter = Highlighter::from_config(config).expect("rules compile");
+
+        for unit in [
+            b"\xff".as_slice(),
+            b"\xc3",
+            b"\xe2\x82",
+            b"\xa0",
+            b"\xf8\xa0",
+            b"\xff\n",
+            b"y\xff",
+        ] {
+            for input in [unit.to_vec(), unit.repeat(8192 / unit.len())] {
+                let mut report = super::BenchmarkReport::default();
+                let _ = highlighter.highlight_bytes_with_reset_mode(
+                    &input,
+                    Some(&mut report),
+                    super::ResetMode::Full,
+                );
+                assert!(report.first_rule_error().is_none(), "{unit:02x?}");
+                highlighter
+                    .try_highlight_bytes(&input)
+                    .expect("text that is not UTF-8 is not a match error");
+            }
+        }
+    }
+
+    // Going on behind a byte that is not UTF-8 starts a search in the middle
+    // of the read. A rule whose match depends on where its search starts
+    // would then match there and nowhere else like it: `\G` is true at that
+    // point, an empty match is refused there, and a `(*COMMIT)` that an
+    // earlier part of the read would have reached is not. Such a rule gets
+    // no color in a read that holds such a byte, and stays switched on.
+    #[test]
+    fn utf_rule_that_depends_on_its_search_start_is_not_searched_behind_an_invalid_byte() {
+        for (regex, invalid_reads, valid_read) in [
+            (
+                r"(*UTF)\Gx",
+                [b"\xffx\n".as_slice(), b"\xff x\n", b"x\xffx\n"].as_slice(),
+                b"xx ax\n".as_slice(),
+            ),
+            (
+                r"(*UTF)\Gfoo\Kbar",
+                [b"\xfffoobar\n".as_slice(), b"noise \xff\nfoobar\n"].as_slice(),
+                b"foobar afoobar\n",
+            ),
+            (
+                r"(*UTF)(*NOTEMPTY_ATSTART)(?:|foo)",
+                [b"\xfffoo foo\n".as_slice(), b"\xff foo\n"].as_slice(),
+                b"foo foo\n",
+            ),
+            (
+                r"(*UTF)x(*COMMIT)y",
+                [b"xa \xff xy\n".as_slice(), b"\xffxy\n"].as_slice(),
+                b"xy xa xy\n",
+            ),
+            (
+                r"(*UTF)(*NO_START_OPT)(*COMMIT)x",
+                [b"\xffx\n".as_slice(), b"a\xff x\n"].as_slice(),
+                b"x ax\n",
+            ),
+        ] {
+            let config = PrismConfig::from_chromaterm_yaml(&format!(
+                "rules:\n  - description: start\n    regex: '{regex}'\n    color: f#ff0000\n  \
+                 - description: plain\n    regex: '(*UTF)z'\n    color: f#00ff00\n"
+            ))
+            .expect("config parses");
+            let highlighter = Highlighter::from_config(config).expect("rules compile");
+            let colored = StreamingHighlighter::new(highlighter.clone()).push(valid_read);
+            assert!(
+                colored.windows(2).any(|window| window == b"\x1b["),
+                "{regex}: {colored:02x?}"
+            );
+
+            let mut streaming = StreamingHighlighter::new_with_benchmark(highlighter.clone());
+            for invalid in invalid_reads {
+                assert_eq!(
+                    &streaming.push(invalid),
+                    invalid,
+                    "{regex} on {invalid:02x?}"
+                );
+                highlighter
+                    .try_highlight_bytes(invalid)
+                    .expect("text that is not UTF-8 is not a match error");
+                assert_eq!(
+                    streaming.push(valid_read),
+                    colored,
+                    "{regex} after {invalid:02x?}"
+                );
+            }
+            assert!(
+                streaming
+                    .benchmark_report()
+                    .expect("benchmark enabled")
+                    .first_rule_error()
+                    .is_none(),
+                "{regex}"
+            );
+            // A rule beside it that does not depend on its search start is
+            // still searched behind the byte.
+            let behind = streaming.push(b"z \xff z\n");
+            assert!(
+                behind.starts_with(b"z \xff \x1b["),
+                "{regex}: {behind:02x?}"
+            );
+        }
     }
 
     #[test]
@@ -9967,6 +10354,242 @@ rules:
             assert!(!super::saves_rendition(&cancelled(b"\x1b[")));
             assert!(!super::restores_cursor(&cancelled(b"\x1b[")));
             assert!(!super::is_soft_terminal_reset(&cancelled(b"\x1b[!")));
+        }
+    }
+
+    // A terminal reads a mode parameter as a number, so `01049` is mode 1049
+    // as `1049` is. Every place that looks for the screen and save modes has
+    // to read the spelling the same way, or a full-screen frame behind it is
+    // highlighted like scrolling text. A number too long to be one of them
+    // must not come out as one, and a raw C1 CSI on a UTF-8 terminal still
+    // names no mode.
+    #[test]
+    fn private_modes_are_read_as_numbers() {
+        for (sequence, enable) in [
+            (b"\x1b[?01049h".as_slice(), true),
+            (b"\x1b[?0047h", true),
+            (b"\x1b[?001047l", false),
+            (b"\x1b[?1049;025h", true),
+            (b"\x1b[?25;0001049l", false),
+            (b"\x1b[?0\x001049h", true),
+            (b"\x9b?01049h", true),
+            (b"\xc2\x9b?01047l", false),
+        ] {
+            assert_eq!(
+                super::alternate_screen_command(sequence),
+                Some(enable),
+                "{sequence:02x?}"
+            );
+        }
+        for sequence in [
+            b"\x1b[?01048h".as_slice(),
+            b"\x1b[?001049h",
+            b"\x1b[?1;01048h",
+        ] {
+            assert!(super::saves_rendition(sequence), "{sequence:02x?}");
+        }
+        for sequence in [
+            // 2^16, 2^32 and 2^64 more than 1049, 1048 and 47.
+            b"\x1b[?66585h".as_slice(),
+            b"\x1b[?4294968345h",
+            b"\x1b[?18446744073709552665h",
+            b"\x1b[?4294968344h",
+            b"\x1b[?65583h",
+            b"\x1b[?10490h",
+            b"\x1b[?104h",
+            b"\x1b[?h",
+            b"\x1b[?01049:1h",
+            b"\x1b[?01049$p",
+        ] {
+            assert_eq!(
+                super::alternate_screen_command(sequence),
+                None,
+                "{sequence:02x?}"
+            );
+            assert!(!super::saves_rendition(sequence), "{sequence:02x?}");
+        }
+
+        for (input, expected) in [
+            // Saved by 01048 and by 01049, restored by the same spelling.
+            (
+                b"\x1b[33m\x1b[?01048h\x1b[31m\x1b[?01048l".as_slice(),
+                Some("\x1b[33m"),
+            ),
+            (
+                b"\x1b[33m\x1b[?01049h\x1b[31m\x1b[?001049l",
+                Some("\x1b[33m"),
+            ),
+            // 0047 switches screens, and each screen keeps its own save.
+            (
+                b"\x1b[33m\x1b7\x1b[?0047h\x1b[31m\x1b7\x1b[?0047l\x1b8",
+                Some("\x1b[33m"),
+            ),
+        ] {
+            let mut state = NativeSgrState::default();
+            for token in super::tokenize_ansi(input) {
+                if let super::Token::Ansi(sequence) = token {
+                    state.apply_sequence(&sequence);
+                }
+            }
+            assert_eq!(
+                state.ansi_start().as_deref(),
+                expected,
+                "after {input:02x?}"
+            );
+        }
+
+        super::TERMINAL_READS_UTF8_IN_THIS_THREAD.with(|switch| switch.set(Some(true)));
+        let raw = super::alternate_screen_command(b"\x9b?01049h");
+        let encoded = super::alternate_screen_command(b"\xc2\x9b?01049h");
+        super::TERMINAL_READS_UTF8_IN_THIS_THREAD.with(|switch| switch.set(None));
+        assert_eq!((raw, encoded), (None, Some(true)));
+    }
+
+    // xterm keeps 30 parameters. Past them it ignores each `;` and reads the
+    // digits on into the 30th, so a 31st parameter is not a mode of its own:
+    // behind 29 others, `1;01049` is 101049, which is no mode, and `10;49`
+    // is 1049. Reading a 31st parameter as a mode would switch screens, and
+    // save or restore the rendition, where the terminal does neither.
+    #[test]
+    fn private_modes_past_the_thirtieth_run_on_into_it() {
+        let sequence = |front: usize, modes: &str, last: char| {
+            format!("\x1b[?{}{modes}{last}", "0;".repeat(front)).into_bytes()
+        };
+        for (modes, switches) in [
+            ("1;01049", false),
+            ("1;1049", false),
+            ("1049;5", false),
+            ("1049;0", false),
+            ("25;1047", false),
+            ("3;47", false),
+            ("0;1049", true),
+            (";1049", true),
+            ("0;0;0;01049", true),
+            ("10;49", true),
+            ("1;0;4;9", true),
+            ("104;7", true),
+            ("4;7", true),
+            ("1049", true),
+            ("1049;", true),
+            ("01049;;", true),
+        ] {
+            assert_eq!(
+                super::alternate_screen_command(&sequence(29, modes, 'h')),
+                switches.then_some(true),
+                "29 parameters, then {modes}"
+            );
+            assert_eq!(
+                super::alternate_screen_command(&sequence(29, modes, 'l')),
+                switches.then_some(false),
+                "29 parameters, then {modes}"
+            );
+        }
+        // In front of the 30th, each parameter is a mode of its own.
+        for (front, modes) in [(28, "1049;5"), (0, "1049;1;2"), (28, "47;1;01049")] {
+            assert_eq!(
+                super::alternate_screen_command(&sequence(front, modes, 'h')),
+                Some(true),
+                "{front} parameters, then {modes}"
+            );
+        }
+
+        for (modes, saves) in [
+            ("1;01048", false),
+            ("1048;5", false),
+            ("1;01049", false),
+            ("0;1048", true),
+            ("10;48", true),
+            ("1048", true),
+        ] {
+            assert_eq!(
+                super::saves_rendition(&sequence(29, modes, 'h')),
+                saves,
+                "29 parameters, then {modes}"
+            );
+        }
+
+        let rendition = |input: &[u8]| {
+            let mut state = NativeSgrState::default();
+            for token in super::tokenize_ansi(input) {
+                if let super::Token::Ansi(sequence) = token {
+                    state.apply_sequence(&sequence);
+                }
+            }
+            state.ansi_start()
+        };
+        let stream = |save: &str, restore: &str| {
+            [
+                b"\x1b[33m".as_slice(),
+                &sequence(29, save, 'h'),
+                b"\x1b[31m",
+                &sequence(29, restore, 'l'),
+            ]
+            .concat()
+        };
+        for (save, restore, expected) in [
+            // Nothing is saved and nothing restored: the last color stays.
+            ("1;01048", "1;01048", Some("\x1b[31m")),
+            ("1;01049", "1;01049", Some("\x1b[31m")),
+            // A real save is not restored by a 31st parameter.
+            ("1048", "1;01048", Some("\x1b[31m")),
+            // Digits that run on into mode 1048 save and restore.
+            ("10;48", "0;1048", Some("\x1b[33m")),
+            ("1049", "104;9", Some("\x1b[33m")),
+        ] {
+            assert_eq!(
+                rendition(&stream(save, restore)).as_deref(),
+                expected,
+                "saved by {save}, restored by {restore}"
+            );
+        }
+
+        // The stream behind a 31st parameter is not on another screen.
+        let config = PrismConfig::from_chromaterm_yaml(
+            "rules:\n  - description: up\n    regex: '\\bup\\b'\n    color: f#00ff00\n",
+        )
+        .expect("config parses");
+        let highlighter = Highlighter::from_config(config).expect("rule compiles");
+        let colors = |modes: &str| {
+            let mut input = b"before up\n".to_vec();
+            input.extend_from_slice(&sequence(29, modes, 'h'));
+            input.extend_from_slice(b"frame up\n");
+            let mut streaming = StreamingHighlighter::new(highlighter.clone());
+            let mut output = streaming.push(&input);
+            output.extend(streaming.finish());
+            output
+                .windows(4)
+                .filter(|window| window == b"\x1b[38")
+                .count()
+        };
+        assert_eq!(colors("1;01049"), colors("1;0"));
+        assert_eq!(colors("10;49"), colors("1049"));
+    }
+
+    // Whatever a stream does with its highlighting when the program
+    // switches screens, the spelling of the mode must not change it.
+    #[test]
+    fn alternate_screen_mode_with_leading_zeros_suspends_highlighting_like_the_plain_one() {
+        let config = PrismConfig::from_chromaterm_yaml(
+            "rules:\n  - description: error\n    regex: error\n    color: f#ff0000\n",
+        )
+        .expect("config parses");
+        let highlighter = Highlighter::from_config(config).expect("rule compiles");
+        for (plain, zeros) in [("1049", "01049"), ("1047", "001047"), ("47", "0047")] {
+            let stream = |mode: &str| {
+                let input =
+                    format!("error\n\x1b[?{mode}herror on the other screen\n\x1b[?{mode}lerror\n");
+                let mut streaming = StreamingHighlighter::new(highlighter.clone());
+                let mut output = streaming.push(input.as_bytes());
+                output.extend(streaming.finish());
+                String::from_utf8(output).expect("output is text")
+            };
+            let expected = stream(plain);
+            assert!(expected.contains("\x1b[38"), "{plain}: {expected:?}");
+            assert_eq!(
+                stream(zeros),
+                expected.replace(&format!("?{plain}"), &format!("?{zeros}")),
+                "{zeros}"
+            );
         }
     }
 
