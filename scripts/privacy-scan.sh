@@ -260,6 +260,29 @@ binary_paths = sorted(
     - {b"", b"scripts/privacy-scan.sh"}
 )
 
+
+
+def open_in_repository(root, raw_path):
+    """A descriptor for the file at a path git lists, or None when the path
+    cannot be opened as git grep would read it. No part of the path may be a
+    symbolic link: each directory is opened from the one above it, so a link
+    put in the place of a directory leads nowhere. No open waits on a pipe
+    or a device, whichever part of the path one stands in for."""
+    *parents, name = raw_path.split(b"/")
+    unfollowed = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+    directory = os.dup(root)
+    try:
+        for parent in parents:
+            below = os.open(parent, unfollowed | os.O_DIRECTORY, dir_fd=directory)
+            os.close(directory)
+            directory = below
+        return os.open(name, unfollowed, dir_fd=directory)
+    except OSError:
+        return None
+    finally:
+        os.close(directory)
+
+
 # Each line of PNG text is checked as it is read, on its own: the name of the
 # file is checked once, so what a line costs does not grow with the path.
 # The path and host search numbers the lines it is sent, and `first_lines`
@@ -275,13 +298,13 @@ first_lines = []
 first_line_paths = []
 embedded_ipv4_findings = []
 embedded_ipv6_findings = []
+repository = os.open(".", os.O_RDONLY | os.O_DIRECTORY)
 for raw_path in binary_paths:
     path = os.fsdecode(raw_path)
-    # Like git grep, this reads regular files only. It does not follow a
-    # link out of the repository, and never waits on a pipe or a device.
-    try:
-        descriptor = os.open(raw_path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
-    except OSError:
+    # Like git grep, this reads regular files only, and reaches them through
+    # directories only: a link is never followed out of the repository.
+    descriptor = open_in_repository(repository, raw_path)
+    if descriptor is None:
         continue
     with os.fdopen(descriptor, "rb") as binary_file:
         status = os.fstat(descriptor)
@@ -323,6 +346,7 @@ for raw_path in binary_paths:
                 embedded_ipv6_findings.append(f"{path}:embedded:{text}")
         if pieces > PIECES_LIMIT:
             unreadable(path, f"text in more than {PIECES_LIMIT} pieces")
+os.close(repository)
 
 marker_search.stdin.close()
 marker_status = marker_search.wait()

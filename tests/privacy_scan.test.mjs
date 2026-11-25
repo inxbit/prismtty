@@ -179,14 +179,18 @@ watchdog=$!
 status=0
 wait "$scan" || status=$?
 kill -KILL -- -"$watchdog" 2> /dev/null
+times > "$SCAN_TIMES"
 exit "$status"
 `;
 
 // Runs the scan over several files at once, in the locale given. `links` are
-// tracked symbolic links, name to target. A scan that was ended for running
-// too long reports the status of its kill signal, never 0.
-function scanFiles(files, { tracked = true, locale = 'en_US.UTF-8', links = {} } = {}) {
+// tracked symbolic links, name to target, and `afterStaging` changes the
+// working tree once everything is staged. A scan that was ended for running
+// too long reports the status of its kill signal, never 0. `cpuSeconds` is
+// the processor time the scan and everything it started used.
+function scanFiles(files, { tracked = true, locale = 'en_US.UTF-8', links = {}, afterStaging = () => {} } = {}) {
   const directory = mkdtempSync(`${tmpdir()}/prismtty-privacy-`);
+  const times = `${mkdtempSync(`${tmpdir()}/prismtty-privacy-times-`)}/times`;
   try {
     mkdirSync(`${directory}/scripts`);
     copyFileSync(privacyScan, `${directory}/scripts/privacy-scan.sh`);
@@ -203,13 +207,20 @@ function scanFiles(files, { tracked = true, locale = 'en_US.UTF-8', links = {} }
       symlinkSync(target, `${directory}/${path}`);
       execFileSync('git', ['add', path], { cwd: directory });
     }
-    return spawnSync('bash', ['-c', boundedScan], {
+    afterStaging(directory);
+    const result = spawnSync('bash', ['-c', boundedScan], {
       cwd: directory,
       encoding: 'utf8',
-      env: { ...process.env, LC_ALL: locale },
+      env: { ...process.env, LC_ALL: locale, SCAN_TIMES: times },
     });
+    // The second line of `times` is the user and system time of the
+    // processes the shell waited for, as minutes and seconds.
+    const spent = [...readFileSync(times, 'utf8').trim().split('\n')[1].matchAll(/(\d+)m([\d.]+)s/g)];
+    result.cpuSeconds = spent.reduce((sum, [, minutes, seconds]) => sum + 60 * Number(minutes) + Number(seconds), 0);
+    return result;
   } finally {
     rmSync(directory, { recursive: true, force: true });
+    rmSync(dirname(times), { recursive: true, force: true });
   }
 }
 
@@ -238,15 +249,34 @@ const uint = (bytes, value, littleEndian = false) => {
 };
 const latin1 = (text) => Buffer.from(text, 'latin1');
 
-// The scan reads chunk lengths and types, not checksums.
+const crcTable = Array.from({ length: 256 }, (_, index) => {
+  let value = index;
+  for (let bit = 0; bit < 8; bit += 1) {
+    value = value & 1 ? 0xedb88320 ^ (value >>> 1) : value >>> 1;
+  }
+  return value >>> 0;
+});
+const crc32 = (bytes) => {
+  let crc = 0xffffffff;
+  for (const byte of bytes) {
+    crc = crcTable[(crc ^ byte) & 0xff] ^ (crc >>> 8);
+  }
+  return (crc ^ 0xffffffff) >>> 0;
+};
+
+// A chunk with its checksum. A length given apart from the content is a lie
+// the scan has to catch.
 const pngChunk = (type, body, length = body.length) =>
-  Buffer.concat([uint(4, length), latin1(type), body, Buffer.alloc(4)]);
+  Buffer.concat([uint(4, length), latin1(type), body, uint(4, crc32(Buffer.concat([latin1(type), body])))]);
+// An image a decoder accepts: one row of gray pixels, stored without
+// compression, so that the pixel data holds the address-like bytes as they
+// are. The chunks given go between the header and the pixels.
 const png = (...chunks) =>
   Buffer.concat([
     Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
-    pngChunk('IHDR', Buffer.alloc(13)),
+    pngChunk('IHDR', Buffer.concat([uint(4, addressLikeNoise.length), uint(4, 1), Buffer.from([8, 0, 0, 0, 0])])),
     ...chunks,
-    pngChunk('IDAT', addressLikeNoise),
+    pngChunk('IDAT', deflateSync(Buffer.concat([Buffer.from([0]), addressLikeNoise]), { level: 0 })),
     pngChunk('IEND', Buffer.alloc(0)),
   ]);
 const pngText = (text) => pngChunk('tEXt', latin1(`impeccable:prompt\0${text}`));
@@ -543,14 +573,20 @@ test('privacy scan is not held up by a long run of address characters in PNG tex
   assert.match(result.stdout, ipv6Found);
 });
 
-test('privacy scan is not held up by the path of a PNG with many lines of text', () => {
-  // The path used to go to the IPv6 pattern with every line: a hundred
-  // thousand lines under long directory names of address characters.
-  const directories = Array(3).fill(`${'.'.repeat(200)}a`).join('/');
-  const lines = pngText(':\n'.repeat(99_990));
-  const result = scanFiles({ [`${directories}/x.png`]: png(lines) });
+test('privacy scan spends no more on a line of PNG text under a long path than under a short one', () => {
+  // The path used to go to the IPv6 pattern with every line, which took
+  // some thirty times the processor time under these directory names. Both
+  // runs do the same work now; five times leaves room for an uneven machine.
+  const lines = png(pngText(':\n'.repeat(99_990)));
+  const short = scanFiles({ 'a/b/c/x.png': lines });
+  const long = scanFiles({ [`${Array(3).fill(`${'.'.repeat(200)}a`).join('/')}/x.png`]: lines });
 
-  assert.equal(result.status, 0, result.stderr || result.stdout);
+  assert.equal(short.status, 0, short.stderr || short.stdout);
+  assert.equal(long.status, 0, long.stderr || long.stdout);
+  assert.ok(
+    long.cpuSeconds < 5 * short.cpuSeconds,
+    `${long.cpuSeconds} s of processor time under the long path, ${short.cpuSeconds} s under the short one`,
+  );
 });
 
 test('privacy scan checks the name of a PNG file with text once', () => {
@@ -581,6 +617,87 @@ test('privacy scan does not follow a link out of the repository', () => {
     }
     rmSync(outside, { recursive: true, force: true });
   }
+});
+
+// Git still lists the tracked path when a directory above the file has been
+// replaced by a link, and does not read through it. What the link points at
+// is outside the repository.
+for (const [label, tracked, replaced] of [
+  ['the directory of a PNG', 'assets/shot.png', 'assets'],
+  ['a directory two levels above a PNG', 'far/deep/er/shot.png', 'far'],
+]) {
+  test(`privacy scan does not read through a link in place of ${label}`, () => {
+    const outside = mkdtempSync(`${tmpdir()}/prismtty-privacy-outside-`);
+    try {
+      const image = png(pngCompressedText(`router ${uniqueLocalAddress}`));
+      mkdirSync(`${outside}/deep/er`, { recursive: true });
+      writeFileSync(`${outside}/shot.png`, image);
+      writeFileSync(`${outside}/deep/er/shot.png`, image);
+      const result = scanFiles(
+        { [tracked]: png() },
+        {
+          afterStaging: (directory) => {
+            rmSync(`${directory}/${replaced}`, { recursive: true });
+            symlinkSync(outside, `${directory}/${replaced}`);
+          },
+        },
+      );
+
+      assert.equal(result.status, 0, result.stderr || result.stdout);
+      assert.doesNotMatch(result.stdout, /embedded/);
+    } finally {
+      rmSync(outside, { recursive: true, force: true });
+    }
+  });
+}
+
+test('privacy scan does not wait on a pipe in place of the directory of a PNG', () => {
+  let pipe;
+  try {
+    const result = scanFiles(
+      { 'assets/shot.png': png(pngText(`router ${privateAddress}`)) },
+      {
+        afterStaging: (directory) => {
+          rmSync(`${directory}/assets`, { recursive: true });
+          pipe = `${directory}/assets`;
+          execFileSync('mkfifo', [pipe]);
+        },
+      },
+    );
+
+    assert.equal(result.status, 0, result.stderr || result.stdout);
+    assert.doesNotMatch(result.stderr, /Traceback/);
+  } finally {
+    // A scan that did wait on the pipe is let go.
+    try {
+      closeSync(openSync(pipe, constants.O_WRONLY | constants.O_NONBLOCK));
+    } catch {
+      // Nobody was waiting, or the pipe is gone with its directory.
+    }
+  }
+});
+
+test('privacy scan passes over a tracked PNG whose directory is now a file', () => {
+  const result = scanFiles(
+    { 'assets/shot.png': png(pngText(`router ${privateAddress}`)) },
+    {
+      afterStaging: (directory) => {
+        rmSync(`${directory}/assets`, { recursive: true });
+        writeFileSync(`${directory}/assets`, 'synthetic notes\n');
+      },
+    },
+  );
+
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+  assert.doesNotMatch(result.stderr, /Traceback/);
+});
+
+test('privacy scan reads a PNG in nested directories', () => {
+  const result = scanFiles({ 'docs/assets/2026/shot.png': png(pngCompressedText(`router ${uniqueLocalAddress}`)) });
+
+  assert.notEqual(result.status, 0);
+  assert.match(result.stdout, ipv6Found);
+  assert.match(result.stdout, /docs\/assets\/2026\/shot\.png:embedded:/);
 });
 
 // macOS regex matching gives up on a line that is not valid UTF-8 when the
