@@ -1436,6 +1436,280 @@ mod tests {
         );
     }
 
+    // The limits count the rules of the selected profiles together with the
+    // user's own, so a longer stock profile takes room from every user. These
+    // are the largest overlays that started and switched in 1.3.11: one that
+    // fills the limit beside the generic profile, and the ones that leave
+    // just enough room for the Junos or the Cisco profile to be selected.
+    #[test]
+    fn overlay_sizes_that_fit_beside_the_stock_profiles_still_fit() {
+        let overlay = |rules: usize| {
+            let mut yaml = String::from("rules:\n");
+            for index in 0..rules {
+                yaml.push_str(&format!(
+                    "  - description: overlay-{index}\n    regex: token-{index}\n    color: f#ffffff\n"
+                ));
+            }
+            let config = tempfile::NamedTempFile::new().expect("temp config");
+            std::fs::write(config.path(), &yaml).expect("overlay writes");
+            config
+        };
+        let store = crate::profiles::ProfileStore::builtin();
+        let generic = vec!["generic".to_string()];
+        let trace = super::IoTrace::open(None).expect("no-op trace");
+
+        let config = overlay(503);
+        let options = crate::cli::args::Options {
+            config: Some(config.path().to_path_buf()),
+            ..crate::cli::args::Options::default()
+        };
+        assert!(
+            super::HighlightSession::new(&options, store.clone(), false, generic.clone()).is_ok(),
+            "503 overlay rules start with the generic profile"
+        );
+
+        for (rules, profile) in [(499, "juniper"), (497, "cisco")] {
+            let config = overlay(rules);
+            let options = crate::cli::args::Options {
+                config: Some(config.path().to_path_buf()),
+                ..crate::cli::args::Options::default()
+            };
+            let target = vec!["generic".to_string(), profile.to_string()];
+            let mut session =
+                super::HighlightSession::new(&options, store.clone(), false, generic.clone())
+                    .expect("the generic set builds");
+            assert_eq!(
+                session
+                    .switch_profiles(&mut Vec::new(), &trace, target.clone())
+                    .expect("the device profile is selected"),
+                super::ProfileSwitchOutcome::Switched,
+                "{rules} overlay rules leave room for {profile}"
+            );
+            assert_eq!(session.profile_names(), target);
+        }
+    }
+
+    /// What the stream writes with the generic profile, in true color: entry
+    /// `n` is what it wrote after read `n` arrived and before the next one,
+    /// and the last entry is what it wrote at the end of input. An
+    /// interactive stream is given a PTY, as a wrapped command has one.
+    fn generic_stream_writes(reads: &[&[u8]], interactive: bool) -> Vec<Vec<u8>> {
+        use std::cell::{Cell, RefCell};
+        use std::collections::VecDeque;
+        use std::io::{Read, Write};
+        use std::os::fd::AsRawFd;
+        use std::rc::Rc;
+
+        struct Reads(VecDeque<Vec<u8>>, Rc<Cell<usize>>);
+        impl Read for Reads {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                self.1.set(self.1.get() + 1);
+                match self.0.pop_front() {
+                    Some(read) => {
+                        buf[..read.len()].copy_from_slice(&read);
+                        Ok(read.len())
+                    }
+                    None => Ok(0),
+                }
+            }
+        }
+        struct Writes(Rc<RefCell<Vec<Vec<u8>>>>, Rc<Cell<usize>>);
+        impl Write for Writes {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.borrow_mut()[self.1.get() - 1].extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let config = tempfile::NamedTempFile::new().expect("temp config");
+        std::fs::write(config.path(), "rules: []\n").expect("empty overlay writes");
+        let options = crate::cli::args::Options {
+            profiles: vec!["generic".to_string()],
+            no_auto_detect: true,
+            no_dynamic_profile: true,
+            force_rgb: true,
+            config: Some(config.path().to_path_buf()),
+            ..Default::default()
+        };
+        let pty = nix::pty::openpty(None, None).expect("openpty");
+        let input = super::InputSource {
+            interactive,
+            pty_fd: interactive.then(|| pty.master.as_raw_fd()),
+            idle_fd: None,
+            recent_input: None,
+        };
+        let reads_made = Rc::new(Cell::new(0));
+        let writes = Rc::new(RefCell::new(vec![Vec::new(); reads.len() + 1]));
+        let reader = Reads(
+            reads.iter().map(|read| read.to_vec()).collect(),
+            reads_made.clone(),
+        );
+        let mut writer = Writes(writes.clone(), reads_made);
+        let trace = super::IoTrace::open(None).expect("no-op trace");
+        let prepared = super::prepare_session(&options, interactive).expect("session prepares");
+        super::highlight_stream(reader, &mut writer, prepared, input, None, trace, None)
+            .expect("highlight_stream succeeds");
+        writes.take()
+    }
+
+    const BAD: &[u8] = b"\x1b[1;38;2;255;0;0m";
+    const BAD_INTERACTIVE: &[u8] = b"\x1b[38;2;255;0;0m";
+    const GOOD: &[u8] = b"\x1b[38;2;0;255;0m";
+
+    // A `not` that is matched without the word after it is drawn in the
+    // bad-state color in the write that draws it, not later: the color is
+    // part of the read's own output, and nothing is held back for it.
+    #[test]
+    fn negation_without_its_next_word_is_drawn_red_with_its_own_read() {
+        for (reads, expected) in [
+            (
+                [b"status not ".as_slice(), b"connected\n"].as_slice(),
+                vec![
+                    [b"status ", BAD, b"not \x1b[0m"].concat(),
+                    [GOOD, b"connected\x1b[0m\n"].concat(),
+                    Vec::new(),
+                ],
+            ),
+            // The next word reaches the end of the read and is held back.
+            (
+                &[b"file not found", b"\n"],
+                vec![
+                    [b"file ", BAD, b"not \x1b[0m"].concat(),
+                    b"found\n".to_vec(),
+                    Vec::new(),
+                ],
+            ),
+            (
+                &[b"file not found"],
+                vec![[b"file ", BAD, b"not \x1b[0m"].concat(), b"found".to_vec()],
+            ),
+            (
+                &[b"file not found\n"],
+                vec![b"file not found\n".to_vec(), Vec::new()],
+            ),
+        ] {
+            assert_eq!(
+                generic_stream_writes(reads, false),
+                expected,
+                "filter stream, {reads:02x?}"
+            );
+        }
+
+        for (reads, expected) in [
+            (
+                [b"status not ".as_slice(), b"connected\n"].as_slice(),
+                vec![
+                    [b"status ", BAD_INTERACTIVE, b"not "].concat(),
+                    [GOOD, b"connected\n"].concat(),
+                    b"\x1b[39m".to_vec(),
+                ],
+            ),
+            (
+                &[b"file not ", b"found\n"],
+                vec![
+                    [b"file ", BAD_INTERACTIVE, b"not "].concat(),
+                    b"\x1b[39mfound\n".to_vec(),
+                    Vec::new(),
+                ],
+            ),
+        ] {
+            assert_eq!(
+                generic_stream_writes(reads, true),
+                expected,
+                "interactive stream, {reads:02x?}"
+            );
+        }
+    }
+
+    // A read that ends inside a control ends the matched text before the
+    // control, so a `not` right in front of it is matched without the word
+    // that follows the control.
+    #[test]
+    fn negation_before_a_control_cut_by_the_read_is_drawn_red() {
+        assert_eq!(
+            generic_stream_writes(&[b"x not \x1b[3", b"4mfound.\x1b[0m\n"], false),
+            [
+                [b"x ".as_slice(), BAD, b"not \x1b[0m"].concat(),
+                b"\x1b[34mfound.\x1b[0m\n".to_vec(),
+                Vec::new(),
+            ]
+        );
+        assert_eq!(
+            generic_stream_writes(&[b"x not \x1b[34mfound.\x1b[0m\n"], false),
+            [b"x not \x1b[34mfound.\x1b[0m\n".to_vec(), Vec::new()]
+        );
+    }
+
+    // A word at the end of a read is held back for the rest of it while it
+    // is at most 512 bytes long. `not` and its hyphens are such a word: at
+    // 512 bytes they wait and are matched with the word that follows, and at
+    // 513 they are drawn at once, matched alone.
+    #[test]
+    fn negation_longer_than_the_held_word_limit_is_matched_alone() {
+        let held = [b"x not".as_slice(), &[b'-'; 509]].concat();
+        assert_eq!(
+            generic_stream_writes(&[&held, b"connected\n"], false),
+            [
+                b"x ".to_vec(),
+                [BAD, &held[2..], b"connected\x1b[0m\n"].concat(),
+                Vec::new(),
+            ]
+        );
+
+        let drawn = [b"x not".as_slice(), &[b'-'; 510]].concat();
+        assert_eq!(
+            generic_stream_writes(&[&drawn, b"connected\n"], false),
+            [
+                [b"x ".as_slice(), BAD, &drawn[2..], b"\x1b[0m"].concat(),
+                [GOOD, b"connected\x1b[0m\n"].concat(),
+                Vec::new(),
+            ]
+        );
+    }
+
+    // zsh redraws a pasted command of several lines one row at a time, each
+    // in inverse and each followed by an erase and a line end. A row is
+    // matched on its own like any line on a terminal, so a row that ends in
+    // `not-` is drawn in the bad-state color, as a row that ends in `down`
+    // is. The rows are written the way zsh was seen to write a three-line
+    // paste; only the word that ends the middle row varies.
+    #[test]
+    fn negation_at_the_end_of_a_row_of_a_pasted_command_is_drawn_red() {
+        let prompt = b"\r\x1b[0m\x1b[27m\x1b[24m\x1b[Jdesk% \x1b[K\x1b[?2004h".as_slice();
+        for word in [b"not-".as_slice(), b"not ", b"down"] {
+            let redraw = [
+                b"\x1b[7m: x\x1b[27m\r\r\n\x1b[7m: ".as_slice(),
+                word,
+                b"\x1b[27m\x1b[K\r\r\n\x1b[7m: z\x1b[27m\x1b[K",
+            ]
+            .concat();
+            assert_eq!(
+                generic_stream_writes(&[prompt, &redraw], true),
+                [
+                    prompt.to_vec(),
+                    [
+                        b"\x1b[7m: x\x1b[27m\r\r\n\x1b[7m: ".as_slice(),
+                        BAD_INTERACTIVE,
+                        word,
+                        b"\x1b[27m",
+                        BAD_INTERACTIVE,
+                        b"\x1b[K",
+                        BAD_INTERACTIVE,
+                        b"\r\r\n\x1b[7m",
+                        BAD_INTERACTIVE,
+                        b"\x1b[39m: z\x1b[27m\x1b[K",
+                    ]
+                    .concat(),
+                    Vec::new(),
+                ],
+                "{word:02x?}"
+            );
+        }
+    }
+
     #[test]
     fn dynamic_reload_requires_buildable_retained_profiles() {
         let mut current_store = crate::profiles::ProfileStore::builtin();

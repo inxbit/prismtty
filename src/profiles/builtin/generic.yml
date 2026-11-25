@@ -17,11 +17,15 @@ rules:
     regex: '(?i)\b((?<!:)([\da-f]{1,2}:){5}[\da-f]{1,2}(?!:)|(?<!\.)([\da-f]{4}\.){2}[\da-f]{4}(?!\.))\b'
     color: f#ff9aff
     exclusive: true
+  # The last alternative is a "not" at the end of the text being matched,
+  # which is a "not" matched without the word after it: the read ended there
+  # or inside the next word, the input ended without a line end, or, on a
+  # terminal, the line ended there. "not connected" cut that way was drawn as
+  # a plain "not" and a green "connected". It is part of this rule, not a
+  # rule of its own, so the profile takes no extra rule out of the limit a
+  # user's own rules share with it.
   - description: bad operational state
-    regex: '(?i)\b(password|abnormal(ly)?|down|los(t|s|ing)|err(or(s)?)?|den(y|ies|ied)|reject(ing|ed)?|drop(ped|s)?|fail(s|ed|ures?)?|not[ \t-]+(connect(ed)?|reachable)|disconnect(ed)?|unreachable|invalid|bad|notconnect|unusable|blocking|blocked|collision(s)?|unsynchronized|mismatch|runts|CRC|resets)\b'
-    color: f#ff0000 bold
-  - description: negation matched without its next word
-    regex: '(?i)\bnot[ \t-]+\z'
+    regex: '(?i)\b((password|abnormal(ly)?|down|los(t|s|ing)|err(or(s)?)?|den(y|ies|ied)|reject(ing|ed)?|drop(ped|s)?|fail(s|ed|ures?)?|not[ \t-]+(connect(ed)?|reachable)|disconnect(ed)?|unreachable|invalid|bad|notconnect|unusable|blocking|blocked|collision(s)?|unsynchronized|mismatch|runts|CRC|resets)\b|not[ \t-]+\z)'
     color: f#ff0000 bold
   - description: warning state
     regex: '(?i)\b(warning(s)?|degraded|standby|learning|listening|passive)\b'
