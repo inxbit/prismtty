@@ -333,6 +333,277 @@ fn generic_profile_does_not_paint_a_negated_good_state_green() {
     }
 }
 
+/// What a stream with the generic profile writes for `reads`, each pushed on
+/// its own, and for the end of input.
+fn stream_with_generic(interactive: bool, reads: &[&str]) -> String {
+    let store = ProfileStore::builtin();
+    let config = PrismConfig::from_profiles(&store, &["generic"]).expect("generic loads");
+    let highlighter = Highlighter::from_config(config).expect("rules compile");
+    let mut streaming = if interactive {
+        StreamingHighlighter::new_interactive(highlighter)
+    } else {
+        StreamingHighlighter::new(highlighter)
+    };
+    let mut output = String::new();
+    for read in reads {
+        output.push_str(&streaming.push_str(read));
+    }
+    output.push_str(&String::from_utf8(streaming.finish()).expect("output remains UTF-8"));
+    output
+}
+
+// Rules see the text one piece at a time, and `not connected` cut in two
+// pieces was drawn as a plain `not` and a green `connected`. A `not` that is
+// matched without the word after it is drawn in the bad-state color, so the
+// line no longer reads as good news. The word after it keeps the color it
+// gets on its own.
+//
+// A piece ends after `not` when the read ends there or inside the next word
+// (that word is held back for the rest of it), when the input ends without a
+// line end, and on a terminal at the end of a line or before a screen
+// switch. So the red is not limited to `not connected`: any `not` there is
+// drawn red, whatever follows.
+#[test]
+fn generic_profile_paints_a_negation_matched_without_its_next_word_red() {
+    for (reads, expected) in [
+        // The read ends right after it.
+        (
+            ["status not ", "connected\n"].as_slice(),
+            format!("status {RED_BOLD}not \x1b[0m{GREEN}connected\x1b[0m\n"),
+        ),
+        (
+            &["peer is NOT\t", "reachable\n"],
+            format!("peer is {RED_BOLD}NOT\t\x1b[0m{GREEN}reachable\x1b[0m\n"),
+        ),
+        (
+            &["file not ", "found\n"],
+            format!("file {RED_BOLD}not \x1b[0mfound\n"),
+        ),
+        (
+            &["status not ", "\nnext\n"],
+            format!("status {RED_BOLD}not \x1b[0m\nnext\n"),
+        ),
+        // The read ends inside the next word, or right after it.
+        (
+            &["status not conn", "ected\n"],
+            format!("status {RED_BOLD}not \x1b[0m{GREEN}connected\x1b[0m\n"),
+        ),
+        (
+            &["status not connected", "\n"],
+            format!("status {RED_BOLD}not \x1b[0m{GREEN}connected\x1b[0m\n"),
+        ),
+        (
+            &["file not fo", "und\n"],
+            format!("file {RED_BOLD}not \x1b[0mfound\n"),
+        ),
+        // The input ends without a line end.
+        (&["status not "], format!("status {RED_BOLD}not \x1b[0m")),
+        (
+            &["file not found"],
+            format!("file {RED_BOLD}not \x1b[0mfound"),
+        ),
+        (&["port is not-"], format!("port is {RED_BOLD}not-\x1b[0m")),
+        // A screen switch follows it.
+        (
+            &["x not \x1b[?1049hfound\x1b[?1049l\n"],
+            format!("x {RED_BOLD}not \x1b[0m\x1b[?1049hfound\x1b[?1049l\n"),
+        ),
+        // The word after it arrives in the same piece: as before.
+        (
+            &["status not connected\n"],
+            format!("status {RED_BOLD}not connected\x1b[0m\n"),
+        ),
+        (
+            &["status not", " connected\n"],
+            format!("status {RED_BOLD}not connected\x1b[0m\n"),
+        ),
+        (
+            &["port is not-", "connected\n"],
+            format!("port is {RED_BOLD}not-connected\x1b[0m\n"),
+        ),
+        (&["file not found\n"], "file not found\n".to_string()),
+        (&["do not do it\n"], "do not do it\n".to_string()),
+        (&["x not \nnext\n"], "x not \nnext\n".to_string()),
+        // No blank or hyphen after it, or another word.
+        (&["not\n"], "not\n".to_string()),
+        (&["status not", "\n"], "status not\n".to_string()),
+        (&["status not"], "status not".to_string()),
+        (&["tie a knot ", "here\n"], "tie a knot here\n".to_string()),
+    ] {
+        assert_eq!(
+            stream_with_generic(false, reads),
+            expected,
+            "filter stream, {reads:?}"
+        );
+    }
+
+    // On a terminal each line is matched on its own, so the end of a line
+    // ends the piece too. The interactive stream draws no bold.
+    const RED: &str = "\x1b[38;2;255;0;0m";
+    for (reads, expected) in [
+        (
+            ["status not ", "connected\n"].as_slice(),
+            format!("status {RED}not {GREEN}connected\n\x1b[39m"),
+        ),
+        (&["x not \nnext\n"], format!("x {RED}not \n\x1b[39mnext\n")),
+        (
+            &["do-not-\nnext\n"],
+            format!("do-{RED}not-\n\x1b[39mnext\n"),
+        ),
+        (
+            &["status not connected\n"],
+            format!("status {RED}not connected\n\x1b[39m"),
+        ),
+        (&["file not found\n"], "file not found\n".to_string()),
+        (&["x not\nnext\n"], "x not\nnext\n".to_string()),
+    ] {
+        assert_eq!(
+            stream_with_generic(true, reads),
+            expected,
+            "interactive stream, {reads:?}"
+        );
+    }
+}
+
+// A shell's line editor draws the command being typed, and on a terminal
+// each row it draws is matched on its own. Two redraws end a row after `not`
+// while the command is still in the editor, and the `not` is then drawn in
+// the bad-state color before the command is run. This is accepted: the same
+// rows already color `down`, as the last case shows for `downwind`.
+//
+// The reads are what zsh was seen to write, at 80 columns after the prompt
+// `desk% `: for a paste of three lines, one row per line, in inverse, each
+// followed by an erase; and for a command that wraps, the last cell of the
+// row, a blank and a carriage return, an erase, and the first character of
+// the next row written twice.
+#[test]
+fn generic_profile_paints_a_negation_at_the_end_of_a_row_the_shell_editor_draws() {
+    const RED: &[u8] = b"\x1b[38;2;255;0;0m";
+    let store = ProfileStore::builtin();
+    let config = PrismConfig::from_profiles(&store, &["generic"]).expect("generic loads");
+    let highlighter = Highlighter::from_config(config).expect("rules compile");
+    let prompt = b"\r\x1b[0m\x1b[27m\x1b[24m\x1b[Jdesk% \x1b[K\x1b[?2004h".as_slice();
+    let first_row = [b"x".repeat(72), b" \r\x1b[K".to_vec()].concat();
+
+    // Each case: the reads, and what is written for each read and at the end
+    // of input. A read that is written as it came is given as `None`.
+    type Case<'a> = (&'a str, Vec<Vec<u8>>, Vec<Option<Vec<u8>>>);
+    let cases: Vec<Case> = vec![
+        (
+            "a pasted line that ends in `not-`",
+            vec![
+                prompt.to_vec(),
+                b"\x1b[7m: x\x1b[27m\r\r\n\x1b[7m: not-\x1b[27m\x1b[K\r\r\n\x1b[7m: z\x1b[27m\x1b[K"
+                    .to_vec(),
+            ],
+            vec![
+                None,
+                Some(
+                    [
+                        b"\x1b[7m: x\x1b[27m\r\r\n\x1b[7m: ".as_slice(),
+                        RED,
+                        b"not-\x1b[27m",
+                        RED,
+                        b"\x1b[K",
+                        RED,
+                        b"\r\r\n\x1b[7m",
+                        RED,
+                        b"\x1b[39m: z\x1b[27m\x1b[K",
+                    ]
+                    .concat(),
+                ),
+                Some(Vec::new()),
+            ],
+        ),
+        (
+            "`: `, 148 `x` and ` notable`: the row ends after `not`",
+            vec![
+                prompt.to_vec(),
+                b":\x08: ".to_vec(),
+                first_row.clone(),
+                [b"x\r".to_vec(), b"x".repeat(76)].concat(),
+                b" n".to_vec(),
+                b"ot \r\x1b[Ka".to_vec(),
+                b"\rable".to_vec(),
+            ],
+            vec![
+                None,
+                None,
+                None,
+                Some(b"x\r".to_vec()),
+                Some([b"x".repeat(76), b" ".to_vec()].concat()),
+                Some([RED, b"not \r\x1b[K", RED].concat()),
+                Some(b"\x1b[39ma\r".to_vec()),
+                Some(b"able".to_vec()),
+            ],
+        ),
+        (
+            "`: `, 151 `x` and `knot `: the row ends after `k`",
+            vec![
+                prompt.to_vec(),
+                b":\x08: ".to_vec(),
+                first_row.clone(),
+                [
+                    b"x\r".to_vec(),
+                    b"x".repeat(79),
+                    b"k \r\x1b[Kn\rnot ".to_vec(),
+                ]
+                .concat(),
+            ],
+            vec![
+                None,
+                None,
+                None,
+                Some(
+                    [
+                        b"x\r".to_vec(),
+                        b"x".repeat(79),
+                        b"k \r\x1b[Kn\r".to_vec(),
+                        RED.to_vec(),
+                        b"not ".to_vec(),
+                    ]
+                    .concat(),
+                ),
+                Some(b"\x1b[39m".to_vec()),
+            ],
+        ),
+        (
+            "`: `, 147 `x` and ` downwind`: the row ends after `down`",
+            vec![
+                prompt.to_vec(),
+                b":\x08: ".to_vec(),
+                first_row.clone(),
+                [b"x\r".to_vec(), b"x".repeat(75)].concat(),
+                b" d".to_vec(),
+                b"own \r\x1b[K".to_vec(),
+                b"w\rwind".to_vec(),
+            ],
+            vec![
+                None,
+                None,
+                None,
+                Some(b"x\r".to_vec()),
+                Some([b"x".repeat(75), b" ".to_vec()].concat()),
+                Some([RED, b"down \r\x1b[K", RED].concat()),
+                Some(b"\x1b[39mw\r".to_vec()),
+                Some(b"wind".to_vec()),
+            ],
+        ),
+    ];
+
+    for (case, reads, expected) in cases {
+        let mut streaming = StreamingHighlighter::new_interactive(highlighter.clone());
+        let mut written: Vec<Vec<u8>> = reads.iter().map(|read| streaming.push(read)).collect();
+        written.push(streaming.finish());
+        let expected: Vec<Vec<u8>> = expected
+            .into_iter()
+            .enumerate()
+            .map(|(index, write)| write.unwrap_or_else(|| reads[index].clone()))
+            .collect();
+        assert_eq!(written, expected, "{case}");
+    }
+}
+
 // `den` alone is a site code or a word, not a denial.
 #[test]
 fn generic_profile_does_not_paint_bare_den_as_a_bad_state() {
