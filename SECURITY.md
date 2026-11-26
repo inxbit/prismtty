@@ -40,7 +40,7 @@ examples that preserve only the token shape needed to reproduce the issue.
 - `--trace-io` records all PTY input and output to the trace file, including
   typed passwords. The file is created owner-only (0600), but treat it as
   sensitive and delete it after debugging.
-- PrismTTY is not a descriptor isolation boundary. Since 1.3.14, descriptors
+- PrismTTY is not a descriptor isolation boundary. Since 1.3.15, descriptors
   above 2 that the caller leaves inheritable, whether passed on purpose
   (`ptty cmd 3<file`) or leaked by a terminal, IDE, multiplexer or launcher,
   reach the wrapped command as they would without the wrapper. Descriptors
