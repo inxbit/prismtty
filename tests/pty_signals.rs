@@ -2316,3 +2316,189 @@ fn diagnostics_in_a_raw_terminal_end_in_cr_lf() {
         .any(|(idx, byte)| *byte == b'\n' && (idx == 0 || output[idx - 1] != b'\r'));
     assert!(!bare_lf, "{:?}", String::from_utf8_lossy(&output));
 }
+
+/// Runs `ptty` on a fresh terminal whose slave has `outer_oflag` added to its
+/// output flags, with the wrapped `script` and an optional shell redirection
+/// for ptty's stdout. With `drawn_before_enter`, the script is expected to
+/// wait for a line of input: the terminal must have received those bytes,
+/// with the keyboard still read raw, before Enter is typed. Returns what the
+/// terminal received and what the redirection saved in `$SAVED`.
+fn run_on_terminal(
+    outer_oflag: libc::tcflag_t,
+    script: &str,
+    redirect: &str,
+    drawn_before_enter: Option<&[u8]>,
+) -> (Vec<u8>, Option<Vec<u8>>) {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let home = tempfile::tempdir().expect("home");
+    let config = home.path().join("empty.yml");
+    std::fs::write(&config, "rules: []\n").expect("config writes");
+    let pair = native_pty_system()
+        .openpty(PtySize::default())
+        .expect("openpty");
+    let tty = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NOCTTY)
+        .open(pair.master.tty_name().expect("outer PTY tty name"))
+        .expect("open outer slave tty");
+    // SAFETY: termios is a plain C struct that tcgetattr fills before it is read.
+    let mut attrs = unsafe { std::mem::zeroed::<libc::termios>() };
+    // SAFETY: `tty` is an open terminal and `attrs` a valid termios for both calls.
+    unsafe {
+        assert_eq!(libc::tcgetattr(tty.as_raw_fd(), &mut attrs), 0);
+        attrs.c_oflag |= outer_oflag;
+        assert_eq!(libc::tcsetattr(tty.as_raw_fd(), libc::TCSANOW, &attrs), 0);
+    }
+    let mut builder = CommandBuilder::new("/bin/sh");
+    builder.env_clear();
+    builder.env("HOME", home.path());
+    builder.env("PRISMTTY_RUNTIME_DIR", home.path().join("runtime"));
+    builder.env("PATH", "/usr/bin:/bin");
+    builder.env("PTTY", env!("CARGO_BIN_EXE_ptty"));
+    builder.env("CONFIG", &config);
+    builder.env("SCRIPT", script);
+    builder.env("SAVED", home.path().join("saved.out"));
+    builder.env("STATUS", home.path().join("status"));
+    builder.args([
+        "-c",
+        &format!(
+            "{{ \"$PTTY\" --config \"$CONFIG\" -- /bin/sh -c \"$SCRIPT\"; echo $? > \"$STATUS\"; }} {redirect}; \
+             echo wrapper-status=$(cat \"$STATUS\")"
+        ),
+    ]);
+    let child = pair.slave.spawn_command(builder).expect("spawn shell");
+    drop(pair.slave);
+    let mut shell = PtySession::new(child, &*pair.master);
+
+    if let Some(drawn) = drawn_before_enter {
+        let seen = shell
+            .capture()
+            .wait_until(Duration::from_secs(10), |out| contains_bytes(out, drawn));
+        // SAFETY: `tty` is an open terminal and `attrs` a valid termios.
+        unsafe {
+            assert_eq!(libc::tcgetattr(tty.as_raw_fd(), &mut attrs), 0);
+        }
+        assert!(
+            contains_bytes(&seen, drawn) && attrs.c_lflag & libc::ICANON == 0,
+            "while the keyboard is read raw (ICANON {}): {:?}",
+            attrs.c_lflag & libc::ICANON != 0,
+            String::from_utf8_lossy(&seen)
+        );
+        // Not `take_writer`: dropping that writer types a newline and an end
+        // of input of its own.
+        let keyboard = pair.master.as_raw_fd().expect("outer PTY descriptor");
+        // SAFETY: `keyboard` is the open PTY master and the buffer is one byte.
+        let typed = unsafe { libc::write(keyboard, b"\n".as_ptr().cast(), 1) };
+        assert_eq!(typed, 1, "type Enter");
+    }
+    let status = shell.wait_for_exit(Duration::from_secs(10));
+    let output = shell.capture().wait_until(Duration::from_secs(2), |out| {
+        contains_bytes(out, b"wrapper-status=0")
+    });
+    drop(tty);
+    assert_eq!(status, Some(0), "{:?}", String::from_utf8_lossy(&output));
+    assert!(
+        contains_bytes(&output, b"wrapper-status=0"),
+        "{:?}",
+        String::from_utf8_lossy(&output)
+    );
+    (output, std::fs::read(home.path().join("saved.out")).ok())
+}
+
+fn has_bare_lf(bytes: &[u8]) -> bool {
+    bytes
+        .iter()
+        .enumerate()
+        .any(|(idx, byte)| *byte == b'\n' && (idx == 0 || bytes[idx - 1] != b'\r'))
+}
+
+/// The output flag that makes a terminal write spaces in place of a tab.
+fn expand_tabs() -> libc::tcflag_t {
+    use nix::sys::termios::OutputFlags;
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    let flag = OutputFlags::TAB3;
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    let flag = OutputFlags::OXTABS;
+    flag.bits()
+}
+
+/// With the keyboard on a terminal and the output saved to a file, the wrapped
+/// PTY starts from the terminal's settings. None of the terminal's output
+/// conversions belong in the file: no CR in front of a LF, and no spaces in
+/// place of a tab when the terminal expands tabs.
+#[test]
+fn output_saved_from_a_terminal_session_keeps_the_commands_bytes() {
+    let (_, saved) = run_on_terminal(
+        expand_tabs(),
+        "printf 'a\\tb\\nx\\r\\ny\\rz\\n'",
+        "> \"$SAVED\"",
+        None,
+    );
+    let saved = saved.expect("saved output");
+
+    assert_eq!(
+        saved,
+        b"a\tb\nx\r\ny\rz\n",
+        "{:?}",
+        String::from_utf8_lossy(&saved)
+    );
+}
+
+/// `ptty cmd | tee log` typed at a terminal: the wrapper keeps that terminal
+/// raw and the output comes back to it through `tee`, so the lines need the
+/// CR the command's PTY puts in front of each LF, in the pipe too. The command
+/// waits for a line of input, so the lines are drawn while the wrapper holds
+/// the terminal, not after it gave it back.
+#[test]
+fn output_piped_back_to_the_terminal_does_not_stair_step() {
+    let (terminal, saved) = run_on_terminal(
+        0,
+        "printf 'a\\nb\\nc\\n'; read line",
+        "| tee \"$SAVED\"",
+        Some(b"a\r\nb\r\nc\r\n"),
+    );
+
+    // The typed Enter is echoed by the command's PTY into the pipe as well.
+    assert_eq!(saved.as_deref(), Some(&b"a\r\nb\r\nc\r\n\r\n"[..]));
+    assert!(
+        !has_bare_lf(&terminal),
+        "{:?}",
+        String::from_utf8_lossy(&terminal)
+    );
+}
+
+/// A full-screen program turns its PTY's LF conversion off and writes a bare
+/// LF to go one row down in the same column. Through `tee` that LF has to
+/// reach the terminal bare; a CR in front of it would send the next
+/// characters to the left edge.
+#[test]
+fn a_bare_line_feed_piped_back_to_the_terminal_stays_bare() {
+    let (terminal, _) = run_on_terminal(
+        0,
+        "stty -opost; printf 'ab\\ncd\\n'; read line",
+        "| tee \"$SAVED\"",
+        Some(b"ab\ncd\n"),
+    );
+
+    assert!(
+        !contains_bytes(&terminal, b"ab\r\ncd"),
+        "{:?}",
+        String::from_utf8_lossy(&terminal)
+    );
+}
+
+/// On a terminal the wrapper keeps the outer terminal raw, so the wrapped PTY
+/// still has to turn each LF into CR LF, as before.
+#[test]
+fn output_on_a_terminal_still_ends_lines_with_cr_lf() {
+    let (output, _) = run_on_terminal(0, "printf 'a\\nb\\n'", "", None);
+
+    assert!(
+        contains_bytes(&output, b"a\r\nb\r\n"),
+        "{:?}",
+        String::from_utf8_lossy(&output)
+    );
+}

@@ -217,7 +217,13 @@ A wrapped command runs in the current directory. When stdin is not a terminal
 (a script, a CI job, or `ptty make < /dev/null`), the command reads that stdin
 directly while its output still goes through the PTY and is highlighted. If the
 command cannot be found or run, PrismTTY exits with 127 or 126, as a shell does;
-otherwise it exits with the command's own status.
+otherwise it exits with the command's own status. When the output goes to a
+regular file (`ptty make > build.log`), or to a pipe while stdin is not a
+terminal, the command's PTY starts with output processing off, so LF and CR LF
+line ends are saved as the command wrote them; the command can change that
+setting. With the keyboard on a terminal and the output in a pipe
+(`ptty ssh host | tee log`) the PTY keeps its usual output settings, because
+the pipe usually leads back to that terminal.
 
 Important options:
 
