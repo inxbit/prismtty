@@ -535,6 +535,10 @@ fn spawn_supervised(
 }
 
 pub(super) fn run_command(options: Options, command: Vec<OsString>) -> Result<ExitCode, CliError> {
+    // Listed before prismtty opens anything of its own, so these are the
+    // descriptors the caller handed over (`cmd 3<file`), which the command
+    // inherits as it would without the wrapper.
+    let caller_fds = inherited_fds();
     let command_name = command[0].clone();
     let command_args = command[1..].to_vec();
     let pty_system = native_pty_system();
@@ -579,7 +583,12 @@ pub(super) fn run_command(options: Options, command: Vec<OsString>) -> Result<Ex
 
     let mut signal_mask = SessionSignalMask::block()?;
     let mut terminal_session = TerminalSession::start(interactive)?;
-    let mut child = if interactive {
+    let mut child = if interactive && pair.master.tty_name().is_none() {
+        // The slave cannot be opened by name (seen with musl in a chroot
+        // without /proc), so portable-pty spawns the command from its own
+        // slave descriptor. It closes every descriptor above stderr in the
+        // child: the caller's do not reach the command, and with std's
+        // exec-error pipe closed an execve failure aborts the child.
         pair.slave
             .spawn_command(builder)
             .map_err(|source| CliError::Spawn {
@@ -587,7 +596,7 @@ pub(super) fn run_command(options: Options, command: Vec<OsString>) -> Result<Ex
                 source,
             })?
     } else {
-        spawn_with_caller_stdin(&builder, &*pair.master)?
+        spawn_with_pty_slave(&builder, &*pair.master, interactive, &caller_fds)?
     };
     close_slave_after_child_exit(pair.slave, child.process_id());
     set_forward_child_pid(child.process_id().map(|pid| pid as i32).unwrap_or(0));
@@ -860,14 +869,16 @@ fn script_interpreter(start: &[u8], syntax: &ShebangSyntax) -> Option<PathBuf> {
 }
 
 /// Checks the `#!` interpreter of a script before it is spawned. A script
-/// whose interpreter cannot be executed only fails in execve, after the fork.
-/// portable-pty, which spawns the command from a terminal, closes every
-/// descriptor above 2 in the child, std's exec-error pipe included, so the
-/// child aborts with "fatal runtime error" instead of the spawn reporting the
-/// failure. The line is parsed as the kernel does, so a CRLF script names
-/// `/bin/sh\r`. Whatever the kernel would not reject for certain is left to
-/// the spawn: an empty name, a relative one when the child's directory is not
-/// known, and every script on a kernel whose syntax is not known here.
+/// whose interpreter cannot be executed only fails in execve, after the fork,
+/// where the spawn can report no more than the errno: ENOENT reads as if the
+/// script itself were missing. This names the interpreter instead. It also
+/// covers the spawn by portable-pty when the slave has no name, which closes
+/// std's exec-error pipe in the child, so the child would abort with "fatal
+/// runtime error" instead. The line is parsed as the kernel does, so a CRLF
+/// script names `/bin/sh\r`. Whatever the kernel would not reject for certain
+/// is left to the spawn: an empty name, a relative one when the child's
+/// directory is not known, and every script on a kernel whose syntax is not
+/// known here.
 fn unusable_script_interpreter(program: &OsStr, cwd: Option<&Path>) -> Option<CliError> {
     let syntax = KERNEL_SHEBANG?;
     let script = program_candidates(program, cwd)
@@ -907,21 +918,26 @@ fn unusable_script_interpreter(program: &OsStr, cwd: Option<&Path>) -> Option<Cl
     })
 }
 
-/// Spawns the wrapped command when stdin is not a terminal. The child reads
-/// the caller's stdin itself, so every read sees what `cmd < file` would: the
-/// data of a pipe or file, then end of input, however often it reads. The PTY
-/// slave is its stdout, stderr and controlling terminal. portable-pty always
-/// puts the slave on stdin, so this mirrors its spawn otherwise: the program
-/// is resolved against the same directory and PATH (`resolve_program` says
-/// where its messages differ), SHELL is set when unset (the builder's
-/// environment is the process's own on this path), and the child starts as a
-/// session leader with default signal dispositions and an empty signal mask.
-/// Inherited descriptors are marked close-on-exec rather than closed, which
-/// keeps std's exec-error pipe working, so an execve failure is reported
-/// instead of aborting the child.
-fn spawn_with_caller_stdin(
+/// Spawns the wrapped command with the PTY slave as its stdout, stderr and
+/// controlling terminal, and as its stdin when `interactive`. Otherwise the
+/// child reads the caller's stdin itself, so every read sees what
+/// `cmd < file` would: the data of a pipe or file, then end of input, however
+/// often it reads. This mirrors portable-pty's spawn: the program is resolved
+/// against the same directory and PATH (`resolve_program` says where its
+/// messages differ), the environment is the builder's, and the child starts
+/// as a session leader with default signal dispositions and an empty signal
+/// mask.
+///
+/// Unlike portable-pty, which closes every descriptor above stderr in the
+/// child, this keeps the ones in `caller_fds` for the command, as a shell
+/// does, and marks any other that would survive the exec close-on-exec. None
+/// is closed, so std's exec-error pipe keeps working and an execve failure is
+/// reported instead of aborting the child.
+fn spawn_with_pty_slave(
     builder: &CommandBuilder,
     master: &dyn portable_pty::MasterPty,
+    interactive: bool,
+    caller_fds: &[RawFd],
 ) -> Result<Box<dyn portable_pty::Child + Send + Sync>, CliError> {
     use std::os::unix::process::CommandExt;
     use std::process::{Command, Stdio};
@@ -946,7 +962,13 @@ fn spawn_with_caller_stdin(
         .write(true)
         .custom_flags(libc::O_NOCTTY)
         .open(tty_name)?;
-    let inherited = inherited_fds();
+    // What prismtty opens itself is close-on-exec, so this is expected to be
+    // empty; it keeps a descriptor some library left inheritable out of the
+    // command.
+    let own_fds: Vec<RawFd> = inherited_fds()
+        .into_iter()
+        .filter(|fd| !caller_fds.contains(fd))
+        .collect();
     // SAFETY: sigset_t is a plain C type; sigemptyset below initializes it before it is used.
     let mut empty_mask = unsafe { mem::zeroed::<libc::sigset_t>() };
     // SAFETY: `empty_mask` is a valid, exclusively borrowed sigset_t.
@@ -954,16 +976,24 @@ fn spawn_with_caller_stdin(
         libc::sigemptyset(&mut empty_mask);
     }
 
+    let stdin = if interactive {
+        Stdio::from(slave.try_clone()?)
+    } else {
+        Stdio::inherit()
+    };
     let mut command = Command::new(&program);
     command
         .arg0(&argv[0])
         .args(&argv[1..])
         .current_dir(&dir)
-        .stdin(Stdio::inherit())
+        .stdin(stdin)
         .stdout(slave.try_clone()?)
         .stderr(slave);
-    if let Some(shell) = builder.get_env("SHELL") {
-        command.env("SHELL", shell);
+    command.env_clear();
+    for key in builder_env_keys(builder) {
+        if let Some(value) = builder.get_env(&key) {
+            command.env(&key, value);
+        }
     }
     // SAFETY: the closure runs in the forked child before exec. It only calls
     // async-signal-safe functions (signal, sigprocmask, setsid, ioctl, fcntl)
@@ -989,7 +1019,7 @@ fn spawn_with_caller_stdin(
             if libc::ioctl(libc::STDOUT_FILENO, libc::TIOCSCTTY as _, 0) == -1 {
                 return Err(io::Error::last_os_error());
             }
-            for &fd in &inherited {
+            for &fd in &own_fds {
                 // A descriptor closed since it was listed only reports EBADF.
                 libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
             }
@@ -1027,6 +1057,25 @@ fn home_dir(builder: &CommandBuilder) -> PathBuf {
         .map(PathBuf::from)
         .or_else(|| directories::BaseDirs::new().map(|dirs| dirs.home_dir().to_path_buf()))
         .unwrap_or_else(|| PathBuf::from("/"))
+}
+
+/// The names of every variable the builder's environment can hold: the
+/// process's own, SHELL, which the builder sets when it is unset, and the
+/// ones set on the builder (the iTerm guard's). The builder lists only
+/// UTF-8 entries, so the guard's copies of the parent's values are named
+/// here as well. Each is looked up in the builder, so a removed variable
+/// stays out and a value that is not UTF-8 passes as it is, as in
+/// portable-pty's spawn.
+fn builder_env_keys(builder: &CommandBuilder) -> Vec<OsString> {
+    let mut keys: Vec<OsString> = std::env::vars_os().map(|(key, _)| key).collect();
+    keys.push(OsString::from("SHELL"));
+    keys.extend(
+        builder
+            .iter_extra_env_as_str()
+            .map(|(key, _)| OsString::from(key)),
+    );
+    keys.extend(STRIPPED_ITERM_ENV.map(|key| OsString::from(format!("PRISMTTY_PARENT_{key}"))));
+    keys
 }
 
 /// Resolves the program as portable-pty's spawn does: a name with a `/`
@@ -1101,14 +1150,16 @@ fn exec_failure_exit_code(error: &io::Error) -> u8 {
             | libc::ETXTBSY
             | libc::E2BIG,
         ) => 126,
+        // A program built for another CPU type.
+        #[cfg(target_vendor = "apple")]
+        Some(libc::EBADARCH) => 126,
         _ => 1,
     }
 }
 
-/// Descriptors above stderr that would survive an exec: ones prismtty
-/// inherited without close-on-exec, since all it opens itself is
-/// close-on-exec. Like portable-pty, this lists /dev/fd, and finds nothing
-/// where that cannot be read. Listing allocates, so it runs before the fork.
+/// Descriptors above stderr that would survive an exec. Like portable-pty,
+/// this lists /dev/fd, and finds nothing where that cannot be read. Listing
+/// allocates, so it runs before the fork.
 fn inherited_fds() -> Vec<RawFd> {
     let Ok(entries) = std::fs::read_dir("/dev/fd") else {
         return Vec::new();
@@ -3102,7 +3153,7 @@ mod tests {
             .expect("signal watcher starts");
         let spawned = run_command.find("spawn_command").expect("child is spawned");
         let spawned_with_caller_stdin = run_command
-            .find("spawn_with_caller_stdin(")
+            .find("spawn_with_pty_slave(")
             .expect("child is spawned without a terminal on stdin");
         let published = run_command
             .find("set_forward_child_pid")
@@ -3637,7 +3688,7 @@ mod tests {
         builder.arg("short-lived output");
         builder.cwd("/");
         let mut child =
-            super::spawn_with_caller_stdin(&builder, &*pair.master).expect("spawn printf");
+            super::spawn_with_pty_slave(&builder, &*pair.master, false, &[]).expect("spawn printf");
         // Let the child write and exit while the parent still holds the slave,
         // as a short command can before the parent reaches the close.
         std::thread::sleep(Duration::from_millis(300));
