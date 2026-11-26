@@ -585,99 +585,62 @@ fn wrapped_command_exec_failure_after_the_fork_uses_shell_exit_codes() {
 // A descriptor the caller hands the wrapped command on purpose (`cmd 3<file`,
 // `--passphrase-fd 3`, a process substitution) reaches it as it does without
 // the wrapper, and nothing prismtty opens itself joins it: the command lists
-// the same descriptors as when the caller runs it directly, with `--trace-io`
-// on as well. One the caller marked close-on-exec stays out, as for any exec.
+// the same descriptors as when the same shell runs it directly, with
+// `--trace-io` on as well. One shell starts all three runs, so whatever else
+// it inherited is in every list.
 #[test]
 #[cfg(unix)]
 fn wrapped_command_inherits_exactly_the_callers_extra_descriptors() {
-    use std::os::unix::process::CommandExt;
-
     let work = tempfile::tempdir().expect("work directory");
     let config = work.path().join("empty.yml");
     fs::write(&config, "rules: []\n").expect("write config");
     let data = work.path().join("data.txt");
     fs::write(&data, "caller-data\n").expect("write data");
-    let data = std::ffi::CString::new(data.to_str().expect("utf-8 path")).expect("no NUL");
-    let script = "read line <&7; echo \"fd7:$line\"; echo fd-list; exec ls /dev/fd";
 
-    let run = |ptty_args: Option<Vec<String>>| {
-        let mut command = match &ptty_args {
-            Some(args) => {
-                let mut command = StdCommand::new(assert_cmd::cargo::cargo_bin("ptty"));
-                command.args(args).args(["--", "/bin/sh", "-c", script]);
-                command
-            }
-            None => {
-                let mut command = StdCommand::new("/bin/sh");
-                command.args(["-c", script]);
-                command
-            }
-        };
-        command
-            .env_clear()
-            .env("PATH", "/usr/bin:/bin")
-            .env("HOME", work.path())
-            .env("PRISMTTY_RUNTIME_DIR", work.path().join("runtime"))
-            .stdin(Stdio::null());
-        let data = data.clone();
-        // SAFETY: open, dup2, close and fcntl are async-signal-safe and run in
-        // the forked child before exec; the path was allocated before the fork.
-        // dup2 clears close-on-exec on its copy, so fd 7 is inherited, and fd 8
-        // is then marked close-on-exec again.
-        unsafe {
-            command.pre_exec(move || {
-                let fd = libc::open(data.as_ptr(), libc::O_RDONLY);
-                if fd == -1 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                if fd != 7 {
-                    if libc::dup2(fd, 7) == -1 {
-                        return Err(std::io::Error::last_os_error());
-                    }
-                    libc::close(fd);
-                }
-                if libc::dup2(2, 8) == -1 || libc::fcntl(8, libc::F_SETFD, libc::FD_CLOEXEC) == -1 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
-        let output = command.output().expect("command runs");
-        let stdout = strip_csi(&output.stdout);
-        assert!(
-            output.status.success() && stdout.contains("fd7:caller-data"),
-            "{ptty_args:?}: fd 7 did not reach the command: {output:?}"
-        );
-        let listed: Vec<u32> = stdout
-            .split("fd-list")
+    let output = StdCommand::new("/bin/sh")
+        .args([
+            "-c",
+            "list='read line <&7; echo \"fd7:$line\"; echo fd-list; exec ls /dev/fd'; \
+             echo direct-start; /bin/sh -c \"$list\" 7<\"$DATA\"; echo direct-end; \
+             echo plain-start; \"$PTTY\" --config \"$CONFIG\" -- /bin/sh -c \"$list\" 7<\"$DATA\"; \
+             echo plain-end=$?; \
+             echo traced-start; \"$PTTY\" --config \"$CONFIG\" --trace-io \"$TRACE\" -- \
+             /bin/sh -c \"$list\" 7<\"$DATA\"; echo traced-end=$?",
+        ])
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", work.path())
+        .env("PRISMTTY_RUNTIME_DIR", work.path().join("runtime"))
+        .env("PTTY", assert_cmd::cargo::cargo_bin("ptty"))
+        .env("CONFIG", &config)
+        .env("TRACE", work.path().join("trace.log"))
+        .env("DATA", &data)
+        .stdin(Stdio::null())
+        .output()
+        .expect("shell runs");
+    let text = strip_csi(&output.stdout).replace('\r', "");
+    assert!(output.status.success(), "{output:?}");
+    let run = |start: &str, end: &str| -> Vec<u32> {
+        let run = text
+            .split(start)
             .nth(1)
-            .expect("descriptor list")
+            .and_then(|rest| rest.split(end).next())
+            .unwrap_or_default();
+        assert!(
+            run.contains("fd7:caller-data"),
+            "{start}: fd 7 did not reach the command: {text:?}"
+        );
+        run.split("fd-list")
+            .nth(1)
+            .unwrap_or_default()
             .split_whitespace()
             .filter_map(|word| word.parse().ok())
-            .collect();
-        listed
+            .collect()
     };
-
-    let direct = run(None);
-    assert!(
-        direct.contains(&7) && !direct.contains(&8),
-        "direct: {direct:?}"
-    );
-    let config = config.to_str().expect("utf-8 path").to_owned();
-    let trace = work.path().join("trace.log");
-    let trace = trace.to_str().expect("utf-8 path").to_owned();
-    for args in [
-        vec!["--config".to_owned(), config.clone()],
-        vec![
-            "--config".to_owned(),
-            config.clone(),
-            "--trace-io".to_owned(),
-            trace,
-        ],
-    ] {
-        let wrapped = run(Some(args.clone()));
-        assert_eq!(wrapped, direct, "{args:?}");
-    }
+    let direct = run("direct-start", "direct-end");
+    assert!(direct.contains(&7), "direct: {text:?}");
+    assert_eq!(run("plain-start", "plain-end=0"), direct, "{text:?}");
+    assert_eq!(run("traced-start", "traced-end=0"), direct, "{text:?}");
 }
 
 /// Drops CSI sequences so assertions see the text a terminal would show.

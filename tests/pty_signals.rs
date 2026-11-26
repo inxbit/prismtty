@@ -1076,10 +1076,114 @@ fn interactive_command_inherits_exactly_the_callers_extra_descriptors() {
     );
 }
 
+/// A current directory the user cannot enter makes the wrapped command start
+/// in the home directory, from a terminal and with stdin redirected. As in
+/// portable-pty's spawn, a HOME that is not UTF-8 is passed over for the home
+/// directory in the passwd database.
+#[test]
+fn command_from_an_unenterable_directory_starts_in_the_passwd_home() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    // SAFETY: geteuid has no preconditions.
+    if unsafe { libc::geteuid() } == 0 {
+        // root can enter any directory, so nothing falls back.
+        return;
+    }
+    // SAFETY: passwd is a plain C struct that getpwuid_r fills before it is read.
+    let mut entry = unsafe { std::mem::zeroed::<libc::passwd>() };
+    let mut buffer = vec![0 as libc::c_char; 16 * 1024];
+    let mut found = std::ptr::null_mut();
+    // SAFETY: every pointer is valid for the call and the buffer length is its own;
+    // getpwuid_r is the thread-safe lookup, as other tests spawn concurrently.
+    let result = unsafe {
+        libc::getpwuid_r(
+            libc::getuid(),
+            &mut entry,
+            buffer.as_mut_ptr(),
+            buffer.len(),
+            &mut found,
+        )
+    };
+    if result != 0 || found.is_null() || entry.pw_dir.is_null() {
+        // No passwd entry or home (some containers): nothing to compare with.
+        return;
+    }
+    // SAFETY: getpwuid_r succeeded, so pw_dir points into `buffer` at a
+    // NUL-terminated string.
+    let passwd_home = unsafe { std::ffi::CStr::from_ptr(entry.pw_dir) };
+    let Ok(passwd_home) = std::fs::canonicalize(OsStr::from_bytes(passwd_home.to_bytes())) else {
+        // A home directory that does not exist (packaging sandboxes).
+        return;
+    };
+    let work = tempfile::tempdir().expect("work directory");
+    let locked = work.path().join("locked");
+    std::fs::create_dir(&locked).expect("locked directory");
+    let config = work.path().join("empty.yml");
+    std::fs::write(&config, "rules: []\n").expect("config writes");
+    let pair = native_pty_system()
+        .openpty(PtySize::default())
+        .expect("openpty");
+    let mut builder = CommandBuilder::new("/bin/sh");
+    builder.env_clear();
+    builder.env(
+        "HOME",
+        OsStr::from_bytes(b"/nonexistent/prismtty-home-\xff"),
+    );
+    builder.env("PRISMTTY_RUNTIME_DIR", work.path().join("runtime"));
+    builder.env("PATH", "/usr/bin:/bin");
+    builder.env("PTTY", env!("CARGO_BIN_EXE_ptty"));
+    builder.env("CONFIG", &config);
+    builder.env("LOCKED", &locked);
+    builder.cwd(work.path());
+    builder.args([
+        "-c",
+        "show='echo \"cwd=$(/bin/pwd -P)\"'; cd \"$LOCKED\" && chmod 000 . || exit 9; \
+         \"$PTTY\" --config \"$CONFIG\" -- /bin/sh -c \"$show\"; echo terminal=$?; \
+         \"$PTTY\" --config \"$CONFIG\" -- /bin/sh -c \"$show\" </dev/null; echo redirected=$?; \
+         chmod 755 \"$LOCKED\"",
+    ]);
+    let child = pair.slave.spawn_command(builder).expect("spawn shell");
+    drop(pair.slave);
+    let mut shell = PtySession::new(child, &*pair.master);
+
+    let status = shell.wait_for_exit(Duration::from_secs(20));
+    let output = shell.capture().wait_until(Duration::from_secs(2), |out| {
+        contains_bytes(out, b"redirected=")
+    });
+    let raw = String::from_utf8_lossy(&output).replace('\r', "");
+    let mut text = String::new();
+    let mut chars = raw.chars();
+    while let Some(ch) = chars.next() {
+        if ch == '\u{1b}' {
+            // Drop a CSI sequence: the highlighter may color the path.
+            if chars.next() == Some('[') {
+                for next in chars.by_ref() {
+                    if ('@'..='~').contains(&next) {
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+        text.push(ch);
+    }
+    let expected = format!("cwd={}\n", passwd_home.display());
+    assert_eq!(status, Some(0), "{text:?}");
+    assert_eq!(
+        text.matches(&expected).count(),
+        2,
+        "{expected:?} in {text:?}"
+    );
+    for line in ["terminal=0", "redirected=0"] {
+        assert!(text.contains(line), "{line} missing: {text:?}");
+    }
+}
+
 /// In an iTerm2 session the wrapped shell must not see the variables that
 /// turn iTerm2's shell integration on a second time: they move to
-/// PRISMTTY_PARENT_* and the session is marked as nested. SHELL is set when
-/// the caller has none, as for any wrapped command.
+/// PRISMTTY_PARENT_* and the session is marked as nested. SHELL is set, as
+/// for any wrapped command.
 #[test]
 fn interactive_command_gets_the_iterm_guard_environment() {
     let home = tempfile::tempdir().expect("home");

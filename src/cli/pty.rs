@@ -586,9 +586,10 @@ pub(super) fn run_command(options: Options, command: Vec<OsString>) -> Result<Ex
     let mut child = if interactive && pair.master.tty_name().is_none() {
         // The slave cannot be opened by name (seen with musl in a chroot
         // without /proc), so portable-pty spawns the command from its own
-        // slave descriptor. It closes every descriptor above stderr in the
-        // child: the caller's do not reach the command, and with std's
-        // exec-error pipe closed an execve failure aborts the child.
+        // slave descriptor. Where it can list /dev/fd it closes every
+        // descriptor above stderr in the child: the caller's do not reach
+        // the command, and with std's exec-error pipe closed an execve
+        // failure aborts the child. Where it cannot, it closes none.
         pair.slave
             .spawn_command(builder)
             .map_err(|source| CliError::Spawn {
@@ -873,12 +874,12 @@ fn script_interpreter(start: &[u8], syntax: &ShebangSyntax) -> Option<PathBuf> {
 /// where the spawn can report no more than the errno: ENOENT reads as if the
 /// script itself were missing. This names the interpreter instead. It also
 /// covers the spawn by portable-pty when the slave has no name, which closes
-/// std's exec-error pipe in the child, so the child would abort with "fatal
-/// runtime error" instead. The line is parsed as the kernel does, so a CRLF
-/// script names `/bin/sh\r`. Whatever the kernel would not reject for certain
-/// is left to the spawn: an empty name, a relative one when the child's
-/// directory is not known, and every script on a kernel whose syntax is not
-/// known here.
+/// std's exec-error pipe in the child where it can list /dev/fd, so the child
+/// would abort with "fatal runtime error" instead. The line is parsed as the
+/// kernel does, so a CRLF script names `/bin/sh\r`. Whatever the kernel would
+/// not reject for certain is left to the spawn: an empty name, a relative one
+/// when the child's directory is not known, and every script on a kernel
+/// whose syntax is not known here.
 fn unusable_script_interpreter(program: &OsStr, cwd: Option<&Path>) -> Option<CliError> {
     let syntax = KERNEL_SHEBANG?;
     let script = program_candidates(program, cwd)
@@ -928,11 +929,14 @@ fn unusable_script_interpreter(program: &OsStr, cwd: Option<&Path>) -> Option<Cl
 /// as a session leader with default signal dispositions and an empty signal
 /// mask.
 ///
-/// Unlike portable-pty, which closes every descriptor above stderr in the
-/// child, this keeps the ones in `caller_fds` for the command, as a shell
-/// does, and marks any other that would survive the exec close-on-exec. None
-/// is closed, so std's exec-error pipe keeps working and an execve failure is
-/// reported instead of aborting the child.
+/// Unlike portable-pty, which closes every descriptor above stderr it finds
+/// in /dev/fd in the child, this keeps the ones in `caller_fds` (sorted, as
+/// `inherited_fds` lists them) for the command, as a shell does, and marks
+/// any other that would survive the exec close-on-exec. That marking also
+/// needs a readable /dev/fd; where there is none, nothing is marked, and
+/// what prismtty opens itself still closes at the exec because it is opened
+/// close-on-exec. None is closed, so std's exec-error pipe keeps working and
+/// an execve failure is reported instead of aborting the child.
 fn spawn_with_pty_slave(
     builder: &CommandBuilder,
     master: &dyn portable_pty::MasterPty,
@@ -967,7 +971,7 @@ fn spawn_with_pty_slave(
     // command.
     let own_fds: Vec<RawFd> = inherited_fds()
         .into_iter()
-        .filter(|fd| !caller_fds.contains(fd))
+        .filter(|fd| caller_fds.binary_search(fd).is_err())
         .collect();
     // SAFETY: sigset_t is a plain C type; sigemptyset below initializes it before it is used.
     let mut empty_mask = unsafe { mem::zeroed::<libc::sigset_t>() };
@@ -1020,8 +1024,13 @@ fn spawn_with_pty_slave(
                 return Err(io::Error::last_os_error());
             }
             for &fd in &own_fds {
-                // A descriptor closed since it was listed only reports EBADF.
-                libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
+                if libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) == -1 {
+                    let error = io::Error::last_os_error();
+                    // A descriptor closed since it was listed is no leak.
+                    if error.raw_os_error() != Some(libc::EBADF) {
+                        return Err(error);
+                    }
+                }
             }
             Ok(())
         });
@@ -1048,15 +1057,68 @@ fn spawn_with_pty_slave(
     Ok(Box::new(child))
 }
 
-/// Where portable-pty starts a child that has no usable directory: $HOME,
-/// else the user's home directory, else `/`.
+/// Where the child starts when it has no usable directory. See
+/// `choose_home_dir`.
 fn home_dir(builder: &CommandBuilder) -> PathBuf {
-    builder
-        .get_env("HOME")
-        .and_then(OsStr::to_str)
-        .map(PathBuf::from)
-        .or_else(|| directories::BaseDirs::new().map(|dirs| dirs.home_dir().to_path_buf()))
-        .unwrap_or_else(|| PathBuf::from("/"))
+    choose_home_dir(builder.get_env("HOME"), passwd_home)
+}
+
+/// $HOME as it is whenever it is UTF-8, as portable-pty takes it, so an
+/// empty, relative or missing one is tried and fails to be entered. Else the
+/// user's home directory in the passwd database, as it is even when it is
+/// not UTF-8 (portable-pty fails the spawn there). Else, when the lookup
+/// fails or finds no entry or an empty home, `/`, as the lookup prismtty
+/// used before (dirs-sys) did.
+fn choose_home_dir(
+    home: Option<&OsStr>,
+    passwd_home: impl FnOnce() -> io::Result<Option<OsString>>,
+) -> PathBuf {
+    if let Some(home) = home.and_then(OsStr::to_str) {
+        return PathBuf::from(home);
+    }
+    match passwd_home() {
+        Ok(Some(dir)) if !dir.is_empty() => PathBuf::from(dir),
+        _ => PathBuf::from("/"),
+    }
+}
+
+/// The user's home directory in the passwd database, looked up as dirs-sys
+/// does: one getpwuid_r with a buffer of _SC_GETPW_R_SIZE_MAX bytes, or 512
+/// when that is not known. A home too long for the buffer fails the lookup.
+/// None when there is no entry or the entry has no home field.
+fn passwd_home() -> io::Result<Option<OsString>> {
+    use std::os::unix::ffi::OsStrExt;
+
+    // SAFETY: sysconf has no memory-safety preconditions.
+    let size = match unsafe { libc::sysconf(libc::_SC_GETPW_R_SIZE_MAX) } {
+        n if n < 0 => 512,
+        n => n as usize,
+    };
+    let mut buffer = vec![0 as libc::c_char; size];
+    // SAFETY: passwd is a plain C struct; getpwuid_r fills it before it is read.
+    let mut entry = unsafe { mem::zeroed::<libc::passwd>() };
+    let mut found = std::ptr::null_mut();
+    // SAFETY: `entry`, `buffer` and `found` are valid and exclusively borrowed
+    // for the call, and the length passed is the buffer's own.
+    let status = unsafe {
+        libc::getpwuid_r(
+            libc::getuid(),
+            &mut entry,
+            buffer.as_mut_ptr(),
+            buffer.len(),
+            &mut found,
+        )
+    };
+    if status != 0 {
+        return Err(io::Error::from_raw_os_error(status));
+    }
+    if found.is_null() || entry.pw_dir.is_null() {
+        return Ok(None);
+    }
+    // SAFETY: the lookup succeeded, so pw_dir points to a NUL-terminated
+    // string in `buffer`, which is still alive.
+    let dir = unsafe { std::ffi::CStr::from_ptr(entry.pw_dir) };
+    Ok(Some(OsStr::from_bytes(dir.to_bytes()).to_owned()))
 }
 
 /// The names of every variable the builder's environment can hold: the
@@ -1157,14 +1219,14 @@ fn exec_failure_exit_code(error: &io::Error) -> u8 {
     }
 }
 
-/// Descriptors above stderr that would survive an exec. Like portable-pty,
-/// this lists /dev/fd, and finds nothing where that cannot be read. Listing
-/// allocates, so it runs before the fork.
+/// Descriptors above stderr that would survive an exec, in ascending order.
+/// Like portable-pty, this lists /dev/fd, and finds nothing where that cannot
+/// be read. Listing allocates, so it runs before the fork.
 fn inherited_fds() -> Vec<RawFd> {
     let Ok(entries) = std::fs::read_dir("/dev/fd") else {
         return Vec::new();
     };
-    entries
+    let mut fds: Vec<RawFd> = entries
         .filter_map(|entry| entry.ok()?.file_name().to_str()?.parse::<RawFd>().ok())
         .filter(|&fd| fd > 2)
         .filter(|&fd| {
@@ -1173,7 +1235,9 @@ fn inherited_fds() -> Vec<RawFd> {
             let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
             flags >= 0 && flags & libc::FD_CLOEXEC == 0
         })
-        .collect()
+        .collect();
+    fds.sort_unstable();
+    fds
 }
 
 fn is_executable(path: &Path) -> bool {
@@ -2655,6 +2719,35 @@ mod tests {
                 OsString::from(unchanged)
             );
         }
+    }
+
+    #[test]
+    fn home_dir_takes_a_utf8_home_else_a_usable_passwd_home_else_the_root() {
+        use std::ffi::{OsStr, OsString};
+        use std::os::unix::ffi::OsStrExt;
+        use std::path::PathBuf;
+
+        let choose = |home: Option<&[u8]>, passwd: std::io::Result<Option<&[u8]>>| {
+            super::choose_home_dir(home.map(OsStr::from_bytes), || {
+                passwd.map(|dir| dir.map(|dir| OsStr::from_bytes(dir).to_owned()))
+            })
+        };
+        let path = |bytes: &[u8]| PathBuf::from(OsString::from(OsStr::from_bytes(bytes)));
+        let failed = || Err(std::io::Error::from_raw_os_error(libc::ERANGE));
+
+        // HOME as it is whenever it is UTF-8, even when it cannot be entered.
+        assert_eq!(choose(Some(b"/home/u"), Ok(Some(b"/p"))), path(b"/home/u"));
+        assert_eq!(choose(Some(b""), Ok(Some(b"/p"))), path(b""));
+        assert_eq!(choose(Some(b"rel"), Ok(Some(b"/p"))), path(b"rel"));
+        // Otherwise the passwd home, as it is.
+        assert_eq!(choose(Some(b"/home-\xff"), Ok(Some(b"/p"))), path(b"/p"));
+        assert_eq!(choose(None, Ok(Some(b"/p-\xff"))), path(b"/p-\xff"));
+        // No usable passwd home: no entry or no home field, an empty one, or a
+        // failed lookup (a home too long for the buffer).
+        assert_eq!(choose(None, Ok(None)), path(b"/"));
+        assert_eq!(choose(None, Ok(Some(b""))), path(b"/"));
+        assert_eq!(choose(None, failed()), path(b"/"));
+        assert_eq!(choose(Some(b"/home-\xff"), failed()), path(b"/"));
     }
 
     #[test]
