@@ -2305,6 +2305,245 @@ fn input_after_child_exit_preserves_wrapped_exit_code() {
     );
 }
 
+/// A wrapped command that leaves a background job behind and then ends with
+/// `last`. The job ignores SIGHUP and SIGTERM, keeps the PTY slave open on
+/// its stdout and stderr, reports its pid and whether its stdout is that
+/// terminal, and then waits on a FIFO nobody opens, so it outlives the
+/// command for as long as the test lets it. The command waits for that
+/// report before it prints its marker and ends.
+fn command_leaving_a_job_behind(last: &str) -> String {
+    format!(
+        "sh -c 'trap \"\" HUP TERM; if [ -t 1 ]; then held=terminal; else held=none; fi; \
+         echo \"$$ $held\" > \"$1/ready\"; read gate < \"$1/gate\"' job \"$1\" &\n\
+         read job < \"$1/ready\"\n\
+         echo \"$job\" > \"$1/job\"\n\
+         {last}\n"
+    )
+}
+
+/// A scratch directory for [`command_leaving_a_job_behind`]: its two FIFOs, an
+/// empty config and a private home and runtime directory for the wrapper.
+fn job_directory() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("job directory");
+    for fifo in ["ready", "gate"] {
+        let path =
+            std::ffi::CString::new(dir.path().join(fifo).into_os_string().into_encoded_bytes())
+                .expect("FIFO path");
+        // SAFETY: `path` is a valid NUL-terminated string for the call.
+        let made = unsafe { libc::mkfifo(path.as_ptr(), 0o600) };
+        assert_eq!(made, 0, "mkfifo {fifo}");
+    }
+    std::fs::write(dir.path().join("empty.yml"), "rules: []\n").expect("empty config");
+    for subdirectory in ["home", "runtime"] {
+        std::fs::create_dir(dir.path().join(subdirectory)).expect("private directory");
+    }
+    dir
+}
+
+/// The wrapper's arguments for running `script` with `dir` as `$1`.
+fn job_command_arguments(dir: &std::path::Path, script: &str) -> Vec<std::ffi::OsString> {
+    let mut arguments: Vec<std::ffi::OsString> = ["-c".into(), dir.join("empty.yml").into()].into();
+    arguments.extend(["--", "sh", "-c", script, "sh"].map(std::ffi::OsString::from));
+    arguments.push(dir.into());
+    arguments
+}
+
+/// The job's pid once the command has recorded it, after checking that the
+/// job held the terminal.
+fn left_job(dir: &std::path::Path) -> libc::pid_t {
+    let record = std::fs::read_to_string(dir.join("job"))
+        .expect("the command did not record its background job");
+    let mut fields = record.split_whitespace();
+    let pid = fields
+        .next()
+        .and_then(|pid| pid.parse().ok())
+        .expect("background job pid");
+    assert_eq!(
+        fields.next(),
+        Some("terminal"),
+        "the background job's stdout was not the wrapped terminal: {record:?}"
+    );
+    pid
+}
+
+/// `bytes` with CSI sequences (the highlighter's colors) taken out.
+fn without_csi(bytes: &[u8]) -> Vec<u8> {
+    let mut plain = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == 0x1b && bytes.get(index + 1) == Some(&b'[') {
+            index += 2;
+            while index < bytes.len() && !(0x40..=0x7e).contains(&bytes[index]) {
+                index += 1;
+            }
+            index += 1;
+            continue;
+        }
+        plain.push(bytes[index]);
+        index += 1;
+    }
+    plain
+}
+
+/// Runs `script` under the wrapper on a terminal of its own and returns the
+/// wrapper's exit status, what reached the terminal, and the left job's pid.
+/// The job is still waiting on its FIFO when the wrapper's status is taken:
+/// nothing opens that FIFO, so the wrapper has to end without the job.
+fn run_on_terminal_leaving_a_job(script: &str) -> (Option<u32>, Vec<u8>, libc::pid_t) {
+    let dir = job_directory();
+    let mut job_guard = PidGuard::from_marker(dir.path().join("job"));
+    let pair = native_pty_system()
+        .openpty(PtySize::default())
+        .expect("openpty");
+    let mut builder = CommandBuilder::new(env!("CARGO_BIN_EXE_ptty"));
+    builder.env("HOME", dir.path().join("home"));
+    builder.env("XDG_CONFIG_HOME", dir.path().join("home"));
+    builder.env("PRISMTTY_RUNTIME_DIR", dir.path().join("runtime"));
+    builder.args(job_command_arguments(dir.path(), script));
+    let child = pair
+        .slave
+        .spawn_command(builder)
+        .expect("spawn interactive ptty");
+    drop(pair.slave);
+    let mut ptty = PtySession::new(child, &*pair.master);
+    let status = ptty.wait_for_exit(Duration::from_secs(20));
+    let output = ptty
+        .capture()
+        .wait_until(Duration::from_millis(500), |_| false);
+    let job = left_job(dir.path());
+    job_guard.set(job);
+    assert!(
+        status.is_some(),
+        "the wrapper did not exit after the wrapped command did while its background job \
+         still held the terminal; output so far: {:?}",
+        String::from_utf8_lossy(&output)
+    );
+    assert!(
+        process_exists(job),
+        "the background job did not outlive the wrapped command"
+    );
+    (status, without_csi(&output), job)
+}
+
+// A command that exits while a job it started keeps the terminal open ends
+// the session: the wrapper reports the command's status at once, the
+// command's last output is drawn, and the job is left running, as it would
+// be without the wrapper. On Linux the PTY stays open for the job, so the
+// wrapper ends at the command's exit, not at the PTY's EOF; macOS revokes
+// the terminal at the exit and ends the same way.
+#[test]
+fn session_ends_with_the_command_while_its_background_job_holds_the_terminal() {
+    let (status, output, _job) = run_on_terminal_leaving_a_job(&command_leaving_a_job_behind(
+        "printf '%s\\n' eos-last-marker; exit 7",
+    ));
+    assert_eq!(
+        status,
+        Some(7),
+        "output: {:?}",
+        String::from_utf8_lossy(&output)
+    );
+    assert!(
+        contains_bytes(&output, b"eos-last-marker"),
+        "the command's last output was lost: {:?}",
+        String::from_utf8_lossy(&output)
+    );
+}
+
+// The same with stdin and stdout not a terminal: no raw mode, no live
+// output, and the wrapper still ends with the command.
+#[test]
+fn session_ends_with_the_command_while_its_background_job_holds_the_terminal_without_a_terminal_on_stdin()
+ {
+    use std::process::{Command, Stdio};
+
+    let dir = job_directory();
+    let mut job_guard = PidGuard::from_marker(dir.path().join("job"));
+    let script = command_leaving_a_job_behind("printf '%s\\n' eos-last-marker; exit 7");
+    let ptty = Command::new(env!("CARGO_BIN_EXE_ptty"))
+        .env("HOME", dir.path().join("home"))
+        .env("XDG_CONFIG_HOME", dir.path().join("home"))
+        .env("PRISMTTY_RUNTIME_DIR", dir.path().join("runtime"))
+        .args(job_command_arguments(dir.path(), &script))
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn ptty");
+    let mut ptty = ProcessGuard::new(ptty);
+    let stdout = ptty.child_mut().stdout.take().expect("piped stdout");
+    let stdout_fd = stdout.as_raw_fd();
+    let capture = CaptureTask::from_reader(stdout, stdout_fd);
+    let status = ptty.wait_for_exit(Duration::from_secs(20));
+    let output = without_csi(&capture.wait_until(Duration::from_secs(5), |output| {
+        contains_bytes(output, b"eos-last-marker")
+    }));
+    let job = left_job(dir.path());
+    job_guard.set(job);
+    assert_eq!(
+        status.map(|status| status.code()),
+        Some(Some(7)),
+        "the wrapper did not exit with the command's status while its background job still \
+         held the terminal; output: {:?}",
+        String::from_utf8_lossy(&output)
+    );
+    assert!(
+        contains_bytes(&output, b"eos-last-marker"),
+        "the command's last output was lost: {:?}",
+        String::from_utf8_lossy(&output)
+    );
+    assert!(
+        process_exists(job),
+        "the background job did not outlive the wrapped command"
+    );
+}
+
+// A command killed by a signal while its job holds the terminal is reported
+// as 128 plus the signal, at its death, with its output drawn.
+#[test]
+fn session_reports_a_command_killed_while_its_background_job_holds_the_terminal() {
+    for (signal, name) in [(libc::SIGTERM, "TERM"), (libc::SIGKILL, "KILL")] {
+        let (status, output, _job) = run_on_terminal_leaving_a_job(&command_leaving_a_job_behind(
+            &format!("printf '%s\\n' eos-last-marker; kill -{name} $$"),
+        ));
+        assert_eq!(
+            status,
+            Some(128 + signal as u32),
+            "SIG{name}: output: {:?}",
+            String::from_utf8_lossy(&output)
+        );
+        assert!(
+            contains_bytes(&output, b"eos-last-marker"),
+            "SIG{name}: the command's last output was lost: {:?}",
+            String::from_utf8_lossy(&output)
+        );
+    }
+}
+
+// A last word with no line end is held back by the live highlighter in case
+// the command continues it. When the command exits instead, the word is
+// drawn once, as the session ends.
+#[test]
+fn held_back_last_word_is_drawn_once_when_the_command_exits_leaving_a_job() {
+    let (status, output, _job) =
+        run_on_terminal_leaving_a_job(&command_leaving_a_job_behind("printf eosheldtail; exit 0"));
+    assert_eq!(
+        status,
+        Some(0),
+        "output: {:?}",
+        String::from_utf8_lossy(&output)
+    );
+    let drawn = output
+        .windows(b"eosheldtail".len())
+        .filter(|window| *window == b"eosheldtail")
+        .count();
+    assert_eq!(
+        drawn,
+        1,
+        "the held-back last word was not drawn exactly once: {:?}",
+        String::from_utf8_lossy(&output)
+    );
+}
+
 /// Closing the outer terminal (a window close, or a dropped ssh link) hangs
 /// up the wrapper's controlling tty: stderr becomes unwritable and SIGHUP
 /// arrives. Cleanup diagnostics must not panic there, so the wrapper still

@@ -2,6 +2,8 @@ use std::cmp::Reverse;
 use std::collections::{HashMap, VecDeque};
 use std::io::{self, Read, Write};
 use std::os::fd::RawFd;
+#[cfg(any(target_os = "linux", test))]
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -84,6 +86,18 @@ pub(super) struct InputSource {
 /// silently when the command prints nothing.
 pub(super) struct PreparedSession<'a> {
     session: HighlightSession<'a>,
+}
+
+impl PreparedSession<'_> {
+    /// Hands the session the flag the PTY reader sets once it has seen the
+    /// wrapped command exit. From then on the reader passes on only output
+    /// already queued in the PTY, so a held-back tail cannot be completed by
+    /// the command any more and is drawn when the stream ends, not after
+    /// another holdback wait.
+    #[cfg(any(target_os = "linux", test))]
+    pub(super) fn end_holdback_at_child_exit(&mut self, child_exit_seen: Arc<AtomicBool>) {
+        self.session.child_exit_seen = Some(child_exit_seen);
+    }
 }
 
 pub(super) fn prepare_session(
@@ -191,9 +205,11 @@ pub(super) fn highlight_stream<R: Read, W: Write>(
         // No echo trigger drew the held-back tail, so it is most likely
         // program output whose next byte may complete it. Wait for that byte
         // only so long; a program that has gone quiet still gets its output
-        // drawn.
+        // drawn. Once the command has exited nothing can complete it, so the
+        // end of the stream draws it instead.
         if input.interactive
             && !session.buffered_echo().is_empty()
+            && !session.child_exit_seen()
             && wait_idle(input.idle_fd, PROGRAM_OUTPUT_HOLDBACK)
         {
             trace.log("FLUSH", b"holdback");
@@ -444,6 +460,8 @@ struct HighlightSession<'a> {
     rule_identities: RuleIdentityRegistry,
     rejected_profile_sets: VecDeque<Vec<String>>,
     slow_rule_warned: bool,
+    #[cfg(any(target_os = "linux", test))]
+    child_exit_seen: Option<Arc<AtomicBool>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -491,11 +509,29 @@ impl<'a> HighlightSession<'a> {
             rule_identities,
             rejected_profile_sets: VecDeque::new(),
             slow_rule_warned: false,
+            #[cfg(any(target_os = "linux", test))]
+            child_exit_seen: None,
         })
     }
 
     fn profile_names(&self) -> &[String] {
         &self.profile_names
+    }
+
+    /// Whether the PTY reader has seen the wrapped command exit. Only the
+    /// Linux PTY reader reports it; elsewhere, and in stdin mode, it is
+    /// always false.
+    fn child_exit_seen(&self) -> bool {
+        #[cfg(any(target_os = "linux", test))]
+        {
+            self.child_exit_seen
+                .as_ref()
+                .is_some_and(|seen| seen.load(Ordering::Acquire))
+        }
+        #[cfg(not(any(target_os = "linux", test)))]
+        {
+            false
+        }
     }
 
     fn profile_store(&self) -> &ProfileStore {
@@ -4804,6 +4840,86 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(1));
 
         assert!(!super::wait_idle(None, Duration::from_secs(5)));
+    }
+
+    // Once the PTY reader has seen the wrapped command exit, what it still
+    // returns was queued before the exit or comes from a leftover background
+    // job, so the read loop no longer waits out the holdback before each
+    // read: a job trickling bytes would otherwise buy another wait every
+    // time. The held-back tail is drawn once, when the stream ends.
+    #[test]
+    fn held_back_tail_is_not_waited_for_after_the_child_exit_is_seen() {
+        use std::collections::VecDeque;
+        use std::os::fd::AsRawFd;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct ExitedChildReader {
+            chunks: VecDeque<&'static [u8]>,
+            exit_seen: Arc<AtomicBool>,
+        }
+        impl std::io::Read for ExitedChildReader {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                // The exit is seen with the read that returns the command's
+                // last bytes; the later chunks stand for a leftover job.
+                self.exit_seen.store(true, Ordering::Release);
+                let Some(chunk) = self.chunks.pop_front() else {
+                    return Ok(0);
+                };
+                buf[..chunk.len()].copy_from_slice(chunk);
+                Ok(chunk.len())
+            }
+        }
+
+        // A silent PTY: a holdback wait on its master would run its full
+        // course and then draw the tail.
+        let quiet = nix::pty::openpty(None, None).expect("openpty");
+        let mut config = tempfile::NamedTempFile::new().expect("temp config");
+        std::io::Write::write_all(&mut config, b"rules: []\n").expect("write temp config");
+        let options = crate::cli::args::Options {
+            profiles: vec!["generic".to_string()],
+            no_auto_detect: true,
+            no_dynamic_profile: true,
+            config: Some(config.path().to_path_buf()),
+            ..Default::default()
+        };
+        let session = super::HighlightSession::new(
+            &options,
+            crate::profiles::ProfileStore::builtin(),
+            true,
+            vec!["generic".to_string()],
+        )
+        .expect("session builds");
+        let mut prepared = super::PreparedSession { session };
+        let exit_seen = Arc::new(AtomicBool::new(false));
+        prepared.end_holdback_at_child_exit(Arc::clone(&exit_seen));
+        let input = super::InputSource {
+            interactive: true,
+            pty_fd: None,
+            idle_fd: Some(quiet.master.as_raw_fd()),
+            recent_input: None,
+        };
+        let trace_file = tempfile::NamedTempFile::new().expect("trace temp file");
+        let trace = super::IoTrace::open(Some(trace_file.path())).expect("trace opens");
+        let reader = ExitedChildReader {
+            chunks: VecDeque::from([b"lastword".as_slice(), b"ab", b"cd"]),
+            exit_seen,
+        };
+        let mut output = Vec::new();
+        super::highlight_stream(reader, &mut output, prepared, input, None, trace, None)
+            .expect("highlight_stream succeeds");
+
+        assert_eq!(String::from_utf8_lossy(&output), "lastwordabcd");
+        let trace_text = std::fs::read_to_string(trace_file.path()).expect("read trace");
+        let holdback = b"holdback"
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            !trace_text.contains(&format!("FLUSH {holdback}")),
+            "a holdback wait ran after the child exit was seen; trace:\n{trace_text}"
+        );
     }
 
     // Startup detection rescans its whole sample, so running it on every read
