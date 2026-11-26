@@ -162,9 +162,11 @@ prismtty --profile cisco < show-tech.txt
 journalctl -xe | prismtty --profile linux-unix
 ```
 
-A wrapped command runs in the current directory. When stdin is not a terminal
-(a script, a CI job, or `ptty make < /dev/null`), the command reads that stdin
-directly while its output still goes through the PTY and is highlighted. If the
+A wrapped command runs in the current directory. Descriptors above 2 that the
+caller passes (`ptty cmd 3<file`, `ptty diff <(a) <(b)`) reach the command as
+they would without the wrapper. When stdin is not a terminal (a script, a CI
+job, or `ptty make < /dev/null`), the command reads that stdin directly while
+its output still goes through the PTY and is highlighted. If the
 command cannot be found or run, PrismTTY exits with 127 or 126, as a shell does;
 otherwise it exits with the command's own status. When the output goes to a
 regular file (`ptty make > build.log`), or to a pipe while stdin is not a

@@ -40,6 +40,15 @@ examples that preserve only the token shape needed to reproduce the issue.
 - `--trace-io` records all PTY input and output to the trace file, including
   typed passwords. The file is created owner-only (0600), but treat it as
   sensitive and delete it after debugging.
+- PrismTTY is not a descriptor isolation boundary. Since 1.3.14, descriptors
+  above 2 that the caller leaves inheritable, whether passed on purpose
+  (`ptty cmd 3<file`) or leaked by a terminal, IDE, multiplexer or launcher,
+  reach the wrapped command as they would without the wrapper. Descriptors
+  marked close-on-exec do not. On a system where the PTY's name cannot be
+  found (a chroot without /proc), inheritable descriptors may still be closed
+  for a command started from a terminal. A launcher that holds sensitive
+  descriptors should close them or set close-on-exec before it starts
+  PrismTTY.
 - User-supplied rule regexes run against every byte of terminal output.
   PrismTTY reads output in 8 KiB chunks, but chunking alone is not a per-match
   execution budget. Every compiled rule also receives an application-owned

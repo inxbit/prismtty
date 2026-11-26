@@ -889,11 +889,10 @@ fn session_leader_without_controlling_terminal_runs_the_command() {
     );
 }
 
-/// From a terminal the wrapped command is spawned by portable-pty, which closes
-/// std's exec-error pipe in the child, so a script whose `#!` interpreter
-/// cannot be run must be caught before the spawn: the child aborted with
-/// "fatal runtime error" (exit 134) drawn into the output instead of failing
-/// with the shell's 127.
+/// From a terminal, a script whose `#!` interpreter cannot be run is caught
+/// before the spawn, so the message names the bad interpreter and the exit
+/// code is the shell's 127. When portable-pty spawned the command here, the
+/// child aborted with "fatal runtime error" (exit 134) drawn into the output.
 #[test]
 fn interactive_script_with_unusable_interpreter_exits_127() {
     use std::os::unix::fs::PermissionsExt;
@@ -939,6 +938,307 @@ fn interactive_script_with_unusable_interpreter_exits_127() {
             String::from_utf8_lossy(&output)
         );
     }
+}
+
+/// From a terminal, an execve that fails after the fork is reported with the
+/// shell's exit code and a prismtty message. The child used to abort with
+/// "fatal runtime error" (exit 134) instead: portable-pty closed std's
+/// exec-error pipe in it. On macOS a program for another CPU type fails there
+/// (126); on Linux a script whose interpreter is a script with a missing
+/// interpreter (127).
+#[test]
+fn interactive_exec_failure_after_the_fork_uses_shell_exit_codes() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let work = tempfile::tempdir().expect("work directory");
+    let config = work.path().join("empty.yml");
+    std::fs::write(&config, "rules: []\n").expect("config writes");
+    let (program, code) = if cfg!(target_os = "linux") {
+        let inner = work.path().join("inner");
+        std::fs::write(&inner, "#!/nonexistent/prismtty-interp\n").expect("write inner");
+        std::fs::set_permissions(&inner, std::fs::Permissions::from_mode(0o755))
+            .expect("inner is executable");
+        let outer = work.path().join("outer.sh");
+        std::fs::write(&outer, format!("#!{}\necho ran\n", inner.display())).expect("write outer");
+        (outer, 127)
+    } else {
+        // A 64-bit Mach-O header for PowerPC, which no Mac runs.
+        let mut header = Vec::new();
+        for word in [0xfeed_facf_u32, 0x0100_0012, 0, 2, 0, 0, 0, 0] {
+            header.extend_from_slice(&word.to_le_bytes());
+        }
+        header.resize(header.len() + 4096, 0);
+        let binary = work.path().join("ppc");
+        std::fs::write(&binary, header).expect("write binary");
+        (binary, 126)
+    };
+    std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755))
+        .expect("program is executable");
+
+    let pair = native_pty_system()
+        .openpty(PtySize::default())
+        .expect("openpty");
+    let mut builder = CommandBuilder::new(env!("CARGO_BIN_EXE_ptty"));
+    builder.env_clear();
+    builder.env("HOME", work.path());
+    builder.env("PRISMTTY_RUNTIME_DIR", work.path().join("runtime"));
+    builder.env("PATH", "/usr/bin:/bin");
+    builder.cwd(work.path());
+    builder.arg("--config");
+    builder.arg(&config);
+    builder.arg("--");
+    builder.arg(&program);
+    let child = pair
+        .slave
+        .spawn_command(builder)
+        .expect("spawn interactive ptty");
+    drop(pair.slave);
+    let mut ptty = PtySession::new(child, &*pair.master);
+
+    let status = ptty.wait_for_exit(Duration::from_secs(10));
+    let output = ptty.capture().wait_until(Duration::from_secs(2), |out| {
+        contains_bytes(out, b"Unable to spawn")
+    });
+    assert_eq!(status, Some(code), "{:?}", String::from_utf8_lossy(&output));
+    assert!(
+        contains_bytes(&output, b"prismtty: PTY error: Unable to spawn"),
+        "{:?}",
+        String::from_utf8_lossy(&output)
+    );
+    // Not "fatal runtime error": the highlighter would color "error".
+    assert!(
+        !contains_bytes(&output, b"output.write(&bytes)"),
+        "{:?}",
+        String::from_utf8_lossy(&output)
+    );
+}
+
+/// From a terminal too, a descriptor the caller hands the wrapped command on
+/// purpose (`cmd 3<file`, a process substitution) reaches it as it does
+/// without the wrapper, and nothing prismtty opens itself joins it: the
+/// command lists the same descriptors as when the shell runs it directly,
+/// with `--trace-io` on as well.
+#[test]
+fn interactive_command_inherits_exactly_the_callers_extra_descriptors() {
+    let home = tempfile::tempdir().expect("home");
+    let config = home.path().join("empty.yml");
+    std::fs::write(&config, "rules: []\n").expect("config writes");
+    let fd7 = home.path().join("fd7.out");
+    let pair = native_pty_system()
+        .openpty(PtySize::default())
+        .expect("openpty");
+    let mut builder = CommandBuilder::new("/bin/sh");
+    builder.env_clear();
+    builder.env("HOME", home.path());
+    builder.env("PRISMTTY_RUNTIME_DIR", home.path().join("runtime"));
+    builder.env("PATH", "/usr/bin:/bin");
+    builder.env("PTTY", env!("CARGO_BIN_EXE_ptty"));
+    builder.env("CONFIG", &config);
+    builder.env("TRACE", home.path().join("trace.log"));
+    builder.env("FD7", &fd7);
+    builder.args([
+        "-c",
+        "list='echo via-fd7 >&7; echo fd-list; exec ls /dev/fd'; \
+         echo direct-start; /bin/sh -c \"$list\" 7>>\"$FD7\"; echo direct-end; \
+         echo plain-start; \"$PTTY\" --config \"$CONFIG\" -- /bin/sh -c \"$list\" 7>>\"$FD7\"; \
+         echo plain-end=$?; \
+         echo traced-start; \"$PTTY\" --config \"$CONFIG\" --trace-io \"$TRACE\" -- \
+         /bin/sh -c \"$list\" 7>>\"$FD7\"; echo traced-end=$?",
+    ]);
+    let child = pair.slave.spawn_command(builder).expect("spawn shell");
+    drop(pair.slave);
+    let mut shell = PtySession::new(child, &*pair.master);
+
+    let status = shell.wait_for_exit(Duration::from_secs(20));
+    let output = shell.capture().wait_until(Duration::from_secs(2), |out| {
+        contains_bytes(out, b"traced-end=")
+    });
+    let text = String::from_utf8_lossy(&output).replace('\r', "");
+    assert_eq!(status, Some(0), "{text:?}");
+    let listed = |start: &str, end: &str| -> Vec<u32> {
+        text.split(start)
+            .nth(1)
+            .and_then(|rest| rest.split(end).next())
+            .and_then(|run| run.split("fd-list").nth(1))
+            .unwrap_or_default()
+            .split_whitespace()
+            .filter_map(|word| word.parse().ok())
+            .collect()
+    };
+    let direct = listed("direct-start", "direct-end");
+    assert!(direct.contains(&7), "direct: {text:?}");
+    assert_eq!(listed("plain-start", "plain-end=0"), direct, "{text:?}");
+    assert_eq!(listed("traced-start", "traced-end=0"), direct, "{text:?}");
+    assert_eq!(
+        std::fs::read_to_string(&fd7).expect("fd 7 output"),
+        "via-fd7\n".repeat(3),
+        "{text:?}"
+    );
+}
+
+/// A current directory the user cannot enter makes the wrapped command start
+/// in the home directory, from a terminal and with stdin redirected. As in
+/// portable-pty's spawn, a HOME that is not UTF-8 is passed over for the home
+/// directory in the passwd database.
+#[test]
+fn command_from_an_unenterable_directory_starts_in_the_passwd_home() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    // SAFETY: geteuid has no preconditions.
+    if unsafe { libc::geteuid() } == 0 {
+        // root can enter any directory, so nothing falls back.
+        return;
+    }
+    // SAFETY: passwd is a plain C struct that getpwuid_r fills before it is read.
+    let mut entry = unsafe { std::mem::zeroed::<libc::passwd>() };
+    let mut buffer = vec![0 as libc::c_char; 16 * 1024];
+    let mut found = std::ptr::null_mut();
+    // SAFETY: every pointer is valid for the call and the buffer length is its own;
+    // getpwuid_r is the thread-safe lookup, as other tests spawn concurrently.
+    let result = unsafe {
+        libc::getpwuid_r(
+            libc::getuid(),
+            &mut entry,
+            buffer.as_mut_ptr(),
+            buffer.len(),
+            &mut found,
+        )
+    };
+    if result != 0 || found.is_null() || entry.pw_dir.is_null() {
+        // No passwd entry or home (some containers): nothing to compare with.
+        return;
+    }
+    // SAFETY: getpwuid_r succeeded, so pw_dir points into `buffer` at a
+    // NUL-terminated string.
+    let passwd_home = unsafe { std::ffi::CStr::from_ptr(entry.pw_dir) };
+    let Ok(passwd_home) = std::fs::canonicalize(OsStr::from_bytes(passwd_home.to_bytes())) else {
+        // A home directory that does not exist (packaging sandboxes).
+        return;
+    };
+    let work = tempfile::tempdir().expect("work directory");
+    let locked = work.path().join("locked");
+    std::fs::create_dir(&locked).expect("locked directory");
+    let config = work.path().join("empty.yml");
+    std::fs::write(&config, "rules: []\n").expect("config writes");
+    let pair = native_pty_system()
+        .openpty(PtySize::default())
+        .expect("openpty");
+    let mut builder = CommandBuilder::new("/bin/sh");
+    builder.env_clear();
+    builder.env(
+        "HOME",
+        OsStr::from_bytes(b"/nonexistent/prismtty-home-\xff"),
+    );
+    builder.env("PRISMTTY_RUNTIME_DIR", work.path().join("runtime"));
+    builder.env("PATH", "/usr/bin:/bin");
+    builder.env("PTTY", env!("CARGO_BIN_EXE_ptty"));
+    builder.env("CONFIG", &config);
+    builder.env("LOCKED", &locked);
+    builder.cwd(work.path());
+    builder.args([
+        "-c",
+        "show='echo \"cwd=$(/bin/pwd -P)\"'; cd \"$LOCKED\" && chmod 000 . || exit 9; \
+         \"$PTTY\" --config \"$CONFIG\" -- /bin/sh -c \"$show\"; echo terminal=$?; \
+         \"$PTTY\" --config \"$CONFIG\" -- /bin/sh -c \"$show\" </dev/null; echo redirected=$?; \
+         chmod 755 \"$LOCKED\"",
+    ]);
+    let child = pair.slave.spawn_command(builder).expect("spawn shell");
+    drop(pair.slave);
+    let mut shell = PtySession::new(child, &*pair.master);
+
+    let status = shell.wait_for_exit(Duration::from_secs(20));
+    let output = shell.capture().wait_until(Duration::from_secs(2), |out| {
+        contains_bytes(out, b"redirected=")
+    });
+    let raw = String::from_utf8_lossy(&output).replace('\r', "");
+    let mut text = String::new();
+    let mut chars = raw.chars();
+    while let Some(ch) = chars.next() {
+        if ch == '\u{1b}' {
+            // Drop a CSI sequence: the highlighter may color the path.
+            if chars.next() == Some('[') {
+                for next in chars.by_ref() {
+                    if ('@'..='~').contains(&next) {
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+        text.push(ch);
+    }
+    let expected = format!("cwd={}\n", passwd_home.display());
+    assert_eq!(status, Some(0), "{text:?}");
+    assert_eq!(
+        text.matches(&expected).count(),
+        2,
+        "{expected:?} in {text:?}"
+    );
+    for line in ["terminal=0", "redirected=0"] {
+        assert!(text.contains(line), "{line} missing: {text:?}");
+    }
+}
+
+/// In an iTerm2 session the wrapped shell must not see the variables that
+/// turn iTerm2's shell integration on a second time: they move to
+/// PRISMTTY_PARENT_* and the session is marked as nested. SHELL is set, as
+/// for any wrapped command.
+#[test]
+fn interactive_command_gets_the_iterm_guard_environment() {
+    let home = tempfile::tempdir().expect("home");
+    let config = home.path().join("empty.yml");
+    std::fs::write(&config, "rules: []\n").expect("config writes");
+    let pair = native_pty_system()
+        .openpty(PtySize::default())
+        .expect("openpty");
+    let mut builder = CommandBuilder::new(env!("CARGO_BIN_EXE_ptty"));
+    builder.env_clear();
+    builder.env("HOME", home.path());
+    builder.env("PRISMTTY_RUNTIME_DIR", home.path().join("runtime"));
+    builder.env("PATH", "/usr/bin:/bin");
+    builder.env("TERM_PROGRAM", "iTerm.app");
+    builder.env("LC_TERMINAL", "iTerm.app");
+    builder.env("ITERM_SESSION_ID", "w0t0p0:prismtty-test");
+    builder.arg("--config");
+    builder.arg(&config);
+    builder.args(["--", "/usr/bin/env"]);
+    let child = pair
+        .slave
+        .spawn_command(builder)
+        .expect("spawn interactive ptty");
+    drop(pair.slave);
+    let mut ptty = PtySession::new(child, &*pair.master);
+
+    let status = ptty.wait_for_exit(Duration::from_secs(10));
+    let output = ptty.capture().wait_until(Duration::from_secs(2), |out| {
+        contains_bytes(out, b"PRISMTTY_NESTED_ITERM=")
+    });
+    let text = String::from_utf8_lossy(&output).replace('\r', "");
+    assert_eq!(status, Some(0), "{text:?}");
+    let env: Vec<&str> = text.lines().collect();
+    for line in [
+        "PRISMTTY_PARENT_TERM_PROGRAM=iTerm.app",
+        "PRISMTTY_PARENT_LC_TERMINAL=iTerm.app",
+        "PRISMTTY_PARENT_ITERM_SESSION_ID=w0t0p0:prismtty-test",
+        "ITERM_SHELL_INTEGRATION_INSTALLED=prismtty",
+        "ITERM2_SQUELCH_MARK=1",
+        "PRISMTTY_NESTED_ITERM=1",
+        "PATH=/usr/bin:/bin",
+    ] {
+        assert!(env.contains(&line), "{line} missing: {text:?}");
+    }
+    for name in ["TERM_PROGRAM=", "LC_TERMINAL=", "ITERM_SESSION_ID="] {
+        assert!(
+            !env.iter().any(|line| line.starts_with(name)),
+            "{name} reached the command: {text:?}"
+        );
+    }
+    assert!(
+        env.iter()
+            .any(|line| line.len() > "SHELL=".len() && line.starts_with("SHELL=")),
+        "SHELL missing: {text:?}"
+    );
 }
 
 fn assert_terminal_restored_after(signal: libc::c_int) {

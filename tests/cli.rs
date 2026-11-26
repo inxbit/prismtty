@@ -582,37 +582,65 @@ fn wrapped_command_exec_failure_after_the_fork_uses_shell_exit_codes() {
     );
 }
 
-// Like portable-pty's spawn, the one for a non-terminal stdin keeps
-// descriptors the caller leaked to prismtty out of the wrapped command.
+// A descriptor the caller hands the wrapped command on purpose (`cmd 3<file`,
+// `--passphrase-fd 3`, a process substitution) reaches it as it does without
+// the wrapper, and nothing prismtty opens itself joins it: the command lists
+// the same descriptors as when the same shell runs it directly, with
+// `--trace-io` on as well. One shell starts all three runs, so whatever else
+// it inherited is in every list.
 #[test]
 #[cfg(unix)]
-fn wrapped_command_does_not_inherit_the_callers_extra_descriptors() {
-    use std::os::unix::process::CommandExt;
+fn wrapped_command_inherits_exactly_the_callers_extra_descriptors() {
+    let work = tempfile::tempdir().expect("work directory");
+    let config = work.path().join("empty.yml");
+    fs::write(&config, "rules: []\n").expect("write config");
+    let data = work.path().join("data.txt");
+    fs::write(&data, "caller-data\n").expect("write data");
 
-    let mut command = StdCommand::new(assert_cmd::cargo::cargo_bin("ptty"));
-    command
+    let output = StdCommand::new("/bin/sh")
         .args([
-            "sh",
             "-c",
-            "if true 2>/dev/null >&7; then echo fd7-open; else echo fd7-closed; fi",
+            "list='read line <&7; echo \"fd7:$line\"; echo fd-list; exec ls /dev/fd'; \
+             echo direct-start; /bin/sh -c \"$list\" 7<\"$DATA\"; echo direct-end; \
+             echo plain-start; \"$PTTY\" --config \"$CONFIG\" -- /bin/sh -c \"$list\" 7<\"$DATA\"; \
+             echo plain-end=$?; \
+             echo traced-start; \"$PTTY\" --config \"$CONFIG\" --trace-io \"$TRACE\" -- \
+             /bin/sh -c \"$list\" 7<\"$DATA\"; echo traced-end=$?",
         ])
-        .stdin(Stdio::null());
-    // SAFETY: dup2 is async-signal-safe and runs in the forked child before exec;
-    // dup2 clears close-on-exec on the copy, so prismtty inherits fd 7.
-    unsafe {
-        command.pre_exec(|| {
-            if libc::dup2(2, 7) == -1 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
-    let output = command.output().expect("ptty runs");
-    let stdout = strip_csi(&output.stdout);
-    assert!(
-        output.status.success() && stdout.contains("fd7-closed"),
-        "the wrapped command inherited fd 7: {output:?}"
-    );
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", work.path())
+        .env("PRISMTTY_RUNTIME_DIR", work.path().join("runtime"))
+        .env("PTTY", assert_cmd::cargo::cargo_bin("ptty"))
+        .env("CONFIG", &config)
+        .env("TRACE", work.path().join("trace.log"))
+        .env("DATA", &data)
+        .stdin(Stdio::null())
+        .output()
+        .expect("shell runs");
+    let text = strip_csi(&output.stdout).replace('\r', "");
+    assert!(output.status.success(), "{output:?}");
+    let run = |start: &str, end: &str| -> Vec<u32> {
+        let run = text
+            .split(start)
+            .nth(1)
+            .and_then(|rest| rest.split(end).next())
+            .unwrap_or_default();
+        assert!(
+            run.contains("fd7:caller-data"),
+            "{start}: fd 7 did not reach the command: {text:?}"
+        );
+        run.split("fd-list")
+            .nth(1)
+            .unwrap_or_default()
+            .split_whitespace()
+            .filter_map(|word| word.parse().ok())
+            .collect()
+    };
+    let direct = run("direct-start", "direct-end");
+    assert!(direct.contains(&7), "direct: {text:?}");
+    assert_eq!(run("plain-start", "plain-end=0"), direct, "{text:?}");
+    assert_eq!(run("traced-start", "traced-end=0"), direct, "{text:?}");
 }
 
 /// Drops CSI sequences so assertions see the text a terminal would show.
