@@ -2,6 +2,58 @@
 
 All notable changes to PrismTTY are documented here.
 
+## 1.3.13 - 2026-11-25
+
+### Fixed
+
+- Wrapped output saved to a file has the line ends the command wrote.
+  `ptty make > build.log` saved CR LF line ends, because the command writes
+  to a PTY and a new PTY puts a CR in front of every LF. A CR LF the command
+  wrote itself was saved as CR CR LF, on macOS a CR was doubled now and then
+  (2 of 20,000 lines in one run), and with the keyboard on a terminal that
+  expands tabs the file held spaces in place of tabs. The command's PTY now
+  starts with output processing off when PrismTTY's output goes to a regular
+  file, or to a pipe while stdin is not a terminal either (a CI job, a
+  script, `ptty cmd </dev/null | grep 'x$'`). A command that turns the
+  processing back on itself still gets it. Colors are added as before.
+
+  Not changed: output on a terminal, and output in a pipe while the keyboard
+  is on a terminal (`ptty ssh host | tee log`, `ptty cmd | grep x` typed at
+  a prompt). There the pipe usually leads back to the terminal PrismTTY is
+  holding raw, and only the command's PTY knows whether a LF means a new
+  line or, for a full-screen program, one row down; the CR LF line ends
+  stay. Add `</dev/null` to get the saved form in a pipe typed at a prompt.
+
+  What this costs. A read from the PTY now holds more of the command's text,
+  so the place where a read ends moves, and with it what depends on that
+  place: a phrase such as `not reachable` can be colored in two parts where
+  it was colored whole, and the 64 KiB start sample for profile detection
+  reaches further into the output. A program that copies the saved bytes to
+  a terminal that is raw at that moment shows lines that do not return to
+  the left edge: `tail -f` of the file on the same terminal while PrismTTY
+  runs, or a pipe reader on a terminal something else made raw. A terminal
+  recorder run under PrismTTY with `> file` (`script -r`) records the same
+  LF-only stream; use `| tee file >/dev/null` to keep the terminal stream.
+
+### Documentation
+
+- Both READMEs say when a wrapped command's PTY starts with output
+  processing off, and that a pipe typed at a terminal keeps the PTY's usual
+  output settings.
+
+### Release and QA
+
+- The publishing job of the release workflow runs in the protected
+  environment `release`, which needs an approval and accepts only `v*` tags,
+  and the crates.io trusted publisher is tied to that environment. Before,
+  a `v*` tag on any commit could publish with that commit's own copy of the
+  workflow. Creating a `v*` tag is limited to repository admins.
+- The privacy scan reads the text chunks (tEXt, zTXt, iTXt) of PNG files,
+  which CONTRIBUTING.md requires generated images to carry, and runs under
+  `LC_ALL=C`, so a text line with one byte that is not UTF-8 no longer hides
+  a private path or address on that line. The reader follows no symbolic
+  link and fails the scan, naming the file, on a malformed or oversized PNG.
+
 ## 1.3.12 - 2026-11-25
 
 ### Security
