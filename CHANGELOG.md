@@ -2,6 +2,63 @@
 
 All notable changes to PrismTTY are documented here.
 
+## 1.3.14 - 2026-11-26
+
+### Fixed
+
+- Descriptors above 2 that the caller passes reach the wrapped command, as
+  they do without the wrapper: `ptty cmd 3<file`, `--passphrase-fd 3`, and
+  process substitution (`ptty diff <(a) <(b)` read "/dev/fd/63: Bad file
+  descriptor"). Both ways of starting the command removed them: the PTY
+  library closes everything above 2, and since 1.3.0 the start with a
+  redirected stdin matched it on purpose. This release reverses that choice.
+  A descriptor the caller marked
+  close-on-exec still does not reach the command, and nothing PrismTTY opens
+  itself does (the PTY, the `--trace-io` file, its signal pipe).
+- A command that cannot be executed after it was found no longer aborts when
+  started from a terminal. A program built for another CPU type on macOS, or
+  a script whose interpreter is itself a script with a missing interpreter on
+  Linux, ended with "fatal runtime error", exit 134 and, on macOS, a crash
+  report. PrismTTY now prints its usual "Unable to spawn" message and exits
+  with the shell's code, 126 or 127. A program for another CPU type gets 126
+  with stdin redirected as well, where it got 1.
+- When the current directory cannot be entered and `HOME` is not UTF-8, a
+  command started with stdin redirected runs in the account's home directory,
+  as it already did from a terminal, instead of failing. From a terminal, an
+  account whose home directory entry is empty or too long now starts in `/`
+  instead of failing.
+
+### Changed
+
+- Spawn failure messages from a terminal use the wording the redirected path
+  already had; the exit codes of these failures are unchanged. A missing
+  absolute path reads "because it does not exist" instead of "because it
+  doesn't exist on the filesystem (ENOENT: No such file or directory)", a
+  path that is not executable loses its "(EACCES: Permission denied)", an
+  empty command name no longer lists each `PATH` entry as a directory, and a
+  failure to enter the directory or to take the terminal names the program.
+
+### Security
+
+- PrismTTY is not a descriptor isolation boundary, and SECURITY.md now says
+  so. Because of the first fix above, every descriptor the caller leaves
+  inheritable reaches the wrapped command, including ones a terminal, IDE,
+  multiplexer or launcher leaked to the shell that starts PrismTTY, exactly
+  as they reach a command started without it. Up to 1.3.13 they were closed.
+  A launcher that holds sensitive descriptors should close them or mark them
+  close-on-exec before it starts PrismTTY.
+
+### Documentation
+
+- Both READMEs say that descriptors the caller passes reach the command.
+
+### Known limits
+
+- On a system where the PTY's name cannot be found (seen with musl in a
+  chroot without `/proc`), a command started from a terminal is still
+  started the old way: where `/dev/fd` can be listed the caller's
+  descriptors are closed and a failed execution still aborts.
+
 ## 1.3.13 - 2026-11-25
 
 ### Fixed
