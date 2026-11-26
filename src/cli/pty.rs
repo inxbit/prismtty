@@ -544,7 +544,9 @@ pub(super) fn run_command(options: Options, command: Vec<OsString>) -> Result<Ex
     // (`ptty cmd </dev/null`), so it gets the interactive highlighter and the
     // holdback flush, as stdin mode does when stdout is a terminal. Raw mode,
     // stdin forwarding and dynamic profiles stay keyed to `interactive`.
-    let live_output = interactive || io::stdout().is_terminal();
+    let output_on_terminal = io::stdout().is_terminal();
+    let live_output = interactive || output_on_terminal;
+    let plain_output = output_is_saved_as_written(interactive, output_on_terminal);
     // Everything that can reject the invocation runs before the child exists,
     // so a typo in a flag or a broken config never runs part of the command,
     // and a reload warning prints before the terminal goes raw.
@@ -567,9 +569,12 @@ pub(super) fn run_command(options: Options, command: Vec<OsString>) -> Result<Ex
     apply_iterm_shell_integration_guard(&mut builder, interactive, parent_terminal_is_iterm());
 
     if interactive {
-        configure_child_pty(&*pair.master)?;
+        configure_child_pty(&*pair.master, plain_output)?;
     } else {
         queue_end_of_input(&*pair.master)?;
+        if plain_output {
+            pass_child_output_through(&*pair.master)?;
+        }
     }
 
     let mut signal_mask = SessionSignalMask::block()?;
@@ -1165,10 +1170,18 @@ fn apply_iterm_shell_integration_guard(
 }
 
 #[cfg(unix)]
-fn configure_child_pty(master: &dyn portable_pty::MasterPty) -> Result<(), CliError> {
+fn configure_child_pty(
+    master: &dyn portable_pty::MasterPty,
+    plain_output: bool,
+) -> Result<(), CliError> {
     let stdin = io::stdin();
     let source = tcgetattr(stdin.as_fd())?;
     let Some(tty_name) = master.tty_name() else {
+        // Seen with musl in a chroot without /proc: the PTY works but its
+        // name cannot be found. The master reaches the same settings.
+        if plain_output {
+            pass_child_output_through(master)?;
+        }
         return Ok(());
     };
     // O_NOCTTY: a session leader without a controlling terminal would
@@ -1180,8 +1193,50 @@ fn configure_child_pty(master: &dyn portable_pty::MasterPty) -> Result<(), CliEr
         .open(tty_name)?;
     let mut termios = source;
     normalize_child_pty_termios(&mut termios);
+    if plain_output {
+        // See `pass_child_output_through`. The flags copied from the terminal
+        // can also ask for tabs as spaces, so the whole step goes.
+        termios.output_flags.remove(OutputFlags::OPOST);
+    }
     tcsetattr(slave_tty.as_fd(), SetArg::TCSANOW, &termios)?;
     Ok(())
+}
+
+/// Whether the command's PTY should start without the kernel's output
+/// conversions, so that prismtty's output has the line ends the command
+/// wrote. A new PTY puts a CR in front of every LF, which a raw terminal on
+/// the other side needs and a saved file does not.
+///
+/// Not when the keyboard is on a terminal and the output goes into a pipe.
+/// That terminal is raw for the whole session, and the pipe usually leads
+/// back to it (`ptty ssh host | tee log`). The command's PTY is then the only
+/// place that knows whether a LF means a new line or, for a full-screen
+/// program that turned the conversion off, one row down; converting anywhere
+/// else draws one of the two wrong.
+fn output_is_saved_as_written(interactive: bool, output_on_terminal: bool) -> bool {
+    !output_on_terminal && (!interactive || stdout_is_regular_file())
+}
+
+/// Through std's metadata and not `libc::fstat`: on a 32-bit glibc build the
+/// plain call fails with EOVERFLOW for a file of 2 GiB or more, and a log
+/// would change from LF to CR LF line ends when it grew past that size.
+fn stdout_is_regular_file() -> bool {
+    io::stdout()
+        .as_fd()
+        .try_clone_to_owned()
+        .and_then(|fd| std::fs::File::from(fd).metadata())
+        .is_ok_and(|metadata| metadata.is_file())
+}
+
+/// Turns off the kernel's output conversions on the child's PTY (see
+/// `output_is_saved_as_written`). The command can still turn them back on
+/// itself.
+fn pass_child_output_through(master: &dyn portable_pty::MasterPty) -> io::Result<()> {
+    let pty = stdin_forward_writer(master)?;
+    let fd = pty.as_raw_fd();
+    let mut attrs = terminal_attrs(fd)?;
+    attrs.c_oflag &= !libc::OPOST;
+    set_terminal_attrs_retrying_eintr(fd, &attrs)
 }
 
 /// Queues an end of input on the child's PTY when there is no terminal to

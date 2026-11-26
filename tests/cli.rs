@@ -636,6 +636,62 @@ fn strip_csi(output: &[u8]) -> String {
     plain
 }
 
+// A pipe or a file is not a terminal, so nothing there needs a CR in front of
+// each LF. The saved bytes are the ones the command wrote, as they are
+// without the wrapper.
+#[test]
+#[cfg(unix)]
+fn wrapped_output_into_a_pipe_or_file_keeps_the_commands_bytes() {
+    let home = tempfile::tempdir().expect("home directory");
+    let config = home.path().join("empty.yml");
+    fs::write(&config, "rules: []\n").expect("config writes");
+    let saved = home.path().join("saved.out");
+    let ptty = |script: &str| {
+        let mut command = StdCommand::new(assert_cmd::cargo::cargo_bin("ptty"));
+        command
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", home.path())
+            .env("PRISMTTY_RUNTIME_DIR", home.path().join("runtime"))
+            .arg("--config")
+            .arg(&config)
+            .args(["--", "/bin/sh", "-c", script])
+            .stdin(Stdio::null());
+        command
+    };
+    let numbers: String = (1..=20000).map(|n| format!("{n}\n")).collect();
+    let cases: [(&str, &[u8]); 3] = [
+        ("printf 'a\\tb\\nc\\n'", b"a\tb\nc\n"),
+        // A CR the command wrote itself stays, alone or in front of a LF.
+        ("printf 'x\\r\\ny\\rz\\n'", b"x\r\ny\rz\n"),
+        // Long enough to cross many reads from the PTY.
+        ("seq 1 20000", numbers.as_bytes()),
+    ];
+
+    for (script, expected) in cases {
+        let piped = ptty(script).output().expect("ptty runs into a pipe");
+        assert!(piped.status.success(), "{script}: {piped:?}");
+        assert!(
+            piped.stdout == expected,
+            "{script} into a pipe: {:?}",
+            String::from_utf8_lossy(&piped.stdout[..piped.stdout.len().min(200)])
+        );
+
+        let file = fs::File::create(&saved).expect("output file");
+        let status = ptty(script)
+            .stdout(file)
+            .status()
+            .expect("ptty runs into a file");
+        assert!(status.success(), "{script}: {status:?}");
+        let written = fs::read(&saved).expect("saved output");
+        assert!(
+            written == expected,
+            "{script} into a file: {:?}",
+            String::from_utf8_lossy(&written[..written.len().min(200)])
+        );
+    }
+}
+
 // The wrapped command starts in the caller's directory, not $HOME, and a
 // relative program path resolves against it the way execvp does.
 #[test]
@@ -655,7 +711,7 @@ fn wrapped_command_runs_in_callers_working_directory() {
         fs::write(&path, "#!/bin/sh\necho \"marker-$(pwd -P)\"\n").expect("write probe");
         fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).expect("probe is executable");
     }
-    let expected = format!("marker-{}\r\n", work_path.display());
+    let expected = format!("marker-{}\n", work_path.display());
 
     let commands: [&[&str]; 3] = [
         &["sh", "-c", "echo \"marker-$(pwd -P)\""],
