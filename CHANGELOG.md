@@ -2,7 +2,13 @@
 
 All notable changes to PrismTTY are documented here.
 
-## 1.3.14 - 2026-11-26
+## 1.3.15 - 2026-11-26
+
+Version 1.3.14 was tagged but never published. One of its new tests compared
+two lists of descriptors in the order `ls` printed them, and failed in the
+release workflow's macOS jobs, where the runner leaves more descriptors open
+and `ls` needs a second row. The test now sorts both lists; nothing else
+differs from what 1.3.14 would have been.
 
 ### Fixed
 

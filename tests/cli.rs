@@ -630,12 +630,17 @@ fn wrapped_command_inherits_exactly_the_callers_extra_descriptors() {
             run.contains("fd7:caller-data"),
             "{start}: fd 7 did not reach the command: {text:?}"
         );
-        run.split("fd-list")
+        // Sorted: on a terminal `ls` fills columns, so with enough
+        // descriptors to need a second row the words are not in order.
+        let mut fds: Vec<u32> = run
+            .split("fd-list")
             .nth(1)
             .unwrap_or_default()
             .split_whitespace()
             .filter_map(|word| word.parse().ok())
-            .collect()
+            .collect();
+        fds.sort_unstable();
+        fds
     };
     let direct = run("direct-start", "direct-end");
     assert!(direct.contains(&7), "direct: {text:?}");
