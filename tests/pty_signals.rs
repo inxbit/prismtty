@@ -1056,14 +1056,19 @@ fn interactive_command_inherits_exactly_the_callers_extra_descriptors() {
     let text = String::from_utf8_lossy(&output).replace('\r', "");
     assert_eq!(status, Some(0), "{text:?}");
     let listed = |start: &str, end: &str| -> Vec<u32> {
-        text.split(start)
+        // Sorted: on a terminal `ls` fills columns, so with enough
+        // descriptors to need a second row the words are not in order.
+        let mut fds: Vec<u32> = text
+            .split(start)
             .nth(1)
             .and_then(|rest| rest.split(end).next())
             .and_then(|run| run.split("fd-list").nth(1))
             .unwrap_or_default()
             .split_whitespace()
             .filter_map(|word| word.parse().ok())
-            .collect()
+            .collect();
+        fds.sort_unstable();
+        fds
     };
     let direct = listed("direct-start", "direct-end");
     assert!(direct.contains(&7), "direct: {text:?}");
