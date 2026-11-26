@@ -227,6 +227,18 @@ setting. With the keyboard on a terminal and the output in a pipe
 (`ptty ssh host | tee log`) the PTY keeps its usual output settings, because
 the pipe usually leads back to that terminal.
 
+To page the output of a command that needs no keyboard, take the terminal off
+its stdin:
+
+```sh
+ptty show-report </dev/null | less -R
+```
+
+PrismTTY then leaves the terminal to the pager. Without `</dev/null`, PrismTTY
+and the pager both read the keyboard and both set the terminal's modes, and
+quitting the pager while the command still runs can leave the terminal in the
+pager's mode; `stty sane` puts it back.
+
 Important options:
 
 - `-p, --profile <name>` forces one or more profiles.
