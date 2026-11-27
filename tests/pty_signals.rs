@@ -3550,17 +3550,41 @@ fn start_with_sigint(command: &mut std::process::Command, entry: EntrySigint, ow
     }
 }
 
-/// A scratch HOME, configuration directory, runtime directory and empty
-/// config for one test.
+/// A scratch HOME, configuration directory, runtime directory and config
+/// for one test.
 struct Scratch {
     dir: tempfile::TempDir,
+    config: &'static str,
 }
 
+/// The word the cleanup tests leave as the command's last, unterminated
+/// output, and the one rule of their config, which colours it.
+const HELD_TAIL: &str = "heldtail";
+
 impl Scratch {
+    /// With an empty config.
     fn new() -> Self {
         let dir = tempfile::tempdir().expect("scratch directory");
         std::fs::write(dir.path().join("empty.yml"), "rules: []\n").expect("empty config");
-        Self { dir }
+        Self {
+            dir,
+            config: "empty.yml",
+        }
+    }
+
+    /// With a config whose one rule colours `HELD_TAIL`, so a session that
+    /// ends on it has a colour open to close.
+    fn colouring_the_held_tail() -> Self {
+        let mut scratch = Self::new();
+        std::fs::write(
+            scratch.path("tail.yml"),
+            format!(
+                "rules:\n  - description: held tail\n    regex: {HELD_TAIL}\n    color: f#ff0000\n"
+            ),
+        )
+        .expect("config with one rule");
+        scratch.config = "tail.yml";
+        scratch
     }
 
     fn path(&self, name: &str) -> std::path::PathBuf {
@@ -3568,7 +3592,7 @@ impl Scratch {
     }
 
     fn config(&self) -> std::path::PathBuf {
-        self.path("empty.yml")
+        self.path(self.config)
     }
 
     /// The pid file a wrapper with process id `pid` registers while it runs.
@@ -3652,6 +3676,26 @@ fn outer_terminal_settings(
     }
 }
 
+/// Whether `output` shows `HELD_TAIL` in a foreground colour that is closed
+/// right after it, by a full reset or a foreground reset.
+fn held_tail_coloured_and_closed(output: &[u8]) -> bool {
+    let tail = HELD_TAIL.as_bytes();
+    let Some(at) = output.windows(tail.len()).position(|window| window == tail) else {
+        return false;
+    };
+    let before = &output[..at];
+    let after = &output[at + tail.len()..];
+    contains_bytes(&before[before.len().saturating_sub(24)..], b"\x1b[38;")
+        && (after.starts_with(b"\x1b[0m") || after.starts_with(b"\x1b[39m"))
+}
+
+/// Whether the trace has drawn `HELD_TAIL` followed by its colour reset.
+fn trace_has_closed_held_tail(trace: &str) -> bool {
+    [b"\x1b[0m".as_slice(), b"\x1b[39m"]
+        .iter()
+        .any(|reset| trace_has(trace, "RENDER", &[HELD_TAIL.as_bytes(), reset].concat()))
+}
+
 /// Hex of `bytes` as `--trace-io` writes it.
 fn trace_hex(bytes: &[u8]) -> String {
     bytes
@@ -3724,7 +3768,7 @@ fn wrapper_dies_from_sigint_after_cleanup_when_its_command_did() {
     use std::os::unix::process::ExitStatusExt;
 
     assert_sh_dies_from_its_own_sigint();
-    let scratch = Scratch::new();
+    let scratch = Scratch::colouring_the_held_tail();
     let trace = scratch.path("trace.log");
     let run = run_redirected(
         &scratch,
@@ -3736,13 +3780,13 @@ fn wrapper_dies_from_sigint_after_cleanup_when_its_command_did() {
     let trace = std::fs::read_to_string(&trace).expect("trace file");
 
     assert!(
-        run.output.contains("first line\nheldtail"),
-        "the last, unterminated output was not written first: {:?}",
+        run.output.contains("first line\n") && held_tail_coloured_and_closed(run.output.as_bytes()),
+        "the last, unterminated output was not written first with its colour closed: {:?}",
         run.output
     );
     assert!(
-        trace_has(&trace, "OUT", b"heldtail") && trace_has(&trace, "RENDER", b"heldtail"),
-        "the trace does not end with the last output: {trace}"
+        trace_has(&trace, "OUT", HELD_TAIL.as_bytes()) && trace_has_closed_held_tail(&trace),
+        "the trace does not end with the last output and its colour reset: {trace}"
     );
     assert!(
         scratch.path("runtime").join("pids.d").is_dir() && !scratch.pid_file(run.pid).exists(),
@@ -3762,7 +3806,7 @@ fn wrapper_on_a_terminal_dies_from_sigint_after_restoring_it_when_its_command_di
     use std::os::unix::process::ExitStatusExt;
 
     assert_sh_dies_from_its_own_sigint();
-    let scratch = Scratch::new();
+    let scratch = Scratch::colouring_the_held_tail();
     let trace = scratch.path("trace.log");
     let pair = native_pty_system()
         .openpty(PtySize::default())
@@ -3790,19 +3834,17 @@ fn wrapper_on_a_terminal_dies_from_sigint_after_restoring_it_when_its_command_di
     let status = wrapper
         .wait_for_exit(Duration::from_secs(10))
         .expect("wrapper exits");
-    let output = capture.wait_until(Duration::from_secs(2), |out| {
-        contains_bytes(out, b"heldtail")
-    });
+    let output = capture.wait_until(Duration::from_secs(2), held_tail_coloured_and_closed);
     let trace = std::fs::read_to_string(&trace).expect("trace file");
 
     assert!(
-        contains_bytes(&output, b"first line\r\nheldtail"),
-        "the last, unterminated output was not drawn first: {:?}",
+        contains_bytes(&output, b"first line\r\n") && held_tail_coloured_and_closed(&output),
+        "the last, unterminated output was not drawn first with its colour closed: {:?}",
         String::from_utf8_lossy(&output)
     );
     assert!(
-        trace_has(&trace, "RENDER", b"heldtail"),
-        "the trace does not end with the last output: {trace}"
+        trace_has_closed_held_tail(&trace),
+        "the trace does not end with the last output and its colour reset: {trace}"
     );
     assert!(
         scratch.path("runtime").join("pids.d").is_dir() && !scratch.pid_file(pid).exists(),
@@ -4154,4 +4196,56 @@ fn sigint_ignored_or_blocked_by_the_caller_still_reports_130() {
             run.output
         );
     }
+}
+
+/// A script starts `cmd &` with SIGINT ignored, so a wrapper started that way
+/// keeps 130 when its command is killed by SIGINT. The script's `$?` reads 130
+/// both for an exit with 130 and for a death by SIGINT, so the real background
+/// job pins only what the script sees. The wait status itself is read from a
+/// wrapper that the shell started with SIGINT ignored by the shell itself
+/// (`trap '' INT` before `exec`), the setting a background job inherits.
+#[test]
+fn a_wrapper_started_by_a_script_with_sigint_ignored_still_reports_130() {
+    use std::os::unix::process::ExitStatusExt;
+    use std::process::{Command, Stdio};
+
+    let scratch = Scratch::new();
+    let shell = |script: &str| {
+        let output_path = scratch.path("job-output");
+        let mut command = Command::new("/bin/sh");
+        scratch.environment(&mut command);
+        command
+            .args(["-c", script])
+            .stdin(Stdio::null())
+            .stdout(File::create(&output_path).expect("output file"))
+            .stderr(Stdio::null());
+        start_with_sigint(&mut command, EntrySigint::Default, false);
+        let mut shell = ProcessGuard::new(command.spawn().expect("spawn sh"));
+        let status = shell
+            .wait_for_exit(Duration::from_secs(10))
+            .expect("sh exits");
+        (
+            status,
+            std::fs::read_to_string(&output_path).unwrap_or_default(),
+        )
+    };
+
+    // Control: the shell starts its background job with SIGINT ignored.
+    let (_, bare) = shell("sh -c 'kill -INT $$; echo SURVIVED' & wait $!; echo BG:$?");
+    assert!(
+        bare.contains("SURVIVED") && bare.contains("BG:0"),
+        "control: the background job did not ignore SIGINT: {bare:?}"
+    );
+
+    let (_, job) =
+        shell("\"$PTTY\" -c \"$CONFIG\" -- sh -c 'kill -INT $$; sleep 5' & wait $!; echo BG:$?");
+    assert!(job.contains("BG:130"), "background job: {job:?}");
+
+    let (status, output) =
+        shell("trap '' INT; exec \"$PTTY\" -c \"$CONFIG\" -- sh -c 'kill -INT $$; sleep 5'");
+    assert_eq!(
+        (status.signal(), status.code()),
+        (None, Some(128 + libc::SIGINT)),
+        "wrapper started with SIGINT ignored by its shell: {output:?}"
+    );
 }
