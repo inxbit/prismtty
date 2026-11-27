@@ -3223,6 +3223,7 @@ fn plain_lines_before_prompt_redraw(
     if columns == 0 {
         return None;
     }
+    let reads_utf8 = terminal_reads_utf8();
     let mut offset = 0;
     let mut split = 0;
     let mut cut = false;
@@ -3268,6 +3269,10 @@ fn plain_lines_before_prompt_redraw(
                             visible_line.push(b'\t');
                             last_line.tab();
                         }
+                        // To a terminal not known to read UTF-8, a byte past
+                        // ASCII can be a control (`8D` is reverse index) or
+                        // take a column of its own.
+                        0x80..=0xff if !reads_utf8 => return None,
                         0x20..=0x7e | 0x80..=0xff => {
                             line_is_plain &= !line_has_cr;
                             visible_line.push(*byte);
