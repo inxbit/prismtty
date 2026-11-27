@@ -3308,11 +3308,16 @@ mod tests {
         let raw_status = |script: &str| {
             let mut command = std::process::Command::new("sh");
             command.arg("-c").arg(script);
-            // SAFETY: signal is async-signal-safe and runs in the forked child before exec; a
-            // SIGINT the test runner inherited as ignored must not keep sh alive.
+            // SAFETY: the closure runs in the forked child before exec and only calls
+            // async-signal-safe functions on a stack-local signal set. A SIGINT the test runner
+            // inherited as ignored or blocked must not keep sh alive.
             unsafe {
                 command.pre_exec(|| {
+                    let mut sigint = std::mem::zeroed::<libc::sigset_t>();
+                    libc::sigemptyset(&mut sigint);
+                    libc::sigaddset(&mut sigint, libc::SIGINT);
                     libc::signal(libc::SIGINT, libc::SIG_DFL);
+                    libc::sigprocmask(libc::SIG_UNBLOCK, &sigint, std::ptr::null_mut());
                     Ok(())
                 });
             }
