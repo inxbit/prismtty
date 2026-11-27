@@ -171,6 +171,19 @@ impl PendingEnd {
 
 static PENDING_END: PendingEnd = PendingEnd::new();
 
+/// Test only: an ending signal to record at the watcher's stop byte, after
+/// its last check, as a handler can while the session stops.
+#[cfg(test)]
+static END_TO_RECORD_AT_STOP: AtomicI32 = AtomicI32::new(0);
+
+#[cfg(test)]
+fn record_end_at_stop_for_test(pending_end: &PendingEnd) {
+    let signal = END_TO_RECORD_AT_STOP.swap(0, Ordering::SeqCst);
+    if signal != 0 {
+        pending_end.record(signal);
+    }
+}
+
 const RAW_SIGNAL_STOP_BYTE: u8 = 0;
 const RESIZE_STOP_BYTE: u8 = b'q';
 const RESIZE_WAKE_BYTE: u8 = b'r';
@@ -3099,6 +3112,8 @@ fn handle_session_signals_with(
             }
         };
         if signal == RAW_SIGNAL_STOP_BYTE {
+            #[cfg(test)]
+            record_end_at_stop_for_test(pending_end);
             break;
         }
         let signal = libc::c_int::from(signal);
@@ -5012,6 +5027,50 @@ mod tests {
             let encoded = super::encode_published_status(status);
             assert_eq!(super::published_leader_status_from(encoded), Some(status));
         }
+    }
+
+    /// Starts the signal watcher as a session does, publishes that the main
+    /// thread reaped the command (`exit 0`, or `killed` by SIGKILL), and stops
+    /// the watcher while a SIGTERM is recorded at its stop byte: after the
+    /// watcher's last check, as a handler can record one while the session
+    /// stops. Prints the outcome published then.
+    #[test]
+    fn end_at_stop_probe() {
+        let Some(state) = probe_state("end_at_stop_probe") else {
+            return;
+        };
+        let raw_mode = Arc::new(Mutex::new(super::RawModeLifecycle::Inactive));
+        let mut watcher =
+            super::SessionSignalWatcher::start(Arc::clone(&raw_mode), true).expect("watcher");
+        let status = if state == "killed" { libc::SIGKILL } else { 0 };
+        *super::forward_child_lock() = super::ReapState::Reaped(status);
+        super::END_TO_RECORD_AT_STOP.store(libc::SIGTERM, Ordering::SeqCst);
+        watcher.stop();
+        println!("outcome={:?}", super::published_end_outcome());
+    }
+
+    // An ending signal that a handler records while the session stops, after
+    // the watcher's last check, is still taken: its command was reaped, so
+    // the command's status decides as for any end. A command that exited 0
+    // gives 0 through the normal end; one that was killed gives 128 plus the
+    // signal received.
+    #[test]
+    fn an_ending_signal_recorded_while_the_session_stops_is_taken() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let printed = run_probe("end_at_stop_probe", "exit 0");
+        assert!(
+            printed.contains("signal: 15")
+                && printed.contains("leader_status: Some(0)")
+                && printed.contains("NormalEnd"),
+            "{printed}"
+        );
+        let (status, printed) = run_ending_probe("end_at_stop_probe", "killed");
+        assert_eq!(
+            (status.signal(), status.code()),
+            (None, Some(128 + libc::SIGTERM)),
+            "{printed}"
+        );
     }
 
     // When the limit ends the process, the 1.4.0 SIGINT rule still holds: a
