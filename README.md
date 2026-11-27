@@ -269,9 +269,12 @@ PrismTTY is not stopped; on macOS a PrismTTY that leads its terminal's session
 also waits, as it exits, while output it wrote to that terminal is still
 unread. The exit code describes the command PrismTTY started, not the rest of
 its process group: 0 does not mean that every process in the group finished
-cleanly. PrismTTY acts on such a signal at any moment while it handles signals,
-also while the session is ending; once it has given the signals back to their
-previous actions, just before it exits, one takes that action, as before.
+cleanly. PrismTTY acts on the first such signal it receives while its handlers
+are installed, also while the session is ending; a later one does not replace
+it, and from then on PrismTTY keeps the signals caught until it exits, catching
+them again at once if it was giving them back. A session that no such signal
+ended gives the signals back to their previous actions as it ends, and a signal
+that arrives after that takes that action, as before.
 
 SIGUSR1 and SIGUSR2 sent to PrismTTY are passed to the command it started,
 alone, while it runs, unless PrismTTY inherited them ignored or blocked, and do
