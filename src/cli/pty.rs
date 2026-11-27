@@ -1158,7 +1158,7 @@ fn start_end_watchdog(signal: libc::c_int, deadline: Instant, sigint_left_defaul
 
 /// How long the limit waits at the deadline for the reap lock, which the
 /// watcher holds while it tears the group down by the same deadline.
-const END_OUTCOME_WAIT: Duration = Duration::from_millis(250);
+const END_OUTCOME_WAIT: Duration = Duration::from_millis(200);
 
 /// The limit's end, at the deadline. It ends the way the outcome the watcher
 /// published decides, as `end_abruptly` does for the watcher, so a SIGINT
