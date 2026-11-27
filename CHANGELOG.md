@@ -54,10 +54,11 @@ All notable changes to PrismTTY are documented here.
   session by a line that holds `not` and a long run of blanks. Where PCRE2
   runs without its JIT compiler (a library built without it, or a system
   that refuses it), `not` followed by 7,142 or more spaces, tabs or hyphens
-  and no good-state word made the rule hit its match limit, and PrismTTY
-  printed `rule 'good operational state' stopped after a bounded regex match
-  error` and stopped coloring those words. With JIT the same took 50,001
-  blanks in one buffer, more than one read holds. The rule now takes the
+  (measured with PCRE2 10.42 and 10.49) and no good-state word made the rule
+  hit its match limit, and PrismTTY printed `rule 'good operational state'
+  stopped after a bounded regex match error` and stopped coloring those
+  words. With JIT the same took about 50,000 blanks in one buffer, more than
+  one read holds. The rule now takes the
   blanks after `not` in one step. It matches exactly what it matched before,
   and its pattern is one byte shorter, so every configuration of your own
   that fit beside the generic profile still fits.
