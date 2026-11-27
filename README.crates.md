@@ -307,7 +307,7 @@ prismtty --reload
 The next output chunk in each running PrismTTY session reloads the active config.
 Only sessions watching the same runtime directory see the reload request.
 Set `PRISMTTY_RUNTIME_DIR` to override the runtime directory for tests or
-isolated sessions. An existing directory is used as it is; one that other users
+isolated sessions. An existing directory keeps its mode; one that other users
 can write to is refused, which only disables live reload for that session.
 PrismTTY owns `pids.d` and `reload` inside that directory: each session sets
 `pids.d` to mode 0700 and deletes every regular file in it whose name is not
