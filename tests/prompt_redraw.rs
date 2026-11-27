@@ -279,19 +279,12 @@ fn a_mode_reset_lets_the_next_prompt_redraw_color_its_lines_again() {
     }
 }
 
+/// The cases with characters past ASCII are in
+/// `pty_characters_past_ascii_are_judged_as_a_utf8_terminal_draws_them`: the
+/// library is not told that the terminal reads UTF-8.
 #[test]
 fn narrow_rows_keep_text_and_color_only_the_matches() {
-    let cases: [(&str, &[u8], &[usize]); 4] = [
-        (
-            "wide glyph and long line",
-            "\u{754c} error ab error cd\r\n\x1b[1Gp$ ".as_bytes(),
-            &[0, 1],
-        ),
-        (
-            "combining mark",
-            "e\u{301} error\r\n\x1b[1Gp$ ".as_bytes(),
-            &[0],
-        ),
+    let cases: [(&str, &[u8], &[usize]); 2] = [
         (
             "erase forms in the tail",
             b"error up\r\n\x1b[K\x1b[1K\x1b[2K\x1b[0J\x1b[1Gp$ ",
@@ -763,6 +756,163 @@ fn a_main_screen_region_counts_until_it_is_reset_there_review_70() {
     }
 }
 
+/// Terminal states set in an earlier read that change how wide a row is,
+/// where a character lands, or which bytes are characters:
+/// - a row of double width or double height (`ESC # 3`, `4`, `6`): xterm
+///   stops a move at the row's last column, half the width (`CursorForward`
+///   in cursor.c, with `LineMaxCol`), and only clears the row's size when it
+///   clears the whole row (`ClearBufRows` in screen.c), as RIS does; `ESC # 5`
+///   resets one row and DECSTR none;
+/// - insert mode (`CSI 4 h`): text shifts the prompt right, past the edge;
+/// - a screen size the program asks for (DECCOLM, DECSCPP, DECSNLS, a window
+///   resize, a status line), which the terminal applies after the read loop
+///   asked for the size;
+/// - a decoding other than UTF-8 (`ESC % @`, national character sets), under
+///   which a byte of a UTF-8 character can be a control.
+///
+/// Each keeps the bypass from then on. RIS clears the first three; only the
+/// exact reverse clears a decoding switch. A line feed can also return the
+/// cursor to the first column (the terminal's output processing turns it
+/// into CR LF, or newline mode is on), so it leaves the column unknown.
+#[test]
+fn reads_after_a_layout_state_the_tracker_must_see_stay_on_the_bypass_review_77() {
+    let read: &[u8] = b"error\r\n\x1b[1GR# ";
+    let cases: [(&str, usize, &[&[u8]]); 26] = [
+        (
+            "double width set in an earlier read",
+            8,
+            &[
+                b"\x1b[2;1H\x1b#6\x1b[1;1H",
+                b"error\r\n\x1b[1GR# \x1b[6C\x1b[2Dx",
+            ],
+        ),
+        ("double height, top half", 8, &[b"\x1b#3", read]),
+        ("double height, bottom half", 8, &[b"\x1b#4", read]),
+        (
+            "double width several reads earlier",
+            8,
+            &[b"\x1b#6", b"one\r\n", b"two\r\n", read],
+        ),
+        ("single width after it", 8, &[b"\x1b#6", b"\x1b#5", read]),
+        (
+            "double width split across reads",
+            8,
+            &[b"\x1b#", b"6", read],
+        ),
+        ("a line size not known", 8, &[b"\x1b#7", read]),
+        (
+            "insert mode",
+            20,
+            &[b"\x1b[4h", b"error\r\n\x1b[18Gp$ \x1b[1GOK"],
+        ),
+        ("insert mode in a list", 20, &[b"\x1b[2;4h", read]),
+        ("insert mode in the C1 form", 20, &[b"\xc2\x9b4h", read]),
+        (
+            "insert mode reset in the C1 form",
+            20,
+            &[b"\x1b[4h", b"\xc2\x9b4l", read],
+        ),
+        ("132 columns", 20, &[b"\x1b[?3h", read]),
+        ("80 columns", 20, &[b"\x1b[?3l", read]),
+        ("columns per page", 20, &[b"\x1b[132$|", read]),
+        ("lines per screen", 20, &[b"\x1b[36*|", read]),
+        (
+            "window resized in characters",
+            20,
+            &[b"\x1b[8;24;40t", read],
+        ),
+        ("window resized in pixels", 20, &[b"\x1b[4;480;640t", read]),
+        ("window resized to 30 lines", 20, &[b"\x1b[30t", read]),
+        ("window maximized", 20, &[b"\x1b[9;1t", read]),
+        ("status line shown", 20, &[b"\x1b[2$~", read]),
+        ("output to the status line", 20, &[b"\x1b[1$}", read]),
+        ("a decoding other than UTF-8", 20, &[b"\x1b%@", read]),
+        (
+            "RIS after the decoding switch",
+            20,
+            &[b"\x1b%@", b"\x1bc", read],
+        ),
+        ("national character sets", 20, &[b"\x1b[?42h", read]),
+        (
+            "a line feed that may also return the cursor",
+            20,
+            &[b"error\r\n\rabcdefghij\np$ \x1b[1Gx"],
+        ),
+        (
+            "a line feed after an unknown column",
+            20,
+            &[b"error\r\nabc\np$ \x1b[1Gx"],
+        ),
+    ];
+    for (name, cols, reads) in cases {
+        assert_bypassed_on(name, 5, cols, reads);
+    }
+}
+
+/// A reset that clears those states, and controls that leave the width
+/// alone, let the next prompt redraw color its lines.
+#[test]
+fn layout_states_that_are_reset_or_change_nothing_let_the_lines_be_colored() {
+    let read: &[u8] = b"error\r\n\x1b[1GR# ";
+    let cases: [(&str, &[&[u8]]); 13] = [
+        ("double width, then RIS", &[b"\x1b#6", b"\x1bc", read]),
+        ("single width alone", &[b"\x1b#5", read]),
+        ("screen alignment test", &[b"\x1b#8", read]),
+        ("insert mode, then reset", &[b"\x1b[4h", b"\x1b[4l", read]),
+        ("insert mode, then RIS", &[b"\x1b[4h", b"\x1bc", read]),
+        ("132 columns, then RIS", &[b"\x1b[?3h", b"\x1bc", read]),
+        ("UTF-8 again", &[b"\x1b%@", b"\x1b%G", read]),
+        (
+            "national character sets off",
+            &[b"\x1b[?42h", b"\x1b[?42l", read],
+        ),
+        ("title stack", &[b"\x1b[22;0t", b"\x1b[23;0t", read]),
+        ("size report", &[b"\x1b[18t", read]),
+        ("no status line", &[b"\x1b[0$~", read]),
+        ("keypad mode", &[b"\x1b=", b"\x1b>", read]),
+        (
+            "a line feed from the first column",
+            &[b"error\r\n\x1b[1G\nR# "],
+        ),
+    ];
+    for (name, reads) in cases {
+        let output = render_on(6, 24, reads);
+        let screen = Screen::rendered(6, 24, &output);
+        let row = (0..6)
+            .find(|row| screen.text(*row).starts_with("error"))
+            .unwrap_or_else(|| {
+                panic!(
+                    "{name}: no error row: {:?}",
+                    String::from_utf8_lossy(&output)
+                )
+            });
+        assert_eq!(
+            red_text(&screen, row),
+            (0..5).collect::<Vec<_>>(),
+            "{name}: {:?}",
+            String::from_utf8_lossy(&output)
+        );
+    }
+}
+
+/// The library starts out not knowing that the terminal reads UTF-8. A byte
+/// past ASCII can then be a control (the UTF-8 `\u{14d}` holds `8D`, reverse
+/// index, to a terminal that reads 8-bit bytes) or take a column of its own,
+/// so a read with one in its text keeps the bypass.
+#[test]
+fn a_read_with_text_past_ascii_keeps_the_bypass_until_the_terminal_reads_utf8() {
+    let cases: [(&str, &[u8]); 2] = [
+        (
+            "in an output line",
+            "error \u{14d}\r\n\x1b[1GR# ".as_bytes(),
+        ),
+        ("in the prompt", "error\r\n\x1b[1G\u{3bb} ".as_bytes()),
+    ];
+    for (name, read) in cases {
+        assert_bypassed(name, &[read]);
+    }
+}
+
 /// Accepted limit: the lines are colored when they are written, and a later
 /// read that goes back into one and rewrites only part of it without
 /// erasing leaves color on the rest. Pinned so a change to it is seen.
@@ -1027,6 +1177,175 @@ fn pty_moves_that_stop_at_the_edge_are_judged_against_the_terminal_width() {
         "{:?}",
         String::from_utf8_lossy(&run.renders)
     );
+}
+
+/// A `sh` script that writes `read` in one write: printf, with every byte
+/// past printable ASCII, and `\\`, `%` and `'`, as an octal escape.
+fn printf_script(read: &[u8]) -> String {
+    let mut format = String::new();
+    for byte in read {
+        match byte {
+            b' '..=b'~' if !matches!(byte, b'\\' | b'%' | b'\'') => format.push(char::from(*byte)),
+            _ => format.push_str(&format!("\\{byte:03o}")),
+        }
+    }
+    format!("printf '{format}' | cat; sleep 0.2")
+}
+
+/// `read` written by the child in one write, in a PTY `rows` by `cols`.
+fn pty_one_read(rows: u16, cols: u16, read: &[u8]) -> Run {
+    let run = run_in_pty_of(rows, cols, &printf_script(read), |_, _| {});
+    assert_eq!(run.reads, vec![read.to_vec()], "one read");
+    run
+}
+
+/// Every `error` in the first rows of `run` is red, and the text is what the
+/// unchanged bytes show. The command line adds the generic profile's rules,
+/// so other words may be colored too.
+fn assert_errors_colored(name: &str, rows: usize, cols: usize, run: &Run, read: &[u8]) {
+    let screen = Screen::rendered(rows, cols, &run.renders);
+    assert!(
+        screen.same_text(&Screen::rendered(rows, cols, read)),
+        "{name}: {:?}",
+        String::from_utf8_lossy(&run.renders)
+    );
+    assert!(
+        contains(&run.renders, b"\x1b[38;2;255;0;0m"),
+        "{name}: {:?}",
+        String::from_utf8_lossy(&run.renders)
+    );
+    for row in 0..rows {
+        let red = red_text(&screen, row);
+        assert!(
+            word_columns(&screen, row, "error")
+                .iter()
+                .all(|col| red.contains(col)),
+            "{name}: row {row}: {:?}",
+            String::from_utf8_lossy(&run.renders)
+        );
+    }
+}
+
+/// With the terminal reading UTF-8 (the command line takes it from the
+/// locale), characters past ASCII in the lines are colored around, and the
+/// width model's cases keep the bypass.
+#[test]
+fn pty_characters_past_ascii_are_judged_as_a_utf8_terminal_draws_them() {
+    let colored: [(&str, &[u8]); 2] = [
+        (
+            "wide glyph and long line",
+            "\u{754c} error ab error cd\r\n\x1b[1Gp$ ".as_bytes(),
+        ),
+        ("combining mark", "e\u{301} error\r\n\x1b[1Gp$ ".as_bytes()),
+    ];
+    for (name, read) in colored {
+        let run = pty_one_read(6, 10, read);
+        assert_errors_colored(name, 6, 10, &run, read);
+    }
+    let raw: [(&str, u16, &[u8]); 3] = [
+        (
+            "wide characters before the prompt",
+            80,
+            "error\r\n\x1b[1G\u{754c}\u{754c}\x1b[Kp$ \x1b[7Gx".as_bytes(),
+        ),
+        (
+            "combining marks before the prompt",
+            80,
+            "error\r\n\x1b[1Ge\u{301}e\u{301}\x1b[Kp$ \x1b[3Gx".as_bytes(),
+        ),
+        (
+            "a wide character in the last column",
+            20,
+            "error\r\n\x1b[1Gp$ \x1b[99C\u{754c}".as_bytes(),
+        ),
+    ];
+    for (name, cols, read) in raw {
+        let run = pty_one_read(5, cols, read);
+        assert_eq!(
+            run.renders,
+            read,
+            "{name}: {:?}",
+            String::from_utf8_lossy(&run.renders)
+        );
+    }
+}
+
+/// A prompt holding characters past ASCII has a width not known to a
+/// column, but at most two columns for each of them. When an erase to the
+/// right comes right after it and that bound ends before the right edge, the
+/// cursor is after the prompt however wide its characters are, and the erase
+/// leaves it whole.
+#[test]
+fn pty_a_unicode_prompt_followed_by_an_erase_to_the_right_is_colored_review_77() {
+    let colored: [(&str, u16, &[u8]); 6] = [
+        (
+            "then CSI K",
+            80,
+            "error\r\n\x1b[1G\u{276f} \x1b[K".as_bytes(),
+        ),
+        (
+            "then CSI 0K",
+            80,
+            "error\r\n\x1b[1G\u{276f} \x1b[0K".as_bytes(),
+        ),
+        (
+            "a wide CJK character",
+            80,
+            "error\r\n\x1b[1G~/\u{754c} \u{276f} \x1b[K".as_bytes(),
+        ),
+        (
+            "combining marks",
+            80,
+            "error\r\n\x1b[1Ge\u{301}t\u{e9} \u{276f} \x1b[K".as_bytes(),
+        ),
+        (
+            "redrawn after an erase below, then bracketed paste",
+            80,
+            "error\r\n\x1b[1G\x1b[J\u{276f} \x1b[K\x1b[?2004h".as_bytes(),
+        ),
+        (
+            "the bound just before the edge",
+            8,
+            "error\r\n\x1b[4G\u{276f} \x1b[K".as_bytes(),
+        ),
+    ];
+    for (name, cols, read) in colored {
+        let run = pty_one_read(5, cols, read);
+        assert_errors_colored(name, 5, usize::from(cols), &run, read);
+    }
+    let raw: [(&str, u16, &[u8]); 6] = [
+        (
+            "the bound reaches the edge",
+            8,
+            "error\r\n\x1b[6G\u{276f} \x1b[K".as_bytes(),
+        ),
+        ("CSI 1K", 80, "error\r\n\x1b[1G\u{276f} \x1b[1K".as_bytes()),
+        ("CSI 2K", 80, "error\r\n\x1b[1G\u{276f} \x1b[2K".as_bytes()),
+        (
+            "a right prompt after the erase",
+            80,
+            "error\r\n\x1b[1G\u{276f} \x1b[K\x1b[73C[0]\x1b[76D".as_bytes(),
+        ),
+        (
+            "erase below",
+            80,
+            "error\r\n\x1b[1G\u{276f} \x1b[J".as_bytes(),
+        ),
+        (
+            "text between the prompt and the erase",
+            80,
+            "error\r\n\x1b[1G\u{276f} x\x1b[K".as_bytes(),
+        ),
+    ];
+    for (name, cols, read) in raw {
+        let run = pty_one_read(5, cols, read);
+        assert_eq!(
+            run.renders,
+            read,
+            "{name}: {:?}",
+            String::from_utf8_lossy(&run.renders)
+        );
+    }
 }
 
 #[test]

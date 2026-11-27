@@ -354,7 +354,17 @@ impl Screen {
                 *self = Self::new(self.rows, self.cols);
                 i
             }
-            '(' | ')' | '#' | ' ' => i + 1,
+            // An escape with intermediates, such as `ESC ( B`, `ESC # 6` or
+            // `ESC % G`: the intermediates, then one final byte.
+            '\x20'..='\x2f' => {
+                while chars
+                    .get(i)
+                    .is_some_and(|ch| ('\x20'..='\x2f').contains(ch))
+                {
+                    i += 1;
+                }
+                (i + 1).min(chars.len())
+            }
             _ => i,
         }
     }
