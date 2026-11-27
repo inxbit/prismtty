@@ -554,7 +554,7 @@ fn prompt_shaped_tails_are_read_strictly() {
 #[test]
 fn moves_that_stop_at_the_edge_keep_the_bypass_review_70() {
     let zsh_right_prompt: &[u8] = b"error\r\n\x1b[1G\x1b[0KHOST% \x1b[K\x1b[53C[0]\x1b[56D";
-    let cases: [(&str, usize, &[u8]); 10] = [
+    let cases: [(&str, usize, &[u8]); 11] = [
         (
             "right then left past both edges",
             8,
@@ -604,6 +604,11 @@ fn moves_that_stop_at_the_edge_keep_the_bypass_review_70() {
             "a zsh right prompt drawn for a wider terminal",
             40,
             zsh_right_prompt,
+        ),
+        (
+            "a wide character in the last column wraps to the next row",
+            20,
+            "error\r\n\x1b[1Gp$ \x1b[99C\u{754c}".as_bytes(),
         ),
     ];
     for (name, cols, read) in cases {
