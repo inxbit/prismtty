@@ -3498,3 +3498,930 @@ fn output_on_a_terminal_still_ends_lines_with_cr_lf() {
         String::from_utf8_lossy(&output)
     );
 }
+
+// A shell decides whether one Ctrl-C ends a loop or a script from how the
+// command it waited for ended. An interactive shell stops when the job was
+// killed by SIGINT; a script stops when the shell itself received SIGINT. The
+// wrapper therefore ends by SIGINT when the command it wrapped was killed by
+// SIGINT, so a loop typed at a prompt around `ptty cmd` stops as it does
+// around `cmd`. Every wrapper below runs with its own HOME, configuration
+// directory, runtime directory and an explicit empty config, and starts with
+// SIGINT set the way the test says, so a disposition or mask the test runner
+// inherited cannot decide the result.
+
+/// How a test starts a process with respect to SIGINT.
+#[derive(Clone, Copy)]
+enum EntrySigint {
+    /// Default action and unblocked, as a shell starts a foreground command.
+    Default,
+    /// Ignored, as a non-interactive shell starts `cmd &`.
+    Ignored,
+    /// Blocked in the signal mask.
+    Blocked,
+}
+
+/// Which session a process a test starts belongs to.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Leader {
+    /// The test's own, as a command run from a shell script is.
+    Inherited,
+    /// A new session of its own, without a terminal.
+    Session,
+    /// A new session whose controlling terminal is the one on its stdin.
+    SessionOnTerminal,
+}
+
+/// Sets SIGINT for the process `command` starts, and the session it runs in.
+fn start_with_sigint(command: &mut std::process::Command, entry: EntrySigint, leader: Leader) {
+    use std::os::unix::process::CommandExt;
+
+    // SAFETY: the closure runs in the forked child before exec and only calls
+    // async-signal-safe functions (setsid, ioctl, signal, sigemptyset,
+    // sigaddset, sigprocmask) on a stack-local signal set.
+    unsafe {
+        command.pre_exec(move || {
+            if leader != Leader::Inherited && libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if leader == Leader::SessionOnTerminal && libc::ioctl(0, libc::TIOCSCTTY as _, 0) == -1
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+            let mut sigint = std::mem::zeroed::<libc::sigset_t>();
+            libc::sigemptyset(&mut sigint);
+            libc::sigaddset(&mut sigint, libc::SIGINT);
+            let (action, how) = match entry {
+                EntrySigint::Default => (libc::SIG_DFL, libc::SIG_UNBLOCK),
+                EntrySigint::Ignored => (libc::SIG_IGN, libc::SIG_UNBLOCK),
+                EntrySigint::Blocked => (libc::SIG_DFL, libc::SIG_BLOCK),
+            };
+            libc::signal(libc::SIGINT, action);
+            libc::sigprocmask(how, &sigint, std::ptr::null_mut());
+            Ok(())
+        });
+    }
+}
+
+/// A scratch HOME, configuration directory, runtime directory and config
+/// for one test.
+struct Scratch {
+    dir: tempfile::TempDir,
+    config: &'static str,
+}
+
+/// The word the cleanup tests leave as the command's last, unterminated
+/// output, and the one rule of their config, which colours it.
+const HELD_TAIL: &str = "heldtail";
+
+impl Scratch {
+    /// With an empty config.
+    fn new() -> Self {
+        let dir = tempfile::tempdir().expect("scratch directory");
+        std::fs::write(dir.path().join("empty.yml"), "rules: []\n").expect("empty config");
+        Self {
+            dir,
+            config: "empty.yml",
+        }
+    }
+
+    /// With a config whose one rule colours `HELD_TAIL`, so a session that
+    /// ends on it has a colour open to close.
+    fn colouring_the_held_tail() -> Self {
+        let mut scratch = Self::new();
+        std::fs::write(
+            scratch.path("tail.yml"),
+            format!(
+                "rules:\n  - description: held tail\n    regex: {HELD_TAIL}\n    color: f#ff0000\n"
+            ),
+        )
+        .expect("config with one rule");
+        scratch.config = "tail.yml";
+        scratch
+    }
+
+    fn path(&self, name: &str) -> std::path::PathBuf {
+        self.dir.path().join(name)
+    }
+
+    fn config(&self) -> std::path::PathBuf {
+        self.path(self.config)
+    }
+
+    /// The pid file a wrapper with process id `pid` registers while it runs.
+    fn pid_file(&self, pid: libc::pid_t) -> std::path::PathBuf {
+        self.path("runtime").join("pids.d").join(pid.to_string())
+    }
+
+    /// Replaces the environment of `command` with the scratch one. The
+    /// wrapper path and its config are in `PTTY` and `CONFIG` for shells.
+    fn environment(&self, command: &mut std::process::Command) {
+        command
+            .env_clear()
+            .env("HOME", self.dir.path())
+            .env("XDG_CONFIG_HOME", self.path("config"))
+            .env("PRISMTTY_RUNTIME_DIR", self.path("runtime"))
+            .env("PATH", "/usr/bin:/bin")
+            .env("TERM", "xterm-256color")
+            .env("PTTY", env!("CARGO_BIN_EXE_ptty"))
+            .env("CONFIG", self.config())
+            .env("SCRATCH", self.dir.path())
+            .env(TEST_TAG, test_tag());
+    }
+
+    /// The file in which the sessions a test's processes lead record their
+    /// pid, for `SessionSweep`.
+    fn sessions(&self) -> std::path::PathBuf {
+        self.path("sessions")
+    }
+
+    /// `ptty -c <config> [extra] -- sh -c <script>`. The command first records
+    /// its pid: under the wrapper it leads a session of its own.
+    fn wrapper(&self, extra: &[&std::ffi::OsStr], script: &str) -> std::process::Command {
+        let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_ptty"));
+        self.environment(&mut command);
+        command.arg("-c").arg(self.config());
+        command.args(extra);
+        command.args([
+            "--",
+            "/bin/sh",
+            "-c",
+            &format!("echo $$ >> \"$SCRATCH/sessions\"; {script}"),
+        ]);
+        command
+    }
+}
+
+/// Every process these tests start carries this variable, so a run can be
+/// checked from outside for anything it left behind. Its value is the test
+/// process's own value of it, or `pty2`.
+const TEST_TAG: &str = "PTY2_TEST_TAG";
+
+fn test_tag() -> String {
+    std::env::var(TEST_TAG).unwrap_or_else(|_| "pty2".to_owned())
+}
+
+/// Kills, when it is dropped, every process left in the sessions a test
+/// created, on return and on panic alike. Those are the sessions of the
+/// processes in the tree under `root`, a process the test spawned, and the
+/// sessions whose leaders wrote their pid to `marker`, one per line: a
+/// command under the wrapper leads a session of its own, and is no longer in
+/// the tree once the wrapper is gone. Processes are found by session id,
+/// never by name, and the test's own session is never touched. Declare it
+/// after the guard of `root`, so it runs first, while the tree is whole.
+struct SessionSweep {
+    root: libc::pid_t,
+    marker: std::path::PathBuf,
+}
+
+impl SessionSweep {
+    fn new(root: libc::pid_t, marker: std::path::PathBuf) -> Self {
+        Self { root, marker }
+    }
+}
+
+impl Drop for SessionSweep {
+    fn drop(&mut self) {
+        // SAFETY: getsid and getpid have no memory-safety preconditions.
+        let (own_session, own_pid) = unsafe { (libc::getsid(0), libc::getpid()) };
+        let mut swept = Vec::new();
+        let mut killed = Vec::new();
+        // A process that forked while it was being killed is caught by the
+        // next pass.
+        for _ in 0..3 {
+            let processes = all_processes();
+            let mut sessions: Vec<libc::pid_t> = process_tree(&processes, self.root)
+                .into_iter()
+                .filter_map(session_of)
+                .collect();
+            sessions.extend(
+                std::fs::read_to_string(&self.marker)
+                    .unwrap_or_default()
+                    .split_whitespace()
+                    .filter_map(|pid| pid.parse::<libc::pid_t>().ok()),
+            );
+            sessions.retain(|session| *session > 1 && *session != own_session);
+            sessions.sort_unstable();
+            sessions.dedup();
+            let mut found = false;
+            for (pid, _) in processes {
+                if pid != own_pid
+                    && session_of(pid).is_some_and(|session| sessions.contains(&session))
+                {
+                    // SAFETY: kill has no memory-safety preconditions; `pid` is in a session this
+                    // test created.
+                    unsafe {
+                        libc::kill(pid, libc::SIGKILL);
+                    }
+                    killed.push(pid);
+                    found = true;
+                }
+            }
+            swept.extend(sessions);
+            if !found {
+                break;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        swept.sort_unstable();
+        swept.dedup();
+        eprintln!("swept sessions {swept:?}, killed {killed:?}");
+    }
+}
+
+/// Every process as (pid, parent pid).
+fn all_processes() -> Vec<(libc::pid_t, libc::pid_t)> {
+    let Ok(output) = std::process::Command::new("ps")
+        .args(["-A", "-o", "pid=", "-o", "ppid="])
+        .output()
+    else {
+        return Vec::new();
+    };
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            Some((fields.next()?.parse().ok()?, fields.next()?.parse().ok()?))
+        })
+        .collect()
+}
+
+/// `root` and every process below it.
+fn process_tree(processes: &[(libc::pid_t, libc::pid_t)], root: libc::pid_t) -> Vec<libc::pid_t> {
+    let mut tree = vec![root];
+    let mut next = 0;
+    while next < tree.len() {
+        let parent = tree[next];
+        tree.extend(
+            processes
+                .iter()
+                .filter(|(_, ppid)| *ppid == parent)
+                .map(|(pid, _)| *pid),
+        );
+        next += 1;
+    }
+    tree
+}
+
+fn session_of(pid: libc::pid_t) -> Option<libc::pid_t> {
+    // SAFETY: getsid has no memory-safety preconditions.
+    let session = unsafe { libc::getsid(pid) };
+    (session > 0).then_some(session)
+}
+
+/// The script the tests use to kill a command with SIGINT dies from it
+/// without the wrapper too, so the wrapped result is compared with the
+/// command's own.
+fn assert_sh_dies_from_its_own_sigint() {
+    use std::os::unix::process::ExitStatusExt;
+    use std::process::{Command, Stdio};
+
+    let mut bare = Command::new("/bin/sh");
+    bare.args(["-c", "kill -INT $$; sleep 5"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    start_with_sigint(&mut bare, EntrySigint::Default, Leader::Inherited);
+    let status = bare.status().expect("run sh without the wrapper");
+    assert_eq!(
+        status.signal(),
+        Some(libc::SIGINT),
+        "control: sh did not die from its own SIGINT ({status:?})"
+    );
+}
+
+fn wait_for_file_containing(path: &std::path::Path, needle: &[u8], timeout: Duration) -> bool {
+    wait_for_condition(timeout, || {
+        std::fs::read(path).is_ok_and(|contents| contains_bytes(&contents, needle))
+    })
+}
+
+/// The outer terminal's settings, read where they can still be read after
+/// the wrapper, its session leader, has exited. macOS then revokes the slave
+/// from every descriptor, but both ends share one set of settings there, so
+/// they are read through the master. Linux keeps the slave usable and gives
+/// the master settings of its own.
+fn outer_terminal_settings(
+    tty: &File,
+    master: &dyn portable_pty::MasterPty,
+) -> nix::sys::termios::Termios {
+    #[cfg(target_os = "macos")]
+    {
+        let _ = tty;
+        let fd = master.as_raw_fd().expect("outer PTY descriptor");
+        // SAFETY: `fd` is the PTY master that `master` keeps open for this call.
+        let master = unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) };
+        nix::sys::termios::tcgetattr(master).expect("terminal settings")
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = master;
+        nix::sys::termios::tcgetattr(tty).expect("terminal settings")
+    }
+}
+
+/// Whether `output` shows `HELD_TAIL` in a foreground colour that is closed
+/// right after it, by a full reset or a foreground reset.
+fn held_tail_coloured_and_closed(output: &[u8]) -> bool {
+    let tail = HELD_TAIL.as_bytes();
+    let Some(at) = output.windows(tail.len()).position(|window| window == tail) else {
+        return false;
+    };
+    let before = &output[..at];
+    let after = &output[at + tail.len()..];
+    contains_bytes(&before[before.len().saturating_sub(24)..], b"\x1b[38;")
+        && (after.starts_with(b"\x1b[0m") || after.starts_with(b"\x1b[39m"))
+}
+
+/// Whether the trace has drawn `HELD_TAIL` followed by its colour reset.
+fn trace_has_closed_held_tail(trace: &str) -> bool {
+    [b"\x1b[0m".as_slice(), b"\x1b[39m"]
+        .iter()
+        .any(|reset| trace_has(trace, "RENDER", &[HELD_TAIL.as_bytes(), reset].concat()))
+}
+
+/// Hex of `bytes` as `--trace-io` writes it.
+fn trace_hex(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Whether the trace has a `direction` line whose bytes contain `bytes`.
+fn trace_has(trace: &str, direction: &str, bytes: &[u8]) -> bool {
+    let hex = trace_hex(bytes);
+    trace
+        .lines()
+        .any(|line| line.split_whitespace().nth(1) == Some(direction) && line.contains(&hex))
+}
+
+/// A wrapper run with stdin, stdout and stderr redirected: its real wait
+/// status and what it wrote.
+struct RedirectedRun {
+    status: std::process::ExitStatus,
+    output: String,
+    pid: libc::pid_t,
+}
+
+/// Runs the wrapper on `script` with stdin from /dev/null and output to a
+/// file. With `signal`, sends it to the wrapper once the script printed READY.
+fn run_redirected(
+    scratch: &Scratch,
+    extra: &[&std::ffi::OsStr],
+    script: &str,
+    entry: EntrySigint,
+    signal: Option<libc::c_int>,
+) -> RedirectedRun {
+    use std::process::Stdio;
+
+    let output_path = scratch.path("output");
+    let mut command = scratch.wrapper(extra, script);
+    command
+        .stdin(Stdio::null())
+        .stdout(File::create(&output_path).expect("output file"))
+        .stderr(File::create(scratch.path("stderr")).expect("stderr file"));
+    start_with_sigint(&mut command, entry, Leader::Inherited);
+    let mut wrapper = ProcessGuard::new(command.spawn().expect("spawn ptty"));
+    let pid = wrapper.pid();
+    let _sweep = SessionSweep::new(pid, scratch.sessions());
+    if let Some(signal) = signal {
+        assert!(
+            wait_for_file_containing(&output_path, b"READY", Duration::from_secs(10)),
+            "the command never printed READY: {:?}",
+            std::fs::read_to_string(&output_path)
+        );
+        // SAFETY: kill has no memory-safety preconditions; the target is the wrapper this test
+        // spawned and has not reaped.
+        assert_eq!(unsafe { libc::kill(pid, signal) }, 0);
+    }
+    let status = wrapper
+        .wait_for_exit(Duration::from_secs(10))
+        .expect("wrapper exits");
+    let mut output = std::fs::read_to_string(&output_path).unwrap_or_default();
+    output.push_str(&std::fs::read_to_string(scratch.path("stderr")).unwrap_or_default());
+    RedirectedRun {
+        status,
+        output,
+        pid,
+    }
+}
+
+#[test]
+fn wrapper_dies_from_sigint_after_cleanup_when_its_command_did() {
+    use std::os::unix::process::ExitStatusExt;
+
+    assert_sh_dies_from_its_own_sigint();
+    let scratch = Scratch::colouring_the_held_tail();
+    let trace = scratch.path("trace.log");
+    let run = run_redirected(
+        &scratch,
+        &[std::ffi::OsStr::new("--trace-io"), trace.as_os_str()],
+        "printf 'first line\\nheld''tail'; kill -INT $$; sleep 5",
+        EntrySigint::Default,
+        None,
+    );
+    let trace = std::fs::read_to_string(&trace).expect("trace file");
+
+    assert!(
+        run.output.contains("first line\n") && held_tail_coloured_and_closed(run.output.as_bytes()),
+        "the last, unterminated output was not written first with its colour closed: {:?}",
+        run.output
+    );
+    assert!(
+        trace_has(&trace, "OUT", HELD_TAIL.as_bytes()) && trace_has_closed_held_tail(&trace),
+        "the trace does not end with the last output and its colour reset: {trace}"
+    );
+    assert!(
+        scratch.path("runtime").join("pids.d").is_dir() && !scratch.pid_file(run.pid).exists(),
+        "the session's pid file was not removed"
+    );
+    assert_eq!(
+        (run.status.signal(), run.status.code()),
+        (Some(libc::SIGINT), None),
+        "wrapper of a command killed by SIGINT: {:?}",
+        run.output
+    );
+}
+
+#[test]
+fn wrapper_on_a_terminal_dies_from_sigint_after_restoring_it_when_its_command_did() {
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::process::ExitStatusExt;
+
+    assert_sh_dies_from_its_own_sigint();
+    let scratch = Scratch::colouring_the_held_tail();
+    let trace = scratch.path("trace.log");
+    let pair = native_pty_system()
+        .openpty(PtySize::default())
+        .expect("openpty");
+    let tty = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NOCTTY)
+        .open(pair.master.tty_name().expect("outer PTY tty name"))
+        .expect("open outer slave tty");
+    drop(pair.slave);
+    let cooked = outer_terminal_settings(&tty, &*pair.master);
+    let capture = CaptureTask::from_master(&*pair.master);
+    let mut command = scratch.wrapper(
+        &[std::ffi::OsStr::new("--trace-io"), trace.as_os_str()],
+        "printf 'first line\\nheld''tail'; kill -INT $$; sleep 5",
+    );
+    command
+        .stdin(tty.try_clone().expect("stdin tty"))
+        .stdout(tty.try_clone().expect("stdout tty"))
+        .stderr(tty.try_clone().expect("stderr tty"));
+    start_with_sigint(
+        &mut command,
+        EntrySigint::Default,
+        Leader::SessionOnTerminal,
+    );
+    let mut wrapper = ProcessGuard::new(command.spawn().expect("spawn ptty"));
+    let pid = wrapper.pid();
+    let _sweep = SessionSweep::new(pid, scratch.sessions());
+    let status = wrapper
+        .wait_for_exit(Duration::from_secs(10))
+        .expect("wrapper exits");
+    let output = capture.wait_until(Duration::from_secs(2), held_tail_coloured_and_closed);
+    let trace = std::fs::read_to_string(&trace).expect("trace file");
+
+    assert!(
+        contains_bytes(&output, b"first line\r\n") && held_tail_coloured_and_closed(&output),
+        "the last, unterminated output was not drawn first with its colour closed: {:?}",
+        String::from_utf8_lossy(&output)
+    );
+    assert!(
+        trace_has_closed_held_tail(&trace),
+        "the trace does not end with the last output and its colour reset: {trace}"
+    );
+    assert!(
+        scratch.path("runtime").join("pids.d").is_dir() && !scratch.pid_file(pid).exists(),
+        "the session's pid file was not removed"
+    );
+    assert!(
+        outer_terminal_settings(&tty, &*pair.master) == cooked,
+        "the terminal was not given back in its own settings"
+    );
+    assert_eq!(
+        (status.signal(), status.code()),
+        (Some(libc::SIGINT), None),
+        "wrapper on a terminal of a command killed by SIGINT: {:?}",
+        String::from_utf8_lossy(&output)
+    );
+}
+
+/// What a shell prints for the loop typed at its prompt, from the typed line
+/// until one Ctrl-C has either brought the prompt back or let the next round
+/// start. `argv` starts the shell (or a wrapper around it) as the session
+/// leader of a fresh terminal with SIGINT at its default action; with
+/// `wrapped`, the loop runs its command under the wrapper. Each round's
+/// command prints READY and then waits until it is killed, so Ctrl-C is typed
+/// only once the first round's command runs, and no round can end on its own
+/// however slow the machine is.
+fn loop_after_one_ctrl_c(scratch: &Scratch, argv: &[&str], wrapped: bool) -> Vec<u8> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let pair = native_pty_system()
+        .openpty(PtySize {
+            rows: 40,
+            cols: 250,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("openpty");
+    let tty = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NOCTTY)
+        .open(pair.master.tty_name().expect("outer PTY tty name"))
+        .expect("open outer slave tty");
+    drop(pair.slave);
+    let capture = CaptureTask::from_master(&*pair.master);
+    let mut command = std::process::Command::new(argv[0]);
+    command.args(&argv[1..]);
+    scratch.environment(&mut command);
+    command
+        .stdin(tty.try_clone().expect("stdin tty"))
+        .stdout(tty.try_clone().expect("stdout tty"))
+        .stderr(tty.try_clone().expect("stderr tty"));
+    start_with_sigint(
+        &mut command,
+        EntrySigint::Default,
+        Leader::SessionOnTerminal,
+    );
+    let mut shell = ProcessGuard::new(command.spawn().expect("spawn interactive shell"));
+    let _sweep = SessionSweep::new(shell.pid(), scratch.sessions());
+    let keyboard = pair.master.as_raw_fd().expect("outer PTY descriptor");
+    let type_text = |text: &[u8]| {
+        // SAFETY: `keyboard` is the open PTY master and the buffer is valid for its length.
+        let typed = unsafe { libc::write(keyboard, text.as_ptr().cast(), text.len()) };
+        assert_eq!(typed, text.len() as isize, "type into the terminal");
+    };
+    let len_now = || capture.wait_until(Duration::ZERO, |_| true).len();
+    let seen_after = |start: usize, needle: &[u8], timeout: Duration| {
+        let output = capture.wait_until(timeout, |out| {
+            out.len() > start && contains_bytes(&out[start..], needle)
+        });
+        output
+            .get(start..)
+            .is_some_and(|tail| contains_bytes(tail, needle))
+    };
+    let shown = || capture.wait_until(Duration::ZERO, |_| true);
+
+    assert!(
+        wait_for_condition(Duration::from_secs(10), || len_now() > 0),
+        "the shell printed nothing"
+    );
+    // The shell records its session, for the sweep. The prompt it prints
+    // differs from the typed text.
+    type_text(b"echo $$ >> \"$SCRATCH/sessions\"; PS1='PRO''MPT> '\r");
+    assert!(
+        seen_after(0, b"PROMPT> ", Duration::from_secs(10)),
+        "the prompt never appeared"
+    );
+    let prefix = if wrapped {
+        "\"$PTTY\" -c \"$CONFIG\" -- "
+    } else {
+        ""
+    };
+    let start = len_now();
+    type_text(
+        format!(
+            "for i in 1 2 3; do {prefix}sh -c 'echo $$ >> \"$SCRATCH/sessions\"; echo RE\"\"ADY; exec sleep 60'; echo IT\"\"ER $i; done; echo LOOP\"\"DONE\r"
+        )
+        .as_bytes(),
+    );
+    assert!(
+        seen_after(start, b"READY", Duration::from_secs(10)),
+        "the loop's first command never started"
+    );
+    let interrupted = len_now();
+    type_text(b"\x03");
+    // Whichever comes first: the prompt (the loop stopped) or the next
+    // round's READY (it went on).
+    let settled = wait_for_condition(Duration::from_secs(20), || {
+        let output = shown();
+        output
+            .get(interrupted..)
+            .is_some_and(|tail| contains_bytes(tail, b"PROMPT> ") || contains_bytes(tail, b"READY"))
+    });
+    let output = shown()[start..].to_vec();
+    assert!(
+        settled,
+        "after Ctrl-C neither the prompt came back nor the next round started within 20 s: {:?}",
+        String::from_utf8_lossy(&output)
+    );
+    if count_of(&output, b"READY") == 1 {
+        type_text(b"exit\r");
+        let _ = shell.wait_for_exit(Duration::from_secs(5));
+    }
+    output
+}
+
+fn count_of(haystack: &[u8], needle: &[u8]) -> usize {
+    haystack
+        .windows(needle.len())
+        .filter(|window| *window == needle)
+        .count()
+}
+
+fn assert_loop_stopped(output: &[u8], what: &str) {
+    assert!(
+        count_of(output, b"READY") == 1
+            && contains_bytes(output, b"PROMPT> ")
+            && !contains_bytes(output, b"ITER 2")
+            && !contains_bytes(output, b"LOOPDONE"),
+        "{what}: the loop went on after one Ctrl-C: {:?}",
+        String::from_utf8_lossy(output)
+    );
+}
+
+/// The first of `paths` that exists.
+fn installed(paths: &[&'static str]) -> Option<&'static str> {
+    paths
+        .iter()
+        .copied()
+        .find(|path| std::path::Path::new(path).exists())
+}
+
+#[test]
+fn one_ctrl_c_stops_a_loop_typed_at_an_interactive_zsh_prompt() {
+    let Some(zsh) = installed(&["/bin/zsh", "/usr/bin/zsh"]) else {
+        eprintln!("skipped: zsh is not installed");
+        return;
+    };
+    let scratch = Scratch::new();
+    let shell = [zsh, "-f", "-i"];
+
+    assert_loop_stopped(
+        &loop_after_one_ctrl_c(&scratch, &shell, false),
+        "control without the wrapper",
+    );
+    assert_loop_stopped(
+        &loop_after_one_ctrl_c(&scratch, &shell, true),
+        "wrapped command",
+    );
+}
+
+#[test]
+fn one_ctrl_c_stops_a_loop_typed_at_an_interactive_bash_prompt() {
+    let Some(bash) = installed(&["/bin/bash", "/usr/bin/bash"]) else {
+        eprintln!("skipped: bash is not installed");
+        return;
+    };
+    let scratch = Scratch::new();
+    let shell = [bash, "--norc", "--noprofile", "-i"];
+
+    assert_loop_stopped(
+        &loop_after_one_ctrl_c(&scratch, &shell, false),
+        "control without the wrapper",
+    );
+    assert_loop_stopped(
+        &loop_after_one_ctrl_c(&scratch, &shell, true),
+        "wrapped command",
+    );
+}
+
+/// The wrapper around an interactive shell, as it is used all day, with a
+/// second wrapper running the loop's command inside it.
+#[test]
+fn one_ctrl_c_stops_a_loop_typed_in_a_wrapped_interactive_shell() {
+    let shell = match installed(&["/bin/zsh", "/usr/bin/zsh"]) {
+        Some(zsh) => vec![zsh, "-f", "-i"],
+        None => vec![
+            installed(&["/bin/bash", "/usr/bin/bash"]).expect("bash is installed"),
+            "--norc",
+            "--noprofile",
+            "-i",
+        ],
+    };
+    let scratch = Scratch::new();
+    let config = scratch.config();
+    let mut argv = vec![
+        env!("CARGO_BIN_EXE_ptty"),
+        "-c",
+        config.to_str().expect("UTF-8 scratch path"),
+        "--",
+    ];
+    argv.extend(shell);
+
+    assert_loop_stopped(
+        &loop_after_one_ctrl_c(&scratch, &argv, false),
+        "control with an unwrapped command",
+    );
+    assert_loop_stopped(
+        &loop_after_one_ctrl_c(&scratch, &argv, true),
+        "wrapped command",
+    );
+}
+
+/// SIGINT sent to the wrapper is forwarded; when it kills the command, the
+/// wrapper ends by it too.
+#[test]
+fn sigint_sent_to_the_wrapper_ends_it_by_sigint_when_it_kills_the_command() {
+    use std::os::unix::process::ExitStatusExt;
+
+    let scratch = Scratch::new();
+    let run = run_redirected(
+        &scratch,
+        &[],
+        "echo READY; exec sleep 5",
+        EntrySigint::Default,
+        Some(libc::SIGINT),
+    );
+
+    assert!(
+        scratch.path("runtime").join("pids.d").is_dir() && !scratch.pid_file(run.pid).exists(),
+        "the session's pid file was not removed"
+    );
+    assert_eq!(
+        (run.status.signal(), run.status.code()),
+        (Some(libc::SIGINT), None),
+        "{:?}",
+        run.output
+    );
+}
+
+// The guards below hold before and after the change.
+
+/// A command that handles SIGINT and exits normally keeps its exit code, both
+/// when it raised the signal itself and when the wrapper forwarded it.
+#[test]
+fn a_command_that_handles_sigint_keeps_its_exit_code() {
+    use std::os::unix::process::ExitStatusExt;
+
+    let scratch = Scratch::new();
+    let own = run_redirected(
+        &scratch,
+        &[],
+        "trap 'exit 7' INT; kill -INT $$; sleep 5",
+        EntrySigint::Default,
+        None,
+    );
+    assert_eq!(
+        (own.status.signal(), own.status.code()),
+        (None, Some(7)),
+        "{:?}",
+        own.output
+    );
+
+    let forwarded = run_redirected(
+        &scratch,
+        &[],
+        "trap 'exit 0' INT; echo READY; while :; do sleep 0.1; done",
+        EntrySigint::Default,
+        Some(libc::SIGINT),
+    );
+    assert_eq!(
+        (forwarded.status.signal(), forwarded.status.code()),
+        (None, Some(128 + libc::SIGINT)),
+        "{:?}",
+        forwarded.output
+    );
+}
+
+/// Only SIGINT is passed on as a signal: a command killed by SIGTERM or
+/// SIGQUIT is still reported as 128 plus the signal.
+#[test]
+fn a_command_killed_by_another_signal_still_reports_128_plus_the_signal() {
+    use std::os::unix::process::ExitStatusExt;
+
+    let scratch = Scratch::new();
+    for (signal, name) in [(libc::SIGTERM, "TERM"), (libc::SIGQUIT, "QUIT")] {
+        let run = run_redirected(
+            &scratch,
+            &[],
+            &format!("kill -{name} $$; sleep 5"),
+            EntrySigint::Default,
+            None,
+        );
+        assert_eq!(
+            (run.status.signal(), run.status.code()),
+            (None, Some(128 + signal)),
+            "SIG{name}: {:?}",
+            run.output
+        );
+    }
+}
+
+/// SIGTERM sent to the wrapper ends it with 143 even when the command is then
+/// killed by SIGINT. The test sends SIGTERM once the command's READY has come
+/// through the wrapper, which by then has registered the command and so
+/// forwards the SIGTERM to it. The command answers that SIGTERM by recording
+/// it and sending SIGINT to itself. Its two markers show that the forwarded
+/// SIGTERM arrived and that the command did not run on past its own SIGINT;
+/// with the control, which shows this shell dies from its own SIGINT, that is
+/// the command dying from SIGINT while the wrapper waits for it. The
+/// command's wait status itself only the wrapper can read.
+#[test]
+fn sigterm_to_the_wrapper_still_reports_143_when_the_command_then_dies_from_sigint() {
+    use std::os::unix::process::ExitStatusExt;
+
+    assert_sh_dies_from_its_own_sigint();
+    let scratch = Scratch::new();
+    let run = run_redirected(
+        &scratch,
+        &[],
+        "trap 'echo seen > \"$SCRATCH/term-forwarded\"; kill -INT $$; echo on > \"$SCRATCH/ran-on\"' TERM; \
+         echo READY; while :; do sleep 1; done",
+        EntrySigint::Default,
+        Some(libc::SIGTERM),
+    );
+
+    assert!(
+        scratch.path("term-forwarded").exists(),
+        "the command never received the SIGTERM the wrapper forwards: {:?}",
+        run.output
+    );
+    assert!(
+        !scratch.path("ran-on").exists(),
+        "the command ran on past its own SIGINT: {:?}",
+        run.output
+    );
+    assert_eq!(
+        (run.status.signal(), run.status.code()),
+        (None, Some(128 + libc::SIGTERM)),
+        "{:?}",
+        run.output
+    );
+}
+
+/// A caller that ignored or blocked SIGINT chose that the wrapper must not die
+/// from it: the wrapper reports a command killed by SIGINT as 130, as before,
+/// and leaves the caller's setting alone.
+#[test]
+fn sigint_ignored_or_blocked_by_the_caller_still_reports_130() {
+    use std::os::unix::process::ExitStatusExt;
+
+    let scratch = Scratch::new();
+    for (entry, name) in [
+        (EntrySigint::Ignored, "ignored"),
+        (EntrySigint::Blocked, "blocked"),
+    ] {
+        let run = run_redirected(&scratch, &[], "kill -INT $$; sleep 5", entry, None);
+        assert_eq!(
+            (run.status.signal(), run.status.code()),
+            (None, Some(128 + libc::SIGINT)),
+            "SIGINT {name} at entry: {:?}",
+            run.output
+        );
+    }
+}
+
+/// A script starts `cmd &` with SIGINT ignored, so a wrapper started that way
+/// keeps 130 when its command is killed by SIGINT. The script's `$?` reads 130
+/// both for an exit with 130 and for a death by SIGINT, so the real background
+/// job pins only what the script sees. The wait status itself is read from a
+/// wrapper that the shell started with SIGINT ignored by the shell itself
+/// (`trap '' INT` before `exec`), the setting a background job inherits.
+#[test]
+fn a_wrapper_started_by_a_script_with_sigint_ignored_still_reports_130() {
+    use std::os::unix::process::ExitStatusExt;
+    use std::process::{Command, Stdio};
+
+    let scratch = Scratch::new();
+    let shell = |script: &str| {
+        let output_path = scratch.path("job-output");
+        let mut command = Command::new("/bin/sh");
+        scratch.environment(&mut command);
+        command
+            .args(["-c", script])
+            .stdin(Stdio::null())
+            .stdout(File::create(&output_path).expect("output file"))
+            .stderr(Stdio::null());
+        start_with_sigint(&mut command, EntrySigint::Default, Leader::Session);
+        let mut shell = ProcessGuard::new(command.spawn().expect("spawn sh"));
+        let _sweep = SessionSweep::new(shell.pid(), scratch.sessions());
+        let status = shell
+            .wait_for_exit(Duration::from_secs(10))
+            .expect("sh exits");
+        (
+            status,
+            std::fs::read_to_string(&output_path).unwrap_or_default(),
+        )
+    };
+
+    // Control: the shell starts its background job with SIGINT ignored.
+    let (_, bare) = shell("sh -c 'kill -INT $$; echo SURVIVED' & wait $!; echo BG:$?");
+    assert!(
+        bare.contains("SURVIVED") && bare.contains("BG:0"),
+        "control: the background job did not ignore SIGINT: {bare:?}"
+    );
+
+    let (_, job) = shell(
+        "\"$PTTY\" -c \"$CONFIG\" -- sh -c 'echo $$ >> \"$SCRATCH/sessions\"; kill -INT $$; sleep 5' & \
+         wait $!; echo BG:$?",
+    );
+    assert!(job.contains("BG:130"), "background job: {job:?}");
+
+    let (status, output) = shell(
+        "trap '' INT; exec \"$PTTY\" -c \"$CONFIG\" -- \
+         sh -c 'echo $$ >> \"$SCRATCH/sessions\"; kill -INT $$; sleep 5'",
+    );
+    assert_eq!(
+        (status.signal(), status.code()),
+        (None, Some(128 + libc::SIGINT)),
+        "wrapper started with SIGINT ignored by its shell: {output:?}"
+    );
+}

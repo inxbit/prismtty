@@ -190,16 +190,26 @@ impl SignalPipeSlot {
     }
 }
 static FORWARD_CHILD_PID: AtomicI32 = AtomicI32::new(0);
-static FORWARD_CHILD_LOCK: Mutex<()> = Mutex::new(());
+/// Serializes signal forwarding with reaping the wrapped child. It holds the
+/// child's raw wait status once the main thread has reaped it: `reap_child`
+/// writes it under this lock before it clears `FORWARD_CHILD_PID`, so the
+/// signal watcher, which reads it under this lock when it finds the pid
+/// already cleared, sees the status that went with that reap. A reap by the
+/// watcher itself uses its own status directly. `set_forward_child_pid`
+/// clears it when the next child is registered.
+static FORWARD_CHILD_LOCK: Mutex<Option<libc::c_int>> = Mutex::new(None);
 
-fn forward_child_lock() -> std::sync::MutexGuard<'static, ()> {
+fn forward_child_lock() -> std::sync::MutexGuard<'static, Option<libc::c_int>> {
     FORWARD_CHILD_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+/// Registers the wrapped child for signal forwarding. A status published for
+/// an earlier child belongs to that child, so it is dropped here.
 fn set_forward_child_pid(pid: libc::pid_t) {
-    let _guard = forward_child_lock();
+    let mut reaped_status = forward_child_lock();
+    *reaped_status = None;
     FORWARD_CHILD_PID.store(pid, Ordering::SeqCst);
 }
 
@@ -759,27 +769,49 @@ fn end_reads_at_child_exit(
     reader
 }
 
-/// Reaps the wrapped child and returns its process-exit byte. Waits without
-/// reaping first so the process-group id remains signalable while the PTY read
-/// loop is ending, then serializes the final reap with signal forwarding. This
-/// closes the otherwise orphan-prone gap between PTY EOF and child exit.
-fn reap_child(child: &mut Box<dyn portable_pty::Child + Send + Sync>) -> Result<u8, CliError> {
+/// How the wrapped child ended: the exit byte prismtty reports for it, and
+/// the raw wait status when prismtty reaped it with waitpid.
+struct ChildExit {
+    code: u8,
+    wait_status: Option<libc::c_int>,
+}
+
+/// Whether a raw wait status says the process was killed by SIGINT.
+fn killed_by_sigint(wait_status: Option<libc::c_int>) -> bool {
+    wait_status
+        .is_some_and(|status| libc::WIFSIGNALED(status) && libc::WTERMSIG(status) == libc::SIGINT)
+}
+
+/// Reaps the wrapped child and returns how it ended. Waits without reaping
+/// first so the process-group id remains signalable while the PTY read loop is
+/// ending, then serializes the final reap with signal forwarding. This closes
+/// the otherwise orphan-prone gap between PTY EOF and child exit.
+fn reap_child(
+    child: &mut Box<dyn portable_pty::Child + Send + Sync>,
+) -> Result<ChildExit, CliError> {
     if let Some(pid) = child.process_id() {
         let pid = pid as libc::pid_t;
         wait_for_child_exit_without_reaping(pid)?;
-        let _guard = forward_child_lock();
+        let mut reaped_status = forward_child_lock();
         let mut status: libc::c_int = 0;
         // SAFETY: `status` is a valid, exclusively borrowed c_int for the call.
         let reaped = if unsafe { libc::waitpid(pid, &mut status, 0) } == -1 {
             Err(io::Error::last_os_error())
         } else {
-            Ok(exit_code_from_wait(status))
+            *reaped_status = Some(status);
+            Ok(ChildExit {
+                code: exit_code_from_wait(status),
+                wait_status: Some(status),
+            })
         };
         FORWARD_CHILD_PID.store(0, Ordering::SeqCst);
         return Ok(reaped?);
     }
     let status = child.wait()?;
-    Ok(exit_code_byte(status.exit_code()))
+    Ok(ChildExit {
+        code: exit_code_byte(status.exit_code()),
+        wait_status: None,
+    })
 }
 
 /// Grace period between the polite SIGHUP and the SIGKILL escalation when the
@@ -802,16 +834,17 @@ fn terminate_and_reap_child(child: &mut Box<dyn portable_pty::Child + Send + Syn
     terminate_and_reap_process_group(pid as libc::pid_t, libc::SIGHUP);
 }
 
-fn terminate_and_reap_process_group(pid: libc::pid_t, initial_signal: libc::c_int) {
-    use nix::errno::Errno;
-    use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
-
+/// Returns the leader's raw wait status when this call reaped it.
+fn terminate_and_reap_process_group(
+    pid: libc::pid_t,
+    initial_signal: libc::c_int,
+) -> Option<libc::c_int> {
     // SAFETY: kill has no memory-safety preconditions; `pid` is the wrapped session leader, so
     // `-pid` is its process group.
     unsafe {
         libc::kill(-pid, initial_signal);
     }
-    let child_pid = nix::unistd::Pid::from_raw(pid);
+    let mut status: libc::c_int = 0;
     let deadline = Instant::now() + CHILD_EXIT_GRACE;
     while Instant::now() < deadline {
         match child_exit_is_waitable(pid) {
@@ -823,10 +856,11 @@ fn terminate_and_reap_process_group(pid: libc::pid_t, initial_signal: libc::c_in
                 unsafe {
                     libc::kill(-pid, libc::SIGKILL);
                 }
-                let _ = waitpid(child_pid, None);
-                return;
+                // SAFETY: `status` is a valid, exclusively borrowed c_int for the call.
+                let reaped = unsafe { libc::waitpid(pid, &mut status, 0) } == pid;
+                return reaped.then_some(status);
             }
-            Err(error) if error.raw_os_error() == Some(libc::ECHILD) => return,
+            Err(error) if error.raw_os_error() == Some(libc::ECHILD) => return None,
             Ok(false) | Err(_) => thread::sleep(Duration::from_millis(20)),
         }
     }
@@ -839,12 +873,15 @@ fn terminate_and_reap_process_group(pid: libc::pid_t, initial_signal: libc::c_in
     }
     let reap_deadline = Instant::now() + CHILD_EXIT_GRACE;
     while Instant::now() < reap_deadline {
-        match waitpid(child_pid, Some(WaitPidFlag::WNOHANG)) {
-            Ok(WaitStatus::StillAlive) => thread::sleep(Duration::from_millis(20)),
-            Ok(_) | Err(Errno::ECHILD) => break,
-            Err(_) => thread::sleep(Duration::from_millis(20)),
+        // SAFETY: `status` is a valid, exclusively borrowed c_int for the call.
+        match unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) } {
+            0 => thread::sleep(Duration::from_millis(20)),
+            reaped if reaped == pid => return Some(status),
+            _ if io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD) => break,
+            _ => thread::sleep(Duration::from_millis(20)),
         }
     }
+    None
 }
 
 /// Claims failure-path cleanup under the same lock used by signal forwarding.
@@ -896,14 +933,16 @@ fn process_group_exists(pid: libc::pid_t) -> bool {
 /// Forwards a terminating signal to the wrapped PTY process group, allows a
 /// bounded graceful exit, then kills any signal-immune descendants and reaps
 /// the process-group leader before the wrapper exits from its signal watcher.
-fn terminate_and_reap_forwarded_child(signal: libc::c_int) {
-    let _guard = forward_child_lock();
+/// Returns the leader's raw wait status: from this reap, or the one
+/// `reap_child` left when the main thread reaped the leader first.
+fn terminate_and_reap_forwarded_child(signal: libc::c_int) -> Option<libc::c_int> {
+    let reaped_status = forward_child_lock();
     let pid = FORWARD_CHILD_PID.load(Ordering::SeqCst);
     if pid <= 0 {
-        return;
+        return *reaped_status;
     }
     FORWARD_CHILD_PID.store(0, Ordering::SeqCst);
-    terminate_and_reap_process_group(pid, signal);
+    terminate_and_reap_process_group(pid, signal)
 }
 
 fn wake_main_loop_after_input_failure() {
@@ -1006,7 +1045,36 @@ fn spawn_supervised(
     })
 }
 
+/// How a wrapped session ends, decided once everything it opened is closed.
+enum SessionEnd {
+    /// Exit with this status byte.
+    Exit(u8),
+    /// The command was killed by SIGINT: end the same way.
+    Interrupted,
+}
+
 pub(super) fn run_command(options: Options, command: Vec<OsString>) -> Result<ExitCode, CliError> {
+    // Read before prismtty blocks or handles any signal, so this is the
+    // caller's choice and not prismtty's own.
+    let sigint_left_default = caller_left_sigint_default();
+    match run_session(options, command, sigint_left_default)? {
+        SessionEnd::Exit(code) => Ok(ExitCode::from(code)),
+        SessionEnd::Interrupted => {
+            // The session's locals are dropped: the terminal is restored, the
+            // pid file removed and the trace closed. What remains buffered is
+            // written before the signal ends the process.
+            let _ = io::stdout().flush();
+            let _ = io::stderr().flush();
+            die_from_signal(libc::SIGINT)
+        }
+    }
+}
+
+fn run_session(
+    options: Options,
+    command: Vec<OsString>,
+    sigint_left_default: bool,
+) -> Result<SessionEnd, CliError> {
     // Listed before prismtty opens anything of its own, so these are the
     // descriptors the caller handed over (`cmd 3<file`), which the command
     // inherits as it would without the wrapper.
@@ -1054,7 +1122,7 @@ pub(super) fn run_command(options: Options, command: Vec<OsString>) -> Result<Ex
     }
 
     let mut signal_mask = SessionSignalMask::block()?;
-    let mut terminal_session = TerminalSession::start(interactive)?;
+    let mut terminal_session = TerminalSession::start(interactive, sigint_left_default)?;
     let mut child = if interactive && pair.master.tty_name().is_none() {
         // The slave cannot be opened by name (seen with musl in a chroot
         // without /proc), so portable-pty spawns the command from its own
@@ -1177,7 +1245,10 @@ pub(super) fn run_command(options: Options, command: Vec<OsString>) -> Result<Ex
             while matches!(reader.read(&mut sink), Ok(n) if n > 0) {}
         });
         terminate_and_reap_registered_child(&mut child);
-        Ok(1)
+        Ok(ChildExit {
+            code: 1,
+            wait_status: None,
+        })
     } else {
         reap_child(&mut child)
     };
@@ -1187,7 +1258,15 @@ pub(super) fn run_command(options: Options, command: Vec<OsString>) -> Result<Ex
         return Err(error.into());
     }
     stream_result?;
-    Ok(ExitCode::from(exit?))
+    let exit = exit?;
+    // A shell stops a loop after Ctrl-C only when the job it waited for was
+    // killed by SIGINT, so prismtty ends that way when its command did. Not
+    // when the caller ignored or blocked SIGINT: it chose that this process
+    // does not die from it.
+    if sigint_left_default && killed_by_sigint(exit.wait_status) {
+        return Ok(SessionEnd::Interrupted);
+    }
+    Ok(SessionEnd::Exit(exit.code))
 }
 
 /// The directory to start the wrapped command in: the caller's, whenever the
@@ -2491,7 +2570,7 @@ struct SessionSignalWatcher {
 }
 
 impl SessionSignalWatcher {
-    fn start(raw_mode_state: SharedRawModeState) -> io::Result<Self> {
+    fn start(raw_mode_state: SharedRawModeState, sigint_left_default: bool) -> io::Result<Self> {
         ensure_child_is_reapable()?;
         let (read_fd, write_fd) = pipe_fds()?;
         if let Err(error) = set_fd_nonblocking(write_fd) {
@@ -2525,7 +2604,7 @@ impl SessionSignalWatcher {
         }
         let thread_state = Arc::clone(&raw_mode_state);
         let thread = spawn_supervised("signal handler", move || {
-            handle_session_signals(read_fd, thread_state)
+            handle_session_signals(read_fd, thread_state, sigint_left_default)
         });
         Ok(Self {
             write_fd,
@@ -2574,9 +2653,10 @@ struct TerminalSession {
 }
 
 impl TerminalSession {
-    fn start(interactive: bool) -> Result<Self, CliError> {
+    fn start(interactive: bool, sigint_left_default: bool) -> Result<Self, CliError> {
         let raw_mode_state = Arc::new(Mutex::new(RawModeLifecycle::Inactive));
-        let signal_watcher = SessionSignalWatcher::start(Arc::clone(&raw_mode_state))?;
+        let signal_watcher =
+            SessionSignalWatcher::start(Arc::clone(&raw_mode_state), sigint_left_default)?;
         let raw_mode = if interactive {
             Some(RawModeGuard::enable(raw_mode_state)?)
         } else {
@@ -2602,8 +2682,12 @@ impl Drop for TerminalSession {
     }
 }
 
-fn handle_session_signals(read_fd: RawFd, raw_mode_state: SharedRawModeState) {
-    handle_session_signals_with(read_fd, &raw_mode_state, || {
+fn handle_session_signals(
+    read_fd: RawFd,
+    raw_mode_state: SharedRawModeState,
+    sigint_left_default: bool,
+) {
+    handle_session_signals_with(read_fd, &raw_mode_state, sigint_left_default, || {
         with_terminal_restored_for_job_control(
             || suspend_raw_mode_from_signal_state(&raw_mode_state),
             || {
@@ -2626,10 +2710,12 @@ fn handle_session_signals(read_fd: RawFd, raw_mode_state: SharedRawModeState) {
 
 /// Acts on the signal numbers the handlers queue in the self-pipe until the
 /// stop byte arrives. `stop_for_job_control` performs one supervised stop and
-/// returns once the wrapper has been continued.
+/// returns once the wrapper has been continued. `sigint_left_default` says
+/// whether the caller left SIGINT at its default action and unblocked.
 fn handle_session_signals_with(
     read_fd: RawFd,
     raw_mode_state: &Mutex<RawModeLifecycle>,
+    sigint_left_default: bool,
     mut stop_for_job_control: impl FnMut() -> io::Result<()>,
 ) {
     let mut pending = VecDeque::new();
@@ -2648,9 +2734,17 @@ fn handle_session_signals_with(
                         "prismtty: could not restore terminal before exit: {error}"
                     ));
                 }
-                terminate_and_reap_forwarded_child(signal);
+                let child_status = terminate_and_reap_forwarded_child(signal);
                 // This runs on the watcher thread, not in the signal handler.
                 unregister_before_exit();
+                // SIGINT that killed the command it was forwarded to (Ctrl-C
+                // with stdin redirected, `kill -INT`) ends prismtty the same
+                // way. Any other signal keeps 128 plus that signal, whatever
+                // the command then died from, as does a command that handled
+                // SIGINT.
+                if signal == libc::SIGINT && sigint_left_default && killed_by_sigint(child_status) {
+                    die_from_signal(libc::SIGINT);
+                }
                 // SAFETY: _exit never returns and skips destructors by design: the terminal was
                 // restored, the child reaped and the pid file removed above.
                 unsafe {
@@ -3002,6 +3096,50 @@ fn ensure_child_is_reapable() -> io::Result<()> {
     }
 }
 
+/// Whether the caller left SIGINT at its default action and unblocked, as a
+/// shell starts a foreground command. A caller that ignored it (`cmd &` in a
+/// script), blocked it, or catches it with a handler of its own (a program
+/// that runs prismtty in process) chose what SIGINT does to this process.
+fn caller_left_sigint_default() -> bool {
+    // SAFETY: sigset_t is a plain C type; pthread_sigmask writes it before it is read.
+    let mut blocked = unsafe { mem::zeroed::<libc::sigset_t>() };
+    // SAFETY: a null new-set pointer only queries the calling thread's mask into `blocked`.
+    let queried =
+        unsafe { libc::pthread_sigmask(libc::SIG_BLOCK, std::ptr::null(), &mut blocked) } == 0;
+    // SAFETY: `blocked` was written by pthread_sigmask above.
+    let unblocked = queried && unsafe { libc::sigismember(&blocked, libc::SIGINT) } == 0;
+    // SAFETY: sigaction is a plain C struct; the sigaction call fills it before it is read.
+    let mut current = unsafe { mem::zeroed::<libc::sigaction>() };
+    // SAFETY: a null new-action pointer only queries the disposition into `current`.
+    let queried = unsafe { libc::sigaction(libc::SIGINT, std::ptr::null(), &mut current) } == 0;
+    unblocked && queried && current.sa_sigaction == libc::SIG_DFL
+}
+
+/// Ends prismtty by `signal`'s default action, as the wrapped command ended,
+/// so whoever waits for prismtty sees the wait status it would have seen for
+/// the command. Only for a signal the caller left at its default action and
+/// unblocked, once prismtty has cleaned up. The signal is raised on the
+/// calling thread and unblocked there, which delivers it before
+/// pthread_sigmask returns; a process-directed kill could instead be taken by
+/// another thread while this one went on. Should that return, prismtty exits
+/// with 128 plus the signal, the status it reported before.
+fn die_from_signal(signal: libc::c_int) -> ! {
+    // SAFETY: sigaction and sigset_t are plain C types, initialized before use; every call takes
+    // valid pointers to these locals, and _exit never returns.
+    unsafe {
+        let mut default = mem::zeroed::<libc::sigaction>();
+        default.sa_sigaction = libc::SIG_DFL;
+        libc::sigemptyset(&mut default.sa_mask);
+        libc::sigaction(signal, &default, std::ptr::null_mut());
+        let mut only = mem::zeroed::<libc::sigset_t>();
+        libc::sigemptyset(&mut only);
+        libc::sigaddset(&mut only, signal);
+        libc::raise(signal);
+        libc::pthread_sigmask(libc::SIG_UNBLOCK, &only, std::ptr::null_mut());
+        libc::_exit(128 + signal)
+    }
+}
+
 /// True when `signal` is currently ignored, for example inherited as ignored
 /// from `nohup`.
 fn signal_is_ignored(signal: libc::c_int) -> bool {
@@ -3170,6 +3308,148 @@ mod tests {
         assert_eq!(super::exit_code_from_wait(raw_status("kill -KILL $$")), 137);
         #[cfg(target_os = "linux")]
         assert_eq!(super::exit_code_from_wait(raw_status("kill -64 $$")), 192);
+    }
+
+    #[test]
+    fn only_a_death_by_sigint_counts_as_killed_by_sigint() {
+        use std::os::unix::process::{CommandExt, ExitStatusExt};
+
+        let raw_status = |script: &str| {
+            let mut command = std::process::Command::new("sh");
+            command.arg("-c").arg(script);
+            // SAFETY: the closure runs in the forked child before exec and only calls
+            // async-signal-safe functions on a stack-local signal set. A SIGINT the test runner
+            // inherited as ignored or blocked must not keep sh alive.
+            unsafe {
+                command.pre_exec(|| {
+                    let mut sigint = std::mem::zeroed::<libc::sigset_t>();
+                    libc::sigemptyset(&mut sigint);
+                    libc::sigaddset(&mut sigint, libc::SIGINT);
+                    libc::signal(libc::SIGINT, libc::SIG_DFL);
+                    libc::sigprocmask(libc::SIG_UNBLOCK, &sigint, std::ptr::null_mut());
+                    Ok(())
+                });
+            }
+            command.status().expect("run sh").into_raw()
+        };
+        assert!(super::killed_by_sigint(Some(raw_status("kill -INT $$"))));
+        assert!(!super::killed_by_sigint(Some(raw_status("kill -TERM $$"))));
+        assert!(!super::killed_by_sigint(Some(raw_status("exit 130"))));
+        assert!(!super::killed_by_sigint(None));
+    }
+
+    /// Set, to `<probe>:<state>`, in a copy of this test binary that a test
+    /// starts to run one probe in a process of its own: the probes change
+    /// process-wide state that tests running in parallel threads would see.
+    const PROBE: &str = "PRISMTTY_UNIT_TEST_PROBE";
+
+    /// The state a probe was started for, or `None` when it runs as an
+    /// ordinary test of the suite, where it does nothing.
+    fn probe_state(probe: &str) -> Option<String> {
+        std::env::var(PROBE)
+            .ok()?
+            .strip_prefix(&format!("{probe}:"))
+            .map(str::to_owned)
+    }
+
+    /// Runs the probe test `probe` alone in a copy of this test binary, for
+    /// `state`, and returns what it printed.
+    fn run_probe(probe: &str, state: &str) -> String {
+        let module = module_path!()
+            .split_once("::")
+            .map_or(module_path!(), |(_, path)| path);
+        let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args([
+                "--exact",
+                &format!("{module}::{probe}"),
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(PROBE, format!("{probe}:{state}"))
+            .output()
+            .expect("run the probe");
+        let printed = String::from_utf8_lossy(&output.stdout).into_owned();
+        assert!(
+            output.status.success() && printed.contains("1 passed"),
+            "probe {probe} for {state}: {output:?}"
+        );
+        printed
+    }
+
+    extern "C" fn sigint_caught_by_the_probe(_: libc::c_int) {}
+
+    /// Sets SIGINT for its whole process as `state` says and prints whether
+    /// that counts as left at its default.
+    #[test]
+    fn sigint_policy_probe() {
+        let Some(state) = probe_state("sigint_policy_probe") else {
+            return;
+        };
+        // SAFETY: sigaction and sigset_t are plain C types, initialized before use; every call
+        // takes valid pointers to these locals, and the handler is an `extern "C" fn(c_int)`
+        // that lives for the whole process. Only this probe runs in this process.
+        unsafe {
+            let mut sigint = std::mem::zeroed::<libc::sigset_t>();
+            libc::sigemptyset(&mut sigint);
+            libc::sigaddset(&mut sigint, libc::SIGINT);
+            let mut action = std::mem::zeroed::<libc::sigaction>();
+            libc::sigemptyset(&mut action.sa_mask);
+            let caught: extern "C" fn(libc::c_int) = sigint_caught_by_the_probe;
+            let (handler, how) = match state.as_str() {
+                "default" => (libc::SIG_DFL, libc::SIG_UNBLOCK),
+                "ignored" => (libc::SIG_IGN, libc::SIG_UNBLOCK),
+                "caught" => (caught as libc::sighandler_t, libc::SIG_UNBLOCK),
+                "blocked" => (libc::SIG_DFL, libc::SIG_BLOCK),
+                other => panic!("unknown SIGINT state {other}"),
+            };
+            action.sa_sigaction = handler;
+            libc::sigaction(libc::SIGINT, &action, std::ptr::null_mut());
+            libc::pthread_sigmask(how, &sigint, std::ptr::null_mut());
+        }
+        println!("left-default={}", super::caller_left_sigint_default());
+    }
+
+    // A program that embeds prismtty and catches SIGINT itself chose what
+    // SIGINT does, as one that ignores or blocks it did. SIGINT's action is
+    // process-wide, so each state is set in a process of its own.
+    #[test]
+    fn sigint_counts_as_left_default_only_at_its_default_action_and_unblocked() {
+        for (state, left_default) in [
+            ("default", true),
+            ("ignored", false),
+            ("caught", false),
+            ("blocked", false),
+        ] {
+            let printed = run_probe("sigint_policy_probe", state);
+            assert!(
+                printed.contains(&format!("left-default={left_default}")),
+                "SIGINT {state}: {printed}"
+            );
+        }
+    }
+
+    /// Publishes an earlier child's death by SIGINT, registers the next child
+    /// and prints what is published then.
+    #[test]
+    fn registration_probe() {
+        if probe_state("registration_probe").is_none() {
+            return;
+        }
+        *super::forward_child_lock() = Some(libc::SIGINT);
+        super::set_forward_child_pid(0);
+        println!("published={:?}", *super::forward_child_lock());
+    }
+
+    // The status a reap published belongs to that child. Registering the next
+    // child must drop it, or a second session in one process could take an
+    // earlier session's SIGINT death for its own. The status slot is
+    // process-wide and other tests publish to it, so the steps run in a
+    // process of their own.
+    #[test]
+    fn registering_a_child_drops_the_status_published_for_the_last_one() {
+        assert!(super::killed_by_sigint(Some(libc::SIGINT)));
+        let printed = run_probe("registration_probe", "after an earlier session");
+        assert!(printed.contains("published=None"), "{printed}");
     }
 
     // AUDIT G5: exit codes above 255 must clamp, not wrap to a misleading 0.
@@ -4034,7 +4314,7 @@ mod tests {
         let state = Mutex::new(super::RawModeLifecycle::Inactive);
         let mut stops = 0;
 
-        super::handle_session_signals_with(read_fd, &state, || {
+        super::handle_session_signals_with(read_fd, &state, true, || {
             stops += 1;
             Ok(())
         });
@@ -4276,7 +4556,7 @@ mod tests {
                 Err(_) => break,
             }
         }
-        assert_eq!(super::reap_child(&mut child).expect("reap printf"), 0);
+        assert_eq!(super::reap_child(&mut child).expect("reap printf").code, 0);
         assert_eq!(output, b"short-lived output");
 
         let source = include_str!("pty.rs");
@@ -4707,7 +4987,7 @@ mod tests {
             notice.install(exit_write.into());
             assert_eq!(exit_pipe_bytes(exit_read), vec![1]);
         }
-        assert_eq!(super::reap_child(&mut child).expect("reap true"), 0);
+        assert_eq!(super::reap_child(&mut child).expect("reap true").code, 0);
     }
 
     #[test]
