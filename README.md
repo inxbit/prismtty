@@ -200,6 +200,26 @@ If a connection attempt fails with a message PrismTTY does not recognize and a
 device prompt follows it, a later close line that names an outer host can leave
 the remote profile active.
 
+Leaving a device that you reached from another device returns to the first
+device's colors when the output shows the end of that connection. After you
+type `exit`, `quit` or `logout`, PrismTTY needs
+`[Connection to NAME closed by foreign host]` for the device you connected to,
+and then, as the first prompt after it, exactly the prompt you were at when you
+opened that connection: as a complete line, or waiting for input when you type
+your next key at it. The prompt must end within the first 512 bytes after your
+Enter (bytes as received, escape sequences not counted) and the lines must come
+within 3 seconds. After Ctrl-] and `quit` (or `q`, `qu`, `qui`) in telnet, it
+needs telnet's own `telnet> quit` line within 4,096 bytes, ending after your
+Enter, then `Connection closed.` as the first non-blank line within 256 bytes,
+and every telnet in the chain must have announced its escape character
+(`Escape character is '^]'.`).
+Anything else keeps the colors as they were: a changed parent prompt, a late or
+buried close, keys typed ahead, a custom telnet escape. These lines are
+trusted: a device that is still connected and prints them, such as a saved
+session log shown at logout, switches the colors too early. Only colors
+change; with `--show-profile` and an unread stderr, the confirming read waits
+until stderr drains.
+
 Interactive mode is designed to preserve shell line editing and typed command
 echo, including zsh prompts that use decorative Unicode prompt markers such as
 `╰─○`, `❯`, or `➜`. Output that stops on a byte that could begin a UTF-8
