@@ -1232,3 +1232,64 @@ fn quiet_piped_output_tail_is_visible_after_holdback() {
         "quiet piped output stayed hidden; saw: {visible:?}"
     );
 }
+
+/// Whether the terminal reads UTF-8 decides what a raw `9B` is: in a UTF-8
+/// locale an invalid byte with text after it, in an 8-bit one a CSI. A line
+/// end it holds runs either way, so under an inverse rendition an open
+/// highlight leaves it out. In UTF-8 only the line end leaves the highlight,
+/// and the text around it keeps it; in an 8-bit locale the highlight closes
+/// before the whole CSI and opens again after it.
+#[test]
+fn a_line_end_in_a_raw_9b_sequence_leaves_the_highlight_as_the_locale_reads_it() {
+    let home = tempfile::tempdir().expect("scratch home");
+    let runtime = home.path().join("runtime");
+    std::fs::create_dir(&runtime).expect("runtime dir");
+    std::fs::set_permissions(
+        &runtime,
+        std::os::unix::fs::PermissionsExt::from_mode(0o700),
+    )
+    .expect("runtime dir mode");
+    let config = home.path().join("rules.yml");
+    std::fs::write(
+        &config,
+        "rules:\n  - description: failure\n    regex: 'failed'\n    color: f#ff0000\n",
+    )
+    .expect("config");
+
+    for (locale, expected) in [
+        ("en_US.UTF-8", &b"failed\x9b3\x1b[39m\r\n\x1b["[..]),
+        ("C", &b"failed\x1b[39m\x9b3\r\n1m\x1b["[..]),
+    ] {
+        let pair = native_pty_system()
+            .openpty(PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .expect("openpty");
+        let mut builder = CommandBuilder::new(env!("CARGO_BIN_EXE_ptty"));
+        builder.env("LC_ALL", locale);
+        builder.env("HOME", home.path());
+        builder.env("XDG_CONFIG_HOME", home.path());
+        builder.env("PRISMTTY_RUNTIME_DIR", &runtime);
+        builder.arg("-c");
+        builder.arg(&config);
+        builder.args(["--no-auto-detect", "--no-dynamic-profile", "sh", "-c"]);
+        builder.arg("printf '\\033[7mfailed\\2333\\n1mnext\\033[0m\\n'");
+
+        let child = pair.slave.spawn_command(builder).expect("spawn ptty");
+        drop(pair.slave);
+        let session = PtySession::new(child, &*pair.master);
+        let out = session
+            .capture()
+            .wait_until(Duration::from_secs(5), |out| contains_bytes(out, b"next"));
+
+        assert!(
+            contains_bytes(&out, expected),
+            "{locale}: expected {:?} in {:?}",
+            String::from_utf8_lossy(expected),
+            String::from_utf8_lossy(&out)
+        );
+    }
+}
