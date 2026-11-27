@@ -3509,29 +3509,10 @@ mod leave_tests {
     }
 
     #[test]
-    fn c2b_colored_and_split_parent_prompts_are_the_parent_prompt() {
+    fn c2b_parent_prompt_split_across_reads_is_the_parent_prompt() {
+        // The read loop passes visible bytes, so a colored prompt arrives
+        // here as its text; the scenario runs cover the colors.
         let store = ProfileStore::builtin();
-        // An ANSI-colored prompt: escape sequences are not part of the text.
-        let mut runtime = local(&store);
-        step(
-            &mut runtime,
-            &store,
-            "ssh core",
-            &["Cisco IOS Software\n\x1b[32msw1#\x1b[0m"],
-        );
-        step(
-            &mut runtime,
-            &store,
-            "ssh leaf",
-            &["--- JUNOS 22.4R3 Kernel 64-bit\nlab@sw2> "],
-        );
-        exit_with(
-            &mut runtime,
-            &store,
-            "\r\n[Connection to leaf closed by foreign host]\r\n\x1b[32msw1#\x1b[0m",
-            &[],
-        );
-        assert_eq!(key(&mut runtime, &store), Some(names(CISCO)));
         // The prompt itself split across reads.
         let mut runtime = cisco_then_juniper(&store);
         exit_with(
@@ -3646,6 +3627,20 @@ mod leave_tests {
     #[test]
     fn c2b_close_shown_after_three_seconds_does_not_return() {
         assert_eq!(close_shown_after(3_500), None);
+    }
+
+    #[test]
+    fn c2b_bracket_in_time_but_parent_prompt_after_three_seconds_does_not_return() {
+        let store = ProfileStore::builtin();
+        let mut runtime = cisco_then_juniper(&store);
+        runtime.observe_input(b"exit");
+        runtime.observe_output(b"exit", &store);
+        runtime.observe_input(b"\r");
+        runtime.observe_output(format!("\r\n{BRACKET}\r\n").as_bytes(), &store);
+        std::thread::sleep(std::time::Duration::from_millis(3_200));
+        runtime.observe_output(b"sw1#", &store);
+        assert_eq!(key(&mut runtime, &store), None);
+        assert_eq!(runtime.stack_len(), 2);
     }
 
     // C-2b, what must not return (pinned to 1.4.1: the child stays).
@@ -3782,6 +3777,59 @@ mod leave_tests {
             assert_eq!(runtime.active_profiles(), names(ARISTA), "{name}");
             assert_eq!(runtime.stack_len(), 2, "{name}");
         }
+    }
+
+    #[test]
+    fn c2b_compares_the_exact_parent_prompt_not_the_vendor() {
+        let store = ProfileStore::builtin();
+        let cisco_pair = |store: &ProfileStore| {
+            let mut runtime = local(store);
+            step(
+                &mut runtime,
+                store,
+                "ssh sw1",
+                &["Cisco IOS Software\nsw1#"],
+            );
+            step(
+                &mut runtime,
+                store,
+                "ssh sw2",
+                &["Cisco IOS Software\nsw2#"],
+            );
+            assert_eq!(runtime.stack_len(), 2);
+            runtime
+        };
+        let mut runtime = cisco_pair(&store);
+        exit_with(&mut runtime, &store, &format!("\r\n{BRACKET}\r\nsw2#"), &[]);
+        key(&mut runtime, &store);
+        assert_eq!(runtime.stack_len(), 2, "the child's own prompt came back");
+        let mut runtime = cisco_pair(&store);
+        exit_with(&mut runtime, &store, &genuine_reply(), &[]);
+        key(&mut runtime, &store);
+        assert_eq!(runtime.stack_len(), 1, "the parent's prompt came back");
+    }
+
+    #[test]
+    fn c2b_parent_prompt_survives_an_edited_command_line() {
+        let store = ProfileStore::builtin();
+        let mut runtime = local(&store);
+        step(
+            &mut runtime,
+            &store,
+            "ssh sw1",
+            &["Cisco IOS Software\nsw1#"],
+        );
+        runtime.observe_input(b"s");
+        runtime.observe_output(b"s", &store);
+        runtime.observe_input(b"sh sw3\x7f");
+        runtime.observe_output(b"sh sw3\x08 \x08", &store);
+        runtime.observe_input(b"2\r");
+        assert_eq!(
+            runtime.observe_output(b"2\r\n--- JUNOS 22.4R3 Kernel 64-bit\r\nlab@sw2> ", &store),
+            Some(names(JUNIPER))
+        );
+        exit_with(&mut runtime, &store, &genuine_reply(), &[]);
+        assert_eq!(key(&mut runtime, &store), Some(names(CISCO)));
     }
 
     // C-2b, the accepted limit: a still-connected child that prints the
@@ -4047,6 +4095,71 @@ mod leave_tests {
             }
             assert_eq!(runtime.active_profiles(), names(JUNIPER), "{name}");
             assert_eq!(runtime.stack_len(), 1, "{name}");
+        }
+    }
+
+    #[test]
+    fn c2c_telnet_started_with_another_escape_is_not_closed_by_ctrl_bracket() {
+        let store = ProfileStore::builtin();
+        for command in [
+            "telnet -r r1",
+            "telnet -E r1",
+            "telnet -e ^X r1",
+            "telnet -8e^X r1",
+        ] {
+            let mut runtime = telnet_to_juniper(&store, command);
+            step(
+                &mut runtime,
+                &store,
+                "\x1dq",
+                &["\ntelnet> q\nConnection closed.\nuser@laptop:~$ "],
+            );
+            assert_eq!(runtime.active_profiles(), names(JUNIPER), "{command}");
+        }
+    }
+
+    #[test]
+    fn c2c_echo_and_close_line_split_across_reads() {
+        let store = ProfileStore::builtin();
+        let mut runtime = telnet_to_juniper(&store, "telnet r1");
+        runtime.observe_input(b"\x1d");
+        assert_eq!(runtime.observe_output(b"\r\ntel", &store), None);
+        assert_eq!(runtime.observe_output(b"net> qu", &store), None);
+        runtime.observe_input(b"qu\r");
+        assert_eq!(runtime.observe_output(b"\r\nConnection clo", &store), None);
+        assert_eq!(
+            runtime.observe_output(b"sed.\r\n", &store),
+            Some(names(LOCAL))
+        );
+    }
+
+    #[test]
+    fn c2c_nested_telnets_need_every_escape_announced() {
+        let store = ProfileStore::builtin();
+        for (inner_announcement, returns) in [("Escape character is '^X'.\n", true), ("", false)] {
+            let mut runtime = telnet_to_juniper(&store, "telnet a1");
+            step(
+                &mut runtime,
+                &store,
+                "telnet b1",
+                &[&format!(
+                    "Connected to b1.\n{inner_announcement}Cisco IOS Software\nb1#"
+                )],
+            );
+            assert_eq!(runtime.active_profiles(), names(CISCO));
+            let quit = step(
+                &mut runtime,
+                &store,
+                "\x1dq",
+                &["\ntelnet> q\nConnection closed.\nuser@laptop:~$ "],
+            );
+            // The local client's Ctrl-] closes a1 and b1 inside it, when
+            // every telnet said which escape it uses.
+            assert_eq!(
+                quit,
+                returns.then(|| names(LOCAL)),
+                "{inner_announcement:?}"
+            );
         }
     }
 
