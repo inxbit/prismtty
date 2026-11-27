@@ -1716,12 +1716,12 @@ impl StreamingHighlighter {
             // cursor back to a cell they were drawn on. A control still open at
             // the end of the read is not known yet, so it keeps the bypass. A
             // later read can still go back into those lines.
-            let (rows, _columns) = self.terminal_size.unwrap_or((0, 0));
+            let (rows, columns) = self.terminal_size.unwrap_or((0, 0));
             let split = if self.pending.is_empty()
                 && !self.read_ends_mid_sequence
                 && self.layout_modes.allow_promotion(rows)
             {
-                plain_lines_before_prompt_redraw(&input.tokens, &self.visible_line_tail)
+                plain_lines_before_prompt_redraw(&input.tokens, &self.visible_line_tail, columns)
             } else {
                 None
             };
@@ -3213,15 +3213,23 @@ fn alternate_screen_command(bytes: &[u8]) -> Option<bool> {
 /// prompt-echo handling, which this path skips. The first line that is not
 /// plain, and everything after it, is written unchanged. `line_tail` is the
 /// visible line the read continues. The read's last line must still show a
-/// prompt when the read ends; see [`LastLine`].
-fn plain_lines_before_prompt_redraw(tokens: &[Token], line_tail: &[u8]) -> Option<usize> {
+/// prompt when the read ends, on a terminal `columns` wide; see [`LastLine`].
+/// With the width not known (0), nothing qualifies.
+fn plain_lines_before_prompt_redraw(
+    tokens: &[Token],
+    line_tail: &[u8],
+    columns: u16,
+) -> Option<usize> {
+    if columns == 0 {
+        return None;
+    }
     let mut offset = 0;
     let mut split = 0;
     let mut cut = false;
     let mut line_is_plain = true;
     let mut line_has_cr = false;
     let mut visible_line = line_tail.to_vec();
-    let mut last_line = LastLine::default();
+    let mut last_line = LastLine::new(columns);
     for token in tokens {
         match token {
             Token::Ansi(bytes) => {
@@ -3282,21 +3290,45 @@ fn plain_lines_before_prompt_redraw(tokens: &[Token], line_tail: &[u8]) -> Optio
 /// stretch of text between CRs and cursor moves that looks like a prompt tail
 /// is remembered with the columns it covers. Text written over those columns
 /// later, an erase that reaches them, or a write or erase at a column that is
-/// not known forgets it. Columns count one per character from the last CR or
-/// `CSI G`, so a wide character counts as one.
-#[derive(Debug, Default)]
+/// not known forgets it.
+///
+/// The cursor column is known only while it is certain. A CR or `CSI G` fixes
+/// it; `CSI C`, `CSI D` and `CSI G` stop at the edges of the screen as the
+/// terminal stops them. A character written in the last column (the next one
+/// may wrap to a new row), a tab (the program may have moved the tab stops),
+/// a character that is not ASCII (it may take no column, one or two), and a
+/// move whose count is too large to read leave it unknown. A stretch holding a
+/// character that is not ASCII is taken to cover two columns for each
+/// character, and a stretch that may not fit on the row is no prompt.
+#[derive(Debug)]
 struct LastLine {
-    /// The cursor column, `None` until a CR or `CSI G` fixes it.
+    /// The terminal's width, at least 1.
+    columns: u32,
+    /// The cursor column, `None` while it is not certain.
     column: Option<u32>,
     stretch: Vec<u8>,
     stretch_start: Option<u32>,
+    /// Continuation bytes still to come for the character being written.
+    continuation_bytes: u8,
     /// The columns of the prompt, from the first to one past the last.
     prompt: Option<(u32, u32)>,
 }
 
 impl LastLine {
+    fn new(columns: u16) -> Self {
+        Self {
+            columns: u32::from(columns.max(1)),
+            column: None,
+            stretch: Vec::new(),
+            stretch_start: None,
+            continuation_bytes: 0,
+            prompt: None,
+        }
+    }
+
     fn line_feed(&mut self) {
         self.stretch.clear();
+        self.continuation_bytes = 0;
         self.prompt = None;
     }
 
@@ -3307,21 +3339,42 @@ impl LastLine {
 
     fn tab(&mut self) {
         self.close_stretch();
-        self.column = self.column.map(|column| (column / 8 + 1).saturating_mul(8));
+        self.column = None;
     }
 
     fn print(&mut self, byte: u8) {
-        // A UTF-8 continuation byte belongs to the character before it.
-        if (0x80..=0xbf).contains(&byte) {
+        if (0x80..=0xbf).contains(&byte) && self.continuation_bytes > 0 {
+            // Part of the character before it.
+            self.continuation_bytes -= 1;
             self.stretch.push(byte);
             return;
         }
         if self.stretch.is_empty() {
             self.stretch_start = self.column;
         }
-        self.forget_prompt_from(self.column, self.column.map(|column| column + 1));
         self.stretch.push(byte);
-        self.column = self.column.map(|column| column.saturating_add(1));
+        if byte.is_ascii() {
+            self.continuation_bytes = 0;
+            self.forget_prompt_from(self.column, self.column.map(|column| column + 1));
+            self.column = self
+                .column
+                .filter(|column| column + 1 < self.columns)
+                .map(|column| column + 1);
+            return;
+        }
+        // A character that is not ASCII, or a byte that is no character: it
+        // may join the cell before it or cover two.
+        self.continuation_bytes = match byte {
+            0xc2..=0xdf => 1,
+            0xe0..=0xef => 2,
+            0xf0..=0xf4 => 3,
+            _ => 0,
+        };
+        self.forget_prompt_from(
+            self.column.map(|column| column.saturating_sub(1)),
+            self.column.map(|column| column + 2),
+        );
+        self.column = None;
     }
 
     fn control(&mut self, bytes: &[u8]) {
@@ -3340,15 +3393,21 @@ impl LastLine {
         let value = bounded_parameter(parameters).unwrap_or(0);
         let count = value.max(1);
         let known = value != u32::MAX;
+        let last = self.columns - 1;
         match final_byte {
-            b'G' => self.column = known.then(|| count - 1),
+            b'G' => self.column = known.then(|| (count - 1).min(last)),
             b'C' => {
                 self.column = self
                     .column
                     .filter(|_| known)
-                    .map(|column| column.saturating_add(count))
+                    .map(|column| column.saturating_add(count).min(last))
             }
-            b'D' => self.column = self.column.map(|column| column.saturating_sub(count)),
+            b'D' => {
+                self.column = self
+                    .column
+                    .filter(|_| known)
+                    .map(|column| column.saturating_sub(count))
+            }
             // Erase in line: 0 to the right, 1 to the left, 2 the whole line.
             // Erase below starts at the cursor as well.
             _ => match (final_byte, value) {
@@ -3372,6 +3431,7 @@ impl LastLine {
     }
 
     fn close_stretch(&mut self) {
+        self.continuation_bytes = 0;
         if self.stretch.is_empty() {
             return;
         }
@@ -3382,8 +3442,12 @@ impl LastLine {
                     .iter()
                     .filter(|byte| !(0x80..=0xbf).contains(*byte))
                     .count();
-                let width = u32::try_from(characters).unwrap_or(u32::MAX);
-                self.prompt = Some((start, start.saturating_add(width)));
+                let per_character = if self.stretch.is_ascii() { 1 } else { 2 };
+                let width = u32::try_from(characters * per_character).unwrap_or(u32::MAX);
+                let end = start.saturating_add(width);
+                if end <= self.columns {
+                    self.prompt = Some((start, end));
+                }
             }
         }
         self.stretch.clear();
