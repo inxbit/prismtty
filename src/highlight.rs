@@ -1672,14 +1672,32 @@ impl StreamingHighlighter {
             // At the bottom of the screen a line feed scrolls in a blank line
             // drawn in the current rendition, so a style that shows on blank
             // cells ends before the terminator. No highlight spans one.
-            if self
-                .interactive_overlay
-                .as_ref()
-                .is_some_and(style_paints_blank_cells)
-            {
-                self.reset_interactive_overlay(&mut output);
+            let terminator = &bytes[line_end..boundary_end];
+            match self.interactive_overlay.as_ref() {
+                Some(style) if style_paints_blank_cells(style) => {
+                    self.reset_interactive_overlay(&mut output);
+                    output.extend_from_slice(terminator);
+                }
+                // The program's own rendition can draw blank cells in the
+                // foreground (inverse, strike, overline, plain underline), and
+                // then a foreground-only highlight shows on that blank line as
+                // well. Only the terminator leaves the highlight: it is open
+                // again right after it, as before.
+                Some(style) if self.native_sgr.draws_blank_cells_with_the_foreground() => {
+                    output.extend(style_reset_bytes(
+                        style,
+                        &self.native_sgr,
+                        self.interactive_reset_mode(),
+                    ));
+                    output.extend_from_slice(terminator);
+                    output.extend(
+                        style
+                            .ansi_start_with_mode(self.highlighter.color_mode)
+                            .into_bytes(),
+                    );
+                }
+                _ => output.extend_from_slice(terminator),
             }
-            output.extend_from_slice(&bytes[line_end..boundary_end]);
             segment_start = boundary_end;
         }
 
@@ -3275,14 +3293,53 @@ fn emit_interactive_highlighted(
     for token in tokens {
         match token {
             Token::Ansi(bytes) => {
-                if let Some(style) = active_style
-                    .as_ref()
-                    .filter(|style| saves_rendition(bytes) || fills_blank_cells_with(bytes, style))
-                {
+                let shows_on_blank_line = active_style.as_ref().is_some_and(|style| {
+                    style_paints_blank_cells(style)
+                        || native_sgr.draws_blank_cells_with_the_foreground()
+                });
+                // A CR or LF inside a control the terminal runs is executed
+                // where it stands and ends the line like a text one, so the
+                // highlight closes before the whole control when it would show
+                // on the blank line. It is open again right after the control,
+                // as it is after every other one.
+                let closes_before = active_style.as_ref().is_some_and(|style| {
+                    (shows_on_blank_line && control_runs_a_line_end(bytes))
+                        || saves_rendition(bytes)
+                        || fills_blank_cells_with(bytes, style)
+                });
+                if let Some(style) = active_style.as_ref().filter(|_| closes_before) {
                     output.extend(style_reset_bytes(style, native_sgr, reset_mode));
                 }
                 native_sgr.apply_sequence(bytes);
-                output.extend_from_slice(bytes);
+                match active_style.as_ref().filter(|_| {
+                    shows_on_blank_line
+                        && !closes_before
+                        && is_raw_c1_csi_the_terminal_does_not_run(bytes)
+                        && bytes.iter().any(|byte| is_line_end(*byte))
+                }) {
+                    // A UTF-8 terminal shows these bytes as text, drawn in the
+                    // open highlight; only their line ends leave it. When the
+                    // highlight is already closed before them, they stay so.
+                    Some(style) => {
+                        let reset = style_reset_bytes(style, native_sgr, reset_mode);
+                        let mut rest = bytes.as_slice();
+                        while let Some(start) = rest.iter().position(|byte| is_line_end(*byte)) {
+                            let end = rest[start..]
+                                .iter()
+                                .position(|byte| !is_line_end(*byte))
+                                .map_or(rest.len(), |len| start + len);
+                            output.extend_from_slice(&rest[..start]);
+                            output.extend_from_slice(&reset);
+                            output.extend_from_slice(&rest[start..end]);
+                            rest = &rest[end..];
+                            if !rest.is_empty() {
+                                output.extend_from_slice(starts.start(style, color_mode));
+                            }
+                        }
+                        output.extend_from_slice(rest);
+                    }
+                    None => output.extend_from_slice(bytes),
+                }
                 if let Some(style) = active_style {
                     output.extend_from_slice(starts.start(style, color_mode));
                 }
@@ -3392,6 +3449,64 @@ fn style_outlasts_start_of(previous: &Style, next: &Style) -> bool {
 /// it erases, inserts or scrolls, while a foreground color alone is not.
 fn style_paints_blank_cells(style: &Style) -> bool {
     style.background.is_some() || style.underline || style.invert || style.strike
+}
+
+fn is_line_end(byte: u8) -> bool {
+    matches!(byte, b'\r' | b'\n')
+}
+
+/// Reports whether the terminal runs the control token `bytes` and executes a
+/// CR or LF inside it. VT parsers execute C0 controls met in the escape, CSI
+/// and intermediate states without leaving the sequence (`ESC LF [31m`,
+/// `CSI 3 LF 1 m`). Inside an OSC, DCS, SOS, PM or APC payload they are string
+/// data and move nothing, so a line end there is no reason to close a
+/// highlight; neither is the string a place to write one.
+///
+/// Only controls whose run is certain count, and only whole ones in ASCII:
+/// where a byte from 80 to FF sits in a control, or cuts one short before its
+/// final byte, terminals disagree on how it runs. A raw `9B` CSI counts only
+/// on a terminal that does not read UTF-8: one that does shows it as text (see
+/// `is_raw_c1_csi_the_terminal_does_not_run`). `C2 9B` never counts: an 8-bit
+/// terminal draws the `C2`, and a UTF-8 one may not run it at all. VT and FF
+/// are not line ends here: some terminals draw them.
+fn control_runs_a_line_end(bytes: &[u8]) -> bool {
+    let Some((&first, rest)) = bytes.split_first() else {
+        return false;
+    };
+    if !rest.is_ascii() || !matches!(first, 0x1b | 0x9b) {
+        return false;
+    }
+    let canceled = matches!(rest.last(), Some(0x18 | 0x1a));
+    let ends_in = |body: &[u8], finals: std::ops::RangeInclusive<u8>| {
+        canceled || body.last().is_some_and(|last| finals.contains(last))
+    };
+    let has_line_end = |body: &[u8]| body.iter().any(|byte| is_line_end(*byte));
+    if first == 0x9b {
+        return !terminal_reads_utf8() && ends_in(rest, 0x40..=0x7e) && has_line_end(rest);
+    }
+    let introducer = skip_escape_state_controls(bytes, 1);
+    let prefix_line_end = has_line_end(&bytes[1..introducer]);
+    match bytes.get(introducer) {
+        Some(b'[') => {
+            let body = &bytes[introducer + 1..];
+            ends_in(body, 0x40..=0x7e) && (prefix_line_end || has_line_end(body))
+        }
+        Some(0x20..=0x2f) => {
+            let body = &bytes[introducer..];
+            ends_in(body, 0x30..=0x7e) && (prefix_line_end || has_line_end(body))
+        }
+        // A string: its payload is data, so only a line end before it counts.
+        Some(b']' | b'P' | b'X' | b'^' | b'_') => {
+            prefix_line_end
+                && (canceled
+                    || bytes.ends_with(b"\x1b\\")
+                    || (bytes[introducer] == b']' && bytes.ends_with(b"\x07")))
+        }
+        // An escape whose final byte follows the line ends before it.
+        Some(_) => prefix_line_end,
+        // Cut short before its final byte.
+        None => false,
+    }
 }
 
 /// Reports whether `bytes` is a control that fills cells with blanks in the

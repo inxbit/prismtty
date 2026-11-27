@@ -2,6 +2,50 @@
 
 All notable changes to PrismTTY are documented here.
 
+## Unreleased
+
+### Fixed
+
+- In interactive output, an open highlight no longer colors the blank line a
+  line feed scrolls in, or the cells a carriage return goes back over, where
+  it would show: when its style paints blank cells, or when the program's own
+  inverse, strike-through, overline or underline without a color of its own
+  draws blank cells in the foreground color. The highlight now closes right
+  before the CR or LF:
+  - For a CR or LF in the text under such a program rendition, it opens again
+    right after the line end. A highlight whose own style paints blank cells
+    closes there as before and opens again at the next text it matches.
+  - For a CR or LF the terminal runs inside an escape or control sequence,
+    such as `ESC [ 3 LF 1 m`, it closes before the whole sequence, which is
+    kept whole, and opens again right after it.
+
+  Text is drawn in the same colors as before. Piped and file output,
+  `profiles test` and the library's `Highlighter::highlight*` are unchanged.
+
+  What this covers, and what it does not:
+
+  - The rule is for CR and LF only. VT and FF keep their bytes, because some
+    terminals draw them as characters.
+  - In a UTF-8 locale a sequence opened by a raw `9B` is text to the
+    terminal, so only the line ends inside it leave the highlight. When the
+    highlight already closes before such a sequence, because it saves the
+    rendition or fills blank cells, its bytes are kept. A terminal that reads
+    8-bit bytes behind a UTF-8 locale, the mismatch `SECURITY.md` describes,
+    runs that sequence as a control, and the bytes now written inside it end
+    it early, so it is drawn differently than before.
+  - Only a whole control sequence that is ASCII after its introducer counts.
+    The introducer is `ESC`, or a raw `9B` where the locale is not UTF-8.
+    `C2 9B`, a sequence with a byte from 80 to FF after its introducer or cut
+    short by one before its final byte, and the payload of an OSC, DCS, SOS,
+    PM or APC string keep their bytes, even when a line end sits in the
+    sequence.
+  - `CSI K` right after a line feed still erases in the color of a
+    foreground-only highlight that meets such a program rendition, as before;
+    that is a separate issue. A highlight whose style paints blank cells
+    already closes before it.
+  - A line that wraps at the right margin has no byte to act on and is drawn
+    as before.
+
 ## 1.4.0 - 2026-11-27
 
 ### Changed
