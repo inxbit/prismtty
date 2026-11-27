@@ -3568,6 +3568,18 @@ enum ScrollRegion {
     Unknown,
 }
 
+impl ScrollRegion {
+    /// Whether the region spans a terminal `rows` high (0 when not known).
+    fn is_whole_screen(self, rows: u16) -> bool {
+        let rows = u32::from(rows);
+        match self {
+            Self::Whole => true,
+            Self::Set { top, bottom } => top <= 1 && rows > 0 && (bottom == 0 || bottom == rows),
+            Self::Unknown => false,
+        }
+    }
+}
+
 /// Terminal modes, followed through the output, under which a line feed, a
 /// backward move or text past the margin can land on a cell that is already
 /// drawn: a scroll region that is not the whole screen (a cursor below it
@@ -3584,9 +3596,21 @@ enum ScrollRegion {
 /// only by the exact `ESC [` form, with plain decimal parameters, within the
 /// first `MAX_RESET_PARAMETERS`, or by RIS. The terminal is taken to start in
 /// the default modes; a mode it was already in is not seen.
+///
+/// Xterm keeps one scroll region for both screens (`top_marg` and `bot_marg`
+/// in its `TScreen`, which a switch of screens leaves alone), and that is
+/// `scroll_region`. A terminal that keeps one for each screen is followed as
+/// well, in `main_screen_region`, and a read is promoted only when both allow
+/// it.
 #[derive(Clone, Debug, Default)]
 struct LayoutModes {
     scroll_region: ScrollRegion,
+    /// The main screen's region on a terminal that keeps one for each
+    /// screen: set only while the output is known to be on the main screen.
+    main_screen_region: ScrollRegion,
+    /// True once the output may have switched to the alternate screen: any
+    /// form that may switch counts, and only an exact switch back clears it.
+    maybe_on_alternate_screen: bool,
     reverse_wrap: bool,
     reverse_wrap_any_line: bool,
     left_right_margins: bool,
@@ -3619,7 +3643,13 @@ impl LayoutModes {
         match (final_byte, parameters.strip_prefix(b"?")) {
             (b'p', None) if parameters == b"!" => self.autowrap_off = true,
             (b'r', Some(modes)) => self.restore_private_modes(modes),
-            (b'r', None) => self.scroll_region = scroll_region_set_by(parameters, exact),
+            (b'r', None) => {
+                let region = scroll_region_set_by(parameters, exact);
+                self.scroll_region = region;
+                if !self.maybe_on_alternate_screen {
+                    self.main_screen_region = region;
+                }
+            }
             (b'h' | b'l', Some(modes)) => self.set_private_modes(modes, final_byte == b'h', exact),
             _ => {}
         }
@@ -3632,8 +3662,10 @@ impl LayoutModes {
                     self.reverse_wrap = true;
                     self.reverse_wrap_any_line = true;
                     self.left_right_margins = true;
+                    self.maybe_on_alternate_screen = true;
                 }
                 (None, false) | (Some(7), false) => self.autowrap_off = true,
+                (Some(47 | 1047 | 1049), true) => self.maybe_on_alternate_screen = true,
                 (Some(45), true) => self.reverse_wrap = true,
                 (Some(1045), true) => self.reverse_wrap_any_line = true,
                 (Some(69), true) => self.left_right_margins = true,
@@ -3653,7 +3685,10 @@ impl LayoutModes {
                 (45, false) => self.reverse_wrap = false,
                 (1045, false) => self.reverse_wrap_any_line = false,
                 (69, false) => self.left_right_margins = false,
-                (47 | 1047 | 1049, false) => self.alternate_screen_restored = false,
+                (47 | 1047 | 1049, false) => {
+                    self.alternate_screen_restored = false;
+                    self.maybe_on_alternate_screen = false;
+                }
                 _ => {}
             }
         }
@@ -3668,7 +3703,10 @@ impl LayoutModes {
                 Some(45) => self.reverse_wrap = true,
                 Some(1045) => self.reverse_wrap_any_line = true,
                 Some(69) => self.left_right_margins = true,
-                Some(47 | 1047 | 1049) => self.alternate_screen_restored = true,
+                Some(47 | 1047 | 1049) => {
+                    self.alternate_screen_restored = true;
+                    self.maybe_on_alternate_screen = true;
+                }
                 Some(_) => {}
                 None => {
                     self.autowrap_off = true;
@@ -3676,6 +3714,7 @@ impl LayoutModes {
                     self.reverse_wrap_any_line = true;
                     self.left_right_margins = true;
                     self.alternate_screen_restored = true;
+                    self.maybe_on_alternate_screen = true;
                 }
             }
         }
@@ -3684,19 +3723,13 @@ impl LayoutModes {
     /// Whether the modes let a read be promoted, on a terminal `rows` high
     /// (0 when that is not known).
     fn allow_promotion(&self, rows: u16) -> bool {
-        let rows = u32::from(rows);
         !self.reverse_wrap
             && !self.reverse_wrap_any_line
             && !self.left_right_margins
             && !self.autowrap_off
             && !self.alternate_screen_restored
-            && match self.scroll_region {
-                ScrollRegion::Whole => true,
-                ScrollRegion::Set { top, bottom } => {
-                    top <= 1 && rows > 0 && (bottom == 0 || bottom == rows)
-                }
-                ScrollRegion::Unknown => false,
-            }
+            && self.scroll_region.is_whole_screen(rows)
+            && self.main_screen_region.is_whole_screen(rows)
     }
 }
 
