@@ -184,6 +184,33 @@ fn record_end_at_stop_for_test(pending_end: &PendingEnd) {
     }
 }
 
+/// Test only: when armed, holds the next End at the entry of its path, as a
+/// slow step can, until released (for ten seconds at most).
+#[cfg(test)]
+struct EndEntryPause {
+    armed: std::sync::atomic::AtomicBool,
+    entered: std::sync::atomic::AtomicBool,
+    released: std::sync::atomic::AtomicBool,
+}
+
+#[cfg(test)]
+static END_ENTRY_PAUSE: EndEntryPause = EndEntryPause {
+    armed: std::sync::atomic::AtomicBool::new(false),
+    entered: std::sync::atomic::AtomicBool::new(false),
+    released: std::sync::atomic::AtomicBool::new(false),
+};
+
+#[cfg(test)]
+fn pause_at_end_entry_for_test() {
+    if END_ENTRY_PAUSE.armed.swap(false, Ordering::SeqCst) {
+        END_ENTRY_PAUSE.entered.store(true, Ordering::SeqCst);
+        let until = Instant::now() + Duration::from_secs(10);
+        while !END_ENTRY_PAUSE.released.load(Ordering::SeqCst) && Instant::now() < until {
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+}
+
 const RAW_SIGNAL_STOP_BYTE: u8 = 0;
 const RESIZE_STOP_BYTE: u8 = b'q';
 const RESIZE_WAKE_BYTE: u8 = b'r';
@@ -1253,6 +1280,8 @@ fn end_session_after_signal(
     raw_mode_state: &Mutex<RawModeLifecycle>,
     sigint_left_default: bool,
 ) {
+    #[cfg(test)]
+    pause_at_end_entry_for_test();
     let deadline = Instant::now() + END_LIMIT;
     let bounded = start_end_watchdog(signal, deadline, sigint_left_default);
     if let Err(error) = terminate_raw_mode_from_signal_state(raw_mode_state) {
@@ -5078,6 +5107,85 @@ mod tests {
             "{printed}"
         );
         let (status, printed) = run_ending_probe("end_at_stop_probe", "killed");
+        assert_eq!(
+            (status.signal(), status.code()),
+            (None, Some(128 + libc::SIGTERM)),
+            "{printed}"
+        );
+    }
+
+    static PRIOR_USR1_RAN: AtomicBool = AtomicBool::new(false);
+
+    extern "C" fn prior_usr1(_: libc::c_int) {
+        PRIOR_USR1_RAN.store(true, Ordering::SeqCst);
+    }
+
+    /// Gives SIGUSR1 an action of its own, as a caller can, starts the signal
+    /// watcher, lets it take SIGTERM and holds that End at the entry of its
+    /// path, before anything is published, and meanwhile stops the session
+    /// from another thread. Prints whether a SIGUSR1 sent then ran the prior
+    /// action and whether the End was published yet, then lets the End go on,
+    /// which ends the process.
+    #[test]
+    fn stop_during_end_probe() {
+        if probe_state("stop_during_end_probe").is_none() {
+            return;
+        }
+        let prior: extern "C" fn(libc::c_int) = prior_usr1;
+        // SAFETY: the handler is an `extern "C" fn(c_int)` that only stores to an atomic. Only
+        // this probe runs in this process.
+        unsafe {
+            libc::signal(libc::SIGUSR1, prior as libc::sighandler_t);
+        }
+        let raw_mode = Arc::new(Mutex::new(super::RawModeLifecycle::Inactive));
+        let watcher = super::SessionSignalWatcher::start(raw_mode, true).expect("watcher");
+        super::END_ENTRY_PAUSE.armed.store(true, Ordering::SeqCst);
+        // SAFETY: kill has no memory-safety preconditions; the target is this probe's own process.
+        unsafe {
+            libc::kill(libc::getpid(), libc::SIGTERM);
+        }
+        let until = Instant::now() + Duration::from_secs(5);
+        while !super::END_ENTRY_PAUSE.entered.load(Ordering::SeqCst) && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let entered = super::END_ENTRY_PAUSE.entered.load(Ordering::SeqCst);
+        let stopper = std::thread::spawn(move || {
+            let mut watcher = watcher;
+            watcher.stop();
+        });
+        // Time for stop to give the signals back, or keep them, and then
+        // wait for the watcher.
+        std::thread::sleep(Duration::from_millis(300));
+        // SAFETY: kill has no memory-safety preconditions; the target is this probe's own process.
+        unsafe {
+            libc::kill(libc::getpid(), libc::SIGUSR1);
+        }
+        std::thread::sleep(Duration::from_millis(100));
+        println!(
+            "entered={entered} prior_ran={} unpublished={}",
+            PRIOR_USR1_RAN.load(Ordering::SeqCst),
+            super::published_end_outcome().is_none()
+        );
+        super::END_ENTRY_PAUSE
+            .released
+            .store(true, Ordering::SeqCst);
+        let _ = stopper.join();
+        println!("the End did not end the process");
+    }
+
+    // While an End is in progress (taken, not yet published), stopping the
+    // session keeps the signals caught: a SIGUSR1 with a default action
+    // could otherwise kill PrismTTY before its pid file is removed and its
+    // status returned. The End then ends the process with 128 plus SIGTERM.
+    #[test]
+    fn signals_stay_caught_while_an_end_is_in_progress() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let (status, printed) = run_ending_probe("stop_during_end_probe", "TERM");
+        assert!(
+            printed.contains("entered=true prior_ran=false unpublished=true"),
+            "{printed}"
+        );
         assert_eq!(
             (status.signal(), status.code()),
             (None, Some(128 + libc::SIGTERM)),
