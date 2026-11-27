@@ -210,15 +210,18 @@ fn exit_code_byte(raw: u32) -> u8 {
     u8::try_from(raw).unwrap_or(u8::MAX)
 }
 
-/// Maps a reaped child's wait status to a process exit byte: a normal exit
-/// preserves its (clamped) code, and a signal death reports `128 + signal`
-/// (the shell convention) instead of a misleading generic code.
-fn exit_code_from_wait(status: nix::sys::wait::WaitStatus) -> u8 {
-    use nix::sys::wait::WaitStatus;
-    match status {
-        WaitStatus::Exited(_, code) => exit_code_byte(code as u32),
-        WaitStatus::Signaled(_, signal, _) => 128u8.saturating_add(signal as i32 as u8),
-        _ => 1,
+/// Maps a reaped child's raw `waitpid` status to a process exit byte: a normal
+/// exit preserves its (clamped) code, and a signal death reports
+/// `128 + signal` (the shell convention) instead of a misleading generic code.
+/// The status is decoded as the kernel wrote it, so a signal number with no
+/// name here (the Linux real-time signals) is reported like any other.
+fn exit_code_from_wait(status: libc::c_int) -> u8 {
+    if libc::WIFEXITED(status) {
+        exit_code_byte(libc::WEXITSTATUS(status) as u32)
+    } else if libc::WIFSIGNALED(status) {
+        128u8.saturating_add(libc::WTERMSIG(status) as u8)
+    } else {
+        1
     }
 }
 
@@ -765,9 +768,15 @@ fn reap_child(child: &mut Box<dyn portable_pty::Child + Send + Sync>) -> Result<
         let pid = pid as libc::pid_t;
         wait_for_child_exit_without_reaping(pid)?;
         let _guard = forward_child_lock();
-        let status = nix::sys::wait::waitpid(nix::unistd::Pid::from_raw(pid), None);
+        let mut status: libc::c_int = 0;
+        // SAFETY: `status` is a valid, exclusively borrowed c_int for the call.
+        let reaped = if unsafe { libc::waitpid(pid, &mut status, 0) } == -1 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(exit_code_from_wait(status))
+        };
         FORWARD_CHILD_PID.store(0, Ordering::SeqCst);
-        return Ok(exit_code_from_wait(status?));
+        return Ok(reaped?);
     }
     let status = child.wait()?;
     Ok(exit_code_byte(status.exit_code()))
@@ -3145,21 +3154,22 @@ mod tests {
     // the signal number, so we reap with waitpid and map the raw status).
     #[test]
     fn exit_code_from_wait_maps_signal_deaths_to_128_plus_signal() {
-        use nix::sys::signal::Signal;
-        use nix::sys::wait::WaitStatus;
-        use nix::unistd::Pid;
+        use std::os::unix::process::ExitStatusExt;
 
-        let pid = Pid::from_raw(1);
-        assert_eq!(super::exit_code_from_wait(WaitStatus::Exited(pid, 0)), 0);
-        assert_eq!(super::exit_code_from_wait(WaitStatus::Exited(pid, 42)), 42);
-        assert_eq!(
-            super::exit_code_from_wait(WaitStatus::Signaled(pid, Signal::SIGTERM, false)),
-            143
-        );
-        assert_eq!(
-            super::exit_code_from_wait(WaitStatus::Signaled(pid, Signal::SIGSEGV, false)),
-            139
-        );
+        let raw_status = |script: &str| {
+            std::process::Command::new("sh")
+                .arg("-c")
+                .arg(script)
+                .status()
+                .expect("run sh")
+                .into_raw()
+        };
+        assert_eq!(super::exit_code_from_wait(raw_status("exit 0")), 0);
+        assert_eq!(super::exit_code_from_wait(raw_status("exit 42")), 42);
+        assert_eq!(super::exit_code_from_wait(raw_status("kill -TERM $$")), 143);
+        assert_eq!(super::exit_code_from_wait(raw_status("kill -KILL $$")), 137);
+        #[cfg(target_os = "linux")]
+        assert_eq!(super::exit_code_from_wait(raw_status("kill -64 $$")), 192);
     }
 
     // AUDIT G5: exit codes above 255 must clamp, not wrap to a misleading 0.

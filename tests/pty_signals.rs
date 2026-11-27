@@ -774,6 +774,59 @@ fn noninteractive_termination_reaps_a_signal_immune_child_group() {
     wrapped_guard.disarm();
 }
 
+/// A wrapped command killed by a real-time signal reports `128 + signal`,
+/// like any other signal death. Linux only: macOS has no real-time signals.
+#[cfg(target_os = "linux")]
+#[test]
+fn child_killed_by_a_real_time_signal_reports_128_plus_signal() {
+    use std::os::unix::process::ExitStatusExt;
+    use std::process::{Command, Stdio};
+
+    let home = tempfile::tempdir().expect("scratch home");
+    let config = home.path().join("empty.yml");
+    std::fs::write(&config, "rules: []\n").expect("empty config");
+    for signal in [50, 64] {
+        let script = format!("kill -{signal} $$");
+        let bare = Command::new("sh")
+            .arg("-c")
+            .arg(&script)
+            .stdin(Stdio::null())
+            .status()
+            .expect("run sh without the wrapper");
+        assert_eq!(
+            bare.signal(),
+            Some(signal),
+            "control: sh without the wrapper did not die from signal {signal}"
+        );
+
+        let stderr_path = home.path().join(format!("stderr-{signal}"));
+        let ptty = Command::new(env!("CARGO_BIN_EXE_ptty"))
+            .env("HOME", home.path())
+            .env("XDG_CONFIG_HOME", home.path())
+            .env("PRISMTTY_RUNTIME_DIR", home.path().join("runtime"))
+            .arg("-c")
+            .arg(&config)
+            .arg("sh")
+            .arg("-c")
+            .arg(&script)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(File::create(&stderr_path).expect("stderr file"))
+            .spawn()
+            .expect("spawn noninteractive ptty");
+        let mut ptty = ProcessGuard::new(ptty);
+        let status = ptty
+            .wait_for_exit(Duration::from_secs(10))
+            .expect("wrapper exits after its command was killed");
+        let stderr = std::fs::read_to_string(&stderr_path).expect("read stderr");
+        assert_eq!(
+            (status.code(), stderr.as_str()),
+            (Some(128 + signal), ""),
+            "wrapped command killed by signal {signal}"
+        );
+    }
+}
+
 /// A signal the caller ignored (`nohup`, or `cmd &` in a non-interactive
 /// shell) stays ignored: the wrapper must not catch it and end the job.
 #[test]
