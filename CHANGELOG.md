@@ -2,6 +2,46 @@
 
 All notable changes to PrismTTY are documented here.
 
+## Unreleased
+
+### Fixed
+
+- In interactive output, lines that arrive in one read together with a
+  prompt redrawn by a cursor move are now colored, as they are when they
+  arrive alone. zsh's right prompt and a device prompt redrawn with `CSI G`
+  are such redraws, and ssh or a slow link often delivers a command's last
+  lines in the same read. Before, a read that held any cursor move was
+  written unchanged as a whole. Now the complete lines before the line with
+  the first cursor move are colored when all of these hold:
+  - The read's last line still looks like a prompt when the read ends. A
+    percentage such as `50% ` does not count, and neither does a prompt that
+    the same read writes over.
+  - Every other control in the read keeps the cursor on its row or below:
+    moves along the row, erase in line and below, SGR, bracketed paste,
+    cursor-key and keypad modes, and the window title or directory. A line
+    that is rewritten in place, holds a tab or shows a prompt with a typed
+    command, and every line after it, stays as it came.
+  - No control is cut off at the end of the read.
+  - No mode set earlier in the output can bring the cursor back to those
+    lines: a scroll region that is not the whole screen, left and right
+    margins, reverse wraparound (modes 45 and 1045), autowrap off, or a
+    restore of saved modes. A mode counts as on after any form of a control
+    that may set it, and as off again only after its exact reset or a full
+    reset (RIS).
+
+  Any other read is written unchanged, as before. Piped and file output,
+  `profiles test` and the library's `Highlighter::highlight*` are unchanged.
+
+  Known limits:
+  - If a later read moves the cursor back into one of those lines and
+    rewrites only part of it without erasing, the text left untouched keeps
+    its color.
+  - A reverse-wraparound, margin, scroll-region or autowrap mode that the
+    terminal was already in when PrismTTY started, for example set by a
+    program run before it or by an outer terminal multiplexer, is not seen.
+    Then the same read can move back over those lines and leave color on
+    part of them.
+
 ## 1.4.1 - 2026-11-27
 
 ### Fixed
