@@ -4228,19 +4228,46 @@ mod leave_tests {
         }
     }
 
+    #[test]
+    fn c2b_key_typed_while_the_line_still_goes_on_is_not_a_waiting_prompt() {
+        let store = ProfileStore::builtin();
+        let mut runtime = cisco_then_juniper_shell(&store);
+        exit_with(&mut runtime, &store, &genuine_reply(), &[]);
+        // A key typed while `sw1#` is the last output, but the next output
+        // is the rest of a line still in flight, not the key's echo.
+        runtime.observe_input(b"s");
+        assert_eq!(
+            runtime.observe_output(b"backup\r\nlab@sw2> s", &store),
+            None
+        );
+        assert_child_kept(&mut runtime, &store, JUNIPER);
+        assert_eq!(runtime.stack_len(), 2);
+    }
+
+    #[test]
+    fn c2b_pasted_exit_returns_like_a_typed_one() {
+        // The paste-end marker comes after the Enter inside the paste; it is
+        // not a key typed ahead of the output.
+        let store = ProfileStore::builtin();
+        let mut runtime = cisco_then_juniper(&store);
+        runtime.observe_input(b"\x1b[200~exit\r\x1b[201~");
+        runtime.observe_output(format!("exit{}", genuine_reply()).as_bytes(), &store);
+        assert_eq!(key(&mut runtime, &store), Some(names(CISCO)));
+    }
+
     // C-2b, the 512-byte bound (review 68, must-change 2).
 
-    /// The reply whose parent prompt ends at byte `end` of the output read
-    /// after the Enter, with `filler` repeated on a line between.
+    /// The reply whose parent prompt ends at byte `end` after the echo of
+    /// the exit line, with `filler` repeated on a line between.
     fn reply_ending_at(end: usize, filler: &str) -> String {
-        let head = format!("\r\n{BRACKET}\r\n");
+        let head = format!("{BRACKET}\r\n");
         let tail = "\r\nsw1#";
         let room = end - head.len() - tail.len();
         let mut line = filler.repeat(room / filler.len());
         line.push_str(&"x".repeat(room - line.len()));
-        let reply = format!("{head}{line}{tail}");
-        assert_eq!(reply.len(), end);
-        reply
+        let body = format!("{head}{line}{tail}");
+        assert_eq!(body.len(), end);
+        format!("\r\n{body}")
     }
 
     #[test]
@@ -4249,11 +4276,12 @@ mod leave_tests {
         for filler in ["x", "\u{e9}", "\u{2500}"] {
             for (end, returns) in [(511, true), (512, true), (513, false)] {
                 let reply = reply_ending_at(end, filler);
+                let last = reply.len();
                 for splits in [
                     &[][..],
                     &[3][..],
-                    &[end - 4][..],
-                    &[end - 1][..],
+                    &[last - 4][..],
+                    &[last - 1][..],
                     &[100, 300][..],
                 ] {
                     let mut runtime = cisco_then_juniper(&store);
@@ -4265,6 +4293,16 @@ mod leave_tests {
                         "prompt ends at byte {end}, filler {filler:?}, splits {splits:?}"
                     );
                 }
+                // Typed fast or pasted: the Enter is read before the echo
+                // of the word, which then arrives with the reply.
+                let mut runtime = cisco_then_juniper(&store);
+                runtime.observe_input(b"exit\r");
+                runtime.observe_output(format!("exit{reply}").as_bytes(), &store);
+                assert_eq!(
+                    key(&mut runtime, &store),
+                    returns.then(|| names(CISCO)),
+                    "typed fast, prompt ends at byte {end}, filler {filler:?}"
+                );
             }
         }
     }
