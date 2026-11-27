@@ -2066,7 +2066,9 @@ fn an_isolated_raw_c1_byte_in_ordinary_text_follows_the_locale() {
     let c2_csi_learned = [b"a\xc2\x9b8m ".as_slice(), UP_GREEN, b"\x1b[8m visible\n"].concat();
     let c2_csi_stripped = [b"a ".as_slice(), UP_GREEN, b" visible\n"].concat();
 
-    let cases: Vec<(&str, &Vec<u8>, &[&str], Vec<u8>, Vec<u8>)> = vec![
+    // Name, input, flags, output in a UTF-8 locale, output outside one.
+    type Case<'a> = (&'a str, &'a Vec<u8>, &'a [&'a str], Vec<u8>, Vec<u8>);
+    let cases: Vec<Case> = vec![
         (
             "raw 9E and its line",
             &stav,
