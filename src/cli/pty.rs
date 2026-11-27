@@ -195,7 +195,8 @@ static FORWARD_CHILD_PID: AtomicI32 = AtomicI32::new(0);
 /// writes it under this lock before it clears `FORWARD_CHILD_PID`, so the
 /// signal watcher, which reads it under this lock when it finds the pid
 /// already cleared, sees the status that went with that reap. A reap by the
-/// watcher itself uses its own status directly.
+/// watcher itself uses its own status directly. `set_forward_child_pid`
+/// clears it when the next child is registered.
 static FORWARD_CHILD_LOCK: Mutex<Option<libc::c_int>> = Mutex::new(None);
 
 fn forward_child_lock() -> std::sync::MutexGuard<'static, Option<libc::c_int>> {
@@ -204,8 +205,11 @@ fn forward_child_lock() -> std::sync::MutexGuard<'static, Option<libc::c_int>> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+/// Registers the wrapped child for signal forwarding. A status published for
+/// an earlier child belongs to that child, so it is dropped here.
 fn set_forward_child_pid(pid: libc::pid_t) {
-    let _guard = forward_child_lock();
+    let mut reaped_status = forward_child_lock();
+    *reaped_status = None;
     FORWARD_CHILD_PID.store(pid, Ordering::SeqCst);
 }
 
@@ -3378,6 +3382,21 @@ mod tests {
         assert!(at_default, "default action, unblocked");
         assert!(!caught, "caught by a handler of the caller");
         assert!(!blocked, "blocked");
+    }
+
+    // The status a reap published belongs to that child. Registering the next
+    // child must drop it, or a second session in one process could take an
+    // earlier session's SIGINT death for its own. Other tests publish only
+    // the statuses of children that exited, never this one.
+    #[test]
+    fn registering_a_child_drops_the_status_published_for_the_last_one() {
+        let earlier_sigint_death = libc::SIGINT;
+        assert!(super::killed_by_sigint(Some(earlier_sigint_death)));
+        *super::forward_child_lock() = Some(earlier_sigint_death);
+
+        super::set_forward_child_pid(0);
+
+        assert_ne!(*super::forward_child_lock(), Some(earlier_sigint_death));
     }
 
     // AUDIT G5: exit codes above 255 must clamp, not wrap to a misleading 0.
