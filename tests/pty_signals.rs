@@ -1320,7 +1320,7 @@ fn assert_terminal_restored_after(signal: libc::c_int) {
     builder.arg("sh");
     builder.arg("-c");
     builder.arg(
-        "echo $$ > \"$PRISMTTY_CHILD_PID\"; trap 'sleep 0.3; exit 0' HUP INT QUIT TERM USR1 USR2 ALRM VTALRM PROF XCPU XFSZ; echo READY; while true; do sleep 0.05; done",
+        "echo $$ > \"$PRISMTTY_CHILD_PID\"; trap 'sleep 0.3; exit 0' HUP INT QUIT TERM ALRM VTALRM PROF XCPU XFSZ; echo READY; while true; do sleep 0.05; done",
     );
     let child = pair
         .slave
@@ -1347,31 +1347,32 @@ fn assert_terminal_restored_after(signal: libc::c_int) {
 
     // SAFETY: kill has no memory-safety preconditions; the target is a process this test spawned.
     assert_eq!(unsafe { libc::kill(ptty.pid(), signal) }, 0);
+    // Read through the master: on macOS the slave is revoked from every
+    // descriptor once the wrapper, its session leader, has exited.
     assert!(
         wait_for_condition(Duration::from_secs(1), || {
-            tcgetattr(&tty)
-                .map(|attrs| attrs == original)
-                .unwrap_or(false)
+            outer_terminal_settings(&tty, &*pair.master) == original
         }),
-        "terminal attributes were not restored before exit after signal {signal}"
+        "terminal attributes were not restored after signal {signal}"
     );
     assert_eq!(
         ptty.wait_for_exit(Duration::from_secs(5)),
-        Some(128 + signal as u32),
-        "interactive wrapper did not report signal-style termination"
+        Some(0),
+        "the wrapper did not return the exit code of the command that handled signal {signal}"
     );
     child_guard.disarm();
 }
 
+/// The signals that end the wrapper restore the terminal it put in raw mode,
+/// and a command that handles one and exits by itself keeps its exit code.
+/// SIGUSR1 and SIGUSR2 are messages for the command instead (below).
 #[test]
-fn catchable_terminating_signals_restore_raw_terminal_state() {
+fn ending_signals_restore_raw_terminal_state_and_keep_a_handled_exit_code() {
     for signal in [
         libc::SIGTERM,
         libc::SIGHUP,
         libc::SIGQUIT,
         libc::SIGINT,
-        libc::SIGUSR1,
-        libc::SIGUSR2,
         libc::SIGALRM,
         libc::SIGVTALRM,
         libc::SIGPROF,
@@ -2108,8 +2109,8 @@ fn external_signal_is_forwarded_to_wrapped_child() {
 
     assert_eq!(
         session.wait_for_exit(Duration::from_secs(2)),
-        Some(128 + libc::SIGTERM as u32),
-        "wrapper did not report signal-style termination"
+        Some(0),
+        "the wrapper did not return the exit code of the command that handled SIGTERM"
     );
     assert!(
         forwarded,
@@ -4243,10 +4244,12 @@ fn sigint_sent_to_the_wrapper_ends_it_by_sigint_when_it_kills_the_command() {
     );
 }
 
-// The guards below hold before and after the change.
+// The guards below held before and after the 1.4.0 change. 1.5.0 changes the
+// wrapper half of the first one: see its comment.
 
 /// A command that handles SIGINT and exits normally keeps its exit code, both
-/// when it raised the signal itself and when the wrapper forwarded it.
+/// when it raised the signal itself and when the wrapper forwarded it. Until
+/// 1.4.0 the wrapper exited with 130 in the second case.
 #[test]
 fn a_command_that_handles_sigint_keeps_its_exit_code() {
     use std::os::unix::process::ExitStatusExt;
@@ -4275,7 +4278,7 @@ fn a_command_that_handles_sigint_keeps_its_exit_code() {
     );
     assert_eq!(
         (forwarded.status.signal(), forwarded.status.code()),
-        (None, Some(128 + libc::SIGINT)),
+        (None, Some(0)),
         "{:?}",
         forwarded.output
     );
@@ -4423,5 +4426,895 @@ fn a_wrapper_started_by_a_script_with_sigint_ignored_still_reports_130() {
         (status.signal(), status.code()),
         (None, Some(128 + libc::SIGINT)),
         "wrapper started with SIGINT ignored by its shell: {output:?}"
+    );
+}
+
+// Signals sent to the wrapper, as 1.5.0 handles them. SIGUSR1 and SIGUSR2 are
+// messages for the command the wrapper started; every other signal that ends
+// the wrapper keeps the 1.4.0 teardown of the command's process group, and the
+// wrapper returns the command's own exit code when the command exited by
+// itself and the normal end of the session completes within its limit.
+
+/// An idle loop for the scripts below. It ends by itself after about ten
+/// seconds, so nothing a test starts outlives it for long even if the sweep
+/// missed it.
+const IDLE: &str = "i=0; while [ $i -lt 100 ]; do sleep 0.1; i=$((i+1)); done";
+
+/// How many lines `name` in the scratch directory holds.
+fn lines_in(scratch: &Scratch, name: &str) -> usize {
+    std::fs::read_to_string(scratch.path(name))
+        .unwrap_or_default()
+        .lines()
+        .count()
+}
+
+/// Whether the process `pid`, a child of this test, has exited, without
+/// reaping it: its pid cannot be reused until it is reaped.
+fn has_exited(pid: libc::pid_t) -> bool {
+    // SAFETY: siginfo_t is a plain C struct; all-zero bytes are a valid value that waitid
+    // overwrites.
+    let mut info = unsafe { std::mem::zeroed::<libc::siginfo_t>() };
+    // SAFETY: `info` is valid for the call; WNOWAIT leaves the child to be reaped by its guard.
+    let result = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            pid as libc::id_t,
+            &mut info,
+            libc::WEXITED | libc::WNOWAIT | libc::WNOHANG,
+        )
+    };
+    // SAFETY: waitid returned 0, so `info` is populated.
+    result == 0 && unsafe { info.si_pid() } == pid
+}
+
+/// Sends `signal` to `pid`, a wrapper this test started and has not reaped.
+fn send(pid: libc::pid_t, signal: libc::c_int) {
+    // SAFETY: kill has no memory-safety preconditions; the target is a wrapper this test spawned
+    // and has not reaped, so its pid is not reused.
+    let sent = unsafe { libc::kill(pid, signal) };
+    assert_eq!(sent, 0, "send signal {signal}");
+}
+
+/// A wrapper started with stdin from /dev/null and its output in a file, for
+/// a test that sends it signals of its own. It waits for the command's READY.
+struct Redirected {
+    // Declared first, so it is dropped first, while the wrapper's tree is whole.
+    _sweep: SessionSweep,
+    wrapper: ProcessGuard,
+    pid: libc::pid_t,
+    output: std::path::PathBuf,
+    stderr: std::path::PathBuf,
+}
+
+impl Redirected {
+    fn start(scratch: &Scratch, extra: &[&std::ffi::OsStr], script: &str) -> Self {
+        let output = scratch.path("output");
+        let mut command = scratch.wrapper(extra, script);
+        command
+            .stdin(std::process::Stdio::null())
+            .stdout(File::create(&output).expect("output file"));
+        Self::spawn(scratch, command, output)
+    }
+
+    /// With stdout already set on `command`; `output` is where READY shows.
+    fn spawn(
+        scratch: &Scratch,
+        mut command: std::process::Command,
+        output: std::path::PathBuf,
+    ) -> Self {
+        let stderr = scratch.path("stderr");
+        command
+            .stdin(std::process::Stdio::null())
+            .stderr(File::create(&stderr).expect("stderr file"));
+        start_with_sigint(&mut command, EntrySigint::Default, Leader::Inherited);
+        let wrapper = ProcessGuard::new(command.spawn().expect("spawn ptty"));
+        let pid = wrapper.pid();
+        Self {
+            _sweep: SessionSweep::new(pid, scratch.sessions()),
+            wrapper,
+            pid,
+            output,
+            stderr,
+        }
+    }
+
+    fn wait_for_ready(&self) {
+        assert!(
+            wait_for_file_containing(&self.output, b"READY", Duration::from_secs(10)),
+            "the command never printed READY: {:?}",
+            self.output()
+        );
+    }
+
+    fn alive(&mut self) -> bool {
+        self.wrapper
+            .child_mut()
+            .try_wait()
+            .expect("poll wrapper")
+            .is_none()
+    }
+
+    fn wait(&mut self, timeout: Duration) -> std::process::ExitStatus {
+        self.wrapper
+            .wait_for_exit(timeout)
+            .unwrap_or_else(|| panic!("the wrapper did not exit: {:?}", self.output()))
+    }
+
+    fn output(&self) -> String {
+        let mut output = std::fs::read_to_string(&self.output).unwrap_or_default();
+        output.push_str(&std::fs::read_to_string(&self.stderr).unwrap_or_default());
+        output
+    }
+}
+
+/// A wrapper on a terminal of its own, as its controlling terminal, as a
+/// shell runs a command at its prompt. It waits for READY and raw mode.
+struct OnTerminal {
+    // Declared first, so it is dropped first, while the wrapper's tree is whole.
+    _sweep: SessionSweep,
+    wrapper: ProcessGuard,
+    pid: libc::pid_t,
+    capture: CaptureTask,
+    tty_path: std::path::PathBuf,
+    tty: Option<File>,
+    master: Option<Box<dyn portable_pty::MasterPty + Send>>,
+    cooked: nix::sys::termios::Termios,
+}
+
+impl OnTerminal {
+    fn start(scratch: &Scratch, extra: &[&std::ffi::OsStr], script: &str) -> Self {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let pair = native_pty_system()
+            .openpty(PtySize::default())
+            .expect("openpty");
+        let tty_path = pair.master.tty_name().expect("outer PTY tty name");
+        let tty = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_NOCTTY)
+            .open(&tty_path)
+            .expect("open outer slave tty");
+        drop(pair.slave);
+        let cooked = outer_terminal_settings(&tty, &*pair.master);
+        let mut command = scratch.wrapper(extra, script);
+        command
+            .stdin(tty.try_clone().expect("stdin tty"))
+            .stdout(tty.try_clone().expect("stdout tty"))
+            .stderr(tty.try_clone().expect("stderr tty"));
+        start_with_sigint(
+            &mut command,
+            EntrySigint::Default,
+            Leader::SessionOnTerminal,
+        );
+        let wrapper = ProcessGuard::new(command.spawn().expect("spawn ptty"));
+        let pid = wrapper.pid();
+        // Made after the spawn: its descriptor is not close-on-exec, and a
+        // wrapper that inherited it would keep the terminal from hanging up.
+        let capture = CaptureTask::from_master(&*pair.master);
+        let session = Self {
+            _sweep: SessionSweep::new(pid, scratch.sessions()),
+            wrapper,
+            pid,
+            capture,
+            tty_path,
+            tty: Some(tty),
+            master: Some(pair.master),
+            cooked,
+        };
+        let ready = session
+            .capture
+            .wait_until(Duration::from_secs(10), |out| contains_bytes(out, b"READY"));
+        assert!(
+            contains_bytes(&ready, b"READY"),
+            "the command never printed READY: {:?}",
+            String::from_utf8_lossy(&ready)
+        );
+        assert!(
+            wait_for_condition(Duration::from_secs(2), || session.is_raw()),
+            "the wrapper never put its terminal in raw mode"
+        );
+        session
+    }
+
+    fn settings(&self) -> nix::sys::termios::Termios {
+        outer_terminal_settings(
+            self.tty.as_ref().expect("terminal open"),
+            &**self.master.as_ref().expect("terminal open"),
+        )
+    }
+
+    fn is_raw(&self) -> bool {
+        !self
+            .settings()
+            .local_flags
+            .contains(nix::sys::termios::LocalFlags::ICANON)
+    }
+
+    fn is_restored(&self) -> bool {
+        self.settings() == self.cooked
+    }
+
+    fn alive(&mut self) -> bool {
+        self.wrapper
+            .child_mut()
+            .try_wait()
+            .expect("poll wrapper")
+            .is_none()
+    }
+
+    fn wait(&mut self, timeout: Duration) -> std::process::ExitStatus {
+        self.wrapper
+            .wait_for_exit(timeout)
+            .expect("the wrapper exits")
+    }
+
+    fn output(&self) -> Vec<u8> {
+        self.capture.wait_until(Duration::ZERO, |_| true)
+    }
+
+    /// Closes every descriptor of the terminal this test holds, which hangs
+    /// up the terminal the wrapper leads.
+    fn hang_up(&mut self) {
+        self.capture.stop_bounded();
+        drop(self.master.take());
+        drop(self.tty.take());
+    }
+
+    /// Reads the terminal again after `capture.stop_bounded`.
+    fn read_again(&mut self) {
+        self.capture = CaptureTask::from_master(&**self.master.as_ref().expect("terminal open"));
+    }
+}
+
+/// A message reaches the command while the session stays live and raw, once
+/// and again, and the session then ends as the command does.
+fn assert_message_reaches_a_live_session(signal: libc::c_int, name: &str) {
+    use std::os::unix::process::ExitStatusExt;
+
+    let scratch = Scratch::new();
+    let mut session = OnTerminal::start(
+        &scratch,
+        &[],
+        &format!("trap 'echo {name} >> \"$SCRATCH/got\"' {name}; echo READY; {IDLE}"),
+    );
+    for round in 1..=2 {
+        send(session.pid, signal);
+        assert!(
+            wait_for_condition(Duration::from_secs(5), || lines_in(&scratch, "got")
+                == round),
+            "SIG{name} number {round} never reached the command"
+        );
+        assert!(
+            session.is_raw(),
+            "the wrapper left raw mode after SIG{name}"
+        );
+        assert!(session.alive(), "SIG{name} ended the wrapper");
+    }
+    // The command does not handle SIGTERM, so it dies from it.
+    send(session.pid, libc::SIGTERM);
+    let status = session.wait(Duration::from_secs(10));
+    assert_eq!(
+        (status.signal(), status.code()),
+        (None, Some(128 + libc::SIGTERM))
+    );
+    assert!(
+        wait_for_condition(Duration::from_secs(1), || session.is_restored()),
+        "the terminal was not given back in its own settings"
+    );
+}
+
+#[test]
+fn usr1_reaches_the_command_and_the_session_stays_live_and_raw() {
+    assert_message_reaches_a_live_session(libc::SIGUSR1, "USR1");
+}
+
+#[test]
+fn usr2_reaches_the_command_and_the_session_stays_live_and_raw() {
+    assert_message_reaches_a_live_session(libc::SIGUSR2, "USR2");
+}
+
+/// A message goes to the command the wrapper started and to nothing else in
+/// its process group: a worker that handles SIGUSR1 while the command ignores
+/// it gets nothing, as with `kill -USR1` of the command's own pid.
+#[test]
+fn a_message_goes_to_the_command_alone() {
+    use std::os::unix::process::ExitStatusExt;
+
+    let scratch = Scratch::new();
+    let mut run = Redirected::start(
+        &scratch,
+        &[],
+        &format!(
+            "sh -c 'trap \"echo worker >> \\\"$SCRATCH/got\\\"\" USR1; echo up > \"$SCRATCH/worker\"; {IDLE}' & \
+             trap '' USR1; echo READY; {IDLE}"
+        ),
+    );
+    run.wait_for_ready();
+    assert!(
+        wait_for_file_containing(&scratch.path("worker"), b"up", Duration::from_secs(5)),
+        "the worker never started"
+    );
+    send(run.pid, libc::SIGUSR1);
+    thread::sleep(Duration::from_millis(800));
+    assert!(run.alive(), "SIGUSR1 ended the wrapper: {:?}", run.output());
+    assert_eq!(
+        lines_in(&scratch, "got"),
+        0,
+        "the worker got the message meant for the command"
+    );
+    send(run.pid, libc::SIGTERM);
+    let status = run.wait(Duration::from_secs(10));
+    assert_eq!(
+        (status.signal(), status.code()),
+        (None, Some(128 + libc::SIGTERM)),
+        "{:?}",
+        run.output()
+    );
+}
+
+/// A command that leaves SIGUSR1 at its default action dies from it, and the
+/// session ends as for any command death: 128 plus the signal, the terminal
+/// given back, the pid file removed.
+#[test]
+fn an_unhandled_usr1_ends_the_command_and_the_session_as_any_command_death() {
+    use std::os::unix::process::ExitStatusExt;
+
+    let scratch = Scratch::new();
+    let mut session = OnTerminal::start(&scratch, &[], &format!("echo READY; {IDLE}"));
+    send(session.pid, libc::SIGUSR1);
+    let status = session.wait(Duration::from_secs(10));
+    assert_eq!(
+        (status.signal(), status.code()),
+        (None, Some(128 + libc::SIGUSR1)),
+        "{:?}",
+        String::from_utf8_lossy(&session.output())
+    );
+    assert!(
+        wait_for_condition(Duration::from_secs(1), || session.is_restored()),
+        "the terminal was not given back in its own settings"
+    );
+    assert!(
+        scratch.path("runtime").join("pids.d").is_dir() && !scratch.pid_file(session.pid).exists(),
+        "the session's pid file was not removed"
+    );
+}
+
+/// The command handles SIGUSR1 by writing a line and SIGTERM by exiting 7.
+fn message_counting_script() -> String {
+    format!("trap 'echo x >> \"$SCRATCH/got\"' USR1; trap 'exit 7' TERM; echo READY; {IDLE}")
+}
+
+/// Signals of one kind coalesce: a burst of messages reaches the command
+/// fewer times than it was sent, and the session goes on.
+#[test]
+fn a_burst_of_messages_coalesces_and_the_session_goes_on() {
+    use std::os::unix::process::ExitStatusExt;
+
+    let scratch = Scratch::new();
+    let mut run = Redirected::start(&scratch, &[], &message_counting_script());
+    run.wait_for_ready();
+    for _ in 0..2000 {
+        send(run.pid, libc::SIGUSR1);
+    }
+    assert!(
+        wait_for_condition(Duration::from_secs(5), || lines_in(&scratch, "got") > 0),
+        "no message reached the command"
+    );
+    thread::sleep(Duration::from_millis(500));
+    assert!(
+        run.alive(),
+        "the burst ended the wrapper: {:?}",
+        run.output()
+    );
+    let delivered = lines_in(&scratch, "got");
+    assert!(
+        (1..=2000).contains(&delivered),
+        "{delivered} messages reached the command"
+    );
+    send(run.pid, libc::SIGTERM);
+    let status = run.wait(Duration::from_secs(10));
+    assert_eq!(
+        (status.signal(), status.code()),
+        (None, Some(7)),
+        "{:?}",
+        run.output()
+    );
+}
+
+/// SIGTERM ends the session while messages keep arriving: the end is not
+/// queued behind them.
+#[test]
+fn sigterm_ends_the_session_during_a_flood_of_messages() {
+    use std::os::unix::process::ExitStatusExt;
+
+    let scratch = Scratch::new();
+    let mut run = Redirected::start(&scratch, &[], &message_counting_script());
+    run.wait_for_ready();
+    let pid = run.pid;
+    let stop = Arc::new(AtomicBool::new(false));
+    let flood = {
+        let stop = Arc::clone(&stop);
+        thread::spawn(move || {
+            // Bounded, and stopped by the test before the wrapper is reaped,
+            // so its pid is never reused while this sends.
+            let until = Instant::now() + Duration::from_secs(10);
+            let mut sent = 0_u64;
+            while !stop.load(Ordering::Acquire) && Instant::now() < until {
+                // SAFETY: kill has no memory-safety preconditions; `pid` is the unreaped wrapper.
+                if unsafe { libc::kill(pid, libc::SIGUSR1) } != 0 {
+                    break;
+                }
+                sent += 1;
+            }
+            sent
+        })
+    };
+    thread::sleep(Duration::from_millis(500));
+    let term_sent = Instant::now();
+    send(pid, libc::SIGTERM);
+    let ended = wait_for_condition(Duration::from_secs(8), || has_exited(pid));
+    let took = term_sent.elapsed();
+    stop.store(true, Ordering::Release);
+    let sent = flood.join().expect("flood thread");
+    let status = run.wait(Duration::from_secs(5));
+    assert!(ended, "the wrapper did not end during the flood");
+    assert_eq!(
+        (status.signal(), status.code()),
+        (None, Some(7)),
+        "after {sent} messages: {:?}",
+        run.output()
+    );
+    assert!(
+        took < Duration::from_secs(5),
+        "the end took {took:?} during the flood"
+    );
+}
+
+/// Once the wrapper has begun to end the session, a message sent after the
+/// ending signal need not reach the command. Here the command's SIGTERM
+/// handler runs five seconds, so the 1.4.0 teardown cuts it off at about two.
+#[test]
+fn a_message_sent_once_the_end_has_begun_is_not_delivered() {
+    use std::os::unix::process::ExitStatusExt;
+
+    let scratch = Scratch::new();
+    let mut run = Redirected::start(
+        &scratch,
+        &[],
+        &format!(
+            "trap 'echo usr1 >> \"$SCRATCH/got\"' USR1; \
+             trap 'echo term >> \"$SCRATCH/got\"; j=0; while [ $j -lt 50 ]; do sleep 0.1; j=$((j+1)); done; exit 0' TERM; \
+             echo READY; {IDLE}"
+        ),
+    );
+    run.wait_for_ready();
+    send(run.pid, libc::SIGTERM);
+    assert!(
+        wait_for_file_containing(&scratch.path("got"), b"term", Duration::from_secs(5)),
+        "the command never handled SIGTERM"
+    );
+    send(run.pid, libc::SIGUSR1);
+    let status = run.wait(Duration::from_secs(10));
+    let got = std::fs::read_to_string(scratch.path("got")).unwrap_or_default();
+    assert_eq!(
+        (status.signal(), status.code()),
+        (None, Some(128 + libc::SIGTERM)),
+        "{got:?} {:?}",
+        run.output()
+    );
+    assert!(
+        !got.contains("usr1"),
+        "the late message was delivered: {got:?}"
+    );
+}
+
+/// Reads `file` until `needle` shows or `timeout` passes.
+fn read_until(file: &mut File, needle: &[u8], timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    let mut seen = Vec::new();
+    let mut buffer = [0_u8; 4096];
+    while Instant::now() < deadline {
+        let mut poll_fd = libc::pollfd {
+            fd: file.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: `poll_fd` is a valid, exclusively borrowed pollfd and the count matches.
+        if unsafe { libc::poll(&mut poll_fd, 1, 50) } <= 0 {
+            continue;
+        }
+        match file.read(&mut buffer) {
+            Ok(read) if read > 0 => seen.extend_from_slice(&buffer[..read]),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => continue,
+            _ => return contains_bytes(&seen, needle),
+        }
+        if contains_bytes(&seen, needle) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Writes to `file`, a non-blocking description of its own, until the pipe or
+/// terminal behind it holds no more.
+fn fill(file: &mut File) {
+    let chunk = [b'f'; 4096];
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match file.write(&chunk) {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => panic!("fill: {error}"),
+        }
+        assert!(Instant::now() < deadline, "fill never blocked");
+    }
+}
+
+/// The command answers SIGTERM with one short line and exits 0, so it is
+/// reaped at once and the wrapper's normal end then has that line to write.
+fn short_line_on_term_script() -> String {
+    format!("trap 'echo bye; exit 0' TERM; echo READY; {IDLE}")
+}
+
+/// The end of a session is limited to about four seconds from the ending
+/// signal. Here the command exits by itself at once, but its last line cannot
+/// be written to the full pipe: the limit ends the wrapper abruptly with 128
+/// plus the signal, as 1.4.0 did, and not sooner (1.4.0 exited at once).
+#[test]
+fn the_end_is_limited_when_the_output_pipe_is_full() {
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::process::ExitStatusExt;
+
+    let scratch = Scratch::new();
+    let fifo = scratch.path("output.fifo");
+    let path = std::ffi::CString::new(fifo.to_str().expect("UTF-8 path")).expect("fifo path");
+    // SAFETY: `path` is a valid NUL-terminated string for the call.
+    assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0, "mkfifo");
+    // Three descriptions of one pipe: the test reads READY from the first,
+    // the wrapper writes to the second, which blocks, and the test fills the
+    // pipe through the third, which does not.
+    let mut read_end = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(&fifo)
+        .expect("read end");
+    let wrapper_end = OpenOptions::new()
+        .write(true)
+        .open(&fifo)
+        .expect("wrapper end");
+    let mut filler = OpenOptions::new()
+        .write(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(&fifo)
+        .expect("filler end");
+    let mut command = scratch.wrapper(&[], &short_line_on_term_script());
+    command.stdout(wrapper_end);
+    let mut run = Redirected::spawn(&scratch, command, scratch.path("unused"));
+    assert!(
+        read_until(&mut read_end, b"READY", Duration::from_secs(10)),
+        "the command never printed READY"
+    );
+    fill(&mut filler);
+    let term_sent = Instant::now();
+    send(run.pid, libc::SIGTERM);
+    let status = run.wait(Duration::from_secs(15));
+    let took = term_sent.elapsed();
+    drop(read_end);
+    assert_eq!(
+        (status.signal(), status.code()),
+        (None, Some(128 + libc::SIGTERM)),
+        "{:?}",
+        run.output()
+    );
+    assert!(
+        took >= Duration::from_secs(3) && took < Duration::from_secs(7),
+        "the end took {took:?}"
+    );
+    assert!(
+        !scratch.pid_file(run.pid).exists(),
+        "the session's pid file was not removed"
+    );
+}
+
+/// The same with a full terminal that nobody reads. A session leader's exit
+/// waits for its terminal's output to drain on macOS (1.4.0 then stayed past
+/// 15 s), so the test reads the terminal again six seconds after the signal:
+/// by then the limit has decided the status, where a normal end that waited
+/// for the terminal would have returned the command's 0.
+#[test]
+fn the_end_is_limited_when_the_terminal_is_full() {
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::process::ExitStatusExt;
+
+    let scratch = Scratch::new();
+    let mut session = OnTerminal::start(&scratch, &[], &short_line_on_term_script());
+    session.capture.stop_bounded();
+    let mut filler = OpenOptions::new()
+        .write(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY)
+        .open(&session.tty_path)
+        .expect("filler description of the terminal");
+    fill(&mut filler);
+    send(session.pid, libc::SIGTERM);
+    thread::sleep(Duration::from_secs(6));
+    session.read_again();
+    let status = session.wait(Duration::from_secs(10));
+    assert_eq!(
+        (status.signal(), status.code()),
+        (None, Some(128 + libc::SIGTERM))
+    );
+    assert!(
+        !scratch.pid_file(session.pid).exists(),
+        "the session's pid file was not removed"
+    );
+}
+
+/// A shell that answers SIGTERM by waiting for its worker reports the
+/// worker's death by SIGKILL as its own exit status 137, an ordinary exit.
+/// The wrapper returns the command's exit code, so it returns 137: the code
+/// describes the command and says nothing about how its processes ended.
+#[test]
+fn a_shell_that_reports_its_killed_worker_with_137_gives_137() {
+    use std::os::unix::process::ExitStatusExt;
+
+    let scratch = Scratch::new();
+    let mut run = Redirected::start(
+        &scratch,
+        &[],
+        &format!(
+            "trap 'echo term >> \"$SCRATCH/got\"' TERM; \
+             sh -c 'trap \"kill -KILL \\$\\$\" TERM; echo READY; {IDLE}'; exit $?"
+        ),
+    );
+    run.wait_for_ready();
+    send(run.pid, libc::SIGTERM);
+    let status = run.wait(Duration::from_secs(10));
+    assert_eq!(
+        (status.signal(), status.code()),
+        (None, Some(137)),
+        "{:?}",
+        run.output()
+    );
+    assert_eq!(
+        lines_in(&scratch, "got"),
+        1,
+        "the shell never handled SIGTERM"
+    );
+}
+
+/// Around the two-second escalation the command either exits by itself or is
+/// killed first. Either may win; the wrapper's status must say which did.
+#[test]
+fn near_the_escalation_the_status_says_whether_the_command_exited_by_itself() {
+    use std::os::unix::process::ExitStatusExt;
+
+    for delay in ["1.9", "1.95", "2.0", "2.05"] {
+        let scratch = Scratch::new();
+        let mut run = Redirected::start(
+            &scratch,
+            &[],
+            &format!(
+                "trap 'sleep {delay}; echo done >> \"$SCRATCH/got\"; exit 7' TERM; echo READY; {IDLE}"
+            ),
+        );
+        run.wait_for_ready();
+        send(run.pid, libc::SIGTERM);
+        let status = run.wait(Duration::from_secs(10));
+        let done = lines_in(&scratch, "got") == 1;
+        match (status.signal(), status.code()) {
+            (None, Some(7)) => assert!(done, "exit 7 without the command's own exit ({delay} s)"),
+            (None, Some(code)) if code == 128 + libc::SIGTERM => {}
+            other => panic!(
+                "unexpected status {other:?} ({delay} s): {:?}",
+                run.output()
+            ),
+        }
+    }
+}
+
+/// A SIGTERM handler that writes a last, unterminated line and exits 7 gives
+/// 7, and that line is drawn with its colour closed, on the screen and in the
+/// trace, before the terminal is given back.
+#[test]
+fn a_term_handler_that_exits_7_gives_7_after_its_last_line_is_drawn() {
+    use std::os::unix::process::ExitStatusExt;
+
+    let scratch = Scratch::colouring_the_held_tail();
+    let trace = scratch.path("trace.log");
+    let mut session = OnTerminal::start(
+        &scratch,
+        &[std::ffi::OsStr::new("--trace-io"), trace.as_os_str()],
+        &format!("trap 'printf \"last line\\nheld\"\"tail\"; exit 7' TERM; echo READY; {IDLE}"),
+    );
+    send(session.pid, libc::SIGTERM);
+    let status = session.wait(Duration::from_secs(10));
+    let output = session
+        .capture
+        .wait_until(Duration::from_secs(2), held_tail_coloured_and_closed);
+    let trace = std::fs::read_to_string(&trace).expect("trace file");
+    assert_eq!(
+        (status.signal(), status.code()),
+        (None, Some(7)),
+        "{:?}",
+        String::from_utf8_lossy(&output)
+    );
+    // The wrapper gives the terminal back as soon as it takes the signal, as
+    // 1.4.0 did, and draws the rest after that: the terminal's own output
+    // processing then adds a carriage return to the PTY's CR LF.
+    assert!(
+        (contains_bytes(&output, b"last line\r\n") || contains_bytes(&output, b"last line\r\r\n"))
+            && held_tail_coloured_and_closed(&output),
+        "the last, unterminated line was not drawn with its colour closed: {:?}",
+        String::from_utf8_lossy(&output)
+    );
+    assert!(
+        trace_has_closed_held_tail(&trace),
+        "the trace does not end with the last line and its colour reset: {trace}"
+    );
+    assert!(
+        wait_for_condition(Duration::from_secs(1), || session.is_restored()),
+        "the terminal was not given back in its own settings"
+    );
+    assert!(
+        !scratch.pid_file(session.pid).exists(),
+        "the session's pid file was not removed"
+    );
+}
+
+#[test]
+fn a_term_handler_that_exits_7_gives_7_after_its_last_line_is_written() {
+    use std::os::unix::process::ExitStatusExt;
+
+    let scratch = Scratch::colouring_the_held_tail();
+    let mut run = Redirected::start(
+        &scratch,
+        &[],
+        &format!("trap 'printf \"last line\\nheld\"\"tail\"; exit 7' TERM; echo READY; {IDLE}"),
+    );
+    run.wait_for_ready();
+    send(run.pid, libc::SIGTERM);
+    let status = run.wait(Duration::from_secs(10));
+    let output = run.output();
+    assert_eq!(
+        (status.signal(), status.code()),
+        (None, Some(7)),
+        "{output:?}"
+    );
+    assert!(
+        output.contains("last line\n") && held_tail_coloured_and_closed(output.as_bytes()),
+        "the last, unterminated line was not written with its colour closed: {output:?}"
+    );
+}
+
+/// SIGINT and SIGQUIT sent to the wrapper keep the 1.4.0 teardown: a command
+/// that ignores them is killed after about two seconds and the wrapper exits
+/// with 128 plus the signal.
+#[test]
+fn int_and_quit_sent_to_the_wrapper_keep_the_bounded_teardown() {
+    use std::os::unix::process::ExitStatusExt;
+
+    for (signal, name) in [(libc::SIGINT, "INT"), (libc::SIGQUIT, "QUIT")] {
+        let scratch = Scratch::new();
+        let mut run = Redirected::start(
+            &scratch,
+            &[],
+            &format!("trap '' {name}; echo READY; {IDLE}"),
+        );
+        run.wait_for_ready();
+        let sent = Instant::now();
+        send(run.pid, signal);
+        let status = run.wait(Duration::from_secs(10));
+        let took = sent.elapsed();
+        assert_eq!(
+            (status.signal(), status.code()),
+            (None, Some(128 + signal)),
+            "SIG{name}: {:?}",
+            run.output()
+        );
+        assert!(
+            took >= Duration::from_millis(1500) && took < Duration::from_secs(5),
+            "SIG{name}: the teardown took {took:?}"
+        );
+    }
+}
+
+/// When the normal end cannot write the command's last output, the end is
+/// abrupt after all: 128 plus the signal, without an error message, and the
+/// group that was already torn down is not signalled again.
+#[test]
+fn an_output_failure_after_a_handled_term_ends_with_143() {
+    use std::os::unix::process::ExitStatusExt;
+
+    let scratch = Scratch::new();
+    let (mut read_end, write_end) = pipe_files();
+    // Kept from the wrapper, which would otherwise hold the pipe open.
+    for end in [&read_end, &write_end] {
+        // SAFETY: F_GETFD and F_SETFD take integer arguments and the descriptor is open.
+        unsafe {
+            let flags = libc::fcntl(end.as_raw_fd(), libc::F_GETFD);
+            libc::fcntl(end.as_raw_fd(), libc::F_SETFD, flags | libc::FD_CLOEXEC);
+        }
+    }
+    let mut command = scratch.wrapper(
+        &[],
+        // The command writes while it is still running, so the wrapper's
+        // write fails while the teardown of its group is under way.
+        &format!("trap 'echo bye; sleep 0.3; exit 0' TERM; echo READY; {IDLE}"),
+    );
+    command.stdout(write_end);
+    let mut run = Redirected::spawn(&scratch, command, scratch.path("unused"));
+    assert!(
+        read_until(&mut read_end, b"READY", Duration::from_secs(10)),
+        "the command never printed READY"
+    );
+    drop(read_end);
+    send(run.pid, libc::SIGTERM);
+    let status = run.wait(Duration::from_secs(10));
+    let stderr = std::fs::read_to_string(scratch.path("stderr")).unwrap_or_default();
+    assert_eq!(
+        (status.signal(), status.code()),
+        (None, Some(128 + libc::SIGTERM)),
+        "{stderr:?}"
+    );
+    assert!(!stderr.contains("prismtty:"), "{stderr:?}");
+}
+
+/// A hangup of the terminal while the command handles SIGHUP: the normal end
+/// races the hangup, so the wrapper returns 129, or the command's own 0 when
+/// the end had nothing left to draw.
+#[test]
+fn a_terminal_hangup_the_command_handles_ends_with_129_or_its_code() {
+    use std::os::unix::process::ExitStatusExt;
+
+    let scratch = Scratch::new();
+    let mut session = OnTerminal::start(
+        &scratch,
+        &[],
+        &format!("trap 'sleep 0.3; echo bye; exit 0' HUP; echo READY; {IDLE}"),
+    );
+    session.hang_up();
+    let status = session.wait(Duration::from_secs(10));
+    assert!(
+        matches!(
+            (status.signal(), status.code()),
+            (None, Some(0)) | (None, Some(129))
+        ),
+        "{status:?}"
+    );
+    assert!(
+        !scratch.pid_file(session.pid).exists(),
+        "the session's pid file was not removed"
+    );
+}
+
+/// A message that kills the command ends the session at once even while a
+/// worker that ignores the hangup keeps the terminal open (on Linux the
+/// terminal is not hung up when its session leader exits).
+#[test]
+fn a_message_that_kills_the_command_ends_the_session_while_its_worker_holds_the_terminal() {
+    use std::os::unix::process::ExitStatusExt;
+
+    let scratch = Scratch::new();
+    let mut run = Redirected::start(
+        &scratch,
+        &[],
+        &format!("( trap '' HUP INT TERM USR1 USR2; {IDLE} ) & echo READY; {IDLE}"),
+    );
+    run.wait_for_ready();
+    let sent = Instant::now();
+    send(run.pid, libc::SIGUSR1);
+    let status = run.wait(Duration::from_secs(10));
+    let took = sent.elapsed();
+    assert_eq!(
+        (status.signal(), status.code()),
+        (None, Some(128 + libc::SIGUSR1)),
+        "{:?}",
+        run.output()
+    );
+    assert!(
+        took < Duration::from_secs(3),
+        "the session ended after {took:?}"
     );
 }
