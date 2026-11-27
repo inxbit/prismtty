@@ -2303,9 +2303,17 @@ fn prompt_echo_source_sgr_leaves_active_style(input: &[u8], ranges: &[(usize, us
         return false;
     }
 
+    // Whether the program may have left a style on, which a terminal that
+    // runs the SGR would draw the command in: one opened by the UTF-8 form
+    // `C2 9B` counts as well, read as its 7-bit form, though no rendition is
+    // learned from it (see `NativeSgrState::apply_sequence`).
     let mut state = NativeSgrState::default();
     for (start, end) in ranges {
-        state.apply_sequence(&input[*start..*end]);
+        let sequence = &input[*start..*end];
+        match sequence.strip_prefix(b"\xc2\x9b") {
+            Some(rest) => state.apply_sequence(&[b"\x1b[".as_slice(), rest].concat()),
+            None => state.apply_sequence(sequence),
+        }
     }
     state.ansi_start().is_some()
 }
