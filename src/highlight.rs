@@ -3302,9 +3302,11 @@ fn plain_lines_before_prompt_redraw(
 /// terminal stops them. A character written in the last column (the next one
 /// may wrap to a new row), a tab (the program may have moved the tab stops),
 /// a character that is not ASCII (it may take no column, one or two), and a
-/// move whose count is too large to read leave it unknown. A character that
-/// is not ASCII and may not fit before the right edge can wrap to the next
-/// row, so it forgets the prompt. A stretch holding a character that is not
+/// move whose count is too large to read leave it unknown. So does a line
+/// feed from any column but the first: the terminal's output processing can
+/// turn it into CR LF, and so does newline mode. A character that is not
+/// ASCII and may not fit before the right edge can wrap to the next row, so
+/// it forgets the prompt. A stretch holding a character that is not
 /// ASCII is taken to cover two columns for each character, and a stretch
 /// that may not fit on the row is no prompt.
 #[derive(Debug)]
@@ -3337,6 +3339,7 @@ impl LastLine {
         self.stretch.clear();
         self.continuation_bytes = 0;
         self.prompt = None;
+        self.column = self.column.filter(|column| *column == 0);
     }
 
     fn carriage_return(&mut self) {
