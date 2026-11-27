@@ -2,6 +2,67 @@
 
 All notable changes to PrismTTY are documented here.
 
+## 1.5.0 - unreleased
+
+### Changed
+
+- SIGUSR1 and SIGUSR2 sent to PrismTTY no longer end it with 128 plus the
+  signal. PrismTTY passes them to the command it started, alone, while that
+  command runs, as `kill -USR1` of the command would without PrismTTY, and
+  the session goes on with the terminal in raw mode. Signals of one kind can
+  coalesce, and one that arrives after PrismTTY began to end the session is
+  not passed on. A signal that PrismTTY inherited as ignored or blocked, as
+  `nohup` leaves SIGHUP and a script's background job leaves SIGINT and
+  SIGQUIT, is still not passed on and does not end PrismTTY, for SIGUSR1 and
+  SIGUSR2 as for the signals that end it.
+
+  A worker that handles SIGUSR1 while the command PrismTTY started ignores it
+  gets nothing, and a shell that leaves SIGUSR1 at its default action dies
+  from it and ends the session with 128 plus the signal. To reach a server
+  started through a shell, start it with `exec`
+  (`prismtty -- sh -c 'exec server'`) or send the signal to the server's own
+  pid.
+
+- When PrismTTY is sent SIGTERM, SIGHUP, SIGINT, SIGQUIT or another signal
+  that ends it, and the command exits by itself, PrismTTY now draws the output
+  that reached it and exits with the command's exit code instead of 128 plus
+  the signal. A SIGTERM handler that exits 0 gives 0 and one that exits 7
+  gives 7, and a shell that reports its worker's death by SIGKILL as 137 gives
+  137. A supervisor that reads 143 as stopped now sees the command's code.
+
+  The teardown is the one of 1.4.0: while the command runs, the signal goes to
+  its process group, and what is left of the group is killed as soon as the
+  command exits, or after two seconds. The command has exited by itself when
+  its wait status is an ordinary exit, even one that came near or after the
+  two seconds. The code describes the command PrismTTY started, not its
+  process group: 0 does not mean that every process in the group finished
+  cleanly.
+
+  The end stays as abrupt as in 1.4.0, with 128 plus the signal, when the
+  command was killed by a signal or could not be collected, or when the normal
+  end cannot complete within about four seconds of the signal, as when nothing
+  reads PrismTTY's output; output not yet drawn can then be lost. The four
+  seconds count while PrismTTY is not stopped; on macOS a PrismTTY that leads
+  its terminal's session also waits, as it exits, while output it wrote to that
+  terminal is still unread. When PrismTTY was sent SIGINT and the command died
+  from it, PrismTTY still ends by SIGINT, and a command that dies from SIGINT
+  after PrismTTY was sent SIGTERM still gives 143. PrismTTY acts on the first
+  ending signal recorded before the final pending-signal check in its shutdown
+  handoff, including one recorded while the session is ending; a later recorded
+  ending signal does not replace it. If none is recorded by that check,
+  PrismTTY gives the signals back to their previous actions. Give-back and any
+  reinstallation of PrismTTY's handlers each use one `sigaction` per signal, so
+  a signal during either transition can take its previous action or reach
+  PrismTTY's handler. A handler that entered earlier but records an ending
+  signal only after the final check has no taker; that signal does not change
+  the session's otherwise determined result. After give-back completes without
+  reinstallation, later signals take their previous actions.
+
+  This changes two statements of the 1.4.0 entry below: a signal other than
+  SIGINT sent to PrismTTY no longer always ends it with 128 plus that signal,
+  and a command that handles a SIGINT PrismTTY passed on keeps its exit code
+  instead of 130.
+
 ## 1.4.1 - 2026-11-27
 
 ### Fixed

@@ -191,18 +191,56 @@ terminal's output processing during the session.
 A command killed by a signal is reported as 128 plus the signal number, as a
 shell does, with one exception: when SIGINT (Ctrl-C) kills the command,
 PrismTTY ends by SIGINT too, after restoring the terminal, so a loop typed at a
-shell prompt stops after one Ctrl-C as it does without PrismTTY. When PrismTTY
-itself is sent a signal that ends it, such as SIGTERM, SIGHUP or SIGINT, it
-passes the signal on to the command and exits with 128 plus that signal; it
-ends by SIGINT instead only when it was sent SIGINT and the command died from
-it, so a command that dies from SIGINT after PrismTTY was sent SIGTERM still
-gives 143. In a shell `$?` is still 130; a program that reads the wait status
-sees the signal (Python's `subprocess` reports -2, `make` prints `Interrupt`).
-PrismTTY keeps 130 when it was started with SIGINT ignored or blocked. A script
-that runs with the terminal on its stdin, and a zsh or dash pipeline where
-PrismTTY is not the last command, still go on after one Ctrl-C, because those
-shells stop only when they receive the Ctrl-C themselves and PrismTTY, holding
-the terminal in raw mode, receives it instead.
+shell prompt stops after one Ctrl-C as it does without PrismTTY. In a shell
+`$?` is still 130; a program that reads the wait status sees the signal
+(Python's `subprocess` reports -2, `make` prints `Interrupt`). PrismTTY keeps
+130 when it was started with SIGINT ignored or blocked. A script that runs with
+the terminal on its stdin, and a zsh or dash pipeline where PrismTTY is not the
+last command, still go on after one Ctrl-C, because those shells stop only when
+they receive the Ctrl-C themselves and PrismTTY, holding the terminal in raw
+mode, receives it instead.
+
+When PrismTTY itself is sent a signal that ends it, such as SIGTERM, SIGHUP,
+SIGINT or SIGQUIT, and the command is still running, PrismTTY passes the signal
+on to the command's process group and, as before, kills what is left of that
+group as soon as the command exits, or after two seconds. If the command exited
+by itself (its wait status is an ordinary exit, even one that came near or
+after those two seconds), PrismTTY, which gives the terminal back as soon as it
+takes the signal, as before, then draws the output that reached it and exits
+with the command's exit code, so a command that cleans up on SIGTERM and exits
+0 gives 0. If the command was killed by a signal or could not be collected, or
+that normal end does not complete within about four seconds of the signal, the
+end is abrupt, as before: PrismTTY exits with 128 plus the signal it was sent,
+and output not yet drawn can be lost. It ends by SIGINT instead when it was
+sent SIGINT and the command died from it, so a command that dies from SIGINT
+after PrismTTY was sent SIGTERM still gives 143. The four seconds count while
+PrismTTY is not stopped; on macOS a PrismTTY that leads its terminal's session
+also waits, as it exits, while output it wrote to that terminal is still
+unread. The exit code describes the command PrismTTY started, not the rest of
+its process group: 0 does not mean that every process in the group finished
+cleanly. PrismTTY acts on the first such signal recorded before the final
+pending-signal check in its shutdown handoff, including one recorded while the
+session is ending; a later recorded one does not replace it. If none is
+recorded by that check, PrismTTY gives the signals back to their previous
+actions. Give-back and any reinstallation of PrismTTY's handlers each use one
+`sigaction` per signal, so a signal during either transition can take its
+previous action or reach PrismTTY's handler. A handler that entered earlier but
+records such a signal only after the final check has no taker; that signal does
+not change the session's otherwise determined result. After give-back completes
+without reinstallation, later signals take their previous actions.
+
+SIGUSR1 and SIGUSR2 sent to PrismTTY are passed to the command it started,
+alone, while it runs, unless PrismTTY inherited them ignored or blocked, and do
+not end PrismTTY themselves; like any signals of one kind they can coalesce,
+and one that arrives after PrismTTY began to end the session is not passed on.
+A worker that handles SIGUSR1 while the command PrismTTY started ignores it
+gets nothing, and a shell that leaves SIGUSR1 at its default action dies from
+it and ends the session; to reach a server started through a shell, start it
+with `exec`, or send the signal to the server's own pid. A signal that PrismTTY
+inherited as ignored or blocked, as `nohup` leaves SIGHUP and a script's
+background job leaves SIGINT and SIGQUIT, is not passed on and does not end
+PrismTTY: PrismTTY leaves it as its caller set it, as before. This holds for
+SIGUSR1 and SIGUSR2 as for the signals that end it.
 
 To page the output of a command that needs no keyboard, take the terminal off
 its stdin:
