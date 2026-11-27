@@ -159,7 +159,7 @@ fn assert_only_errors_colored(
 
 #[test]
 fn lines_that_share_a_read_with_a_prompt_redraw_are_colored() {
-    let read = b"link is down error 10.0.0.1\r\nsecond error\r\n\x1b[1G\x1b[0Kuser@host ~ $ ";
+    let read = b"link is down error 192.0.2.1\r\nsecond error\r\n\x1b[1G\x1b[0Kuser@host ~ $ ";
     let output = render(&[read]);
     assert!(
         output.ends_with(b"\x1b[1G\x1b[0Kuser@host ~ $ "),
@@ -167,7 +167,7 @@ fn lines_that_share_a_read_with_a_prompt_redraw_are_colored() {
         String::from_utf8_lossy(&output)
     );
     let screen = Screen::rendered(6, 40, &output);
-    assert_eq!(screen.text(0), "link is down error 10.0.0.1");
+    assert_eq!(screen.text(0), "link is down error 192.0.2.1");
     assert_eq!(red_text(&screen, 0), (13..18).collect::<Vec<_>>());
     assert_eq!(red_text(&screen, 1), (7..12).collect::<Vec<_>>());
     assert_eq!(screen.text(2), "user@host ~ $");
@@ -215,7 +215,7 @@ fn zsh_output_coalesced_with_its_right_prompt_is_colored() {
     ]);
     let right_prompt = concat(&[
         b"\r\n",
-        b"link is down error 10.0.0.1\r\nsecond error\r\n",
+        b"link is down error 192.0.2.1\r\nsecond error\r\n",
         &prompt_sp,
         b"\r\x1b[0m\x1b[27m\x1b[24m\x1b[Jhost% \x1b[K\x1b[53C[0]\x1b[56D\x1b[?2004h",
     ]);
@@ -225,7 +225,7 @@ fn zsh_output_coalesced_with_its_right_prompt_is_colored() {
     // rewritten in place, so it and everything after it stay as they came.
     let two_line = concat(&[
         b"\r\n",
-        b"link is down error 10.0.0.1\r\n",
+        b"link is down error 192.0.2.1\r\n",
         &prompt_sp,
         b"\r\x1b[0m\x1b[27m\x1b[24m\x1b[Jerror zone up\r\n% \x1b[K\x1b[74C[0]\x1b[77D\x1b[?2004h",
     ]);
@@ -308,12 +308,12 @@ fn reads_that_can_return_to_their_lines_stay_on_the_bypass_review_45() {
         ("two rows repainted", &[b"error AAAA\r\nerror BBBB\r\n\x1b[2A\x1b[1Gxx\x1b[1B\x1b[1Gxx"]),
         ("absolute position", &[b"error AAAA\r\nerror BBBB\r\n\x1b[1;1HOK"]),
         ("OSC, then up", &[b"\x1b]0;title\ninner\x07error\r\n\x1b[1AOK"]),
-        ("logo, then up", &[b"\x1b[1m\x1b[31m   --+oo up oo+--\r\n   ++ 10.0.0.9 ++\r\n\x1b[m\x1b[2A\x1b[30Cuser@host up\r\n"]),
+        ("logo, then up", &[b"\x1b[1m\x1b[31m   --+oo up oo+--\r\n   ++ 192.0.2.9 ++\r\n\x1b[m\x1b[2A\x1b[30Cuser@host up\r\n"]),
         ("CSI A cut by the read end", &[b"error error\r\n\x1b[1Gp$ \x1b[1", b"A\x1b[1GOK"]),
         ("ESC 8 cut by the read end", &[b"\x1b7\r\nerror error\r\n\x1b[1Gp$ \x1b", b"8OK"]),
         ("OSC payload LF", &[b"\x1b]0;error\n\x07\x1b[1Gplain"]),
         ("DCS payload LF", &[b"\x1bPerror\n\x1b\\\x1b[1Gplain"]),
-        ("progress repaint", &[b"build error 10.0.0.1\r\n\x1b[1A\x1b[2Kprogress 50%\r\n"]),
+        ("progress repaint", &[b"build error 192.0.2.1\r\n\x1b[1A\x1b[2Kprogress 50%\r\n"]),
         ("cursor move on the first line", &[b"\x1b[5Gabc error\r\nnext error\r\n"]),
     ];
     for (name, reads) in cases {
@@ -722,10 +722,10 @@ fn wait_for_file(path: &Path) {
 fn pty_output_written_with_its_prompt_redraw_in_one_write_is_colored() {
     let run = run_in_pty(
         24,
-        "printf 'link is down error 10.0.0.1\\r\\nsecond error\\r\\n\\033[1G\\033[0Kuser@host ~ $ ' | cat; sleep 0.2",
+        "printf 'link is down error 192.0.2.1\\r\\nsecond error\\r\\n\\033[1G\\033[0Kuser@host ~ $ ' | cat; sleep 0.2",
         |_, _| {},
     );
-    let write = b"link is down error 10.0.0.1\r\nsecond error\r\n\x1b[1G\x1b[0Kuser@host ~ $ ";
+    let write = b"link is down error 192.0.2.1\r\nsecond error\r\n\x1b[1G\x1b[0Kuser@host ~ $ ";
     assert_eq!(
         run.reads,
         vec![write.to_vec()],
