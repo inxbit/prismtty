@@ -3094,7 +3094,8 @@ fn ensure_child_is_reapable() -> io::Result<()> {
 
 /// Whether the caller left SIGINT at its default action and unblocked, as a
 /// shell starts a foreground command. A caller that ignored it (`cmd &` in a
-/// script) or blocked it chose that the process does not die from it.
+/// script), blocked it, or catches it with a handler of its own (a program
+/// that runs prismtty in process) chose what SIGINT does to this process.
 fn caller_left_sigint_default() -> bool {
     // SAFETY: sigset_t is a plain C type; pthread_sigmask writes it before it is read.
     let mut blocked = unsafe { mem::zeroed::<libc::sigset_t>() };
@@ -3103,7 +3104,11 @@ fn caller_left_sigint_default() -> bool {
         unsafe { libc::pthread_sigmask(libc::SIG_BLOCK, std::ptr::null(), &mut blocked) } == 0;
     // SAFETY: `blocked` was written by pthread_sigmask above.
     let unblocked = queried && unsafe { libc::sigismember(&blocked, libc::SIGINT) } == 0;
-    unblocked && !signal_is_ignored(libc::SIGINT)
+    // SAFETY: sigaction is a plain C struct; the sigaction call fills it before it is read.
+    let mut current = unsafe { mem::zeroed::<libc::sigaction>() };
+    // SAFETY: a null new-action pointer only queries the disposition into `current`.
+    let queried = unsafe { libc::sigaction(libc::SIGINT, std::ptr::null(), &mut current) } == 0;
+    unblocked && queried && current.sa_sigaction == libc::SIG_DFL
 }
 
 /// Ends prismtty by `signal`'s default action, as the wrapped command ended,
@@ -3327,6 +3332,52 @@ mod tests {
         assert!(!super::killed_by_sigint(Some(raw_status("kill -TERM $$"))));
         assert!(!super::killed_by_sigint(Some(raw_status("exit 130"))));
         assert!(!super::killed_by_sigint(None));
+    }
+
+    extern "C" fn sigint_caught_by_the_test(_: libc::c_int) {}
+
+    // A program that embeds prismtty and catches SIGINT itself chose what
+    // SIGINT does, as one that ignores or blocks it did. The test changes
+    // SIGINT for this process and its own thread only while it reads the
+    // policy, and puts both back before it asserts. A caught handler does not
+    // survive exec, so processes other tests start meanwhile are unaffected;
+    // the ignored case, which would be inherited, is left to the integration
+    // tests, which run in processes of their own.
+    #[test]
+    fn sigint_counts_as_left_default_only_at_its_default_action_and_unblocked() {
+        // SAFETY: sigaction and sigset_t are plain C types, initialized before use; every call
+        // takes valid pointers to these locals, and the handler is an `extern "C" fn(c_int)`
+        // that lives for the whole process.
+        let (at_default, caught, blocked) = unsafe {
+            let mut previous = std::mem::zeroed::<libc::sigaction>();
+            libc::sigaction(libc::SIGINT, std::ptr::null(), &mut previous);
+            let mut previous_mask = std::mem::zeroed::<libc::sigset_t>();
+            libc::pthread_sigmask(libc::SIG_BLOCK, std::ptr::null(), &mut previous_mask);
+            let mut sigint = std::mem::zeroed::<libc::sigset_t>();
+            libc::sigemptyset(&mut sigint);
+            libc::sigaddset(&mut sigint, libc::SIGINT);
+            let mut default = std::mem::zeroed::<libc::sigaction>();
+            default.sa_sigaction = libc::SIG_DFL;
+            libc::sigemptyset(&mut default.sa_mask);
+            let mut handler = default;
+            handler.sa_sigaction = sigint_caught_by_the_test as libc::sighandler_t;
+
+            libc::sigaction(libc::SIGINT, &default, std::ptr::null_mut());
+            libc::pthread_sigmask(libc::SIG_UNBLOCK, &sigint, std::ptr::null_mut());
+            let at_default = super::caller_left_sigint_default();
+            libc::sigaction(libc::SIGINT, &handler, std::ptr::null_mut());
+            let caught = super::caller_left_sigint_default();
+            libc::sigaction(libc::SIGINT, &default, std::ptr::null_mut());
+            libc::pthread_sigmask(libc::SIG_BLOCK, &sigint, std::ptr::null_mut());
+            let blocked = super::caller_left_sigint_default();
+
+            libc::pthread_sigmask(libc::SIG_SETMASK, &previous_mask, std::ptr::null_mut());
+            libc::sigaction(libc::SIGINT, &previous, std::ptr::null_mut());
+            (at_default, caught, blocked)
+        };
+        assert!(at_default, "default action, unblocked");
+        assert!(!caught, "caught by a handler of the caller");
+        assert!(!blocked, "blocked");
     }
 
     // AUDIT G5: exit codes above 255 must clamp, not wrap to a misleading 0.
