@@ -4179,3 +4179,733 @@ fn example_custom_router_ha_role_requires_context() {
         "an HA-role status line should highlight"
     );
 }
+
+// --- Line ends inside an open interactive highlight (STR-13) ---
+//
+// A CR or LF that a terminal executes while a highlight is open takes the
+// current rendition to the cells it brings: the blank line a line feed
+// scrolls in, or the cells a carriage return goes back over. When that
+// rendition would show the highlight there (its style paints blank cells, or
+// the program's own inverse, strike, overline or uncolored underline draws
+// them in the foreground color), the highlight is closed right before the
+// line end and opened again right after it. These tests replay the output as
+// a terminal reads it and compare the full rendition of every drawn cell and
+// of every line end with the program's own.
+
+/// The SGR state a terminal draws with.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct Rendition {
+    foreground: String,
+    background: String,
+    underline: String,
+    underline_color: String,
+    attributes: std::collections::BTreeSet<u16>,
+}
+
+impl Rendition {
+    fn apply(&mut self, parameters: &[u8]) {
+        let parameters: Vec<u8> = parameters.iter().copied().filter(|b| *b >= 0x20).collect();
+        let text = String::from_utf8_lossy(&parameters).to_string();
+        let fields: Vec<&str> = if text.is_empty() {
+            vec!["0"]
+        } else {
+            text.split(';').collect()
+        };
+        let mut index = 0;
+        while index < fields.len() {
+            let field = fields[index];
+            let number: u16 = field.split(':').next().unwrap_or("").parse().unwrap_or(0);
+            let extended = |index: &mut usize| -> String {
+                if field.contains(':') {
+                    return field.to_string();
+                }
+                let take = if fields.get(*index + 1) == Some(&"5") {
+                    3
+                } else {
+                    5
+                };
+                let value = fields[*index..(*index + take).min(fields.len())].join(";");
+                *index += take - 1;
+                value
+            };
+            match number {
+                0 => *self = Self::default(),
+                38 => self.foreground = extended(&mut index),
+                48 => self.background = extended(&mut index),
+                58 => self.underline_color = extended(&mut index),
+                39 => self.foreground.clear(),
+                49 => self.background.clear(),
+                59 => self.underline_color.clear(),
+                30..=37 | 90..=97 => self.foreground = field.to_string(),
+                40..=47 | 100..=107 => self.background = field.to_string(),
+                4 if field == "4:0" => self.underline.clear(),
+                4 | 21 => self.underline = field.to_string(),
+                24 => self.underline.clear(),
+                22 => {
+                    self.attributes.remove(&1);
+                    self.attributes.remove(&2);
+                }
+                23 | 25 | 27 | 28 | 29 | 55 => {
+                    let set = match number {
+                        23 => 3,
+                        25 => 5,
+                        27 => 7,
+                        28 => 8,
+                        29 => 9,
+                        _ => 53,
+                    };
+                    self.attributes.remove(&set);
+                    if number == 25 {
+                        self.attributes.remove(&6);
+                    }
+                }
+                1 | 2 | 3 | 5 | 6 | 7 | 8 | 9 | 53 => {
+                    self.attributes.insert(number);
+                }
+                _ => {}
+            }
+            index += 1;
+        }
+    }
+}
+
+/// What an 8-bit VT terminal (the library's default model) draws from
+/// `output`: each visible byte with its rendition, and each C0 control it
+/// executes (CR, LF, VT, FF, BS, HT) with the rendition in effect there.
+/// This is a record of drawn bytes and controls, not a screen: it models no
+/// cursor movement, erasure or scrolling, which these fixtures do not need.
+/// C0 controls inside an escape, CSI or ESC intermediate are executed where
+/// they stand; inside an OSC, DCS, SOS, PM or APC payload they are data.
+/// `C2` before a raw `9B` is a character there.
+#[derive(Debug, Default)]
+struct Drawn {
+    cells: Vec<(u8, Rendition)>,
+    controls: Vec<(u8, Rendition)>,
+}
+
+fn drawn(output: &[u8]) -> Drawn {
+    let mut screen = Drawn::default();
+    let mut rendition = Rendition::default();
+    let executes = |byte: u8, rendition: &Rendition, screen: &mut Drawn| {
+        if matches!(byte, b'\r' | b'\n' | 0x0b | 0x0c | 0x08 | b'\t') {
+            screen.controls.push((byte, rendition.clone()));
+        }
+    };
+    let mut index = 0;
+    while index < output.len() {
+        let byte = output[index];
+        let csi_body = if byte == 0x1b {
+            let mut next = index + 1;
+            while next < output.len()
+                && ((output[next] < 0x20 && !matches!(output[next], 0x18 | 0x1a | 0x1b))
+                    || output[next] == 0x7f)
+            {
+                executes(output[next], &rendition, &mut screen);
+                next += 1;
+            }
+            match output.get(next) {
+                Some(b'[') => Some(next + 1),
+                Some(b']' | b'P' | b'X' | b'^' | b'_') => {
+                    let osc = output[next] == b']';
+                    let mut end = next + 1;
+                    while end < output.len() {
+                        if (osc && output[end] == 0x07) || matches!(output[end], 0x18 | 0x1a) {
+                            end += 1;
+                            break;
+                        }
+                        if output[end] == 0x1b && output.get(end + 1) == Some(&b'\\') {
+                            end += 2;
+                            break;
+                        }
+                        end += 1;
+                    }
+                    index = end;
+                    continue;
+                }
+                Some(0x18 | 0x1a) => {
+                    index = next + 1;
+                    continue;
+                }
+                Some(_) => {
+                    let mut end = next;
+                    while end < output.len()
+                        && ((0x20..=0x2f).contains(&output[end])
+                            || (output[end] < 0x20 && !matches!(output[end], 0x18 | 0x1a | 0x1b)))
+                    {
+                        executes(output[end], &rendition, &mut screen);
+                        end += 1;
+                    }
+                    index = end + 1;
+                    continue;
+                }
+                None => break,
+            }
+        } else if byte == 0x9b {
+            Some(index + 1)
+        } else {
+            None
+        };
+        if let Some(start) = csi_body {
+            let mut end = start;
+            let mut body = Vec::new();
+            let mut ascii = true;
+            while end < output.len() && !(0x40..=0x7e).contains(&output[end]) {
+                if matches!(output[end], 0x18 | 0x1a) {
+                    break;
+                }
+                // An ESC inside a CSI cancels it and starts a new control.
+                if output[end] == 0x1b {
+                    break;
+                }
+                executes(output[end], &rendition, &mut screen);
+                ascii &= output[end] < 0x80;
+                body.push(output[end]);
+                end += 1;
+            }
+            if output.get(end) == Some(&0x1b) {
+                index = end;
+                continue;
+            }
+            if output.get(end) == Some(&b'm') && ascii {
+                rendition.apply(&body);
+            }
+            index = end + 1;
+            continue;
+        }
+        if byte < 0x20 || byte == 0x7f {
+            executes(byte, &rendition, &mut screen);
+        } else {
+            screen.cells.push((byte, rendition.clone()));
+        }
+        index += 1;
+    }
+    screen
+}
+
+fn line_end_highlighter() -> Highlighter {
+    let config = PrismConfig::from_chromaterm_yaml(
+        r##"
+rules:
+  - description: failure
+    regex: 'fail(ed)?|error|link\s+down'
+    color: f#ff0000
+  - description: warning
+    regex: 'WARN'
+    color: b#ffff00 f#000000
+"##,
+    )
+    .expect("config parses");
+    Highlighter::from_config(config).expect("highlighter builds")
+}
+
+fn interactive_line_end_output(input: &[u8], full_reset: bool) -> Vec<u8> {
+    let mut streaming = StreamingHighlighter::new_interactive(line_end_highlighter());
+    streaming.set_no_minimal_resets(full_reset);
+    let mut output = streaming.push(input);
+    output.extend(streaming.finish());
+    output
+}
+
+const HIGHLIGHT_RED: &str = "2;255;0;0";
+
+/// The program's own rendition of every cell and control, from `input`.
+fn program_drawn(input: &[u8]) -> Drawn {
+    drawn(input)
+}
+
+/// Asserts that `output` draws every cell of `input` with the program's own
+/// rendition, except the bytes of `highlighted`, which carry the highlight's
+/// red foreground over it; and that every CR and LF runs in the program's own
+/// rendition.
+fn assert_line_ends_leave_the_highlight(input: &[u8], output: &[u8], highlighted: &[u8]) {
+    let program = program_drawn(input);
+    let shown = drawn(output);
+    let context = format!(
+        "input {:?}\noutput {:?}",
+        String::from_utf8_lossy(input),
+        String::from_utf8_lossy(output)
+    );
+    assert_eq!(
+        shown.cells.iter().map(|(b, _)| *b).collect::<Vec<_>>(),
+        program.cells.iter().map(|(b, _)| *b).collect::<Vec<_>>(),
+        "same visible bytes: {context}"
+    );
+    let text: Vec<u8> = program.cells.iter().map(|(b, _)| *b).collect();
+    let start = text
+        .windows(highlighted.len())
+        .position(|window| window == highlighted)
+        .expect("highlighted text is drawn");
+    for (index, ((_, own), (_, drawn))) in program.cells.iter().zip(&shown.cells).enumerate() {
+        let mut expected = own.clone();
+        if (start..start + highlighted.len()).contains(&index) {
+            expected.foreground = format!("38;{HIGHLIGHT_RED}");
+        }
+        assert_eq!(drawn, &expected, "cell {index}: {context}");
+    }
+    let line_ends = |screen: &Drawn| -> Vec<(u8, Rendition)> {
+        screen
+            .controls
+            .iter()
+            .filter(|(b, _)| matches!(b, b'\r' | b'\n'))
+            .cloned()
+            .collect()
+    };
+    assert_eq!(
+        line_ends(&shown),
+        line_ends(&program),
+        "line ends: {context}"
+    );
+}
+
+// Program renditions that draw blank cells in the foreground color.
+const FOREGROUND_DRAWN: [&str; 8] = [
+    "7",
+    "9",
+    "53",
+    "4",
+    "4:3",
+    "21",
+    "7;31;44",
+    "7;38;5;33;48;2;1;2;3",
+];
+
+#[test]
+fn interactive_highlight_leaves_out_a_text_line_end_under_a_foreground_drawn_rendition() {
+    for full_reset in [false, true] {
+        for rendition in FOREGROUND_DRAWN {
+            for line_end in ["\n", "\r\n", "\r"] {
+                let input = format!("\x1b[{rendition}mfailed{line_end}next\x1b[0m\n");
+                let output = interactive_line_end_output(input.as_bytes(), full_reset);
+                assert_line_ends_leave_the_highlight(input.as_bytes(), &output, b"failed");
+            }
+        }
+    }
+}
+
+// The library models an 8-bit terminal, so a raw `9B` opens a CSI here.
+const LINE_END_CONTROLS: [&str; 7] = [
+    "\x1b[3\n1m",
+    "\x1b[3\r1m",
+    "\x1b[3\r\n1m",
+    "\x1b\n[31m",
+    "\x1b\r[2K",
+    "\x1b(\nB",
+    "\u{9b}3\n1m",
+];
+
+fn line_end_control_bytes(control: &str) -> Vec<u8> {
+    // `\u{9b}` stands for the raw byte 9B, not its UTF-8 form.
+    control
+        .replace('\u{9b}', "\u{1}")
+        .into_bytes()
+        .into_iter()
+        .map(|b| if b == 1 { 0x9b } else { b })
+        .collect()
+}
+
+#[test]
+fn interactive_highlight_closes_around_a_control_that_runs_a_line_end() {
+    for full_reset in [false, true] {
+        for rendition in ["7", "9", "53", "4", "7;31;44", "4:3;38;2;9;8;7"] {
+            for control in LINE_END_CONTROLS {
+                let control = line_end_control_bytes(control);
+                let mut input = format!("\x1b[{rendition}mfailed").into_bytes();
+                input.extend_from_slice(&control);
+                input.extend_from_slice(b"next\x1b[0m\n");
+                let output = interactive_line_end_output(&input, full_reset);
+                assert_eq!(
+                    output
+                        .windows(control.len())
+                        .filter(|w| *w == control.as_slice())
+                        .count(),
+                    1,
+                    "the control is written once and whole: {:?}",
+                    String::from_utf8_lossy(&output)
+                );
+                assert_line_ends_leave_the_highlight(&input, &output, b"failed");
+            }
+        }
+    }
+}
+
+#[test]
+fn interactive_background_highlight_closes_around_a_control_that_runs_a_line_end() {
+    for full_reset in [false, true] {
+        for control in ["\x1b[3\n1m", "\x1b\n[31m"] {
+            let input = format!("WARN{control}next\n");
+            let output = interactive_line_end_output(input.as_bytes(), full_reset);
+            let shown = drawn(&output);
+            let line_end = shown
+                .controls
+                .iter()
+                .find(|(b, _)| *b == b'\n')
+                .expect("the control's line feed runs");
+            assert_eq!(
+                line_end.1,
+                Rendition::default(),
+                "{:?}",
+                String::from_utf8_lossy(&output)
+            );
+            let warn: Vec<&Rendition> = shown.cells.iter().take(4).map(|(_, r)| r).collect();
+            assert!(warn.iter().all(|r| !r.background.is_empty()), "{output:?}");
+        }
+    }
+}
+
+#[test]
+fn interactive_highlight_goes_on_after_a_line_end_control_inside_its_match() {
+    for full_reset in [false, true] {
+        let input = b"\x1b[7merr\x1b[3\n1mor next\x1b[0m\n";
+        let output = interactive_line_end_output(input, full_reset);
+        assert_line_ends_leave_the_highlight(input, &output, b"error");
+    }
+}
+
+// Negative controls: what these tests pin is 1.4.0's behavior and must not
+// change.
+
+/// Asserts that the first executed control of `kinds` in `output`, the one
+/// right after the highlighted text, runs in the program's own rendition with
+/// the highlight's red over it, as 1.4.0 leaves the highlight open there.
+fn assert_controls_keep_the_highlight(input: &[u8], output: &[u8], kinds: &[u8]) {
+    let program = program_drawn(input);
+    let shown = drawn(output);
+    let pick = |screen: &Drawn| -> Vec<(u8, Rendition)> {
+        screen
+            .controls
+            .iter()
+            .filter(|(b, _)| kinds.contains(b))
+            .take(1)
+            .cloned()
+            .collect()
+    };
+    let expected: Vec<(u8, Rendition)> = pick(&program)
+        .into_iter()
+        .map(|(b, mut r)| {
+            r.foreground = format!("38;{HIGHLIGHT_RED}");
+            (b, r)
+        })
+        .collect();
+    assert_eq!(
+        pick(&shown),
+        expected,
+        "{:?}",
+        String::from_utf8_lossy(output)
+    );
+}
+
+#[test]
+fn interactive_highlight_stays_open_over_vertical_tab_form_feed_backspace_and_tab() {
+    for full_reset in [false, true] {
+        for rendition in ["7", "9", "53", "4"] {
+            for (input, kind) in [
+                (format!("\x1b[{rendition}mlink\x0bdown\x1b[0m\n"), 0x0b),
+                (format!("\x1b[{rendition}mlink\x0cdown\x1b[0m\n"), 0x0c),
+                (
+                    format!("\x1b[{rendition}mfailed\x1b[3\x0b1mnext\x1b[0m\n"),
+                    0x0b,
+                ),
+                (
+                    format!("\x1b[{rendition}mfailed\x1b[3\x0c1mnext\x1b[0m\n"),
+                    0x0c,
+                ),
+                (
+                    format!("\x1b[{rendition}mfailed\x1b\x0b[31mnext\x1b[0m\n"),
+                    0x0b,
+                ),
+                (
+                    format!("\x1b[{rendition}mfailed\x1b(\x0cBnext\x1b[0m\n"),
+                    0x0c,
+                ),
+                (
+                    format!("\x1b[{rendition}mfailed\x1b[3\x081mnext\x1b[0m\n"),
+                    0x08,
+                ),
+                (
+                    format!("\x1b[{rendition}mfailed\x1b[3\t1mnext\x1b[0m\n"),
+                    b'\t',
+                ),
+                (
+                    format!("\x1b[{rendition}mfailed\x1b\x08[31mnext\x1b[0m\n"),
+                    0x08,
+                ),
+            ] {
+                let output = interactive_line_end_output(input.as_bytes(), full_reset);
+                assert_controls_keep_the_highlight(input.as_bytes(), &output, &[kind]);
+            }
+        }
+    }
+}
+
+#[test]
+fn interactive_highlight_stays_open_over_line_ends_it_cannot_see_or_need_not_leave() {
+    for full_reset in [false, true] {
+        for (input, written_whole) in [
+            // A string payload's line feed is data: nothing goes inside it.
+            (
+                &b"\x1b[7mfailed\x1b]0;title\nmore\x07next\x1b[0m\n"[..],
+                &b"failed\x1b]0;title\nmore\x07"[..],
+            ),
+            (
+                b"\x1b[7mfailed\x1bPq\nmore\x1b\\next\x1b[0m\n",
+                b"failed\x1bPq\nmore\x1b\\",
+            ),
+            (
+                b"\x1b[7mfailed\x1bXs\nm\x1b\\next\x1b[0m\n",
+                b"failed\x1bXs\nm\x1b\\",
+            ),
+            (
+                b"\x1b[7mfailed\x1b^p\nm\x1b\\next\x1b[0m\n",
+                b"failed\x1b^p\nm\x1b\\",
+            ),
+            (
+                b"\x1b[7mfailed\x1b_a\nm\x1b\\next\x1b[0m\n",
+                b"failed\x1b_a\nm\x1b\\",
+            ),
+            // Terminals disagree on how these run, so 1.4.0's bytes stay.
+            (
+                b"\x1b[7mfailed\xc2\x9b3\n1mnext\x1b[0m\n",
+                b"failed\xc2\x9b3\n1m",
+            ),
+            (
+                b"\x1b[7mfailed\x1b[3\xc2\xb2\n1mnext\x1b[0m\n",
+                b"failed\x1b[3\xc2\xb2\n1m",
+            ),
+        ] {
+            let output = interactive_line_end_output(input, full_reset);
+            assert!(
+                output
+                    .windows(written_whole.len())
+                    .any(|w| w == written_whole),
+                "{:?}",
+                String::from_utf8_lossy(&output)
+            );
+        }
+        // Renditions that do not draw blank cells in the foreground color
+        // keep a foreground-only highlight open over a line end.
+        for rendition in ["1", "3", "31", "4;58;5;200"] {
+            for input in [
+                format!("\x1b[{rendition}mfailed\nnext\x1b[0m\n"),
+                format!("\x1b[{rendition}mfailed\x1b[3\n1mnext\x1b[0m\n"),
+            ] {
+                let output = interactive_line_end_output(input.as_bytes(), full_reset);
+                assert_controls_keep_the_highlight(input.as_bytes(), &output, b"\n");
+            }
+        }
+    }
+}
+
+#[test]
+fn noninteractive_highlight_is_unchanged_at_line_ends() {
+    for input in [
+        &b"\x1b[7mfailed\x1b[3\n1mnext\x1b[0m\n"[..],
+        b"\x1b[7mfailed\x1b\n[31mnext\x1b[0m\n",
+        b"\x1b[9mlink\ndown\x1b[0m\n",
+    ] {
+        let mut streaming = StreamingHighlighter::new(line_end_highlighter());
+        let mut output = streaming.push(input);
+        output.extend(streaming.finish());
+        // The pipe path keeps a highlight open over a line end inside a
+        // control, as 1.4.0 does; only the terminal path leaves it out.
+        if input.starts_with(b"\x1b[7mfailed") {
+            assert_controls_keep_the_highlight(input, &output, b"\n");
+        } else {
+            let shown = drawn(&output);
+            assert!(
+                shown
+                    .cells
+                    .iter()
+                    .any(|(_, r)| r.foreground == format!("38;{HIGHLIGHT_RED}")),
+                "{output:?}"
+            );
+        }
+        let library = line_end_highlighter().highlight_str(&String::from_utf8_lossy(input));
+        assert_eq!(
+            library.as_bytes(),
+            output.as_slice(),
+            "the library and the pipe path agree"
+        );
+    }
+}
+
+// Generated from the 1.4.0 library (c39cc8d): input, full reset, output.
+const RELEASE_INTERACTIVE_BYTES: &[(&[u8], bool, &[u8])] = &[
+    (b"\x1b[7mlink\x0bdown\x1b[0m\x0a", false, b"\x1b[7m\x1b[38;2;255;0;0mlink\x0bdown\x1b[0m\x1b[38;2;255;0;0m\x0a\x1b[39m"),
+    (b"\x1b[7mlink\x0bdown\x1b[0m\x0a", true, b"\x1b[7m\x1b[38;2;255;0;0mlink\x0bdown\x1b[0m\x1b[38;2;255;0;0m\x0a\x1b[0m"),
+    (b"\x1b[7mlink\x0cdown\x1b[0m\x0a", false, b"\x1b[7m\x1b[38;2;255;0;0mlink\x0cdown\x1b[0m\x1b[38;2;255;0;0m\x0a\x1b[39m"),
+    (b"\x1b[7mlink\x0cdown\x1b[0m\x0a", true, b"\x1b[7m\x1b[38;2;255;0;0mlink\x0cdown\x1b[0m\x1b[38;2;255;0;0m\x0a\x1b[0m"),
+    (b"\x1b[7mfailed\x1b[3\x0b1mnext\x1b[0m\x0a", false, b"\x1b[7m\x1b[38;2;255;0;0mfailed\x1b[3\x0b1m\x1b[38;2;255;0;0m\x1b[31mnext\x1b[0m\x0a"),
+    (b"\x1b[7mfailed\x1b[3\x0b1mnext\x1b[0m\x0a", true, b"\x1b[7m\x1b[38;2;255;0;0mfailed\x1b[3\x0b1m\x1b[38;2;255;0;0m\x1b[0m\x1b[7;31mnext\x1b[0m\x0a"),
+    (b"\x1b[7mfailed\x1b[3\x0c1mnext\x1b[0m\x0a", false, b"\x1b[7m\x1b[38;2;255;0;0mfailed\x1b[3\x0c1m\x1b[38;2;255;0;0m\x1b[31mnext\x1b[0m\x0a"),
+    (b"\x1b[7mfailed\x1b[3\x0c1mnext\x1b[0m\x0a", true, b"\x1b[7m\x1b[38;2;255;0;0mfailed\x1b[3\x0c1m\x1b[38;2;255;0;0m\x1b[0m\x1b[7;31mnext\x1b[0m\x0a"),
+    (b"\x1b[7mfailed\x1b\x0b[31mnext\x1b[0m\x0a", false, b"\x1b[7m\x1b[38;2;255;0;0mfailed\x1b\x0b[31m\x1b[38;2;255;0;0m\x1b[31mnext\x1b[0m\x0a"),
+    (b"\x1b[7mfailed\x1b\x0b[31mnext\x1b[0m\x0a", true, b"\x1b[7m\x1b[38;2;255;0;0mfailed\x1b\x0b[31m\x1b[38;2;255;0;0m\x1b[0m\x1b[7;31mnext\x1b[0m\x0a"),
+    (b"\x1b[7mfailed\x1b(\x0cBnext\x1b[0m\x0a", false, b"\x1b[7m\x1b[38;2;255;0;0mfailed\x1b(\x0cB\x1b[38;2;255;0;0m\x1b[39mnext\x1b[0m\x0a"),
+    (b"\x1b[7mfailed\x1b(\x0cBnext\x1b[0m\x0a", true, b"\x1b[7m\x1b[38;2;255;0;0mfailed\x1b(\x0cB\x1b[38;2;255;0;0m\x1b[0m\x1b[7mnext\x1b[0m\x0a"),
+    (b"\x1b[7mfailed\x1b[3\x081mnext\x1b[0m\x0a", false, b"\x1b[7m\x1b[38;2;255;0;0mfailed\x1b[3\x081m\x1b[38;2;255;0;0m\x1b[31mnext\x1b[0m\x0a"),
+    (b"\x1b[7mfailed\x1b[3\x081mnext\x1b[0m\x0a", true, b"\x1b[7m\x1b[38;2;255;0;0mfailed\x1b[3\x081m\x1b[38;2;255;0;0m\x1b[0m\x1b[7;31mnext\x1b[0m\x0a"),
+    (b"\x1b[7mfailed\x1b[3\x091mnext\x1b[0m\x0a", false, b"\x1b[7m\x1b[38;2;255;0;0mfailed\x1b[3\x091m\x1b[38;2;255;0;0m\x1b[31mnext\x1b[0m\x0a"),
+    (b"\x1b[7mfailed\x1b[3\x091mnext\x1b[0m\x0a", true, b"\x1b[7m\x1b[38;2;255;0;0mfailed\x1b[3\x091m\x1b[38;2;255;0;0m\x1b[0m\x1b[7;31mnext\x1b[0m\x0a"),
+    (b"\x1b[7mfailed\x1b\x08[31mnext\x1b[0m\x0a", false, b"\x1b[7m\x1b[38;2;255;0;0mfailed\x1b\x08[31m\x1b[38;2;255;0;0m\x1b[31mnext\x1b[0m\x0a"),
+    (b"\x1b[7mfailed\x1b\x08[31mnext\x1b[0m\x0a", true, b"\x1b[7m\x1b[38;2;255;0;0mfailed\x1b\x08[31m\x1b[38;2;255;0;0m\x1b[0m\x1b[7;31mnext\x1b[0m\x0a"),
+    (b"\x1b[53mlink\x0bdown\x1b[0m\x0a", false, b"\x1b[53m\x1b[38;2;255;0;0mlink\x0bdown\x1b[0m\x1b[38;2;255;0;0m\x0a\x1b[39m"),
+    (b"\x1b[53mlink\x0bdown\x1b[0m\x0a", true, b"\x1b[53m\x1b[38;2;255;0;0mlink\x0bdown\x1b[0m\x1b[38;2;255;0;0m\x0a\x1b[0m"),
+    (b"\x1b[53mlink\x0cdown\x1b[0m\x0a", false, b"\x1b[53m\x1b[38;2;255;0;0mlink\x0cdown\x1b[0m\x1b[38;2;255;0;0m\x0a\x1b[39m"),
+    (b"\x1b[53mlink\x0cdown\x1b[0m\x0a", true, b"\x1b[53m\x1b[38;2;255;0;0mlink\x0cdown\x1b[0m\x1b[38;2;255;0;0m\x0a\x1b[0m"),
+    (b"\x1b[53mfailed\x1b[3\x0b1mnext\x1b[0m\x0a", false, b"\x1b[53m\x1b[38;2;255;0;0mfailed\x1b[3\x0b1m\x1b[38;2;255;0;0m\x1b[31mnext\x1b[0m\x0a"),
+    (b"\x1b[53mfailed\x1b[3\x0b1mnext\x1b[0m\x0a", true, b"\x1b[53m\x1b[38;2;255;0;0mfailed\x1b[3\x0b1m\x1b[38;2;255;0;0m\x1b[0m\x1b[53;31mnext\x1b[0m\x0a"),
+    (b"\x1b[53mfailed\x1b[3\x0c1mnext\x1b[0m\x0a", false, b"\x1b[53m\x1b[38;2;255;0;0mfailed\x1b[3\x0c1m\x1b[38;2;255;0;0m\x1b[31mnext\x1b[0m\x0a"),
+    (b"\x1b[53mfailed\x1b[3\x0c1mnext\x1b[0m\x0a", true, b"\x1b[53m\x1b[38;2;255;0;0mfailed\x1b[3\x0c1m\x1b[38;2;255;0;0m\x1b[0m\x1b[53;31mnext\x1b[0m\x0a"),
+    (b"\x1b[53mfailed\x1b\x0b[31mnext\x1b[0m\x0a", false, b"\x1b[53m\x1b[38;2;255;0;0mfailed\x1b\x0b[31m\x1b[38;2;255;0;0m\x1b[31mnext\x1b[0m\x0a"),
+    (b"\x1b[53mfailed\x1b\x0b[31mnext\x1b[0m\x0a", true, b"\x1b[53m\x1b[38;2;255;0;0mfailed\x1b\x0b[31m\x1b[38;2;255;0;0m\x1b[0m\x1b[53;31mnext\x1b[0m\x0a"),
+    (b"\x1b[53mfailed\x1b(\x0cBnext\x1b[0m\x0a", false, b"\x1b[53m\x1b[38;2;255;0;0mfailed\x1b(\x0cB\x1b[38;2;255;0;0m\x1b[39mnext\x1b[0m\x0a"),
+    (b"\x1b[53mfailed\x1b(\x0cBnext\x1b[0m\x0a", true, b"\x1b[53m\x1b[38;2;255;0;0mfailed\x1b(\x0cB\x1b[38;2;255;0;0m\x1b[0m\x1b[53mnext\x1b[0m\x0a"),
+    (b"\x1b[53mfailed\x1b[3\x081mnext\x1b[0m\x0a", false, b"\x1b[53m\x1b[38;2;255;0;0mfailed\x1b[3\x081m\x1b[38;2;255;0;0m\x1b[31mnext\x1b[0m\x0a"),
+    (b"\x1b[53mfailed\x1b[3\x081mnext\x1b[0m\x0a", true, b"\x1b[53m\x1b[38;2;255;0;0mfailed\x1b[3\x081m\x1b[38;2;255;0;0m\x1b[0m\x1b[53;31mnext\x1b[0m\x0a"),
+    (b"\x1b[53mfailed\x1b[3\x091mnext\x1b[0m\x0a", false, b"\x1b[53m\x1b[38;2;255;0;0mfailed\x1b[3\x091m\x1b[38;2;255;0;0m\x1b[31mnext\x1b[0m\x0a"),
+    (b"\x1b[53mfailed\x1b[3\x091mnext\x1b[0m\x0a", true, b"\x1b[53m\x1b[38;2;255;0;0mfailed\x1b[3\x091m\x1b[38;2;255;0;0m\x1b[0m\x1b[53;31mnext\x1b[0m\x0a"),
+    (b"\x1b[53mfailed\x1b\x08[31mnext\x1b[0m\x0a", false, b"\x1b[53m\x1b[38;2;255;0;0mfailed\x1b\x08[31m\x1b[38;2;255;0;0m\x1b[31mnext\x1b[0m\x0a"),
+    (b"\x1b[53mfailed\x1b\x08[31mnext\x1b[0m\x0a", true, b"\x1b[53m\x1b[38;2;255;0;0mfailed\x1b\x08[31m\x1b[38;2;255;0;0m\x1b[0m\x1b[53;31mnext\x1b[0m\x0a"),
+    (b"\x1b[7mfailed\x1b]0;title\x0amore\x07next\x1b[0m\x0a", false, b"\x1b[7m\x1b[38;2;255;0;0mfailed\x1b]0;title\x0amore\x07\x1b[38;2;255;0;0m\x1b[39mnext\x1b[0m\x0a"),
+    (b"\x1b[7mfailed\x1b]0;title\x0amore\x07next\x1b[0m\x0a", true, b"\x1b[7m\x1b[38;2;255;0;0mfailed\x1b]0;title\x0amore\x07\x1b[38;2;255;0;0m\x1b[0m\x1b[7mnext\x1b[0m\x0a"),
+    (b"\x1b[7mfailed\x1bPq\x0amore\x1b\\next\x1b[0m\x0a", false, b"\x1b[7m\x1b[38;2;255;0;0mfailed\x1bPq\x0amore\x1b\\\x1b[38;2;255;0;0m\x1b[39mnext\x1b[0m\x0a"),
+    (b"\x1b[7mfailed\x1bPq\x0amore\x1b\\next\x1b[0m\x0a", true, b"\x1b[7m\x1b[38;2;255;0;0mfailed\x1bPq\x0amore\x1b\\\x1b[38;2;255;0;0m\x1b[0m\x1b[7mnext\x1b[0m\x0a"),
+    (b"\x1b[7mfailed\x1bXs\x0am\x1b\\next\x1b[0m\x0a", false, b"\x1b[7m\x1b[38;2;255;0;0mfailed\x1bXs\x0am\x1b\\\x1b[38;2;255;0;0m\x1b[39mnext\x1b[0m\x0a"),
+    (b"\x1b[7mfailed\x1bXs\x0am\x1b\\next\x1b[0m\x0a", true, b"\x1b[7m\x1b[38;2;255;0;0mfailed\x1bXs\x0am\x1b\\\x1b[38;2;255;0;0m\x1b[0m\x1b[7mnext\x1b[0m\x0a"),
+    (b"\x1b[7mfailed\x1b^p\x0am\x1b\\next\x1b[0m\x0a", false, b"\x1b[7m\x1b[38;2;255;0;0mfailed\x1b^p\x0am\x1b\\\x1b[38;2;255;0;0m\x1b[39mnext\x1b[0m\x0a"),
+    (b"\x1b[7mfailed\x1b^p\x0am\x1b\\next\x1b[0m\x0a", true, b"\x1b[7m\x1b[38;2;255;0;0mfailed\x1b^p\x0am\x1b\\\x1b[38;2;255;0;0m\x1b[0m\x1b[7mnext\x1b[0m\x0a"),
+    (b"\x1b[7mfailed\x1b_a\x0am\x1b\\next\x1b[0m\x0a", false, b"\x1b[7m\x1b[38;2;255;0;0mfailed\x1b_a\x0am\x1b\\\x1b[38;2;255;0;0m\x1b[39mnext\x1b[0m\x0a"),
+    (b"\x1b[7mfailed\x1b_a\x0am\x1b\\next\x1b[0m\x0a", true, b"\x1b[7m\x1b[38;2;255;0;0mfailed\x1b_a\x0am\x1b\\\x1b[38;2;255;0;0m\x1b[0m\x1b[7mnext\x1b[0m\x0a"),
+    (b"\x1b[7mfailed\xc2\x9b3\x0a1mnext\x1b[0m\x0a", false, b"\x1b[7m\x1b[38;2;255;0;0mfailed\xc2\x9b3\x0a1m\x1b[38;2;255;0;0m\x1b[31mnext\x1b[0m\x0a"),
+    (b"\x1b[7mfailed\xc2\x9b3\x0a1mnext\x1b[0m\x0a", true, b"\x1b[7m\x1b[38;2;255;0;0mfailed\xc2\x9b3\x0a1m\x1b[38;2;255;0;0m\x1b[0m\x1b[7;31mnext\x1b[0m\x0a"),
+    (b"\x1b[7mfailed\x1b[3\xc2\xb2\x0a1mnext\x1b[0m\x0a", false, b"\x1b[7m\x1b[38;2;255;0;0mfailed\x1b[3\xc2\xb2\x0a1m\x1b[38;2;255;0;0m\x1b[39mnext\x1b[0m\x0a"),
+    (b"\x1b[7mfailed\x1b[3\xc2\xb2\x0a1mnext\x1b[0m\x0a", true, b"\x1b[7m\x1b[38;2;255;0;0mfailed\x1b[3\xc2\xb2\x0a1m\x1b[38;2;255;0;0m\x1b[0m\x1b[7mnext\x1b[0m\x0a"),
+    (b"\x1b[7mfailed\x1b\x0a[3\xc2\xb2mnext\x1b[0m\x0a", false, b"\x1b[7m\x1b[38;2;255;0;0mfailed\x1b\x0a[3\xc2\xb2m\x1b[38;2;255;0;0m\x1b[39mnext\x1b[0m\x0a"),
+    (b"\x1b[7mfailed\x1b\x0a[3\xc2\xb2mnext\x1b[0m\x0a", true, b"\x1b[7m\x1b[38;2;255;0;0mfailed\x1b\x0a[3\xc2\xb2m\x1b[38;2;255;0;0m\x1b[0m\x1b[7mnext\x1b[0m\x0a"),
+    (b"\x1b[7mfailed\x1b\x0d[3\xc2\xb2mnext\x1b[0m\x0a", false, b"\x1b[7m\x1b[38;2;255;0;0mfailed\x1b\x0d[3\xc2\xb2m\x1b[38;2;255;0;0m\x1b[39mnext\x1b[0m\x0a"),
+    (b"\x1b[7mfailed\x1b\x0d[3\xc2\xb2mnext\x1b[0m\x0a", true, b"\x1b[7m\x1b[38;2;255;0;0mfailed\x1b\x0d[3\xc2\xb2m\x1b[38;2;255;0;0m\x1b[0m\x1b[7mnext\x1b[0m\x0a"),
+    (b"\x1b[7mfailed\x1b\x0a(\xc2\xb2Bnext\x1b[0m\x0a", false, b"\x1b[7m\x1b[38;2;255;0;0mfailed\x1b\x0a(\x1b[38;2;255;0;0m\x1b[39m\xc2\xb2Bnext\x1b[0m\x0a"),
+    (b"\x1b[7mfailed\x1b\x0a(\xc2\xb2Bnext\x1b[0m\x0a", true, b"\x1b[7m\x1b[38;2;255;0;0mfailed\x1b\x0a(\x1b[38;2;255;0;0m\x1b[0m\x1b[7m\xc2\xb2Bnext\x1b[0m\x0a"),
+    (b"\x1b[7mfailed\x1b(\x0a\xc2\xb2Bnext\x1b[0m\x0a", false, b"\x1b[7m\x1b[38;2;255;0;0mfailed\x1b(\x0a\x1b[38;2;255;0;0m\x1b[39m\xc2\xb2Bnext\x1b[0m\x0a"),
+    (b"\x1b[7mfailed\x1b(\x0a\xc2\xb2Bnext\x1b[0m\x0a", true, b"\x1b[7m\x1b[38;2;255;0;0mfailed\x1b(\x0a\x1b[38;2;255;0;0m\x1b[0m\x1b[7m\xc2\xb2Bnext\x1b[0m\x0a"),
+    (b"\x1b[7mfailed\x1b\x0d(\xc2\xb2Bnext\x1b[0m\x0a", false, b"\x1b[7m\x1b[38;2;255;0;0mfailed\x1b\x0d(\x1b[38;2;255;0;0m\x1b[39m\xc2\xb2Bnext\x1b[0m\x0a"),
+    (b"\x1b[7mfailed\x1b\x0d(\xc2\xb2Bnext\x1b[0m\x0a", true, b"\x1b[7m\x1b[38;2;255;0;0mfailed\x1b\x0d(\x1b[38;2;255;0;0m\x1b[0m\x1b[7m\xc2\xb2Bnext\x1b[0m\x0a"),
+    (b"\x1b[7mfailed\x1b[3\x0a\xc2\x9b1mnext\x1b[0m\x0a", false, b"\x1b[7m\x1b[38;2;255;0;0mfailed\x1b[3\x0a\x1b[38;2;255;0;0m\xc2\x9b1m\x1b[38;2;255;0;0m\x1b[39mnext\x1b[0m\x0a"),
+    (b"\x1b[7mfailed\x1b[3\x0a\xc2\x9b1mnext\x1b[0m\x0a", true, b"\x1b[7m\x1b[38;2;255;0;0mfailed\x1b[3\x0a\x1b[38;2;255;0;0m\xc2\x9b1m\x1b[38;2;255;0;0m\x1b[0m\x1b[1;7mnext\x1b[0m\x0a"),
+    (b"\x1b[7mfailed\x1b\x0a\xc2\x9b1mnext\x1b[0m\x0a", false, b"\x1b[7m\x1b[38;2;255;0;0mfailed\x1b\x0a\x1b[38;2;255;0;0m\xc2\x9b1m\x1b[38;2;255;0;0m\x1b[39mnext\x1b[0m\x0a"),
+    (b"\x1b[7mfailed\x1b\x0a\xc2\x9b1mnext\x1b[0m\x0a", true, b"\x1b[7m\x1b[38;2;255;0;0mfailed\x1b\x0a\x1b[38;2;255;0;0m\xc2\x9b1m\x1b[38;2;255;0;0m\x1b[0m\x1b[1;7mnext\x1b[0m\x0a"),
+    (b"\x1b[1mfailed\x0anext\x1b[0m\x0a", false, b"\x1b[1m\x1b[38;2;255;0;0mfailed\x0a\x1b[39mnext\x1b[0m\x0a"),
+    (b"\x1b[1mfailed\x0anext\x1b[0m\x0a", true, b"\x1b[1m\x1b[38;2;255;0;0mfailed\x0a\x1b[0m\x1b[1mnext\x1b[0m\x0a"),
+    (b"\x1b[1mfailed\x1b[3\x0a1mnext\x1b[0m\x0a", false, b"\x1b[1m\x1b[38;2;255;0;0mfailed\x1b[3\x0a1m\x1b[38;2;255;0;0m\x1b[31mnext\x1b[0m\x0a"),
+    (b"\x1b[1mfailed\x1b[3\x0a1mnext\x1b[0m\x0a", true, b"\x1b[1m\x1b[38;2;255;0;0mfailed\x1b[3\x0a1m\x1b[38;2;255;0;0m\x1b[0m\x1b[1;31mnext\x1b[0m\x0a"),
+    (b"\x1b[3mfailed\x0anext\x1b[0m\x0a", false, b"\x1b[3m\x1b[38;2;255;0;0mfailed\x0a\x1b[39mnext\x1b[0m\x0a"),
+    (b"\x1b[3mfailed\x0anext\x1b[0m\x0a", true, b"\x1b[3m\x1b[38;2;255;0;0mfailed\x0a\x1b[0m\x1b[3mnext\x1b[0m\x0a"),
+    (b"\x1b[3mfailed\x1b[3\x0a1mnext\x1b[0m\x0a", false, b"\x1b[3m\x1b[38;2;255;0;0mfailed\x1b[3\x0a1m\x1b[38;2;255;0;0m\x1b[31mnext\x1b[0m\x0a"),
+    (b"\x1b[3mfailed\x1b[3\x0a1mnext\x1b[0m\x0a", true, b"\x1b[3m\x1b[38;2;255;0;0mfailed\x1b[3\x0a1m\x1b[38;2;255;0;0m\x1b[0m\x1b[3;31mnext\x1b[0m\x0a"),
+    (b"\x1b[31mfailed\x0anext\x1b[0m\x0a", false, b"\x1b[31m\x1b[38;2;255;0;0mfailed\x0a\x1b[31mnext\x1b[0m\x0a"),
+    (b"\x1b[31mfailed\x0anext\x1b[0m\x0a", true, b"\x1b[31m\x1b[38;2;255;0;0mfailed\x0a\x1b[0m\x1b[31mnext\x1b[0m\x0a"),
+    (b"\x1b[31mfailed\x1b[3\x0a1mnext\x1b[0m\x0a", false, b"\x1b[31m\x1b[38;2;255;0;0mfailed\x1b[3\x0a1m\x1b[38;2;255;0;0m\x1b[31mnext\x1b[0m\x0a"),
+    (b"\x1b[31mfailed\x1b[3\x0a1mnext\x1b[0m\x0a", true, b"\x1b[31m\x1b[38;2;255;0;0mfailed\x1b[3\x0a1m\x1b[38;2;255;0;0m\x1b[0m\x1b[31mnext\x1b[0m\x0a"),
+    (b"\x1b[4;58;5;200mfailed\x0anext\x1b[0m\x0a", false, b"\x1b[4;58;5;200m\x1b[38;2;255;0;0mfailed\x0a\x1b[39mnext\x1b[0m\x0a"),
+    (b"\x1b[4;58;5;200mfailed\x0anext\x1b[0m\x0a", true, b"\x1b[4;58;5;200m\x1b[38;2;255;0;0mfailed\x0a\x1b[0m\x1b[4;58;5;200mnext\x1b[0m\x0a"),
+    (b"\x1b[4;58;5;200mfailed\x1b[3\x0a1mnext\x1b[0m\x0a", false, b"\x1b[4;58;5;200m\x1b[38;2;255;0;0mfailed\x1b[3\x0a1m\x1b[38;2;255;0;0m\x1b[31mnext\x1b[0m\x0a"),
+    (b"\x1b[4;58;5;200mfailed\x1b[3\x0a1mnext\x1b[0m\x0a", true, b"\x1b[4;58;5;200m\x1b[38;2;255;0;0mfailed\x1b[3\x0a1m\x1b[38;2;255;0;0m\x1b[0m\x1b[4;31;58;5;200mnext\x1b[0m\x0a"),
+];
+// Generated from the 1.4.0 library (c39cc8d): input, output.
+const RELEASE_PIPE_BYTES: &[(&[u8], &[u8])] = &[
+    (b"\x1b[7mfailed\x1b[3\x0a1mnext\x1b[0m\x0a", b"\x1b[7m\x1b[38;2;255;0;0mfailed\x1b[3\x0a1m\x1b[38;2;255;0;0m\x1b[0m\x1b[7;31mnext\x1b[0m\x0a"),
+    (b"\x1b[7mfailed\x1b\x0a[31mnext\x1b[0m\x0a", b"\x1b[7m\x1b[38;2;255;0;0mfailed\x1b\x0a[31m\x1b[38;2;255;0;0m\x1b[0m\x1b[7;31mnext\x1b[0m\x0a"),
+    (b"\x1b[9mlink\x0adown\x1b[0m\x0a", b"\x1b[9m\x1b[38;2;255;0;0mlink\x0adown\x1b[0m\x1b[38;2;255;0;0m\x1b[0m\x0a"),
+    (b"\x1b[7mfailed\x0anext \x1b[4mWARN\x0d\x0aok\x1b[0m\x0a", b"\x1b[7m\x1b[38;2;255;0;0mfailed\x1b[0m\x1b[7m\x0anext \x1b[4m\x1b[38;2;0;0;0;48;2;255;255;0mWARN\x1b[0m\x1b[4;7m\x0d\x0aok\x1b[0m\x0a"),
+];
+
+// Where the line-end rule does not apply, interactive output is 1.4.0's, byte
+// for byte: VT, FF, BS and HT; string payloads; `C2 9B`; a control with a byte
+// from 80 to FF, or one cut short by such a byte, even when a line end sits in
+// its ESC prefix; renditions that draw no blank cells.
+#[test]
+fn interactive_output_keeps_release_bytes_where_the_line_end_rule_does_not_apply() {
+    for (input, full_reset, expected) in RELEASE_INTERACTIVE_BYTES {
+        let output = interactive_line_end_output(input, *full_reset);
+        assert!(
+            output == *expected,
+            "full reset {full_reset}: {:?}\n  got {:?}\n want {:?}",
+            String::from_utf8_lossy(input),
+            String::from_utf8_lossy(&output),
+            String::from_utf8_lossy(expected)
+        );
+    }
+}
+
+#[test]
+fn noninteractive_output_keeps_release_bytes_at_line_ends() {
+    for (input, expected) in RELEASE_PIPE_BYTES {
+        let mut streaming = StreamingHighlighter::new(line_end_highlighter());
+        let mut output = streaming.push(input);
+        output.extend(streaming.finish());
+        assert!(
+            output == *expected,
+            "{:?}\n  got {:?}\n want {:?}",
+            String::from_utf8_lossy(input),
+            String::from_utf8_lossy(&output),
+            String::from_utf8_lossy(expected)
+        );
+    }
+}
+
+// The line-end decisions do not depend on where a read ends: every two-part
+// split of each fixture gives the output of one read. Two kinds of cut are
+// left out or checked by what is drawn instead:
+// - A cut inside a match ends the match, in 1.4.0 too, so fixtures whose
+//   match runs over a VT, FF or line-end control are not split.
+// - A cut between a CR and its LF makes each its own line end, each closed
+//   and reopened on its own; the cells and line ends are drawn the same.
+#[test]
+fn line_end_fixtures_give_one_output_at_every_read_split() {
+    let mut inputs: Vec<Vec<u8>> = RELEASE_INTERACTIVE_BYTES
+        .iter()
+        .filter(|(input, _, _)| !input.windows(4).any(|w| w == b"link"))
+        .map(|(input, _, _)| input.to_vec())
+        .collect();
+    for rendition in ["7", "4", "7;31;44"] {
+        for body in [
+            &b"failed\nnext"[..],
+            b"failed\r\nnext",
+            b"failed\x1b[3\n1mnext",
+            b"failed\x1b[3\r\n1mnext",
+            b"failed\x1b\r[2Knext",
+            b"failed\x1b(\nBnext",
+            b"failed\x9b3\n1mnext",
+        ] {
+            let mut input = format!("\x1b[{rendition}m").into_bytes();
+            input.extend_from_slice(body);
+            input.extend_from_slice(b"\x1b[0m\n");
+            inputs.push(input);
+        }
+    }
+    for input in &inputs {
+        for full_reset in [false, true] {
+            let whole = interactive_line_end_output(input, full_reset);
+            for cut in 1..input.len() {
+                let mut streaming = StreamingHighlighter::new_interactive(line_end_highlighter());
+                streaming.set_no_minimal_resets(full_reset);
+                let mut output = streaming.push(&input[..cut]);
+                output.extend(streaming.push(&input[cut..]));
+                output.extend(streaming.finish());
+                let context = format!(
+                    "cut {cut} of {:?}, full reset {full_reset}\n  got {:?}\n want {:?}",
+                    String::from_utf8_lossy(input),
+                    String::from_utf8_lossy(&output),
+                    String::from_utf8_lossy(&whole)
+                );
+                if input[cut - 1] == b'\r' && input[cut] == b'\n' {
+                    let (split, one) = (drawn(&output), drawn(&whole));
+                    assert_eq!(split.cells, one.cells, "{context}");
+                    assert_eq!(split.controls, one.controls, "{context}");
+                } else {
+                    assert!(output == whole, "{context}");
+                }
+            }
+        }
+    }
+}
