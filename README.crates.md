@@ -176,6 +176,18 @@ setting. With the keyboard on a terminal and the output in a pipe
 (`ptty ssh host | tee log`) the PTY keeps its usual output settings, because
 the pipe usually leads back to that terminal.
 
+A command killed by a signal is reported as 128 plus the signal number, as a
+shell does, with one exception: when SIGINT (Ctrl-C) kills the command,
+PrismTTY ends by SIGINT too, after restoring the terminal, so a loop typed at a
+shell prompt stops after one Ctrl-C as it does without PrismTTY. In a shell
+`$?` is still 130; a program that reads the wait status sees the signal
+(Python's `subprocess` reports -2, `make` prints `Interrupt`). PrismTTY keeps
+130 when it was started with SIGINT ignored or blocked. A script that runs with
+the terminal on its stdin, and a zsh or dash pipeline where PrismTTY is not the
+last command, still go on after one Ctrl-C, because those shells stop only when
+they receive the Ctrl-C themselves and PrismTTY, holding the terminal in raw
+mode, receives it instead.
+
 To page the output of a command that needs no keyboard, take the terminal off
 its stdin:
 

@@ -2,6 +2,35 @@
 
 All notable changes to PrismTTY are documented here.
 
+## 1.4.0 - unreleased
+
+### Changed
+
+- When the wrapped command is killed by SIGINT, PrismTTY now ends by SIGINT
+  too, once it has drawn the command's last output, restored the terminal and
+  removed its pid file. It used to exit with status 130. A shell stops a loop
+  typed at its prompt after one Ctrl-C only when the command it waited for was
+  killed by SIGINT, so `for i in 1 2 3; do prismtty -- sleep 10; done` went on
+  to the next round after Ctrl-C; at a zsh or bash prompt, and in a PrismTTY
+  session around an interactive shell, it now stops as it does without
+  PrismTTY. The same holds when PrismTTY itself receives SIGINT (Ctrl-C with
+  stdin redirected, or `kill -INT`), forwards it, and the command dies from it.
+
+  What a caller sees. In a shell, `$?` is still 130. A program that reads the
+  wait status itself sees a death by SIGINT: Python's `subprocess` reports -2
+  instead of 130, and `make` prints `Interrupt` instead of `Error 130`.
+
+  What stays as before. A command killed by SIGQUIT, SIGTERM, SIGHUP or a
+  crash is still reported as 128 plus the signal, and any signal other than
+  SIGINT that PrismTTY receives still ends it with 128 plus that signal. A
+  command that handles SIGINT and exits keeps its exit code. When SIGINT was
+  ignored or blocked as PrismTTY started (`cmd &` in a script ignores it),
+  PrismTTY still exits with 130. A script that runs with the terminal on its
+  stdin (`bash loop.sh`), and a zsh or dash pipeline where PrismTTY is not the
+  last command, still go on after one Ctrl-C: those shells stop only when they
+  receive the Ctrl-C themselves, and while PrismTTY holds the terminal in raw
+  mode it is PrismTTY that receives it.
+
 ## 1.3.17 - 2026-11-27
 
 ### Fixed
