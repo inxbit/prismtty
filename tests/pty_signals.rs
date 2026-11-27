@@ -5030,6 +5030,20 @@ fn read_until(file: &mut File, needle: &[u8], timeout: Duration) -> bool {
     false
 }
 
+/// Reads `file`, a non-blocking description, until nothing has come for
+/// `quiet`, for five seconds at most.
+fn read_until_quiet(file: &mut File, quiet: Duration) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut buffer = [0_u8; 4096];
+    let mut last = Instant::now();
+    while Instant::now() < deadline && last.elapsed() < quiet {
+        match file.read(&mut buffer) {
+            Ok(read) if read > 0 => last = Instant::now(),
+            _ => thread::sleep(Duration::from_millis(10)),
+        }
+    }
+}
+
 /// Writes to `file`, a non-blocking description of its own, until the pipe or
 /// terminal behind it holds no more.
 fn fill(file: &mut File) {
@@ -5097,6 +5111,10 @@ fn the_end_is_limited_when_the_output_pipe_is_full() {
         read_until(&mut read_end, b"READY", Duration::from_secs(10)),
         "the command never printed READY"
     );
+    // Whatever the wrapper still writes after READY (a line end it held
+    // back) is read first, so that the wrapper is idle when the pipe fills:
+    // its next write is then the command's last line, which it has read.
+    read_until_quiet(&mut read_end, Duration::from_millis(300));
     fill(&mut filler);
     let term_sent = Instant::now();
     send(run.pid, libc::SIGTERM);
