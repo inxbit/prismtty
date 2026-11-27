@@ -3520,9 +3520,19 @@ enum EntrySigint {
     Blocked,
 }
 
-/// Sets SIGINT for the process `command` starts, and with `own_terminal`
-/// makes it the session leader of the terminal on its stdin.
-fn start_with_sigint(command: &mut std::process::Command, entry: EntrySigint, own_terminal: bool) {
+/// Which session a process a test starts belongs to.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Leader {
+    /// The test's own, as a command run from a shell script is.
+    Inherited,
+    /// A new session of its own, without a terminal.
+    Session,
+    /// A new session whose controlling terminal is the one on its stdin.
+    SessionOnTerminal,
+}
+
+/// Sets SIGINT for the process `command` starts, and the session it runs in.
+fn start_with_sigint(command: &mut std::process::Command, entry: EntrySigint, leader: Leader) {
     use std::os::unix::process::CommandExt;
 
     // SAFETY: the closure runs in the forked child before exec and only calls
@@ -3530,8 +3540,10 @@ fn start_with_sigint(command: &mut std::process::Command, entry: EntrySigint, ow
     // sigaddset, sigprocmask) on a stack-local signal set.
     unsafe {
         command.pre_exec(move || {
-            if own_terminal
-                && (libc::setsid() == -1 || libc::ioctl(0, libc::TIOCSCTTY as _, 0) == -1)
+            if leader != Leader::Inherited && libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if leader == Leader::SessionOnTerminal && libc::ioctl(0, libc::TIOCSCTTY as _, 0) == -1
             {
                 return Err(std::io::Error::last_os_error());
             }
@@ -3611,18 +3623,149 @@ impl Scratch {
             .env("PATH", "/usr/bin:/bin")
             .env("TERM", "xterm-256color")
             .env("PTTY", env!("CARGO_BIN_EXE_ptty"))
-            .env("CONFIG", self.config());
+            .env("CONFIG", self.config())
+            .env("SCRATCH", self.dir.path())
+            .env(TEST_TAG, test_tag());
     }
 
-    /// `ptty -c <empty config> [extra] -- sh -c <script>`.
+    /// The file in which the sessions a test's processes lead record their
+    /// pid, for `SessionSweep`.
+    fn sessions(&self) -> std::path::PathBuf {
+        self.path("sessions")
+    }
+
+    /// `ptty -c <config> [extra] -- sh -c <script>`. The command first records
+    /// its pid: under the wrapper it leads a session of its own.
     fn wrapper(&self, extra: &[&std::ffi::OsStr], script: &str) -> std::process::Command {
         let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_ptty"));
         self.environment(&mut command);
         command.arg("-c").arg(self.config());
         command.args(extra);
-        command.args(["--", "/bin/sh", "-c", script]);
+        command.args([
+            "--",
+            "/bin/sh",
+            "-c",
+            &format!("echo $$ >> \"$SCRATCH/sessions\"; {script}"),
+        ]);
         command
     }
+}
+
+/// Every process these tests start carries this variable, so a run can be
+/// checked from outside for anything it left behind. Its value is the test
+/// process's own value of it, or `pty2`.
+const TEST_TAG: &str = "PTY2_TEST_TAG";
+
+fn test_tag() -> String {
+    std::env::var(TEST_TAG).unwrap_or_else(|_| "pty2".to_owned())
+}
+
+/// Kills, when it is dropped, every process left in the sessions a test
+/// created, on return and on panic alike. Those are the sessions of the
+/// processes in the tree under `root`, a process the test spawned, and the
+/// sessions whose leaders wrote their pid to `marker`, one per line: a
+/// command under the wrapper leads a session of its own, and is no longer in
+/// the tree once the wrapper is gone. Processes are found by session id,
+/// never by name, and the test's own session is never touched. Declare it
+/// after the guard of `root`, so it runs first, while the tree is whole.
+struct SessionSweep {
+    root: libc::pid_t,
+    marker: std::path::PathBuf,
+}
+
+impl SessionSweep {
+    fn new(root: libc::pid_t, marker: std::path::PathBuf) -> Self {
+        Self { root, marker }
+    }
+}
+
+impl Drop for SessionSweep {
+    fn drop(&mut self) {
+        // SAFETY: getsid and getpid have no memory-safety preconditions.
+        let (own_session, own_pid) = unsafe { (libc::getsid(0), libc::getpid()) };
+        let mut swept = Vec::new();
+        let mut killed = Vec::new();
+        // A process that forked while it was being killed is caught by the
+        // next pass.
+        for _ in 0..3 {
+            let processes = all_processes();
+            let mut sessions: Vec<libc::pid_t> = process_tree(&processes, self.root)
+                .into_iter()
+                .filter_map(session_of)
+                .collect();
+            sessions.extend(
+                std::fs::read_to_string(&self.marker)
+                    .unwrap_or_default()
+                    .split_whitespace()
+                    .filter_map(|pid| pid.parse::<libc::pid_t>().ok()),
+            );
+            sessions.retain(|session| *session > 1 && *session != own_session);
+            sessions.sort_unstable();
+            sessions.dedup();
+            let mut found = false;
+            for (pid, _) in processes {
+                if pid != own_pid
+                    && session_of(pid).is_some_and(|session| sessions.contains(&session))
+                {
+                    // SAFETY: kill has no memory-safety preconditions; `pid` is in a session this
+                    // test created.
+                    unsafe {
+                        libc::kill(pid, libc::SIGKILL);
+                    }
+                    killed.push(pid);
+                    found = true;
+                }
+            }
+            swept.extend(sessions);
+            if !found {
+                break;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        swept.sort_unstable();
+        swept.dedup();
+        eprintln!("swept sessions {swept:?}, killed {killed:?}");
+    }
+}
+
+/// Every process as (pid, parent pid).
+fn all_processes() -> Vec<(libc::pid_t, libc::pid_t)> {
+    let Ok(output) = std::process::Command::new("ps")
+        .args(["-A", "-o", "pid=", "-o", "ppid="])
+        .output()
+    else {
+        return Vec::new();
+    };
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            Some((fields.next()?.parse().ok()?, fields.next()?.parse().ok()?))
+        })
+        .collect()
+}
+
+/// `root` and every process below it.
+fn process_tree(processes: &[(libc::pid_t, libc::pid_t)], root: libc::pid_t) -> Vec<libc::pid_t> {
+    let mut tree = vec![root];
+    let mut next = 0;
+    while next < tree.len() {
+        let parent = tree[next];
+        tree.extend(
+            processes
+                .iter()
+                .filter(|(_, ppid)| *ppid == parent)
+                .map(|(pid, _)| *pid),
+        );
+        next += 1;
+    }
+    tree
+}
+
+fn session_of(pid: libc::pid_t) -> Option<libc::pid_t> {
+    // SAFETY: getsid has no memory-safety preconditions.
+    let session = unsafe { libc::getsid(pid) };
+    (session > 0).then_some(session)
 }
 
 /// The script the tests use to kill a command with SIGINT dies from it
@@ -3637,7 +3780,7 @@ fn assert_sh_dies_from_its_own_sigint() {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    start_with_sigint(&mut bare, EntrySigint::Default, false);
+    start_with_sigint(&mut bare, EntrySigint::Default, Leader::Inherited);
     let status = bare.status().expect("run sh without the wrapper");
     assert_eq!(
         status.signal(),
@@ -3738,9 +3881,10 @@ fn run_redirected(
         .stdin(Stdio::null())
         .stdout(File::create(&output_path).expect("output file"))
         .stderr(File::create(scratch.path("stderr")).expect("stderr file"));
-    start_with_sigint(&mut command, entry, false);
+    start_with_sigint(&mut command, entry, Leader::Inherited);
     let mut wrapper = ProcessGuard::new(command.spawn().expect("spawn ptty"));
     let pid = wrapper.pid();
+    let _sweep = SessionSweep::new(pid, scratch.sessions());
     if let Some(signal) = signal {
         assert!(
             wait_for_file_containing(&output_path, b"READY", Duration::from_secs(10)),
@@ -3828,9 +3972,14 @@ fn wrapper_on_a_terminal_dies_from_sigint_after_restoring_it_when_its_command_di
         .stdin(tty.try_clone().expect("stdin tty"))
         .stdout(tty.try_clone().expect("stdout tty"))
         .stderr(tty.try_clone().expect("stderr tty"));
-    start_with_sigint(&mut command, EntrySigint::Default, true);
+    start_with_sigint(
+        &mut command,
+        EntrySigint::Default,
+        Leader::SessionOnTerminal,
+    );
     let mut wrapper = ProcessGuard::new(command.spawn().expect("spawn ptty"));
     let pid = wrapper.pid();
+    let _sweep = SessionSweep::new(pid, scratch.sessions());
     let status = wrapper
         .wait_for_exit(Duration::from_secs(10))
         .expect("wrapper exits");
@@ -3896,8 +4045,13 @@ fn loop_after_one_ctrl_c(scratch: &Scratch, argv: &[&str], wrapped: bool) -> Vec
         .stdin(tty.try_clone().expect("stdin tty"))
         .stdout(tty.try_clone().expect("stdout tty"))
         .stderr(tty.try_clone().expect("stderr tty"));
-    start_with_sigint(&mut command, EntrySigint::Default, true);
+    start_with_sigint(
+        &mut command,
+        EntrySigint::Default,
+        Leader::SessionOnTerminal,
+    );
     let mut shell = ProcessGuard::new(command.spawn().expect("spawn interactive shell"));
+    let _sweep = SessionSweep::new(shell.pid(), scratch.sessions());
     let keyboard = pair.master.as_raw_fd().expect("outer PTY descriptor");
     let type_text = |text: &[u8]| {
         // SAFETY: `keyboard` is the open PTY master and the buffer is valid for its length.
@@ -3919,8 +4073,9 @@ fn loop_after_one_ctrl_c(scratch: &Scratch, argv: &[&str], wrapped: bool) -> Vec
         wait_for_condition(Duration::from_secs(10), || len_now() > 0),
         "the shell printed nothing"
     );
-    // The prompt the shell prints differs from the typed text.
-    type_text(b"PS1='PRO''MPT> '\r");
+    // The shell records its session, for the sweep. The prompt it prints
+    // differs from the typed text.
+    type_text(b"echo $$ >> \"$SCRATCH/sessions\"; PS1='PRO''MPT> '\r");
     assert!(
         seen_after(0, b"PROMPT> ", Duration::from_secs(10)),
         "the prompt never appeared"
@@ -3933,7 +4088,7 @@ fn loop_after_one_ctrl_c(scratch: &Scratch, argv: &[&str], wrapped: bool) -> Vec
     let start = len_now();
     type_text(
         format!(
-            "for i in 1 2 3; do {prefix}sh -c 'echo RE\"\"ADY; exec sleep 600'; echo IT\"\"ER $i; done; echo LOOP\"\"DONE\r"
+            "for i in 1 2 3; do {prefix}sh -c 'echo $$ >> \"$SCRATCH/sessions\"; echo RE\"\"ADY; exec sleep 60'; echo IT\"\"ER $i; done; echo LOOP\"\"DONE\r"
         )
         .as_bytes(),
     );
@@ -4151,9 +4306,14 @@ fn a_command_killed_by_another_signal_still_reports_128_plus_the_signal() {
 }
 
 /// SIGTERM sent to the wrapper ends it with 143 even when the command is then
-/// killed by SIGINT. The command sends the SIGTERM itself and answers the
-/// SIGTERM the wrapper forwards to it with SIGINT to itself, so the wrapper
-/// has received SIGTERM, and is waiting for the command, when SIGINT kills it.
+/// killed by SIGINT. The test sends SIGTERM once the command's READY has come
+/// through the wrapper, which by then has registered the command and so
+/// forwards the SIGTERM to it. The command answers that SIGTERM by recording
+/// it and sending SIGINT to itself. Its two markers show that the forwarded
+/// SIGTERM arrived and that the command did not run on past its own SIGINT;
+/// with the control, which shows this shell dies from its own SIGINT, that is
+/// the command dying from SIGINT while the wrapper waits for it. The
+/// command's wait status itself only the wrapper can read.
 #[test]
 fn sigterm_to_the_wrapper_still_reports_143_when_the_command_then_dies_from_sigint() {
     use std::os::unix::process::ExitStatusExt;
@@ -4163,11 +4323,22 @@ fn sigterm_to_the_wrapper_still_reports_143_when_the_command_then_dies_from_sigi
     let run = run_redirected(
         &scratch,
         &[],
-        "trap 'kill -INT $$' TERM; kill -TERM $PPID; while :; do sleep 1; done",
+        "trap 'echo seen > \"$SCRATCH/term-forwarded\"; kill -INT $$; echo on > \"$SCRATCH/ran-on\"' TERM; \
+         echo READY; while :; do sleep 1; done",
         EntrySigint::Default,
-        None,
+        Some(libc::SIGTERM),
     );
 
+    assert!(
+        scratch.path("term-forwarded").exists(),
+        "the command never received the SIGTERM the wrapper forwards: {:?}",
+        run.output
+    );
+    assert!(
+        !scratch.path("ran-on").exists(),
+        "the command ran on past its own SIGINT: {:?}",
+        run.output
+    );
     assert_eq!(
         (run.status.signal(), run.status.code()),
         (None, Some(128 + libc::SIGTERM)),
@@ -4219,8 +4390,9 @@ fn a_wrapper_started_by_a_script_with_sigint_ignored_still_reports_130() {
             .stdin(Stdio::null())
             .stdout(File::create(&output_path).expect("output file"))
             .stderr(Stdio::null());
-        start_with_sigint(&mut command, EntrySigint::Default, false);
+        start_with_sigint(&mut command, EntrySigint::Default, Leader::Session);
         let mut shell = ProcessGuard::new(command.spawn().expect("spawn sh"));
+        let _sweep = SessionSweep::new(shell.pid(), scratch.sessions());
         let status = shell
             .wait_for_exit(Duration::from_secs(10))
             .expect("sh exits");
@@ -4237,12 +4409,16 @@ fn a_wrapper_started_by_a_script_with_sigint_ignored_still_reports_130() {
         "control: the background job did not ignore SIGINT: {bare:?}"
     );
 
-    let (_, job) =
-        shell("\"$PTTY\" -c \"$CONFIG\" -- sh -c 'kill -INT $$; sleep 5' & wait $!; echo BG:$?");
+    let (_, job) = shell(
+        "\"$PTTY\" -c \"$CONFIG\" -- sh -c 'echo $$ >> \"$SCRATCH/sessions\"; kill -INT $$; sleep 5' & \
+         wait $!; echo BG:$?",
+    );
     assert!(job.contains("BG:130"), "background job: {job:?}");
 
-    let (status, output) =
-        shell("trap '' INT; exec \"$PTTY\" -c \"$CONFIG\" -- sh -c 'kill -INT $$; sleep 5'");
+    let (status, output) = shell(
+        "trap '' INT; exec \"$PTTY\" -c \"$CONFIG\" -- \
+         sh -c 'echo $$ >> \"$SCRATCH/sessions\"; kill -INT $$; sleep 5'",
+    );
     assert_eq!(
         (status.signal(), status.code()),
         (None, Some(128 + libc::SIGINT)),
