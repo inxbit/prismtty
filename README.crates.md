@@ -162,6 +162,12 @@ prismtty --profile cisco < show-tech.txt
 journalctl -xe | prismtty --profile linux-unix
 ```
 
+When PrismTTY reads a file or a pipe, highlighting pauses while the alternate
+screen that full-screen programs such as `less` and `vim` draw on is active,
+and resumes when that screen is closed or the terminal is reset. Output that
+ends before then, such as a log cut off while a pager was open, stays
+unhighlighted from the switch on.
+
 A wrapped command runs in the current directory. Descriptors above 2 that the
 caller passes (`ptty cmd 3<file`, `ptty diff <(a) <(b)`) reach the command as
 they would without the wrapper. When stdin is not a terminal (a script, a CI
