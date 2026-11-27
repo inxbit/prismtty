@@ -47,6 +47,21 @@ All notable changes to PrismTTY are documented here.
   themselves, and while PrismTTY holds the terminal in raw mode it is
   PrismTTY that receives it.
 
+### Fixed
+
+- The generic profile's good operational state rule (the green `up`,
+  `connected`, `enabled` and so on) is no longer switched off for the
+  session by a line that holds `not` and a long run of blanks. Where PCRE2
+  runs without its JIT compiler (a library built without it, or a system
+  that refuses it), `not` followed by 7,142 or more spaces, tabs or hyphens
+  and no good-state word made the rule hit its match limit, and PrismTTY
+  printed `rule 'good operational state' stopped after a bounded regex match
+  error` and stopped coloring those words. With JIT the same took 50,001
+  blanks in one buffer, more than one read holds. The rule now takes the
+  blanks after `not` in one step. It matches exactly what it matched before,
+  and its pattern is one byte shorter, so every configuration of your own
+  that fit beside the generic profile still fits.
+
 ## 1.3.17 - 2026-11-27
 
 ### Fixed

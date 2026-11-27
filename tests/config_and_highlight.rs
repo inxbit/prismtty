@@ -333,6 +333,36 @@ fn generic_profile_does_not_paint_a_negated_good_state_green() {
     }
 }
 
+// PCRE2 runs a rule without its JIT compiler when the library was built
+// without it or the host refuses JIT memory. `(*NO_JIT)` in front of a rule
+// makes this one run that way. A `not` followed by a run of blanks that no
+// good-state word ends must not spend the rule's match limit there: a rule
+// that hits its limit is switched off for the session. A read is at most
+// 8 KiB, so 8000 blanks fit in one; with JIT the run fits in 64 KiB.
+#[test]
+fn generic_profile_rules_stay_within_their_match_limit_after_a_long_blank_run() {
+    let store = ProfileStore::builtin();
+    let stock = PrismConfig::from_profiles(&store, &["generic"]).expect("generic loads");
+    let mut no_jit = stock.clone();
+    for rule in &mut no_jit.rules {
+        rule.regex = format!("(*NO_JIT){}", rule.regex);
+    }
+    for (config, length) in [(no_jit, 8000), (stock, 64 * 1024)] {
+        let highlighter = Highlighter::from_config(config).expect("rules compile");
+        for blank in [" ", "\t", "-", " \t"] {
+            for tail in ["x", "", "\n"] {
+                let input = format!("not{}{tail}", blank.repeat(length / blank.len()));
+                if let Err(error) = highlighter.try_highlight_bytes(input.as_bytes()) {
+                    panic!(
+                        "{length} bytes of {blank:?} after `not`, then {tail:?}: rule {:?}: {}",
+                        error.description, error.message
+                    );
+                }
+            }
+        }
+    }
+}
+
 /// What a stream with the generic profile writes for `reads`, each pushed on
 /// its own, and for the end of input.
 fn stream_with_generic(interactive: bool, reads: &[&str]) -> String {

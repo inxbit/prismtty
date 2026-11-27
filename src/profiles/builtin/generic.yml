@@ -30,8 +30,15 @@ rules:
   - description: warning state
     regex: '(?i)\b(warning(s)?|degraded|standby|learning|listening|passive)\b'
     color: f#ffff00
+  # "not" takes its blanks all at once (`++`): no good-state word starts
+  # with a blank or a hyphen, so giving one back never finds a word. PCRE2
+  # cannot see that through `(?&good)`. Without JIT it gave a long run of
+  # blanks back one at a time until the rule's match limit ran out, and the
+  # rule was switched off. `enabled?` (not `enable(d)?`) pays for the extra
+  # `+`: the pattern's bytes count toward the limit a user's own rules
+  # share with the profile.
   - description: good operational state
-    regex: '(?i)\bnot[ \t-]+(?&good)\b(*SKIP)(*F)|\b(?<good>up|ok(ay)?|permit(t?ed|s)?|accept(s|ed)?|enable(d)?|online|succe((ss(ful|fully)?)|ed(ed)?)?|connect(?:ed|(?![ \t]+to[ \t]+host\b))|reachable|valid|forwarding|synchronized|active)\b'
+    regex: '(?i)\bnot[ \t-]++(?&good)\b(*SKIP)(*F)|\b(?<good>up|ok(ay)?|permit(t?ed|s)?|accept(s|ed)?|enabled?|online|succe((ss(ful|fully)?)|ed(ed)?)?|connect(?:ed|(?![ \t]+to[ \t]+host\b))|reachable|valid|forwarding|synchronized|active)\b'
     color: f#00ff00
   - description: syslog severe
     regex: '(%\w+(?:-\w+)?-[0-3]-\w+)\b'
