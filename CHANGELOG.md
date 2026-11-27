@@ -2,7 +2,7 @@
 
 All notable changes to PrismTTY are documented here.
 
-## 1.4.0 - unreleased
+## 1.4.0 - 2026-11-27
 
 ### Changed
 
@@ -61,6 +61,19 @@ All notable changes to PrismTTY are documented here.
   blanks after `not` in one step. It matches exactly what it matched before,
   and its pattern is one byte shorter, so every configuration of your own
   that fit beside the generic profile still fits.
+
+### Documentation
+
+- Both READMEs and SECURITY.md now state limits that are left as they are:
+  rules match bytes, and `(*UTF)` at the start of a rule matches characters;
+  `--show-profile` reports no selection that stays `generic`; `--sanitize` and
+  `--strip-ansi` guard a terminal that reads UTF-8 and do not remove every
+  control; PrismTTY owns `pids.d` and `reload` in its runtime directory, and
+  in a temporary directory other users can write to, a user who creates
+  `prismtty-<uid>` first disables live reload for your sessions; highlighting
+  of a file or pipe pauses while the alternate screen is active; with stdin
+  redirected and the output on a terminal, a recording of that terminal holds
+  CR CR LF, on purpose.
 
 ## 1.3.17 - 2026-11-27
 
