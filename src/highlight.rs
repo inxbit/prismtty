@@ -3623,6 +3623,22 @@ struct LayoutModes {
     left_right_margins: bool,
     autowrap_off: bool,
     alternate_screen_restored: bool,
+    /// A row may be of double width or double height (`ESC # 3`, `4`, `6`),
+    /// or the screen may be taking a size the program asked for (DECCOLM,
+    /// DECSCPP, DECSNLS, a window resize, a status line), so a row can be
+    /// narrower than the width the read loop gives. Only RIS clears it:
+    /// `ESC # 5` resets one row.
+    row_width_unknown: bool,
+    /// Insert mode (`CSI 4 h`): text shifts the cells right of it, and can
+    /// push the prompt past the right edge.
+    insert_mode: bool,
+    /// The terminal may have left UTF-8 (`ESC %` with a final other than
+    /// `G`), so a byte of a UTF-8 character can be a control. RIS need not
+    /// bring UTF-8 back; only `ESC % G` clears it.
+    decoding_switched: bool,
+    /// National replacement character sets (`CSI ? 42 h`). Kept across RIS
+    /// as well; only its exact reset clears it.
+    national_charsets: bool,
 }
 
 impl LayoutModes {
@@ -3636,7 +3652,23 @@ impl LayoutModes {
 
     fn observe_control(&mut self, bytes: &[u8]) {
         if bytes == b"\x1bc" {
-            *self = Self::default();
+            *self = Self {
+                decoding_switched: self.decoding_switched,
+                national_charsets: self.national_charsets,
+                ..Self::default()
+            };
+            return;
+        }
+        if let Some(size) = bytes.strip_prefix(b"\x1b#") {
+            // Single width (DECSWL) and the alignment test (DECALN) set no
+            // row's size; anything else may.
+            if size != b"5" && size != b"8" {
+                self.row_width_unknown = true;
+            }
+            return;
+        }
+        if let Some(coding) = bytes.strip_prefix(b"\x1b%") {
+            self.decoding_switched = coding != b"G";
             return;
         }
         let Some(body) = csi_body(bytes) else {
@@ -3658,7 +3690,50 @@ impl LayoutModes {
                 }
             }
             (b'h' | b'l', Some(modes)) => self.set_private_modes(modes, final_byte == b'h', exact),
+            (b'h' | b'l', None) => self.set_ansi_modes(parameters, final_byte == b'h', exact),
+            (b'|', None) if parameters.ends_with(b"$") || parameters.ends_with(b"*") => {
+                // DECSCPP (columns per page) and DECSNLS (lines per screen).
+                self.row_width_unknown = true;
+            }
+            (b't', None) if parameters.iter().all(|b| b.is_ascii_digit() || *b == b';') => {
+                // A window operation that resizes: 4 and 8 to a size, 9
+                // maximizes, 10 goes full screen, 24 and up set the lines.
+                let first = parameters.split(|b| *b == b';').next().unwrap_or_default();
+                if bounded_parameter(first)
+                    .is_some_and(|op| matches!(op, 4 | 8 | 9 | 10) || op >= 24)
+                {
+                    self.row_width_unknown = true;
+                }
+            }
+            (b'~' | b'}', None) if parameters.ends_with(b"$") => {
+                // DECSSDT shows a status line, DECSASD writes to it.
+                let kind = &parameters[..parameters.len() - 1];
+                if bounded_parameter(kind).is_some_and(|kind| kind != 0) {
+                    self.row_width_unknown = true;
+                }
+            }
             _ => {}
+        }
+    }
+
+    /// `CSI ... h` and `l` without `?`: insert mode is 4.
+    fn set_ansi_modes(&mut self, modes: &[u8], set: bool, exact: bool) {
+        if set && liberal_mode_numbers(modes).any(|mode| matches!(mode, None | Some(4))) {
+            self.insert_mode = true;
+        }
+        if set
+            || !exact
+            || !modes
+                .iter()
+                .all(|byte| byte.is_ascii_digit() || *byte == b';')
+        {
+            return;
+        }
+        if private_mode_numbers(modes)
+            .take(MAX_RESET_PARAMETERS)
+            .any(|mode| mode == 4)
+        {
+            self.insert_mode = false;
         }
     }
 
@@ -3670,8 +3745,17 @@ impl LayoutModes {
                     self.reverse_wrap_any_line = true;
                     self.left_right_margins = true;
                     self.maybe_on_alternate_screen = true;
+                    self.row_width_unknown = true;
+                    self.national_charsets = true;
                 }
-                (None, false) | (Some(7), false) => self.autowrap_off = true,
+                (None, false) => {
+                    self.autowrap_off = true;
+                    self.row_width_unknown = true;
+                }
+                (Some(7), false) => self.autowrap_off = true,
+                // DECCOLM, either way: the terminal takes 80 or 132 columns.
+                (Some(3), _) => self.row_width_unknown = true,
+                (Some(42), true) => self.national_charsets = true,
                 (Some(47 | 1047 | 1049), true) => self.maybe_on_alternate_screen = true,
                 (Some(45), true) => self.reverse_wrap = true,
                 (Some(1045), true) => self.reverse_wrap_any_line = true,
@@ -3692,6 +3776,7 @@ impl LayoutModes {
                 (45, false) => self.reverse_wrap = false,
                 (1045, false) => self.reverse_wrap_any_line = false,
                 (69, false) => self.left_right_margins = false,
+                (42, false) => self.national_charsets = false,
                 (47 | 1047 | 1049, false) => {
                     self.alternate_screen_restored = false;
                     self.maybe_on_alternate_screen = false;
@@ -3735,6 +3820,10 @@ impl LayoutModes {
             && !self.left_right_margins
             && !self.autowrap_off
             && !self.alternate_screen_restored
+            && !self.row_width_unknown
+            && !self.insert_mode
+            && !self.decoding_switched
+            && !self.national_charsets
             && self.scroll_region.is_whole_screen(rows)
             && self.main_screen_region.is_whole_screen(rows)
     }
