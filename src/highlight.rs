@@ -3297,9 +3297,11 @@ fn plain_lines_before_prompt_redraw(
 /// terminal stops them. A character written in the last column (the next one
 /// may wrap to a new row), a tab (the program may have moved the tab stops),
 /// a character that is not ASCII (it may take no column, one or two), and a
-/// move whose count is too large to read leave it unknown. A stretch holding a
-/// character that is not ASCII is taken to cover two columns for each
-/// character, and a stretch that may not fit on the row is no prompt.
+/// move whose count is too large to read leave it unknown. A character that
+/// is not ASCII and may not fit before the right edge can wrap to the next
+/// row, so it forgets the prompt. A stretch holding a character that is not
+/// ASCII is taken to cover two columns for each character, and a stretch
+/// that may not fit on the row is no prompt.
 #[derive(Debug)]
 struct LastLine {
     /// The terminal's width, at least 1.
@@ -3363,17 +3365,22 @@ impl LastLine {
             return;
         }
         // A character that is not ASCII, or a byte that is no character: it
-        // may join the cell before it or cover two.
+        // may join the cell before it or cover two, and one two columns wide
+        // that does not fit wraps to the next row.
         self.continuation_bytes = match byte {
             0xc2..=0xdf => 1,
             0xe0..=0xef => 2,
             0xf0..=0xf4 => 3,
             _ => 0,
         };
-        self.forget_prompt_from(
-            self.column.map(|column| column.saturating_sub(1)),
-            self.column.map(|column| column + 2),
-        );
+        if self.column.is_some_and(|column| column + 2 <= self.columns) {
+            self.forget_prompt_from(
+                self.column.map(|column| column.saturating_sub(1)),
+                self.column.map(|column| column + 2),
+            );
+        } else {
+            self.prompt = None;
+        }
         self.column = None;
     }
 
