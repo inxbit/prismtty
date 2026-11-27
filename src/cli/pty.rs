@@ -4956,26 +4956,38 @@ mod tests {
     }
 
     /// Publishes the watcher's outcome for a command that SIGINT killed, the
-    /// signal received being `state` (INT or TERM), and then runs the limit's
-    /// end at the deadline: as when the watcher, delayed after its reap, has
-    /// not yet ended the process itself.
+    /// signal received being INT or TERM, and then runs the limit's end at
+    /// the deadline: as when the watcher, delayed after its reap, has not yet
+    /// ended the process itself. With `LOCKED_INT` the watcher is delayed
+    /// while it still holds the reap lock, for longer than the limit would
+    /// ever wait for it.
     #[test]
     fn end_at_deadline_probe() {
         let Some(state) = probe_state("end_at_deadline_probe") else {
             return;
         };
-        let signal = if state == "INT" {
-            libc::SIGINT
-        } else {
+        let signal = if state == "TERM" {
             libc::SIGTERM
+        } else {
+            libc::SIGINT
         };
-        *super::forward_child_lock() = super::ReapState::Ended(super::EndOutcome {
+        let outcome = super::EndOutcome {
             signal,
             leader_status: Some(libc::SIGINT),
             deadline: Instant::now(),
             owner: super::EndOwner::Watcher,
-        });
-        super::end_at_deadline(signal, true);
+        };
+        let mut reap_state = super::forward_child_lock();
+        super::publish_end_outcome(&mut reap_state, outcome);
+        if state == "LOCKED_INT" {
+            let limit = std::thread::spawn(move || super::end_at_deadline(signal, true));
+            std::thread::sleep(Duration::from_millis(1500));
+            drop(reap_state);
+            let _ = limit.join();
+        } else {
+            drop(reap_state);
+            super::end_at_deadline(signal, true);
+        }
         println!("the limit did not end the process");
     }
 
@@ -4987,6 +4999,9 @@ mod tests {
         use std::os::unix::process::ExitStatusExt;
 
         let (status, printed) = run_ending_probe("end_at_deadline_probe", "INT");
+        assert_eq!(status.signal(), Some(libc::SIGINT), "{status:?} {printed}");
+        // The same while the watcher, delayed, still holds the reap lock.
+        let (status, printed) = run_ending_probe("end_at_deadline_probe", "LOCKED_INT");
         assert_eq!(status.signal(), Some(libc::SIGINT), "{status:?} {printed}");
         let (status, printed) = run_ending_probe("end_at_deadline_probe", "TERM");
         assert_eq!(
