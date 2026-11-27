@@ -3772,24 +3772,454 @@ impl ScrollRegion {
     }
 }
 
-/// Terminal modes, followed through the output, under which a line feed, a
-/// backward move or text past the margin can land on a cell that is already
-/// drawn: a scroll region that is not the whole screen (a cursor below it
-/// stays on the last row when a line feed comes), left and right margins
-/// (mode 69), reverse wraparound (modes 45 and 1045: BS and `CSI D` at the
-/// first column step back onto the row above), autowrap off (mode 7: text
-/// past the margin overwrites the last column), a restore of saved modes
-/// that can put the terminal on the alternate screen, insert mode, and the
-/// states that make a row narrower than the width the read loop gives or
-/// turn bytes of a UTF-8 character into controls (see the fields).
+/// How a control on [`CONTROL_TABLE`] is taken.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Listed {
+    /// Leaves later output drawn as it would be without it.
+    Inert,
+    /// Leaves a state that [`LayoutModes`] follows, with the exact reset
+    /// that clears it.
+    Followed,
+}
+
+/// The forms a control on [`CONTROL_TABLE`] takes.
+#[derive(Clone, Copy, Debug)]
+enum Form {
+    /// These bytes exactly.
+    Bytes(&'static [u8]),
+    /// A C0 control in the text.
+    C0(u8),
+    /// `ESC [`, plain parameters (decimal digits and `;`, and `:` for SGR),
+    /// at most this many of them, no private marker, no intermediate, and
+    /// this final byte.
+    Csi(u8, usize),
+    /// `ESC [`, this private marker, plain parameters, an intermediate if one
+    /// is named, and this final byte.
+    PrivateCsi(u8, Option<u8>, u8),
+    /// `ESC [`, plain parameters, this intermediate and this final byte.
+    CsiWith(u8, u8),
+    /// `CSI ? n h` and `CSI ? n l` for this mode, alone or in a list whose
+    /// every mode is on the table.
+    PrivateMode(u32),
+    /// `CSI n h` and `CSI n l` for this mode, alone or in such a list.
+    AnsiMode(u32),
+    /// `CSI n ; ... t` (a window operation) whose first parameter is this.
+    WindowOp(u32),
+    /// `ESC ] Ps ; ... ` ended by BEL or `ESC \`, whose text up to the
+    /// first `;` is this.
+    Osc(&'static [u8]),
+    /// The same whose text starts with this.
+    OscPrefix(&'static [u8]),
+}
+
+/// One control proved to leave later output drawn as it would be without
+/// it: no later byte is parsed differently, no later move or erase lands
+/// elsewhere, and no row changes width; or one whose lasting state the
+/// tracker follows exactly.
+#[derive(Debug)]
+struct TableEntry {
+    form: Form,
+    listed: Listed,
+    /// Why it is on the table. Read by people, not by the code.
+    #[expect(dead_code, reason = "each entry states why it is on the table")]
+    reason: &'static str,
+}
+
+const fn inert(form: Form, reason: &'static str) -> TableEntry {
+    TableEntry {
+        form,
+        listed: Listed::Inert,
+        reason,
+    }
+}
+
+const fn followed(form: Form, reason: &'static str) -> TableEntry {
+    TableEntry {
+        form,
+        listed: Listed::Followed,
+        reason,
+    }
+}
+
+/// The controls a read may follow and still be promoted: each one PrismTTY
+/// has seen since it started, or since the last RIS, must be on this table.
+/// Any other control, known or not, keeps every later read on the bypass
+/// until RIS: a private mode, an ANSI mode, an escape, a CSI final, a
+/// private marker or an intermediate that is not here, every DCS, SOS, PM
+/// and APC string but one, every C1 form, and a mode restored by XTRESTORE.
+/// Among them are VT52 mode (`CSI ? 2 l`, which hands the terminal's parser
+/// to VT52, where `ESC [` starts nothing), Tektronix mode (`CSI ? 38 h`),
+/// column mode (`CSI ? 3 h` and `l`), insert-free line sizes (`ESC # 3`, `4`
+/// and `6`), window resizes, status lines, newline mode (`CSI 20 h`),
+/// character sets other than ASCII as G0, and shift out. The references are
+/// to xterm's source.
+const CONTROL_TABLE: &[TableEntry] = &[
+    // The text's own controls.
+    inert(Form::C0(0x00), "NUL: ignored"),
+    inert(Form::C0(0x07), "BEL: rings, draws nothing"),
+    inert(
+        Form::C0(0x08),
+        "BS: moves the cursor (reverse wrap is followed)",
+    ),
+    inert(
+        Form::C0(0x09),
+        "HT: moves to a tab stop; the model never trusts a tab",
+    ),
+    inert(Form::C0(0x0a), "LF: moves down"),
+    inert(Form::C0(0x0b), "VT: a line feed in xterm"),
+    inert(Form::C0(0x0c), "FF: a line feed in xterm"),
+    inert(Form::C0(0x0d), "CR: moves to the first column"),
+    inert(Form::C0(0x0f), "SI: invokes G0, the default, into GL"),
+    inert(Form::C0(0x7f), "DEL: ignored"),
+    // Rendition, moves, erases and edits: they change cells and the
+    // cursor's place, and leave no mode.
+    inert(Form::Csi(b'm', usize::MAX), "SGR: rendition only"),
+    inert(Form::Csi(b'A', 1), "CUU: moves the cursor"),
+    inert(Form::Csi(b'B', 1), "CUD: moves the cursor"),
+    inert(Form::Csi(b'C', 1), "CUF: moves the cursor"),
+    inert(Form::Csi(b'D', 1), "CUB: moves the cursor"),
+    inert(Form::Csi(b'E', 1), "CNL: moves the cursor"),
+    inert(Form::Csi(b'F', 1), "CPL: moves the cursor"),
+    inert(Form::Csi(b'G', 1), "CHA: moves the cursor"),
+    inert(Form::Csi(b'H', 2), "CUP: moves the cursor"),
+    inert(Form::Csi(b'f', 2), "HVP: moves the cursor"),
+    inert(Form::Csi(b'd', 1), "VPA: moves the cursor"),
+    inert(Form::Csi(b'e', 1), "VPR: moves the cursor"),
+    inert(Form::Csi(b'a', 1), "HPR: moves the cursor"),
+    inert(Form::Csi(b'`', 1), "HPA: moves the cursor"),
+    inert(Form::Csi(b'J', 1), "ED: erases"),
+    inert(Form::Csi(b'K', 1), "EL: erases"),
+    inert(Form::Csi(b'X', 1), "ECH: erases characters"),
+    inert(Form::Csi(b'P', 1), "DCH: deletes characters"),
+    inert(Form::Csi(b'@', 1), "ICH: inserts blanks"),
+    inert(Form::Csi(b'L', 1), "IL: inserts lines"),
+    inert(Form::Csi(b'M', 1), "DL: deletes lines"),
+    inert(Form::Csi(b'S', 1), "SU: scrolls up"),
+    inert(
+        Form::Csi(b'T', 1),
+        "SD: scrolls down (one parameter; five start mouse highlighting)",
+    ),
+    inert(Form::Csi(b'b', 1), "REP: repeats a character"),
+    inert(Form::Bytes(b"\x1bD"), "IND: moves down or scrolls"),
+    inert(Form::Bytes(b"\x1bE"), "NEL: moves to the next line"),
+    inert(Form::Bytes(b"\x1bM"), "RI: moves up or scrolls"),
+    // Saved and restored cursors. xterm saves and restores the position, the
+    // rendition, origin mode, protection, the character sets and the wrap
+    // flag (cursor.c `CursorSave2`, `CursorRestoreFlags` with `DECSC_FLAGS`).
+    // Origin mode is on the table; a character set other than the default,
+    // and protection, are not, so a restore brings back nothing the guard has
+    // not already taken as off the table.
+    inert(Form::Bytes(b"\x1b7"), "DECSC: saves the cursor"),
+    inert(Form::Bytes(b"\x1b8"), "DECRC: restores what DECSC saved"),
+    inert(
+        Form::Csi(b's', 2),
+        "SCOSC, or DECSLRM while mode 69 is on, which is followed",
+    ),
+    inert(Form::Csi(b'u', 0), "SCORC: restores what SCOSC saved"),
+    // Tab stops: the model takes the column after a tab as not known.
+    inert(Form::Bytes(b"\x1bH"), "HTS: sets a tab stop"),
+    inert(Form::Csi(b'g', 1), "TBC: clears tab stops"),
+    // Input, the cursor's look, and queries the terminal answers on input.
+    inert(Form::Bytes(b"\x1b="), "DECKPAM: keypad keys (input only)"),
+    inert(Form::Bytes(b"\x1b>"), "DECKPNM: keypad keys (input only)"),
+    inert(Form::PrivateMode(1), "DECCKM: cursor keys (input only)"),
+    inert(Form::PrivateMode(4), "DECSCLM: smooth scroll (speed only)"),
+    inert(
+        Form::PrivateMode(5),
+        "DECSCNM: reverse video for the screen (colors only)",
+    ),
+    inert(
+        Form::PrivateMode(6),
+        "DECOM: positions from the scroll region and the margins, which are followed",
+    ),
+    inert(Form::PrivateMode(12), "cursor blink (the cursor's look)"),
+    inert(Form::PrivateMode(25), "DECTCEM: cursor shown or hidden"),
+    inert(Form::PrivateMode(1000), "mouse reporting (input only)"),
+    inert(Form::PrivateMode(1002), "mouse reporting (input only)"),
+    inert(Form::PrivateMode(1003), "mouse reporting (input only)"),
+    inert(Form::PrivateMode(1004), "focus reporting (input only)"),
+    inert(Form::PrivateMode(1005), "mouse encoding (input only)"),
+    inert(Form::PrivateMode(1006), "mouse encoding (input only)"),
+    inert(Form::PrivateMode(1007), "wheel as cursor keys (input only)"),
+    inert(Form::PrivateMode(1015), "mouse encoding (input only)"),
+    inert(Form::PrivateMode(1034), "meta key (input only)"),
+    inert(Form::PrivateMode(1036), "meta key (input only)"),
+    inert(Form::PrivateMode(1039), "alt key (input only)"),
+    inert(Form::PrivateMode(2004), "bracketed paste (input only)"),
+    inert(Form::CsiWith(b' ', b'q'), "DECSCUSR: cursor shape"),
+    inert(
+        Form::PrivateCsi(b'>', None, b'm'),
+        "XTMODKEYS: key encoding (input only)",
+    ),
+    inert(
+        Form::PrivateCsi(b'>', None, b'n'),
+        "XTMODKEYS reset (input only)",
+    ),
+    inert(Form::PrivateCsi(b'?', None, b'm'), "XTQMODKEYS: a query"),
+    inert(
+        Form::PrivateCsi(b'>', None, b'u'),
+        "keyboard protocol push (input only)",
+    ),
+    inert(
+        Form::PrivateCsi(b'<', None, b'u'),
+        "keyboard protocol pop (input only)",
+    ),
+    inert(
+        Form::PrivateCsi(b'=', None, b'u'),
+        "keyboard protocol flags (input only)",
+    ),
+    inert(
+        Form::PrivateCsi(b'?', None, b'u'),
+        "keyboard protocol query",
+    ),
+    inert(Form::Csi(b'c', 1), "DA1: a query"),
+    inert(Form::PrivateCsi(b'>', None, b'c'), "DA2: a query"),
+    inert(Form::PrivateCsi(b'=', None, b'c'), "DA3: a query"),
+    inert(Form::PrivateCsi(b'>', None, b'q'), "XTVERSION: a query"),
+    inert(Form::Csi(b'n', 1), "DSR: a query"),
+    inert(Form::PrivateCsi(b'?', None, b'n'), "DECDSR: a query"),
+    inert(Form::CsiWith(b'$', b'p'), "DECRQM: a query"),
+    inert(Form::PrivateCsi(b'?', Some(b'$'), b'p'), "DECRQM: a query"),
+    inert(
+        Form::PrivateCsi(b'?', None, b's'),
+        "XTSAVE: saves modes, changes none",
+    ),
+    inert(Form::WindowOp(11), "a window report"),
+    inert(Form::WindowOp(13), "a window report"),
+    inert(Form::WindowOp(14), "a window report"),
+    inert(Form::WindowOp(15), "a window report"),
+    inert(Form::WindowOp(16), "a window report"),
+    inert(Form::WindowOp(18), "a window report"),
+    inert(Form::WindowOp(19), "a window report"),
+    inert(Form::WindowOp(20), "a window report"),
+    inert(Form::WindowOp(21), "a window report"),
+    inert(Form::WindowOp(22), "the title stack: saves the title"),
+    inert(Form::WindowOp(23), "the title stack: restores the title"),
+    // vim's xterm compatibility test (term.c): a DCS string and a CSI with
+    // an intermediate that no terminal function names. A terminal ignores
+    // them or draws them as text, and either way keeps no mode.
+    inert(
+        Form::Bytes(b"\x1bPzz\x1b\\"),
+        "vim's probe: a DCS no function names",
+    ),
+    inert(
+        Form::Bytes(b"\x1b[0%m"),
+        "vim's probe: a CSI no function names",
+    ),
+    // Character sets: G0 as ASCII is the default; ncurses' sgr0 sends it.
+    inert(Form::Bytes(b"\x1b(B"), "SCS: ASCII as G0, the default"),
+    // Line sizes back to normal.
+    inert(
+        Form::Bytes(b"\x1b#5"),
+        "DECSWL: the cursor's row single width",
+    ),
+    inert(
+        Form::Bytes(b"\x1b#8"),
+        "DECALN: fills the screen, resets margins and line sizes",
+    ),
+    inert(Form::Bytes(b"\x1b\\"), "ST alone: ends no string"),
+    // Strings that draw nothing: titles, the directory, links, shell
+    // integration marks, colors and the clipboard.
+    inert(Form::Osc(b"0"), "the icon name and title"),
+    inert(Form::Osc(b"1"), "the icon name"),
+    inert(Form::Osc(b"2"), "the title"),
+    inert(Form::Osc(b"4"), "palette colors"),
+    inert(Form::Osc(b"7"), "the working directory"),
+    inert(Form::Osc(b"8"), "a hyperlink over later text"),
+    inert(Form::Osc(b"10"), "the text color"),
+    inert(Form::Osc(b"11"), "the background color"),
+    inert(Form::Osc(b"12"), "the cursor color"),
+    inert(Form::Osc(b"52"), "the clipboard"),
+    inert(Form::Osc(b"104"), "palette colors reset"),
+    inert(Form::Osc(b"110"), "the text color reset"),
+    inert(Form::Osc(b"111"), "the background color reset"),
+    inert(Form::Osc(b"112"), "the cursor color reset"),
+    inert(Form::Osc(b"133"), "shell integration marks"),
+    inert(Form::Osc(b"633"), "shell integration marks"),
+    inert(
+        Form::OscPrefix(b"1337;CurrentDir="),
+        "iTerm2: the working directory",
+    ),
+    inert(Form::OscPrefix(b"1337;RemoteHost="), "iTerm2: the host"),
+    inert(Form::OscPrefix(b"1337;SetMark"), "iTerm2: a mark"),
+    inert(
+        Form::OscPrefix(b"1337;ShellIntegrationVersion="),
+        "iTerm2: shell integration",
+    ),
+    inert(Form::OscPrefix(b"1337;SetUserVar="), "iTerm2: a variable"),
+    // States the tracker follows, each with its exact reset.
+    followed(
+        Form::Csi(b'r', 2),
+        "DECSTBM: a scroll region, cleared by one spanning the screen",
+    ),
+    followed(
+        Form::PrivateMode(7),
+        "DECAWM: autowrap, off until `CSI ? 7 h`",
+    ),
+    followed(Form::PrivateMode(45), "reverse wrap, until `CSI ? 45 l`"),
+    followed(
+        Form::PrivateMode(1045),
+        "reverse wrap, until `CSI ? 1045 l`",
+    ),
+    followed(
+        Form::PrivateMode(69),
+        "DECLRMM: margins, until `CSI ? 69 l`",
+    ),
+    followed(
+        Form::PrivateMode(47),
+        "the alternate screen, for the region per screen",
+    ),
+    followed(
+        Form::PrivateMode(1047),
+        "the alternate screen, for the region per screen",
+    ),
+    followed(
+        Form::PrivateMode(1049),
+        "the alternate screen, for the region per screen",
+    ),
+    followed(
+        Form::PrivateMode(42),
+        "DECNRCM: national character sets, until `CSI ? 42 l`, across RIS",
+    ),
+    followed(Form::AnsiMode(4), "IRM: insert mode, until `CSI 4 l`"),
+    followed(
+        Form::CsiWith(b'!', b'p'),
+        "DECSTR: can leave autowrap off, until `CSI ? 7 h`",
+    ),
+];
+
+/// How [`CONTROL_TABLE`] takes `bytes`, a control token, or `None` when it
+/// is not on it.
+fn listed_control(bytes: &[u8]) -> Option<Listed> {
+    if let Some(entry) = CONTROL_TABLE.iter().find(|entry| match entry.form {
+        Form::Bytes(exact) => exact == bytes,
+        _ => false,
+    }) {
+        return Some(entry.listed);
+    }
+    if let Some(body) = bytes.strip_prefix(b"\x1b]") {
+        let text = body
+            .strip_suffix(b"\x07")
+            .or_else(|| body.strip_suffix(b"\x1b\\"))?;
+        let number = text.split(|byte| *byte == b';').next().unwrap_or_default();
+        return CONTROL_TABLE
+            .iter()
+            .find(|entry| match entry.form {
+                Form::Osc(id) => id == number,
+                Form::OscPrefix(prefix) => text.starts_with(prefix),
+                _ => false,
+            })
+            .map(|entry| entry.listed);
+    }
+    let body = bytes.strip_prefix(b"\x1b[")?;
+    let (&final_byte, rest) = body.split_last()?;
+    if !(0x40..=0x7e).contains(&final_byte) || !rest.iter().all(|b| (0x20..0x40).contains(b)) {
+        return None;
+    }
+    let (marker, rest) = match rest.first() {
+        Some(&marker @ (b'?' | b'>' | b'<' | b'=')) => (Some(marker), &rest[1..]),
+        _ => (None, rest),
+    };
+    let split = rest
+        .iter()
+        .position(|byte| (0x20..0x30).contains(byte))
+        .unwrap_or(rest.len());
+    let (parameters, intermediates) = rest.split_at(split);
+    let intermediate = match intermediates {
+        [] => None,
+        [one] => Some(*one),
+        _ => return None,
+    };
+    let plain = parameters
+        .iter()
+        .all(|byte| byte.is_ascii_digit() || *byte == b';');
+    let sgr_plain = parameters
+        .iter()
+        .all(|byte| byte.is_ascii_digit() || matches!(*byte, b';' | b':'));
+    if matches!(final_byte, b'h' | b'l') && intermediate.is_none() && plain {
+        let want_private = marker == Some(b'?');
+        if marker.is_some() && !want_private {
+            return None;
+        }
+        let mut listed = Listed::Inert;
+        for mode in liberal_mode_numbers(parameters) {
+            let entry = CONTROL_TABLE.iter().find(|entry| match entry.form {
+                Form::PrivateMode(number) => want_private && Some(number) == mode,
+                Form::AnsiMode(number) => !want_private && Some(number) == mode,
+                _ => false,
+            })?;
+            if entry.listed == Listed::Followed {
+                listed = Listed::Followed;
+            }
+        }
+        return Some(listed);
+    }
+    let count = if parameters.is_empty() {
+        0
+    } else {
+        parameters.split(|byte| *byte == b';').count()
+    };
+    CONTROL_TABLE
+        .iter()
+        .find(|entry| match entry.form {
+            Form::Csi(wanted, at_most) => {
+                marker.is_none()
+                    && intermediate.is_none()
+                    && wanted == final_byte
+                    && count <= at_most
+                    && (plain || (final_byte == b'm' && sgr_plain))
+            }
+            Form::PrivateCsi(wanted_marker, wanted_intermediate, wanted) => {
+                marker == Some(wanted_marker)
+                    && intermediate == wanted_intermediate
+                    && wanted == final_byte
+                    && plain
+            }
+            Form::CsiWith(wanted_intermediate, wanted) => {
+                marker.is_none()
+                    && intermediate == Some(wanted_intermediate)
+                    && wanted == final_byte
+                    && plain
+            }
+            Form::WindowOp(op) => {
+                marker.is_none()
+                    && intermediate.is_none()
+                    && final_byte == b't'
+                    && plain
+                    && bounded_parameter(
+                        parameters
+                            .split(|byte| *byte == b';')
+                            .next()
+                            .unwrap_or_default(),
+                    ) == Some(op)
+            }
+            _ => false,
+        })
+        .map(|entry| entry.listed)
+}
+
+/// Whether `byte`, a C0 control or DEL in the text, is on [`CONTROL_TABLE`].
+fn listed_text_control(byte: u8) -> bool {
+    CONTROL_TABLE
+        .iter()
+        .any(|entry| matches!(entry.form, Form::C0(listed) if listed == byte))
+}
+
+/// The guard over everything PrismTTY has seen since it started or since
+/// the last RIS: whether a control off [`CONTROL_TABLE`] came, and the
+/// states that the table's followed controls leave, under which a line
+/// feed, a backward move or text past the margin can land on a cell that is
+/// already drawn: a scroll region that is not the whole screen (a cursor
+/// below it stays on the last row when a line feed comes), left and right
+/// margins (mode 69), reverse wraparound (modes 45 and 1045: BS and `CSI D`
+/// at the first column step back onto the row above), autowrap off (mode 7:
+/// text past the margin overwrites the last column), insert mode (text
+/// shifts the prompt right), and a decoding other than UTF-8.
 ///
-/// Setting is read liberally, clearing strictly. Any CSI form can set a
-/// hazard, C1 forms included, and so can a mode number at any position or
-/// past what a terminal keeps, a number too large to read, a restore of saved
-/// modes and a soft reset (DECSTR can leave autowrap off). A hazard is cleared
-/// only by the exact `ESC [` form, with plain decimal parameters, within the
-/// first `MAX_RESET_PARAMETERS`, or by RIS, and a row size or a screen size
-/// only by RIS. The terminal is taken to start in the default modes; a mode it
+/// A followed state is set by any listed form that may set it, a mode
+/// number at any position or past what a terminal keeps included, and
+/// cleared only by its exact reset within the first `MAX_RESET_PARAMETERS`,
+/// or by RIS. The terminal is taken to start in the default modes; a mode it
 /// was already in is not seen.
 ///
 /// Xterm keeps one scroll region for both screens (`top_marg` and `bot_marg`
@@ -3799,6 +4229,8 @@ impl ScrollRegion {
 /// it.
 #[derive(Clone, Debug, Default)]
 struct LayoutModes {
+    /// A control off [`CONTROL_TABLE`] came. Only RIS clears it.
+    unlisted_control: bool,
     scroll_region: ScrollRegion,
     /// The main screen's region on a terminal that keeps one for each
     /// screen: set only while the output is known to be on the main screen.
@@ -3810,13 +4242,6 @@ struct LayoutModes {
     reverse_wrap_any_line: bool,
     left_right_margins: bool,
     autowrap_off: bool,
-    alternate_screen_restored: bool,
-    /// A row may be of double width or double height (`ESC # 3`, `4`, `6`),
-    /// or the screen may be taking a size the program asked for (DECCOLM,
-    /// DECSCPP, DECSNLS, a window resize, a status line), so a row can be
-    /// narrower than the width the read loop gives. Only RIS clears it:
-    /// `ESC # 5` resets one row.
-    row_width_unknown: bool,
     /// Insert mode (`CSI 4 h`): text shifts the cells right of it, and can
     /// push the prompt past the right edge.
     insert_mode: bool,
@@ -3832,8 +4257,16 @@ struct LayoutModes {
 impl LayoutModes {
     fn observe(&mut self, tokens: &[Token]) {
         for token in tokens {
-            if let Token::Ansi(bytes) = token {
-                self.observe_control(bytes);
+            match token {
+                Token::Ansi(bytes) => self.observe_control(bytes),
+                Token::Text(text) => {
+                    if text
+                        .iter()
+                        .any(|byte| (*byte < 0x20 || *byte == 0x7f) && !listed_text_control(*byte))
+                    {
+                        self.unlisted_control = true;
+                    }
+                }
             }
         }
     }
@@ -3847,77 +4280,42 @@ impl LayoutModes {
             };
             return;
         }
-        if let Some(size) = bytes.strip_prefix(b"\x1b#") {
-            // Single width (DECSWL) and the alignment test (DECALN) set no
-            // row's size; anything else may.
-            if size != b"5" && size != b"8" {
-                self.row_width_unknown = true;
-            }
-            return;
-        }
         if let Some(coding) = bytes.strip_prefix(b"\x1b%") {
             self.decoding_switched = coding != b"G";
             return;
         }
-        let Some(body) = csi_body(bytes) else {
+        match listed_control(bytes) {
+            None => {
+                self.unlisted_control = true;
+                return;
+            }
+            Some(Listed::Inert) => return,
+            Some(Listed::Followed) => {}
+        }
+        // A followed control: an exact `ESC [` form with plain parameters.
+        let Some((&final_byte, parameters)) = bytes[2..].split_last() else {
             return;
         };
-        let Some((&final_byte, parameters)) = body.split_last() else {
-            return;
-        };
-        let exact =
-            bytes.starts_with(b"\x1b[") && bytes[2..].iter().all(|b| (0x20..0x7f).contains(b));
         match (final_byte, parameters.strip_prefix(b"?")) {
-            (b'p', None) if parameters == b"!" => self.autowrap_off = true,
-            (b'r', Some(modes)) => self.restore_private_modes(modes),
+            (b'p', None) => self.autowrap_off = true,
             (b'r', None) => {
-                let region = scroll_region_set_by(parameters, exact);
+                let region = scroll_region_set_by(parameters, true);
                 self.scroll_region = region;
                 if !self.maybe_on_alternate_screen {
                     self.main_screen_region = region;
                 }
             }
-            (b'h' | b'l', Some(modes)) => self.set_private_modes(modes, final_byte == b'h', exact),
-            (b'h' | b'l', None) => self.set_ansi_modes(parameters, final_byte == b'h', exact),
-            (b'|', None) if parameters.ends_with(b"$") || parameters.ends_with(b"*") => {
-                // DECSCPP (columns per page) and DECSNLS (lines per screen).
-                self.row_width_unknown = true;
-            }
-            (b't', None) if parameters.iter().all(|b| b.is_ascii_digit() || *b == b';') => {
-                // A window operation that resizes: 4 and 8 to a size, 9
-                // maximizes, 10 goes full screen, 24 and up set the lines.
-                let first = parameters.split(|b| *b == b';').next().unwrap_or_default();
-                if bounded_parameter(first)
-                    .is_some_and(|op| matches!(op, 4 | 8 | 9 | 10) || op >= 24)
-                {
-                    self.row_width_unknown = true;
-                }
-            }
-            (b'~' | b'}', None) if parameters.ends_with(b"$") => {
-                // DECSSDT shows a status line, DECSASD writes to it.
-                let kind = &parameters[..parameters.len() - 1];
-                if bounded_parameter(kind).is_some_and(|kind| kind != 0) {
-                    self.row_width_unknown = true;
-                }
-            }
+            (b'h' | b'l', Some(modes)) => self.set_private_modes(modes, final_byte == b'h'),
+            (b'h' | b'l', None) => self.set_ansi_modes(parameters, final_byte == b'h'),
             _ => {}
         }
     }
 
     /// `CSI ... h` and `l` without `?`: insert mode is 4.
-    fn set_ansi_modes(&mut self, modes: &[u8], set: bool, exact: bool) {
-        if set && liberal_mode_numbers(modes).any(|mode| matches!(mode, None | Some(4))) {
+    fn set_ansi_modes(&mut self, modes: &[u8], set: bool) {
+        if set {
             self.insert_mode = true;
-        }
-        if set
-            || !exact
-            || !modes
-                .iter()
-                .all(|byte| byte.is_ascii_digit() || *byte == b';')
-        {
-            return;
-        }
-        if private_mode_numbers(modes)
+        } else if private_mode_numbers(modes)
             .take(MAX_RESET_PARAMETERS)
             .any(|mode| mode == 4)
         {
@@ -3925,24 +4323,10 @@ impl LayoutModes {
         }
     }
 
-    fn set_private_modes(&mut self, modes: &[u8], set: bool, exact: bool) {
+    fn set_private_modes(&mut self, modes: &[u8], set: bool) {
         for mode in liberal_mode_numbers(modes) {
             match (mode, set) {
-                (None, true) => {
-                    self.reverse_wrap = true;
-                    self.reverse_wrap_any_line = true;
-                    self.left_right_margins = true;
-                    self.maybe_on_alternate_screen = true;
-                    self.row_width_unknown = true;
-                    self.national_charsets = true;
-                }
-                (None, false) => {
-                    self.autowrap_off = true;
-                    self.row_width_unknown = true;
-                }
                 (Some(7), false) => self.autowrap_off = true,
-                // DECCOLM, either way: the terminal takes 80 or 132 columns.
-                (Some(3), _) => self.row_width_unknown = true,
                 (Some(42), true) => self.national_charsets = true,
                 (Some(47 | 1047 | 1049), true) => self.maybe_on_alternate_screen = true,
                 (Some(45), true) => self.reverse_wrap = true,
@@ -3951,13 +4335,6 @@ impl LayoutModes {
                 _ => {}
             }
         }
-        if !exact
-            || !modes
-                .iter()
-                .all(|byte| byte.is_ascii_digit() || *byte == b';')
-        {
-            return;
-        }
         for mode in private_mode_numbers(modes).take(MAX_RESET_PARAMETERS) {
             match (mode, set) {
                 (7, true) => self.autowrap_off = false,
@@ -3965,37 +4342,8 @@ impl LayoutModes {
                 (1045, false) => self.reverse_wrap_any_line = false,
                 (69, false) => self.left_right_margins = false,
                 (42, false) => self.national_charsets = false,
-                (47 | 1047 | 1049, false) => {
-                    self.alternate_screen_restored = false;
-                    self.maybe_on_alternate_screen = false;
-                }
+                (47 | 1047 | 1049, false) => self.maybe_on_alternate_screen = false,
                 _ => {}
-            }
-        }
-    }
-
-    /// XTRESTORE: the restored values are not known, so each tracked mode it
-    /// names counts as on, and a screen mode as the alternate screen.
-    fn restore_private_modes(&mut self, modes: &[u8]) {
-        for mode in liberal_mode_numbers(modes) {
-            match mode {
-                Some(7) => self.autowrap_off = true,
-                Some(45) => self.reverse_wrap = true,
-                Some(1045) => self.reverse_wrap_any_line = true,
-                Some(69) => self.left_right_margins = true,
-                Some(47 | 1047 | 1049) => {
-                    self.alternate_screen_restored = true;
-                    self.maybe_on_alternate_screen = true;
-                }
-                Some(_) => {}
-                None => {
-                    self.autowrap_off = true;
-                    self.reverse_wrap = true;
-                    self.reverse_wrap_any_line = true;
-                    self.left_right_margins = true;
-                    self.alternate_screen_restored = true;
-                    self.maybe_on_alternate_screen = true;
-                }
             }
         }
     }
@@ -4003,12 +4351,11 @@ impl LayoutModes {
     /// Whether the modes let a read be promoted, on a terminal `rows` high
     /// (0 when that is not known).
     fn allow_promotion(&self, rows: u16) -> bool {
-        !self.reverse_wrap
+        !self.unlisted_control
+            && !self.reverse_wrap
             && !self.reverse_wrap_any_line
             && !self.left_right_margins
             && !self.autowrap_off
-            && !self.alternate_screen_restored
-            && !self.row_width_unknown
             && !self.insert_mode
             && !self.decoding_switched
             && !self.national_charsets
