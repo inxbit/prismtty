@@ -4805,7 +4805,64 @@ fn an_unhandled_usr1_ends_the_command_and_the_session_as_any_command_death() {
 
 /// The command handles SIGUSR1 by writing a line and SIGTERM by exiting 7.
 fn message_counting_script() -> String {
-    format!("trap 'echo x >> \"$SCRATCH/got\"' USR1; trap 'exit 7' TERM; echo READY; {IDLE}")
+    format!(
+        "trap 'echo x >> \"$SCRATCH/got\"' USR1; trap 'echo y >> \"$SCRATCH/got\"' USR2; \
+         trap 'exit 7' TERM; echo READY; {IDLE}"
+    )
+}
+
+/// Sends SIGUSR1 and SIGUSR2 in turn to a wrapper as fast as it can, for at
+/// most ten seconds. It is stopped, by `stop` or when it is dropped, before
+/// the wrapper is reaped, so it never signals a pid that was reused.
+struct Flood {
+    stop: Arc<AtomicBool>,
+    thread: Option<thread::JoinHandle<u64>>,
+}
+
+impl Flood {
+    /// Declare it after the wrapper's guard, so it is dropped first.
+    fn start(pid: libc::pid_t) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread = {
+            let stop = Arc::clone(&stop);
+            thread::spawn(move || {
+                let until = Instant::now() + Duration::from_secs(10);
+                let mut sent = 0_u64;
+                while !stop.load(Ordering::Acquire) && Instant::now() < until {
+                    let signal = if sent % 2 == 0 {
+                        libc::SIGUSR1
+                    } else {
+                        libc::SIGUSR2
+                    };
+                    // SAFETY: kill has no memory-safety preconditions; `pid` is a wrapper that
+                    // is not reaped while this runs.
+                    if unsafe { libc::kill(pid, signal) } != 0 {
+                        break;
+                    }
+                    sent += 1;
+                }
+                sent
+            })
+        };
+        Self {
+            stop,
+            thread: Some(thread),
+        }
+    }
+
+    /// Stops it and returns how many signals it sent.
+    fn stop(&mut self) -> u64 {
+        self.stop.store(true, Ordering::Release);
+        self.thread
+            .take()
+            .map_or(0, |thread| thread.join().unwrap_or(0))
+    }
+}
+
+impl Drop for Flood {
+    fn drop(&mut self) {
+        self.stop();
+    }
 }
 
 /// Signals of one kind coalesce: a burst of messages reaches the command
@@ -4855,31 +4912,13 @@ fn sigterm_ends_the_session_during_a_flood_of_messages() {
     let mut run = Redirected::start(&scratch, &[], &message_counting_script());
     run.wait_for_ready();
     let pid = run.pid;
-    let stop = Arc::new(AtomicBool::new(false));
-    let flood = {
-        let stop = Arc::clone(&stop);
-        thread::spawn(move || {
-            // Bounded, and stopped by the test before the wrapper is reaped,
-            // so its pid is never reused while this sends.
-            let until = Instant::now() + Duration::from_secs(10);
-            let mut sent = 0_u64;
-            while !stop.load(Ordering::Acquire) && Instant::now() < until {
-                // SAFETY: kill has no memory-safety preconditions; `pid` is the unreaped wrapper.
-                if unsafe { libc::kill(pid, libc::SIGUSR1) } != 0 {
-                    break;
-                }
-                sent += 1;
-            }
-            sent
-        })
-    };
+    let mut flood = Flood::start(pid);
     thread::sleep(Duration::from_millis(500));
     let term_sent = Instant::now();
     send(pid, libc::SIGTERM);
     let ended = wait_for_condition(Duration::from_secs(8), || has_exited(pid));
     let took = term_sent.elapsed();
-    stop.store(true, Ordering::Release);
-    let sent = flood.join().expect("flood thread");
+    let sent = flood.stop();
     let status = run.wait(Duration::from_secs(5));
     assert!(ended, "the wrapper did not end during the flood");
     assert_eq!(
@@ -4962,23 +5001,30 @@ fn read_until(file: &mut File, needle: &[u8], timeout: Duration) -> bool {
 /// Writes to `file`, a non-blocking description of its own, until the pipe or
 /// terminal behind it holds no more.
 fn fill(file: &mut File) {
-    let chunk = [b'f'; 4096];
     let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        match file.write(&chunk) {
-            Ok(_) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return,
-            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
-            Err(error) => panic!("fill: {error}"),
+    // Large writes first, then single bytes into what room a large write
+    // could not use.
+    for chunk in [&[b'f'; 4096][..], b"f"] {
+        loop {
+            match file.write(chunk) {
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(error) => panic!("fill: {error}"),
+            }
+            assert!(Instant::now() < deadline, "fill never blocked");
         }
-        assert!(Instant::now() < deadline, "fill never blocked");
     }
 }
 
 /// The command answers SIGTERM with one short line and exits 0, so it is
 /// reaped at once and the wrapper's normal end then has that line to write.
+/// It waits on a builtin: a foreground job killed by the SIGTERM would make
+/// the shell report it, and on macOS a second write that the blocked wrapper
+/// cannot read holds the command's own exit (it leads its terminal's session)
+/// past the limit, which then ends the session as a command not collected.
 fn short_line_on_term_script() -> String {
-    format!("trap 'echo bye; exit 0' TERM; echo READY; {IDLE}")
+    "trap 'echo bye; exit 0' TERM; echo READY; sleep 30 & wait $!".to_owned()
 }
 
 /// The end of a session is limited to about four seconds from the ending
@@ -5060,17 +5106,24 @@ fn the_end_is_limited_when_the_terminal_is_full() {
         .open(&session.tty_path)
         .expect("filler description of the terminal");
     fill(&mut filler);
+    let pid_file = scratch.pid_file(session.pid);
+    assert!(pid_file.is_file(), "the session did not register");
+    let term_sent = Instant::now();
     send(session.pid, libc::SIGTERM);
-    thread::sleep(Duration::from_secs(6));
+    // The limit removes the pid file at about four seconds, just before its
+    // abrupt exit; a normal end still blocked on the full terminal has not.
+    let removed = wait_for_condition(Duration::from_millis(5500), || !pid_file.exists());
+    let removed_after = term_sent.elapsed();
+    thread::sleep(Duration::from_secs(6).saturating_sub(term_sent.elapsed()));
     session.read_again();
     let status = session.wait(Duration::from_secs(10));
+    assert!(
+        removed,
+        "the pid file was still there {removed_after:?} after the signal"
+    );
     assert_eq!(
         (status.signal(), status.code()),
         (None, Some(128 + libc::SIGTERM))
-    );
-    assert!(
-        !scratch.pid_file(session.pid).exists(),
-        "the session's pid file was not removed"
     );
 }
 
