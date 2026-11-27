@@ -348,7 +348,17 @@ Only sessions watching the same runtime directory see the reload request.
 Set `PRISMTTY_RUNTIME_DIR` to override the runtime directory, which is useful for
 tests or isolated sessions. An existing directory is used as it is; one that
 other users can write to is refused, which only disables live reload for that
-session.
+session. PrismTTY owns `pids.d` and `reload` inside that directory: each
+session sets `pids.d` to mode 0700 and deletes every regular file in it whose
+name is not the number of a running process. Do not point the variable at a
+directory that has a `pids.d` or a `reload` of your own.
+
+On Linux without `TMPDIR` the default directory is `/tmp/prismtty-<uid>`, a
+name any local user can predict. Another local user who creates it first
+disables live reload for your sessions. Those sessions still show and
+highlight their output, and each prints `prismtty: live reload disabled for
+this session` and the reason. Set `PRISMTTY_RUNTIME_DIR` to a private directory, such as one
+in your home, to avoid this.
 
 ## Built-In Profiles
 
