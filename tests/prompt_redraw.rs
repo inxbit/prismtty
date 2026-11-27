@@ -651,8 +651,18 @@ fn a_read_pushed_without_the_terminal_size_keeps_the_bypass() {
         "{:?}",
         String::from_utf8_lossy(&first)
     );
-    let second = sized.push(read);
-    assert_eq!(second, read, "{:?}", String::from_utf8_lossy(&second));
+    // The next read starts on a new line, so with a size it would be
+    // promoted too.
+    let next: &[u8] = b"\r\nerror\r\n\x1b[1G\x1b[0KR1# ";
+    let second = sized.push(next);
+    assert_eq!(second, next, "{:?}", String::from_utf8_lossy(&second));
+    sized.set_terminal_size(24, 80);
+    let third = sized.push(next);
+    assert!(
+        contains(&third, b"\x1b[38"),
+        "{:?}",
+        String::from_utf8_lossy(&third)
+    );
 }
 
 /// Xterm keeps one scroll region for both screens. A terminal that keeps
