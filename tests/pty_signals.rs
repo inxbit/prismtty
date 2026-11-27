@@ -2305,16 +2305,47 @@ fn input_after_child_exit_preserves_wrapped_exit_code() {
     );
 }
 
+/// Whether the wrapper ends the session at the wrapped command's exit while
+/// a background job still holds the terminal: on macOS, which revokes the
+/// terminal at the exit, and on Linux from 4.12, where prismtty learns of
+/// the exit itself. Older Linux kernels read the terminal to its EOF.
+fn session_ends_at_command_exit() -> bool {
+    if cfg!(target_os = "macos") {
+        return true;
+    }
+    if !cfg!(target_os = "linux") {
+        return false;
+    }
+    // SAFETY: utsname is a plain C struct of byte arrays; all-zero bytes are a
+    // valid value that uname overwrites.
+    let mut name = unsafe { std::mem::zeroed::<libc::utsname>() };
+    // SAFETY: `name` is a valid, exclusively borrowed utsname for the call.
+    if unsafe { libc::uname(&mut name) } != 0 {
+        return false;
+    }
+    // SAFETY: uname filled `release` with a NUL-terminated string that lives
+    // as long as `name`.
+    let release = unsafe { std::ffi::CStr::from_ptr(name.release.as_ptr()) }.to_string_lossy();
+    let mut parts = release.splitn(2, '.');
+    let major = parts.next().and_then(|major| major.parse::<u64>().ok());
+    let minor = parts
+        .next()
+        .and_then(|rest| rest.split(|c: char| !c.is_ascii_digit()).next())
+        .and_then(|minor| minor.parse::<u64>().ok());
+    matches!((major, minor), (Some(major), Some(minor)) if (major, minor) >= (4, 12))
+}
+
 /// A wrapped command that leaves a background job behind and then ends with
 /// `last`. The job ignores SIGHUP and SIGTERM, keeps the PTY slave open on
 /// its stdout and stderr, reports its pid and whether its stdout is that
-/// terminal, and then waits on a FIFO nobody opens, so it outlives the
-/// command for as long as the test lets it. The command waits for that
-/// report before it prints its marker and ends.
+/// terminal, and then waits on a FIFO gate. When the gate opens it records
+/// that it is still alive and writes once more to the terminal. The command
+/// waits for the job's report before it prints its marker and ends.
 fn command_leaving_a_job_behind(last: &str) -> String {
     format!(
         "sh -c 'trap \"\" HUP TERM; if [ -t 1 ]; then held=terminal; else held=none; fi; \
-         echo \"$$ $held\" > \"$1/ready\"; read gate < \"$1/gate\"' job \"$1\" &\n\
+         echo \"$$ $held\" > \"$1/ready\"; read gate < \"$1/gate\"; : > \"$1/released\"; \
+         echo late' job \"$1\" &\n\
          read job < \"$1/ready\"\n\
          echo \"$job\" > \"$1/job\"\n\
          {last}\n"
@@ -2348,22 +2379,82 @@ fn job_command_arguments(dir: &std::path::Path, script: &str) -> Vec<std::ffi::O
     arguments
 }
 
-/// The job's pid once the command has recorded it, after checking that the
-/// job held the terminal.
-fn left_job(dir: &std::path::Path) -> libc::pid_t {
+/// Checks that the job the command left held the wrapped terminal.
+fn assert_job_held_the_terminal(dir: &std::path::Path) {
     let record = std::fs::read_to_string(dir.join("job"))
         .expect("the command did not record its background job");
-    let mut fields = record.split_whitespace();
-    let pid = fields
-        .next()
-        .and_then(|pid| pid.parse().ok())
-        .expect("background job pid");
     assert_eq!(
-        fields.next(),
+        record.split_whitespace().nth(1),
         Some("terminal"),
         "the background job's stdout was not the wrapped terminal: {record:?}"
     );
-    pid
+}
+
+/// Opens the job's gate. The job must be waiting on it, so a gate that no
+/// process has open for reading within the bound is a failure.
+fn open_job_gate(dir: &std::path::Path) {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut gate = loop {
+        match OpenOptions::new()
+            .write(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(dir.join("gate"))
+        {
+            Ok(gate) => break gate,
+            Err(error) if Instant::now() < deadline => {
+                assert_eq!(error.raw_os_error(), Some(libc::ENXIO), "open the gate");
+                thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => panic!("the background job is not waiting on its gate: {error}"),
+        }
+    };
+    gate.write_all(b"go\n").expect("open the job's gate");
+}
+
+/// Waits for the wrapper to end while the job left behind holds the
+/// terminal and returns its status. Where the session ends at the command's
+/// exit, the wrapper must return with the job still waiting on its gate, and
+/// the job must then see the gate open, so it outlived the wrapper. Where it
+/// does not, the gate is opened first and the wrapper ends at the terminal's
+/// EOF, as before.
+fn wrapper_status_leaving_a_job<T>(
+    dir: &std::path::Path,
+    mut wait_for_exit: impl FnMut(Duration) -> Option<T>,
+) -> T {
+    let ends_at_exit = session_ends_at_command_exit();
+    if !ends_at_exit {
+        open_job_gate(dir);
+    }
+    let status = wait_for_exit(Duration::from_secs(20)).unwrap_or_else(|| {
+        if ends_at_exit {
+            panic!(
+                "the wrapper did not exit after the wrapped command did while its background \
+                 job still held the terminal"
+            )
+        }
+        panic!("the wrapper did not exit after its background job let the terminal go")
+    });
+    if ends_at_exit {
+        open_job_gate(dir);
+    }
+    assert!(
+        wait_for_condition(Duration::from_secs(10), || dir.join("released").exists()),
+        "the background job never saw its gate open"
+    );
+    assert_job_held_the_terminal(dir);
+    status
+}
+
+/// Everything `capture` read, once its source has reached its end.
+fn completed_output(capture: &CaptureTask) -> Vec<u8> {
+    let finished = capture.finished_flag();
+    assert!(
+        wait_for_condition(Duration::from_secs(10), || finished.load(Ordering::Acquire)),
+        "the wrapper's output did not reach its end"
+    );
+    capture.wait_until(Duration::ZERO, |_| true)
 }
 
 /// `bytes` with CSI sequences (the highlighter's colors) taken out.
@@ -2386,12 +2477,10 @@ fn without_csi(bytes: &[u8]) -> Vec<u8> {
 }
 
 /// Runs `script` under the wrapper on a terminal of its own and returns the
-/// wrapper's exit status, what reached the terminal, and the left job's pid.
-/// The job is still waiting on its FIFO when the wrapper's status is taken:
-/// nothing opens that FIFO, so the wrapper has to end without the job.
-fn run_on_terminal_leaving_a_job(script: &str) -> (Option<u32>, Vec<u8>, libc::pid_t) {
+/// wrapper's exit status and everything that reached the terminal.
+fn run_on_terminal_leaving_a_job(script: &str) -> (u32, Vec<u8>) {
     let dir = job_directory();
-    let mut job_guard = PidGuard::from_marker(dir.path().join("job"));
+    let _job_guard = PidGuard::from_marker(dir.path().join("job"));
     let pair = native_pty_system()
         .openpty(PtySize::default())
         .expect("openpty");
@@ -2406,23 +2495,8 @@ fn run_on_terminal_leaving_a_job(script: &str) -> (Option<u32>, Vec<u8>, libc::p
         .expect("spawn interactive ptty");
     drop(pair.slave);
     let mut ptty = PtySession::new(child, &*pair.master);
-    let status = ptty.wait_for_exit(Duration::from_secs(20));
-    let output = ptty
-        .capture()
-        .wait_until(Duration::from_millis(500), |_| false);
-    let job = left_job(dir.path());
-    job_guard.set(job);
-    assert!(
-        status.is_some(),
-        "the wrapper did not exit after the wrapped command did while its background job \
-         still held the terminal; output so far: {:?}",
-        String::from_utf8_lossy(&output)
-    );
-    assert!(
-        process_exists(job),
-        "the background job did not outlive the wrapped command"
-    );
-    (status, without_csi(&output), job)
+    let status = wrapper_status_leaving_a_job(dir.path(), |timeout| ptty.wait_for_exit(timeout));
+    (status, without_csi(&completed_output(ptty.capture())))
 }
 
 // A command that exits while a job it started keeps the terminal open ends
@@ -2433,15 +2507,10 @@ fn run_on_terminal_leaving_a_job(script: &str) -> (Option<u32>, Vec<u8>, libc::p
 // the terminal at the exit and ends the same way.
 #[test]
 fn session_ends_with_the_command_while_its_background_job_holds_the_terminal() {
-    let (status, output, _job) = run_on_terminal_leaving_a_job(&command_leaving_a_job_behind(
+    let (status, output) = run_on_terminal_leaving_a_job(&command_leaving_a_job_behind(
         "printf '%s\\n' eos-last-marker; exit 7",
     ));
-    assert_eq!(
-        status,
-        Some(7),
-        "output: {:?}",
-        String::from_utf8_lossy(&output)
-    );
+    assert_eq!(status, 7, "output: {:?}", String::from_utf8_lossy(&output));
     assert!(
         contains_bytes(&output, b"eos-last-marker"),
         "the command's last output was lost: {:?}",
@@ -2457,7 +2526,7 @@ fn session_ends_with_the_command_while_its_background_job_holds_the_terminal_wit
     use std::process::{Command, Stdio};
 
     let dir = job_directory();
-    let mut job_guard = PidGuard::from_marker(dir.path().join("job"));
+    let _job_guard = PidGuard::from_marker(dir.path().join("job"));
     let script = command_leaving_a_job_behind("printf '%s\\n' eos-last-marker; exit 7");
     let ptty = Command::new(env!("CARGO_BIN_EXE_ptty"))
         .env("HOME", dir.path().join("home"))
@@ -2473,17 +2542,12 @@ fn session_ends_with_the_command_while_its_background_job_holds_the_terminal_wit
     let stdout = ptty.child_mut().stdout.take().expect("piped stdout");
     let stdout_fd = stdout.as_raw_fd();
     let capture = CaptureTask::from_reader(stdout, stdout_fd);
-    let status = ptty.wait_for_exit(Duration::from_secs(20));
-    let output = without_csi(&capture.wait_until(Duration::from_secs(5), |output| {
-        contains_bytes(output, b"eos-last-marker")
-    }));
-    let job = left_job(dir.path());
-    job_guard.set(job);
+    let status = wrapper_status_leaving_a_job(dir.path(), |timeout| ptty.wait_for_exit(timeout));
+    let output = without_csi(&completed_output(&capture));
     assert_eq!(
-        status.map(|status| status.code()),
-        Some(Some(7)),
-        "the wrapper did not exit with the command's status while its background job still \
-         held the terminal; output: {:?}",
+        status.code(),
+        Some(7),
+        "the wrapper did not exit with the command's status; output: {:?}",
         String::from_utf8_lossy(&output)
     );
     assert!(
@@ -2491,23 +2555,19 @@ fn session_ends_with_the_command_while_its_background_job_holds_the_terminal_wit
         "the command's last output was lost: {:?}",
         String::from_utf8_lossy(&output)
     );
-    assert!(
-        process_exists(job),
-        "the background job did not outlive the wrapped command"
-    );
 }
 
 // A command killed by a signal while its job holds the terminal is reported
-// as 128 plus the signal, at its death, with its output drawn.
+// as 128 plus the signal, with its output drawn.
 #[test]
 fn session_reports_a_command_killed_while_its_background_job_holds_the_terminal() {
     for (signal, name) in [(libc::SIGTERM, "TERM"), (libc::SIGKILL, "KILL")] {
-        let (status, output, _job) = run_on_terminal_leaving_a_job(&command_leaving_a_job_behind(
+        let (status, output) = run_on_terminal_leaving_a_job(&command_leaving_a_job_behind(
             &format!("printf '%s\\n' eos-last-marker; kill -{name} $$"),
         ));
         assert_eq!(
             status,
-            Some(128 + signal as u32),
+            128 + signal as u32,
             "SIG{name}: output: {:?}",
             String::from_utf8_lossy(&output)
         );
@@ -2524,14 +2584,9 @@ fn session_reports_a_command_killed_while_its_background_job_holds_the_terminal(
 // drawn once, as the session ends.
 #[test]
 fn held_back_last_word_is_drawn_once_when_the_command_exits_leaving_a_job() {
-    let (status, output, _job) =
+    let (status, output) =
         run_on_terminal_leaving_a_job(&command_leaving_a_job_behind("printf eosheldtail; exit 0"));
-    assert_eq!(
-        status,
-        Some(0),
-        "output: {:?}",
-        String::from_utf8_lossy(&output)
-    );
+    assert_eq!(status, 0, "output: {:?}", String::from_utf8_lossy(&output));
     let drawn = output
         .windows(b"eosheldtail".len())
         .filter(|window| *window == b"eosheldtail")
@@ -2542,6 +2597,123 @@ fn held_back_last_word_is_drawn_once_when_the_command_exits_leaving_a_job() {
         "the held-back last word was not drawn exactly once: {:?}",
         String::from_utf8_lossy(&output)
     );
+}
+
+/// The lowest descriptor the command under [`TIGHT_DESCRIPTOR_LIMIT`] may
+/// still get: every lower one is taken before the wrapper starts.
+const TIGHT_DESCRIPTOR_FLOOR: libc::c_int = 55;
+/// A limit on open descriptors that leaves the wrapper just what it needs.
+const TIGHT_DESCRIPTOR_LIMIT: libc::rlim_t = 64;
+
+// A wrapper that starts with few descriptors to spare still runs the command
+// and reports its status and output. The early end at the command's exit is
+// optional: its two descriptors are taken only once everything the session
+// needs is open, and the session goes without it when they are not there.
+#[test]
+fn wrapped_command_runs_with_few_descriptors_to_spare() {
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::process::CommandExt;
+    use std::process::{Command, Stdio};
+
+    for terminal in [false, true] {
+        let dir = job_directory();
+        let pair = native_pty_system()
+            .openpty(PtySize::default())
+            .expect("openpty");
+        let mut command = Command::new(env!("CARGO_BIN_EXE_ptty"));
+        command
+            .env("HOME", dir.path().join("home"))
+            .env("XDG_CONFIG_HOME", dir.path().join("home"))
+            .env("PRISMTTY_RUNTIME_DIR", dir.path().join("runtime"))
+            .args(job_command_arguments(
+                dir.path(),
+                "sleep 0.1; printf own-word; exit 23",
+            ));
+        let (terminal_capture, tty) = if terminal {
+            let tty = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .custom_flags(libc::O_NOCTTY)
+                .open(pair.master.tty_name().expect("outer PTY tty name"))
+                .expect("open outer slave tty");
+            command
+                .stdin(Stdio::from(tty.try_clone().expect("stdin tty")))
+                .stdout(Stdio::from(tty.try_clone().expect("stdout tty")))
+                .stderr(Stdio::from(tty.try_clone().expect("stderr tty")));
+            (Some(CaptureTask::from_master(&*pair.master)), Some(tty))
+        } else {
+            command
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            (None, None)
+        };
+        // SAFETY: the closure runs in the forked child before exec and calls
+        // only async-signal-safe functions (setsid, ioctl, open, close,
+        // setrlimit); it allocates nothing.
+        unsafe {
+            command.pre_exec(move || {
+                if terminal
+                    && (libc::setsid() == -1 || libc::ioctl(0, libc::TIOCSCTTY as _, 0) == -1)
+                {
+                    return Err(std::io::Error::last_os_error());
+                }
+                loop {
+                    let fd = libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY);
+                    if fd < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    if fd >= TIGHT_DESCRIPTOR_FLOOR {
+                        libc::close(fd);
+                        break;
+                    }
+                }
+                let limit = libc::rlimit {
+                    rlim_cur: TIGHT_DESCRIPTOR_LIMIT,
+                    rlim_max: TIGHT_DESCRIPTOR_LIMIT,
+                };
+                if libc::setrlimit(libc::RLIMIT_NOFILE, &limit) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut ptty = ProcessGuard::new(command.spawn().expect("spawn ptty"));
+        drop(command);
+        drop(tty);
+        let captures = match terminal_capture {
+            Some(capture) => vec![capture],
+            None => {
+                let stdout = ptty.child_mut().stdout.take().expect("piped stdout");
+                let stderr = ptty.child_mut().stderr.take().expect("piped stderr");
+                let (stdout_fd, stderr_fd) = (stdout.as_raw_fd(), stderr.as_raw_fd());
+                vec![
+                    CaptureTask::from_reader(stdout, stdout_fd),
+                    CaptureTask::from_reader(stderr, stderr_fd),
+                ]
+            }
+        };
+        let output = ptty.wait_for_exit(Duration::from_secs(20)).map(|status| {
+            let output: Vec<u8> = captures.iter().flat_map(completed_output).collect();
+            (status, output)
+        });
+        let (status, output) =
+            output.unwrap_or_else(|| panic!("terminal stdin {terminal}: the wrapper did not exit"));
+        let output = without_csi(&output);
+        assert_eq!(
+            status.code(),
+            Some(23),
+            "terminal stdin {terminal}: the command's status was lost under a tight \
+             descriptor limit; output: {:?}",
+            String::from_utf8_lossy(&output)
+        );
+        assert!(
+            contains_bytes(&output, b"own-word"),
+            "terminal stdin {terminal}: the command's output was lost under a tight descriptor \
+             limit: {:?}",
+            String::from_utf8_lossy(&output)
+        );
+    }
 }
 
 /// Closing the outer terminal (a window close, or a dropped ssh link) hangs

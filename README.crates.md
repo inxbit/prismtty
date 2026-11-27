@@ -188,6 +188,12 @@ and the pager both read the keyboard and both set the terminal's modes, and
 quitting the pager while the command still runs can leave the terminal in the
 pager's mode; `stty sane` puts it back.
 
+On Linux 4.12 and newer, as on macOS, the session ends when the wrapped command
+exits even if a background job it started still holds the terminal; output
+that job writes afterwards is not shown, and a command that switches its
+terminal to a line discipline other than the ordinary one (N_TTY) can lose
+output it has already written.
+
 Important options:
 
 - `-p, --profile <name>` forces one or more profiles.
