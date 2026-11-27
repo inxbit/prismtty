@@ -3532,9 +3532,32 @@ enum Leader {
     SessionOnTerminal,
 }
 
+/// On macOS the first use of libnotify in a process sets up its globals once,
+/// and a fork while another thread is inside that set-up aborts the child in
+/// libnotify's fork handler, before exec ("os_once_t is corrupt", seen twice
+/// in this suite). A spawn with `pre_exec` forks, so the set-up is finished
+/// before the first one.
+fn settle_fork_handlers() {
+    #[cfg(target_os = "macos")]
+    {
+        // SAFETY: a libSystem function that takes a plain int and only reads
+        // libnotify's own state.
+        unsafe extern "C" {
+            fn notify_is_valid_token(token: libc::c_int) -> bool;
+        }
+        static SETTLED: std::sync::Once = std::sync::Once::new();
+        // SAFETY: see the declaration above.
+        SETTLED.call_once(|| unsafe {
+            notify_is_valid_token(0);
+        });
+    }
+}
+
 /// Sets SIGINT for the process `command` starts, and the session it runs in.
 fn start_with_sigint(command: &mut std::process::Command, entry: EntrySigint, leader: Leader) {
     use std::os::unix::process::CommandExt;
+
+    settle_fork_handlers();
 
     // SAFETY: the closure runs in the forked child before exec and only calls
     // async-signal-safe functions (setsid, ioctl, signal, sigemptyset,
