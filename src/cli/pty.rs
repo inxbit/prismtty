@@ -1156,13 +1156,43 @@ fn start_end_watchdog(signal: libc::c_int, deadline: Instant, sigint_left_defaul
         .is_ok()
 }
 
-/// The limit's end, at the deadline, with 128 plus `signal`, as 1.4.0 did.
-fn end_at_deadline(signal: libc::c_int, _sigint_left_default: bool) {
-    if claim_exit(EXIT_ABRUPTLY) {
-        unregister_before_exit();
-        // SAFETY: _exit never returns and skips destructors by design: the terminal was
-        // restored when the signal was taken, and the pid file removed above.
-        unsafe { libc::_exit(128 + signal) }
+/// How long the limit waits at the deadline for the reap lock, which the
+/// watcher holds while it tears the group down by the same deadline.
+const END_OUTCOME_WAIT: Duration = Duration::from_millis(250);
+
+/// The limit's end, at the deadline. It ends the way the outcome the watcher
+/// published decides, as `end_abruptly` does for the watcher, so a SIGINT
+/// that killed the command still ends prismtty by SIGINT. When no outcome
+/// can be read in `END_OUTCOME_WAIT` (the watcher is still tearing down) the
+/// command was not collected, and the end is 128 plus `signal`.
+fn end_at_deadline(signal: libc::c_int, sigint_left_default: bool) {
+    let outcome = published_end_outcome_within(END_OUTCOME_WAIT).unwrap_or(EndOutcome {
+        signal,
+        leader_status: None,
+        deadline: Instant::now(),
+        owner: EndOwner::Watcher,
+    });
+    end_abruptly(&outcome, sigint_left_default);
+}
+
+/// The outcome the signal watcher published, taking the reap lock only
+/// within `limit`.
+fn published_end_outcome_within(limit: Duration) -> Option<EndOutcome> {
+    let until = Instant::now() + limit;
+    loop {
+        let state = match FORWARD_CHILD_LOCK.try_lock() {
+            Ok(state) => *state,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => *poisoned.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) if Instant::now() < until => {
+                thread::sleep(Duration::from_millis(1));
+                continue;
+            }
+            Err(std::sync::TryLockError::WouldBlock) => return None,
+        };
+        return match state {
+            ReapState::Ended(outcome) => Some(outcome),
+            _ => None,
+        };
     }
 }
 
@@ -1174,7 +1204,7 @@ fn end_abruptly(outcome: &EndOutcome, sigint_left_default: bool) -> ! {
     if !claim_exit(EXIT_ABRUPTLY) {
         wait_for_the_claimed_exit();
     }
-    // This runs on the watcher thread, not in the signal handler.
+    // This runs on the watcher or the limit's thread, not in a signal handler.
     unregister_before_exit();
     if outcome.signal == libc::SIGINT
         && sigint_left_default
