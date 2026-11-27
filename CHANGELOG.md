@@ -2,7 +2,7 @@
 
 All notable changes to PrismTTY are documented here.
 
-## 1.5.1 - 2026-11-27
+## Unreleased
 
 ### Changed
 
@@ -22,6 +22,20 @@ All notable changes to PrismTTY are documented here.
 - In a UTF-8 locale a highlight no longer widens over an invalid byte, no
   color is taken from the UTF-8 form `C2 9B`, and when a filter processes
   the bytes it drops a `C2` that begins no character.
+
+### Known limits
+
+- In default mode, after an ESC and a byte from 80 up, which a terminal like
+  xterm ignores while it holds the ESC open, a highlight can end an OSC
+  string the terminal opened there, and the `^` written for an unfinished
+  ESC at the end of the output can start a PM string. 1.4.1 does both after
+  `ESC FF`; in a UTF-8 locale a raw byte from 80 to 9F now does too.
+  `--sanitize` drops the ESC in both cases.
+- On a terminal `--sanitize` does not neutralize every incomplete control at
+  the end of input: an unfinished ESC can reach the terminal, and the next
+  program to write there can finish it.
+
+## 1.5.1 - 2026-11-27
 
 ### Fixed
 
@@ -73,18 +87,6 @@ All notable changes to PrismTTY are documented here.
   - A removed reset's other effects are not reproduced: on a terminal where
     SGR 0 also closes an OSC 8 hyperlink, such as WezTerm, the link still goes
     on over the typed command.
-
-### Known limits
-
-- In default mode, after an ESC and a byte from 80 up, which a terminal like
-  xterm ignores while it holds the ESC open, a highlight can end an OSC
-  string the terminal opened there, and the `^` written for an unfinished
-  ESC at the end of the output can start a PM string. 1.4.1 does both after
-  `ESC FF`; in a UTF-8 locale a raw byte from 80 to 9F now does too.
-  `--sanitize` drops the ESC in both cases.
-- On a terminal `--sanitize` does not neutralize every incomplete control at
-  the end of input: an unfinished ESC can reach the terminal, and the next
-  program to write there can finish it.
 
 ## 1.5.0 - 2026-11-27
 
