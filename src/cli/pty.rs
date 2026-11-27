@@ -7,6 +7,8 @@ use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+#[cfg(any(target_os = "linux", test))]
+use std::sync::atomic::AtomicBool;
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicI32, AtomicUsize, Ordering},
@@ -26,7 +28,7 @@ use super::CliError;
 use super::args::Options;
 use super::profile_selection::dynamic_profile_enabled;
 use super::runtime::{register_for_reload, unregister_before_exit};
-use super::stream::{InputSource, highlight_stream, prepare_session};
+use super::stream::{InputSource, PreparedSession, highlight_stream, prepare_session};
 use super::trace::IoTrace;
 
 const STRIPPED_ITERM_ENV: [&str; 6] = [
@@ -220,7 +222,11 @@ fn exit_code_from_wait(status: nix::sys::wait::WaitStatus) -> u8 {
     }
 }
 
-fn wait_for_child_exit_without_reaping(pid: libc::pid_t) -> io::Result<()> {
+/// Waits until the child can be reaped and returns waitid's `si_code` for it.
+/// That is normally an exit (`CLD_EXITED`, `CLD_KILLED`, `CLD_DUMPED`), but a
+/// child that made prismtty its tracer is also reported when it stops
+/// (`CLD_TRAPPED`), and it is still alive then.
+fn wait_for_child_exit_without_reaping(pid: libc::pid_t) -> io::Result<libc::c_int> {
     loop {
         // SAFETY: siginfo_t is a plain C struct; all-zero bytes are a valid value that waitid
         // overwrites.
@@ -236,7 +242,7 @@ fn wait_for_child_exit_without_reaping(pid: libc::pid_t) -> io::Result<()> {
             )
         };
         if result == 0 {
-            return Ok(());
+            return Ok(info.si_code);
         }
         let error = io::Error::last_os_error();
         if error.kind() != io::ErrorKind::Interrupted {
@@ -281,16 +287,473 @@ fn child_exit_is_waitable(pid: libc::pid_t) -> io::Result<bool> {
 /// read instead, and this close then runs while the read loop drains the
 /// master. The slave is closed at once when the child's pid is unknown, the
 /// wait fails or no thread can be started.
-fn close_slave_after_child_exit(slave: Box<dyn SlavePty + Send>, pid: Option<u32>) {
+///
+/// Where the child's exit can end the session early (see
+/// [`child_exit_notice`]), it also returns the notice through which the
+/// waiter reports that exit, after it has closed the slave.
+fn close_slave_after_child_exit(
+    slave: Box<dyn SlavePty + Send>,
+    pid: Option<u32>,
+) -> Option<Arc<ChildExitNotice>> {
     let Some(pid) = pid else {
         drop(slave);
-        return;
+        return None;
     };
-    // A failed spawn drops the closure, and the slave with it.
-    let _ = thread::Builder::new().spawn(move || {
-        let _ = wait_for_child_exit_without_reaping(pid as libc::pid_t);
-        drop(slave);
+    let notice = child_exit_notice();
+    // A failed spawn drops the closure, the slave and the reporter with it,
+    // and a reporter dropped before the wait reports the exit as unknown.
+    let mut reporter = notice.clone().map(|notice| ChildExitReporter {
+        notice,
+        exited: false,
     });
+    let _ = thread::Builder::new().spawn(move || {
+        let exit = wait_for_child_exit_without_reaping(pid as libc::pid_t);
+        drop(slave);
+        if let Some(reporter) = reporter.as_mut() {
+            reporter.exited = exit.is_ok_and(child_has_exited);
+        }
+    });
+    notice
+}
+
+/// Whether the child's exit may end the session before the PTY's EOF, and
+/// if so the notice that carries it from the waiter to the read loop.
+///
+/// On Linux a PTY is not hung up when its session leader exits: a background
+/// job the command left behind keeps the slave open, and reading the master
+/// to EOF would keep the session (raw mode, no exit status) until that job
+/// closes it. With the notice the read loop learns of the exit and ends once
+/// a poll of the master shows nothing left queued. That needs two kernel
+/// fixes: from Linux 4.7 (commit 0f40fbbcc34e) a poll of the master first
+/// lets the kernel hand over output still on its way from the slave, so the
+/// command's last bytes cannot look absent; from Linux 4.12 (commit
+/// 77dae6134440) a flush on the slave no longer removes bytes the master has
+/// already reported readable, so the read that follows such a poll cannot
+/// block on a background job. Older kernels, a release that cannot be
+/// parsed, and WSL1 (which reports 4.4) keep reading to EOF.
+///
+/// The early end also assumes the PTY's ordinary line discipline (N_TTY),
+/// which hands written output to the master at once. A command that puts its
+/// terminal into another discipline that can hold written output back (such
+/// as N_HDLC with output stopped) can lose bytes it wrote successfully.
+///
+/// macOS revokes the terminal when the session leader exits, so EOF arrives
+/// at once there and there is no notice.
+#[cfg(target_os = "linux")]
+fn child_exit_notice() -> Option<Arc<ChildExitNotice>> {
+    kernel_release()
+        .is_some_and(|release| pty_drain_is_reliable(&release))
+        .then(Default::default)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn child_exit_notice() -> Option<Arc<ChildExitNotice>> {
+    None
+}
+
+/// Hands the report of the child's exit from the waiter to the pipe the
+/// read loop polls. The waiter starts with the child, but the pipe is only
+/// made once everything else the session needs is open, since it is the
+/// first thing to go without when descriptors run short; either may come
+/// first, and whichever comes second writes the byte, once.
+#[derive(Default)]
+struct ChildExitNotice {
+    state: Mutex<ChildExitState>,
+}
+
+#[derive(Default)]
+enum ChildExitState {
+    /// Neither the exit nor the pipe yet.
+    #[default]
+    Waiting,
+    /// The child has exited; the pipe is not there yet.
+    Exited,
+    /// The wait ended without a real exit; the pipe is not there yet.
+    Unknown,
+    /// The pipe's write end, waiting for the exit. Only Linux installs one.
+    #[cfg_attr(not(any(target_os = "linux", test)), allow(dead_code))]
+    Writer(OwnedFd),
+    /// Settled: the byte was written, or the write end closed without one.
+    Done,
+}
+
+impl ChildExitNotice {
+    /// The waiter's report: whether the child really exited.
+    fn report(&self, exited: bool) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *state = match mem::take(&mut *state) {
+            ChildExitState::Waiting if exited => ChildExitState::Exited,
+            ChildExitState::Waiting => ChildExitState::Unknown,
+            ChildExitState::Writer(exit_write) => {
+                if exited {
+                    write_exit_byte(exit_write);
+                }
+                ChildExitState::Done
+            }
+            settled => settled,
+        };
+    }
+
+    /// Gives the notice the pipe's write end, to write to now if the child
+    /// has already exited, or once it does. A write end that comes after an
+    /// unknown end of the wait is closed without a byte.
+    #[cfg(any(target_os = "linux", test))]
+    fn install(&self, exit_write: OwnedFd) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *state = match mem::take(&mut *state) {
+            ChildExitState::Waiting => ChildExitState::Writer(exit_write),
+            ChildExitState::Exited => {
+                write_exit_byte(exit_write);
+                ChildExitState::Done
+            }
+            _ => ChildExitState::Done,
+        };
+    }
+}
+
+/// The waiter's side of a [`ChildExitNotice`]. It reports when it is
+/// dropped, so a waiter thread that never ran reports an unknown end.
+struct ChildExitReporter {
+    notice: Arc<ChildExitNotice>,
+    exited: bool,
+}
+
+impl Drop for ChildExitReporter {
+    fn drop(&mut self) {
+        self.notice.report(self.exited);
+    }
+}
+
+/// Writes the one byte that reports the child's exit and closes the pipe.
+fn write_exit_byte(exit_write: OwnedFd) {
+    let mut exit_write = std::fs::File::from(exit_write);
+    loop {
+        // An unread pipe end that is already closed only fails the write.
+        match exit_write.write(&[1]) {
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            _ => return,
+        }
+    }
+}
+
+/// Whether a waitid `si_code` reports the end of the process: a normal exit,
+/// death by a signal, or death by a signal with a core dump. waitid also
+/// reports a child that made prismtty its tracer when it stops, and that
+/// child is alive.
+fn child_has_exited(si_code: libc::c_int) -> bool {
+    matches!(
+        si_code,
+        libc::CLD_EXITED | libc::CLD_KILLED | libc::CLD_DUMPED
+    )
+}
+
+/// The running kernel's release, as `uname -r` prints it.
+#[cfg(target_os = "linux")]
+fn kernel_release() -> Option<String> {
+    // SAFETY: utsname is a plain C struct of byte arrays; all-zero bytes are a
+    // valid value that uname overwrites.
+    let mut name = unsafe { mem::zeroed::<libc::utsname>() };
+    // SAFETY: `name` is a valid, exclusively borrowed utsname for the call.
+    if unsafe { libc::uname(&mut name) } != 0 {
+        return None;
+    }
+    // SAFETY: uname filled `release` with a NUL-terminated string that lives
+    // as long as `name`.
+    let release = unsafe { std::ffi::CStr::from_ptr(name.release.as_ptr()) };
+    Some(release.to_string_lossy().into_owned())
+}
+
+/// Whether a Linux kernel release (`6.8.0-110-generic`) is 4.12 or newer, the
+/// first release with both fixes [`child_exit_notice`] needs. A release that
+/// does not start with `major.minor` counts as older.
+#[cfg(any(target_os = "linux", test))]
+fn pty_drain_is_reliable(release: &str) -> bool {
+    let mut parts = release.splitn(2, '.');
+    let major = parts.next().unwrap_or_default();
+    let minor_digits = parts
+        .next()
+        .unwrap_or_default()
+        .split(|character: char| !character.is_ascii_digit())
+        .next()
+        .unwrap_or_default();
+    if major.is_empty() || !major.bytes().all(|byte| byte.is_ascii_digit()) {
+        return false;
+    }
+    match (major.parse::<u64>(), minor_digits.parse::<u64>()) {
+        (Ok(major), Ok(minor)) => (major, minor) >= (4, 12),
+        _ => false,
+    }
+}
+
+/// How many bytes the reader still returns once it has seen the child exit:
+/// what the PTY has queued then (about 20 KiB at most on Linux 6.8) and
+/// whatever a leftover background job adds while it is read. The limit only
+/// ends a session whose leftover job never stops writing.
+#[cfg(any(target_os = "linux", test))]
+const CHILD_EXIT_READ_LIMIT: usize = 1024 * 1024;
+
+/// What a poll of the PTY master reported.
+#[cfg(any(target_os = "linux", test))]
+#[derive(Debug, PartialEq, Eq)]
+enum MasterReadiness {
+    /// Output to read, with or without a hangup behind it.
+    Data,
+    /// Every slave descriptor is closed and nothing is left to read. A
+    /// blocking read is not safe here: a process that opens the slave again
+    /// before it starts would make it wait for that process.
+    HungUp,
+    /// Nothing to read yet.
+    Quiet,
+    /// The descriptor is invalid or reported an error.
+    Failed,
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn master_readiness(revents: libc::c_short) -> MasterReadiness {
+    if revents & libc::POLLNVAL != 0 {
+        MasterReadiness::Failed
+    } else if revents & libc::POLLIN != 0 {
+        MasterReadiness::Data
+    } else if revents & libc::POLLERR != 0 {
+        MasterReadiness::Failed
+    } else if revents & libc::POLLHUP != 0 {
+        MasterReadiness::HungUp
+    } else {
+        MasterReadiness::Quiet
+    }
+}
+
+/// Polls `fds` for input and returns each one's `revents`, retrying a poll a
+/// signal interrupted.
+#[cfg(any(target_os = "linux", test))]
+fn poll_input<const N: usize>(
+    fds: [RawFd; N],
+    timeout_ms: libc::c_int,
+) -> io::Result<[libc::c_short; N]> {
+    let mut poll_fds = fds.map(|fd| libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    });
+    loop {
+        // SAFETY: `poll_fds` is a valid, exclusively borrowed array of N
+        // initialized entries and the count passed matches it.
+        let ready = unsafe { libc::poll(poll_fds.as_mut_ptr(), N as libc::nfds_t, timeout_ms) };
+        if ready >= 0 {
+            return Ok(poll_fds.map(|poll_fd| poll_fd.revents));
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn master_poll_failed() -> io::Error {
+    io::Error::other("polling the PTY master failed")
+}
+
+/// Reads the PTY master like the plain reader until the wrapped child has
+/// exited, and after that only what the PTY still has queued, so the session
+/// ends with the child even while something else keeps the slave open (see
+/// [`child_exit_notice`]). `master` is the descriptor `inner` reads, polled
+/// as well. The child's exit arrives as one byte on `exit_read`; a pipe
+/// closed without a byte leaves plain reads to EOF.
+#[cfg(any(target_os = "linux", test))]
+struct ChildExitReader<R, E = std::fs::File> {
+    inner: R,
+    master: RawFd,
+    exit_read: Option<E>,
+    /// Bytes still to return once the exit is seen; `None` until then.
+    remaining: Option<usize>,
+    exit_seen: Arc<AtomicBool>,
+}
+
+#[cfg(any(target_os = "linux", test))]
+impl<R: Read, E: Read + AsRawFd> ChildExitReader<R, E> {
+    fn new(inner: R, master: RawFd, exit_read: E, exit_seen: Arc<AtomicBool>) -> Self {
+        Self {
+            inner,
+            master,
+            exit_read: Some(exit_read),
+            remaining: None,
+            exit_seen,
+        }
+    }
+
+    /// One read once the exit is seen: what is queued now, never more than
+    /// the bytes still allowed, and the end once nothing is queued.
+    fn read_queued(&mut self, buf: &mut [u8], remaining: usize) -> io::Result<usize> {
+        let [master] = poll_input([self.master], 0)?;
+        match master_readiness(master) {
+            MasterReadiness::Data => {
+                let limit = buf.len().min(remaining);
+                let read = self.inner.read(&mut buf[..limit])?;
+                self.remaining = Some(if read == 0 { 0 } else { remaining - read });
+                Ok(read)
+            }
+            MasterReadiness::HungUp | MasterReadiness::Quiet => {
+                self.remaining = Some(0);
+                Ok(0)
+            }
+            MasterReadiness::Failed => Err(master_poll_failed()),
+        }
+    }
+}
+
+/// Reads the one byte of the exit pipe: true for the byte, false for a pipe
+/// closed without one.
+#[cfg(any(target_os = "linux", test))]
+fn read_exit_byte(exit_read: &mut impl Read) -> io::Result<bool> {
+    let mut byte = [0_u8; 1];
+    loop {
+        match exit_read.read(&mut byte) {
+            Ok(read) => return Ok(read == 1),
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+#[cfg(any(target_os = "linux", test))]
+impl<R: Read, E: Read + AsRawFd> Read for ChildExitReader<R, E> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        loop {
+            if let Some(remaining) = self.remaining {
+                if remaining == 0 {
+                    return Ok(0);
+                }
+                return self.read_queued(buf, remaining);
+            }
+            let Some(exit_read) = self.exit_read.as_mut() else {
+                return self.inner.read(buf);
+            };
+            let [master, exit] = poll_input([self.master, exit_read.as_raw_fd()], -1)?;
+            if exit != 0 {
+                // The exit is taken first even when the same poll also shows
+                // output: that output is then read, and counted, as queued.
+                // A master that looked empty in this poll is polled again
+                // before the end, since the child's last write may have
+                // landed after it.
+                if read_exit_byte(exit_read)? {
+                    self.remaining = Some(CHILD_EXIT_READ_LIMIT);
+                    self.exit_seen.store(true, Ordering::Release);
+                } else {
+                    self.exit_read = None;
+                }
+                continue;
+            }
+            match master_readiness(master) {
+                MasterReadiness::Data => return self.inner.read(buf),
+                MasterReadiness::HungUp => {
+                    self.remaining = Some(0);
+                    return Ok(0);
+                }
+                MasterReadiness::Quiet => {}
+                MasterReadiness::Failed => return Err(master_poll_failed()),
+            }
+        }
+    }
+}
+
+/// The PTY master read as portable-pty's reader reads it, where EIO (every
+/// slave descriptor closed) is the end, from a descriptor of its own that
+/// [`ChildExitReader`] can also poll.
+#[cfg(target_os = "linux")]
+struct MasterFile(std::fs::File);
+
+#[cfg(target_os = "linux")]
+impl Read for MasterFile {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        match self.0.read(buf) {
+            Err(error) if error.raw_os_error() == Some(libc::EIO) => Ok(0),
+            result => result,
+        }
+    }
+}
+
+/// The reader of the PTY master, and the descriptor it reads when that is
+/// needed to end at the child's exit: on Linux with a [`ChildExitNotice`], a
+/// duplicate of the master of its own, which costs the same one descriptor
+/// as portable-pty's reader; otherwise portable-pty's reader, as before.
+#[cfg(target_os = "linux")]
+fn master_reader(
+    master: &dyn portable_pty::MasterPty,
+    child_exit: Option<&Arc<ChildExitNotice>>,
+) -> anyhow::Result<(Box<dyn Read + Send>, Option<RawFd>)> {
+    if child_exit.is_none() {
+        return Ok((master.try_clone_reader()?, None));
+    }
+    let file = std::fs::File::from(dup_master_fd(master)?);
+    let fd = file.as_raw_fd();
+    Ok((Box::new(MasterFile(file)), Some(fd)))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn master_reader(
+    master: &dyn portable_pty::MasterPty,
+    _child_exit: Option<&Arc<ChildExitNotice>>,
+) -> anyhow::Result<(Box<dyn Read + Send>, Option<RawFd>)> {
+    Ok((master.try_clone_reader()?, None))
+}
+
+/// Puts [`ChildExitReader`] in front of the master reader so that the session
+/// ends at the child's exit, and tells the session so that it stops holding
+/// back output for the child once it has exited. It runs after everything
+/// else the session needs is open, and the pipe is all it adds: without one
+/// (no descriptors left, or no notice) the reader reads to EOF as before.
+#[cfg(target_os = "linux")]
+fn end_reads_at_child_exit(
+    reader: Box<dyn Read + Send>,
+    master: Option<RawFd>,
+    child_exit: Option<Arc<ChildExitNotice>>,
+    prepared: &mut PreparedSession<'_>,
+) -> Box<dyn Read + Send> {
+    let (Some(master), Some(child_exit)) = (master, child_exit) else {
+        return reader;
+    };
+    let Ok((exit_read, exit_write)) = pipe_fds() else {
+        return reader;
+    };
+    // SAFETY: both descriptors were just created by pipe_fds and nothing else
+    // owns them.
+    let (exit_read, exit_write) = unsafe {
+        (
+            OwnedFd::from_raw_fd(exit_read),
+            OwnedFd::from_raw_fd(exit_write),
+        )
+    };
+    child_exit.install(exit_write);
+    let exit_seen = Arc::new(AtomicBool::new(false));
+    prepared.end_holdback_at_child_exit(Arc::clone(&exit_seen));
+    Box::new(ChildExitReader::new(
+        reader,
+        master,
+        std::fs::File::from(exit_read),
+        exit_seen,
+    ))
+}
+
+/// The terminal ends the session when the child exits, so the reader reads
+/// to EOF unchanged.
+#[cfg(not(target_os = "linux"))]
+fn end_reads_at_child_exit(
+    reader: Box<dyn Read + Send>,
+    _master: Option<RawFd>,
+    _child_exit: Option<Arc<ChildExitNotice>>,
+    _prepared: &mut PreparedSession<'_>,
+) -> Box<dyn Read + Send> {
+    reader
 }
 
 /// Reaps the wrapped child and returns its process-exit byte. Waits without
@@ -554,7 +1017,7 @@ pub(super) fn run_command(options: Options, command: Vec<OsString>) -> Result<Ex
     // Everything that can reject the invocation runs before the child exists,
     // so a typo in a flag or a broken config never runs part of the command,
     // and a reload warning prints before the terminal goes raw.
-    let prepared = prepare_session(&options, live_output)?;
+    let mut prepared = prepare_session(&options, live_output)?;
     let trace = IoTrace::open(options.trace_io.as_deref())?;
     let (_registration, reload_watcher) = register_for_reload();
 
@@ -599,7 +1062,7 @@ pub(super) fn run_command(options: Options, command: Vec<OsString>) -> Result<Ex
     } else {
         spawn_with_pty_slave(&builder, &*pair.master, interactive, &caller_fds)?
     };
-    close_slave_after_child_exit(pair.slave, child.process_id());
+    let child_exit = close_slave_after_child_exit(pair.slave, child.process_id());
     set_forward_child_pid(child.process_id().map(|pid| pid as i32).unwrap_or(0));
     cleanup_child_on_err(signal_mask.restore(), &mut child)?;
 
@@ -665,9 +1128,13 @@ pub(super) fn run_command(options: Options, command: Vec<OsString>) -> Result<Ex
         });
     }
 
-    let mut reader = cleanup_child_on_err(pair.master.try_clone_reader(), &mut child)?;
+    let (reader, reader_fd) = cleanup_child_on_err(
+        master_reader(&*pair.master, child_exit.as_ref()),
+        &mut child,
+    )?;
     let mut resize_watcher =
         cleanup_child_on_err(PtyResizeWatcher::start(pair.master), &mut child)?;
+    let mut reader = end_reads_at_child_exit(reader, reader_fd, child_exit, &mut prepared);
 
     let mut stdout = WaitWhenWouldBlock {
         inner: io::stdout(),
@@ -3812,6 +4279,425 @@ mod tests {
             .expect("run_command boundary exists");
         assert!(run_command.contains("close_slave_after_child_exit(pair.slave"));
         assert!(!run_command.contains("drop(pair.slave)"));
+    }
+
+    /// A pipe as two owned files: (read end, write end).
+    fn test_pipe() -> (std::fs::File, std::fs::File) {
+        use std::os::fd::FromRawFd;
+
+        let (read, write) = super::pipe_fds().expect("pipe");
+        // SAFETY: both descriptors were just created by pipe_fds and nothing
+        // else owns them.
+        unsafe {
+            (
+                std::fs::File::from_raw_fd(read),
+                std::fs::File::from_raw_fd(write),
+            )
+        }
+    }
+
+    /// An exit pipe whose byte is already written and whose writer is closed,
+    /// as the waiter leaves it after the child has exited.
+    fn reported_exit() -> std::fs::File {
+        use std::io::Write;
+
+        let (read, mut write) = test_pipe();
+        write.write_all(&[1]).expect("write the exit byte");
+        drop(write);
+        read
+    }
+
+    /// A reader over `file` that polls `file` itself, as on Linux the reader
+    /// polls the master descriptor it reads.
+    fn exit_reader(
+        file: std::fs::File,
+        exit_read: std::fs::File,
+        exit_seen: &Arc<AtomicBool>,
+    ) -> super::ChildExitReader<std::fs::File> {
+        let master = std::os::fd::AsRawFd::as_raw_fd(&file);
+        super::ChildExitReader::new(file, master, exit_read, Arc::clone(exit_seen))
+    }
+
+    // When the exit and output are both ready in one poll, the reader takes
+    // the exit first, so the read that follows counts against the limit. A
+    // regular file stands in for a master that always has more to read, as
+    // under a leftover job that never stops writing: the reader stops at
+    // exactly the limit, a read is cut to what is left, and the end stays.
+    #[test]
+    fn child_exit_reader_stops_at_exactly_the_limit_counting_from_the_first_read() {
+        use std::io::{Read, Seek, Write};
+
+        let mut file = tempfile::tempfile().expect("temp file");
+        file.write_all(&vec![b'x'; 2 * super::CHILD_EXIT_READ_LIMIT])
+            .expect("fill the file");
+        file.rewind().expect("rewind");
+        let exit_seen = Arc::new(AtomicBool::new(false));
+        let mut reader = exit_reader(file, reported_exit(), &exit_seen);
+
+        // 7000 does not divide the limit, so the last read is cut short.
+        let mut buffer = vec![0_u8; 7000];
+        let first = reader.read(&mut buffer).expect("first read");
+        assert!(first > 0, "the first read returned nothing");
+        assert!(
+            exit_seen.load(Ordering::Acquire),
+            "the exit was not taken before the output of the same poll"
+        );
+        let mut total = first;
+        loop {
+            let read = reader.read(&mut buffer).expect("read");
+            if read == 0 {
+                break;
+            }
+            total += read;
+            assert!(
+                total <= super::CHILD_EXIT_READ_LIMIT,
+                "read past the limit: {total}"
+            );
+        }
+        assert_eq!(total, super::CHILD_EXIT_READ_LIMIT);
+        for _ in 0..3 {
+            assert_eq!(reader.read(&mut buffer).expect("read after the end"), 0);
+        }
+    }
+
+    // After the exit, the reader returns what is queued and then ends; the
+    // end stays even when more output arrives later.
+    #[test]
+    fn child_exit_reader_returns_queued_output_then_ends_for_good() {
+        use std::io::{Read, Write};
+
+        let (master_read, mut master_write) = test_pipe();
+        master_write.write_all(b"last").expect("queue output");
+        let exit_seen = Arc::new(AtomicBool::new(false));
+        let mut reader = exit_reader(master_read, reported_exit(), &exit_seen);
+        let mut buffer = [0_u8; 64];
+        let read = reader.read(&mut buffer).expect("read queued output");
+        assert_eq!(&buffer[..read], b"last");
+        assert!(exit_seen.load(Ordering::Acquire));
+        assert_eq!(reader.read(&mut buffer).expect("read at the end"), 0);
+        master_write
+            .write_all(b"late")
+            .expect("write after the end");
+        assert_eq!(reader.read(&mut buffer).expect("read after the end"), 0);
+    }
+
+    // An exit seen on its own, with nothing queued, ends the read.
+    #[test]
+    fn child_exit_reader_ends_when_the_exit_comes_with_nothing_queued() {
+        use std::io::Read;
+
+        let (master_read, _master_write) = test_pipe();
+        let exit_seen = Arc::new(AtomicBool::new(false));
+        let mut reader = exit_reader(master_read, reported_exit(), &exit_seen);
+        let mut buffer = [0_u8; 64];
+        assert_eq!(reader.read(&mut buffer).expect("read"), 0);
+        assert!(exit_seen.load(Ordering::Acquire));
+    }
+
+    // The poll that shows the exit can show the master still empty while the
+    // child's last write is about to land. The reader polls the master again
+    // after taking the exit, so output that arrives in between is read, and
+    // counted, instead of being cut off by the earlier, empty sample.
+    #[test]
+    fn child_exit_reader_reads_output_that_lands_after_the_exit_was_polled() {
+        use std::io::{Read, Write};
+
+        /// The exit pipe; reading its byte, which the reader does only after
+        /// the poll that found it, makes the master readable.
+        struct ExitThenOutput {
+            exit_read: std::fs::File,
+            master_write: Option<std::fs::File>,
+        }
+        impl Read for ExitThenOutput {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                if let Some(mut master_write) = self.master_write.take() {
+                    master_write.write_all(b"lastword")?;
+                }
+                self.exit_read.read(buf)
+            }
+        }
+        impl std::os::fd::AsRawFd for ExitThenOutput {
+            fn as_raw_fd(&self) -> RawFd {
+                self.exit_read.as_raw_fd()
+            }
+        }
+
+        let (master_read, master_write) = test_pipe();
+        let master = std::os::fd::AsRawFd::as_raw_fd(&master_read);
+        let exit_seen = Arc::new(AtomicBool::new(false));
+        let mut reader = super::ChildExitReader::new(
+            master_read,
+            master,
+            ExitThenOutput {
+                exit_read: reported_exit(),
+                master_write: Some(master_write),
+            },
+            Arc::clone(&exit_seen),
+        );
+        let mut buffer = [0_u8; 64];
+        let read = reader.read(&mut buffer).expect("read");
+        assert_eq!(&buffer[..read], b"lastword");
+        assert!(exit_seen.load(Ordering::Acquire));
+        assert_eq!(
+            reader.remaining,
+            Some(super::CHILD_EXIT_READ_LIMIT - b"lastword".len())
+        );
+        assert_eq!(reader.read(&mut buffer).expect("read at the end"), 0);
+    }
+
+    // A waiter that could not report the exit closes the pipe without a
+    // byte. The reader then reads to the master's EOF exactly as without it,
+    // and stops polling the dead pipe.
+    #[test]
+    fn child_exit_reader_without_an_exit_byte_reads_to_eof() {
+        use std::io::{Read, Write};
+
+        let (exit_read, exit_write) = test_pipe();
+        drop(exit_write);
+        let (master_read, mut master_write) = test_pipe();
+        let exit_seen = Arc::new(AtomicBool::new(false));
+        let mut reader = exit_reader(master_read, exit_read, &exit_seen);
+        master_write.write_all(b"abc").expect("write");
+        // A reader that kept polling the dead pipe would spin instead of
+        // returning, so the read runs on a thread the test can give up on.
+        let (done_tx, done_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let mut buffer = [0_u8; 64];
+            let read = reader.read(&mut buffer).map(|read| buffer[..read].to_vec());
+            let _ = done_tx.send((read, reader));
+        });
+        let (read, mut reader) = done_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the read did not return; the closed exit pipe is still polled");
+        assert_eq!(read.expect("read"), b"abc");
+        assert!(
+            reader.exit_read.is_none(),
+            "the dead exit pipe is still polled"
+        );
+        let mut buffer = [0_u8; 64];
+        master_write.write_all(b"def").expect("write");
+        let read = reader.read(&mut buffer).expect("read");
+        assert_eq!(&buffer[..read], b"def");
+        drop(master_write);
+        assert_eq!(reader.read(&mut buffer).expect("read at EOF"), 0);
+        assert!(!exit_seen.load(Ordering::Acquire));
+    }
+
+    // A read into an empty buffer returns nothing and takes nothing: the
+    // exit and the queued output are still there for the next read.
+    #[test]
+    fn child_exit_reader_changes_nothing_for_an_empty_buffer() {
+        use std::io::{Read, Write};
+
+        let (master_read, mut master_write) = test_pipe();
+        master_write.write_all(b"last").expect("queue output");
+        let exit_seen = Arc::new(AtomicBool::new(false));
+        let mut reader = exit_reader(master_read, reported_exit(), &exit_seen);
+        assert_eq!(reader.read(&mut []).expect("empty read"), 0);
+        assert!(!exit_seen.load(Ordering::Acquire));
+        let mut buffer = [0_u8; 64];
+        let read = reader.read(&mut buffer).expect("read");
+        assert_eq!(&buffer[..read], b"last");
+        assert!(exit_seen.load(Ordering::Acquire));
+    }
+
+    // Output is read first, whatever else comes with it; then an invalid
+    // descriptor or an error is a failure; a hangup alone is the end without
+    // a read, which could block if something opened the slave again.
+    #[test]
+    fn master_readiness_reads_output_first_and_ends_at_a_hangup_alone() {
+        use super::MasterReadiness::{Data, Failed, HungUp, Quiet};
+
+        assert_eq!(super::master_readiness(libc::POLLIN), Data);
+        assert_eq!(super::master_readiness(libc::POLLIN | libc::POLLHUP), Data);
+        assert_eq!(super::master_readiness(libc::POLLIN | libc::POLLERR), Data);
+        assert_eq!(super::master_readiness(libc::POLLHUP), HungUp);
+        assert_eq!(
+            super::master_readiness(libc::POLLHUP | libc::POLLERR),
+            Failed
+        );
+        assert_eq!(super::master_readiness(libc::POLLERR), Failed);
+        assert_eq!(super::master_readiness(libc::POLLNVAL), Failed);
+        assert_eq!(
+            super::master_readiness(libc::POLLIN | libc::POLLNVAL),
+            Failed
+        );
+        assert_eq!(super::master_readiness(0), Quiet);
+    }
+
+    // On Linux a master whose slaves are all closed reports a hangup alone.
+    // The reader ends there without a read of its own.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn child_exit_reader_ends_at_a_hangup_alone_without_reading() {
+        use std::io::Read;
+
+        struct MustNotRead;
+        impl Read for MustNotRead {
+            fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+                panic!("the reader read a master that reported a hangup alone");
+            }
+        }
+
+        let pty = nix::pty::openpty(None, None).expect("openpty");
+        drop(pty.slave);
+        let (exit_read, _exit_write) = test_pipe();
+        let mut reader = super::ChildExitReader::new(
+            MustNotRead,
+            std::os::fd::AsRawFd::as_raw_fd(&pty.master),
+            exit_read,
+            Arc::new(AtomicBool::new(false)),
+        );
+        let mut buffer = [0_u8; 64];
+        assert_eq!(reader.read(&mut buffer).expect("read"), 0);
+    }
+
+    // The early end needs a kernel with both PTY fixes it relies on: from
+    // 4.7 a master poll lets output still on its way arrive first, and from
+    // 4.12 a slave flush no longer removes output a poll has reported.
+    #[test]
+    fn pty_drain_is_reliable_from_linux_4_12() {
+        for release in [
+            "6.8.0-110-generic",
+            "5.14.0-427.13.1.el9_4.x86_64",
+            "4.18.0-553.el8_10.x86_64",
+            "4.12.0",
+            "4.12",
+            "4.14.336",
+            "10.0.1",
+        ] {
+            assert!(super::pty_drain_is_reliable(release), "{release}");
+        }
+        for release in [
+            "4.11.12",
+            "4.11",
+            "4.8.0-22-generic",
+            "4.7.0",
+            "4.7",
+            "4.6.9",
+            "4.4.0-19041-Microsoft",
+            "3.10.0-1160.el7.x86_64",
+            "",
+            "garbage",
+            "6",
+            "6.",
+            ".8",
+            "v6.8.0",
+            "6.x",
+        ] {
+            assert!(!super::pty_drain_is_reliable(release), "{release}");
+        }
+    }
+
+    // Only a process that is gone counts as exited. waitid also reports a
+    // child that made prismtty its tracer when it stops: that child is alive,
+    // and so is one that stopped or continued.
+    #[test]
+    fn only_a_real_exit_counts() {
+        for (si_code, exited) in [
+            (libc::CLD_EXITED, true),
+            (libc::CLD_KILLED, true),
+            (libc::CLD_DUMPED, true),
+            (libc::CLD_TRAPPED, false),
+            (libc::CLD_STOPPED, false),
+            (libc::CLD_CONTINUED, false),
+        ] {
+            assert_eq!(super::child_has_exited(si_code), exited, "{si_code}");
+        }
+    }
+
+    /// Everything the exit pipe receives until its write end is closed. A
+    /// write end left open fails here, after a bound, instead of blocking the
+    /// test.
+    fn exit_pipe_bytes(mut exit_read: std::fs::File) -> Vec<u8> {
+        use std::io::Read;
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut bytes = Vec::new();
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let timeout = libc::c_int::try_from(remaining.as_millis()).unwrap_or(libc::c_int::MAX);
+            let [revents] =
+                super::poll_input([std::os::fd::AsRawFd::as_raw_fd(&exit_read)], timeout)
+                    .expect("poll the exit pipe");
+            assert!(revents != 0, "the exit pipe's write end was left open");
+            let mut chunk = [0_u8; 16];
+            let read = exit_read.read(&mut chunk).expect("read the exit pipe");
+            if read == 0 {
+                return bytes;
+            }
+            bytes.extend_from_slice(&chunk[..read]);
+        }
+    }
+
+    // The waiter can report the exit before or after the read loop's pipe is
+    // handed over. Either way the byte is written exactly once, by whichever
+    // comes second, and the pipe is closed after it.
+    #[test]
+    fn child_exit_notice_writes_the_byte_once_in_either_order() {
+        let notice = super::ChildExitNotice::default();
+        let (exit_read, exit_write) = test_pipe();
+        notice.report(true);
+        notice.install(exit_write.into());
+        assert_eq!(exit_pipe_bytes(exit_read), vec![1], "exit before the pipe");
+
+        let notice = super::ChildExitNotice::default();
+        let (exit_read, exit_write) = test_pipe();
+        notice.install(exit_write.into());
+        notice.report(true);
+        assert_eq!(exit_pipe_bytes(exit_read), vec![1], "pipe before the exit");
+    }
+
+    // A wait that ended without a real exit, in either order, and a waiter
+    // that never ran close the pipe without a byte.
+    #[test]
+    fn child_exit_notice_writes_no_byte_without_a_real_exit() {
+        let notice = super::ChildExitNotice::default();
+        let (exit_read, exit_write) = test_pipe();
+        notice.report(false);
+        notice.install(exit_write.into());
+        assert!(exit_pipe_bytes(exit_read).is_empty(), "unknown end first");
+
+        let notice = super::ChildExitNotice::default();
+        let (exit_read, exit_write) = test_pipe();
+        notice.install(exit_write.into());
+        notice.report(false);
+        assert!(exit_pipe_bytes(exit_read).is_empty(), "pipe first");
+
+        let notice = Arc::new(super::ChildExitNotice::default());
+        let (exit_read, exit_write) = test_pipe();
+        notice.install(exit_write.into());
+        drop(super::ChildExitReporter {
+            notice: Arc::clone(&notice),
+            exited: false,
+        });
+        assert!(exit_pipe_bytes(exit_read).is_empty(), "waiter never ran");
+    }
+
+    // The waiter reports a real exit after it has closed the slave, on Linux
+    // from 4.12; elsewhere there is no notice and nothing changes.
+    #[test]
+    fn waiter_reports_the_child_exit_where_the_kernel_allows_it() {
+        let pair = portable_pty::native_pty_system()
+            .openpty(portable_pty::PtySize::default())
+            .expect("openpty");
+        let mut builder = portable_pty::CommandBuilder::new("true");
+        builder.cwd("/");
+        let mut child =
+            super::spawn_with_pty_slave(&builder, &*pair.master, false, &[]).expect("spawn true");
+        let notice = super::close_slave_after_child_exit(pair.slave, child.process_id());
+        #[cfg(target_os = "linux")]
+        let expected =
+            super::kernel_release().is_some_and(|release| super::pty_drain_is_reliable(&release));
+        #[cfg(not(target_os = "linux"))]
+        let expected = false;
+        assert_eq!(notice.is_some(), expected);
+        if let Some(notice) = notice {
+            let (exit_read, exit_write) = test_pipe();
+            notice.install(exit_write.into());
+            assert_eq!(exit_pipe_bytes(exit_read), vec![1]);
+        }
+        assert_eq!(super::reap_child(&mut child).expect("reap true"), 0);
     }
 
     #[test]
