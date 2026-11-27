@@ -2,6 +2,38 @@
 
 All notable changes to PrismTTY are documented here.
 
+## Unreleased
+
+### Fixed
+
+- In interactive output, an open highlight no longer colors the blank line a
+  line feed scrolls in, or the cells a carriage return goes back over, where
+  it would show: when its style paints blank cells, or when the program's own
+  inverse, strike-through, overline or underline without a color of its own
+  draws blank cells in the foreground color. The highlight now closes right
+  before the CR or LF and opens again right after it. This holds for a CR or
+  LF in the text and for one the terminal runs inside an escape or control
+  sequence, such as `ESC [ 3 LF 1 m`: that sequence is kept whole, and the
+  highlight closes before all of it. Text is drawn in the same colors as
+  before. Piped and file output, `profiles test` and the library's
+  `Highlighter::highlight*` are unchanged.
+
+  What this covers, and what it does not:
+
+  - The rule is for CR and LF only. VT and FF keep their bytes, because some
+    terminals draw them as characters.
+  - In a UTF-8 locale a sequence opened by a raw `9B` is text to the
+    terminal, so only the line ends inside it leave the highlight. A terminal
+    that reads 8-bit bytes behind a UTF-8 locale, the mismatch `SECURITY.md`
+    describes, runs that sequence as a control, and the bytes now written
+    inside it end it early, so it is drawn differently than before.
+  - `C2 9B`, a control sequence with a byte from 80 to FF in it, and the
+    payload of an OSC, DCS, SOS, PM or APC string keep their bytes.
+  - `CSI K` right after a line feed still erases in the highlight color, as
+    before; that is a separate issue.
+  - A line that wraps at the right margin has no byte to act on and is drawn
+    as before.
+
 ## 1.4.0 - 2026-11-27
 
 ### Changed
