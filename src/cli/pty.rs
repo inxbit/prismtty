@@ -1112,8 +1112,14 @@ fn end_registered_child(
         deadline,
         owner: end_owner(leader_status, normal_end_bounded),
     };
-    *reap_state = ReapState::Ended(outcome);
+    publish_end_outcome(&mut reap_state, outcome);
     outcome
+}
+
+/// Publishes the watcher's outcome, under the reap lock that `reap_state`
+/// holds.
+fn publish_end_outcome(reap_state: &mut ReapState, outcome: EndOutcome) {
+    *reap_state = ReapState::Ended(outcome);
 }
 
 /// Who ends the process once the watcher has taken an ending signal: the main
