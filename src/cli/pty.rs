@@ -2923,6 +2923,7 @@ struct SessionSignalWatcher {
     thread: Option<thread::JoinHandle<()>>,
     previous_signal_handlers: Vec<(libc::c_int, libc::sigaction)>,
     raw_mode_state: SharedRawModeState,
+    sigint_left_default: bool,
 }
 
 impl SessionSignalWatcher {
@@ -2968,6 +2969,7 @@ impl SessionSignalWatcher {
             thread: Some(thread),
             previous_signal_handlers,
             raw_mode_state,
+            sigint_left_default,
         })
     }
 
@@ -2977,10 +2979,18 @@ impl SessionSignalWatcher {
                 "prismtty: could not restore terminal during cleanup: {error}"
             ));
         }
+        // After an ending signal the process is on its way out: its signals
+        // stay caught, with nothing left to act on them, so a second SIGTERM
+        // or a late SIGUSR1 cannot kill it by signal before it has removed its
+        // pid file and returned its status. Otherwise the signals are given
+        // back first, as in 1.4.1: from then on one takes its default action.
+        let ended = published_end_outcome().is_some();
+        if !ended {
+            restore_signal_handlers(&self.previous_signal_handlers);
+        }
+        self.previous_signal_handlers.clear();
         // Wait out any handler that is mid-write before the descriptor is
-        // closed (or leak it if one stalls). A handler that starts later
-        // writes nothing, but an ending signal it records is still taken by
-        // the watcher, which checks for one before it reads the stop byte.
+        // closed (or leak it if one stalls).
         let closable = RAW_MODE_SIGNAL_PIPE.disarm();
         if self.write_fd >= 0 {
             write_signal_byte(self.write_fd, RAW_SIGNAL_STOP_BYTE);
@@ -2989,17 +2999,19 @@ impl SessionSignalWatcher {
             }
             self.write_fd = -1;
         }
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
+        let Some(thread) = self.thread.take() else {
+            return;
+        };
+        let _ = thread.join();
+        // An ending signal that a handler recorded while it was still
+        // installed, after the watcher's last check, is taken here, on the
+        // stopping thread: the session is ending, its command has been reaped
+        // or given up on, and that decides the status as for any end.
+        if !ended && published_end_outcome().is_none() {
+            if let Some(signal) = PENDING_END.get() {
+                end_session_after_signal(signal, &self.raw_mode_state, self.sigint_left_default);
+            }
         }
-        // After an ending signal the process is on its way out: its signals
-        // stay caught, with nothing left to act on them, so a second SIGTERM
-        // or a late SIGUSR1 cannot kill it by signal before it has removed its
-        // pid file and returned its status.
-        if published_end_outcome().is_none() {
-            restore_signal_handlers(&self.previous_signal_handlers);
-        }
-        self.previous_signal_handlers.clear();
     }
 }
 
