@@ -11,7 +11,7 @@ use std::process::ExitCode;
 use std::sync::atomic::AtomicBool;
 use std::sync::{
     Arc, Mutex,
-    atomic::{AtomicI32, AtomicUsize, Ordering},
+    atomic::{AtomicI32, AtomicU64, AtomicUsize, Ordering},
     mpsc::{self, SyncSender},
 };
 use std::thread;
@@ -331,6 +331,7 @@ fn published_end_outcome() -> Option<EndOutcome> {
 fn set_forward_child_pid(pid: libc::pid_t) {
     let mut reap_state = forward_child_lock();
     *reap_state = ReapState::Unreaped;
+    PUBLISHED_LEADER_STATUS.store(0, Ordering::SeqCst);
     FORWARD_CHILD_PID.store(pid, Ordering::SeqCst);
 }
 
@@ -1117,9 +1118,40 @@ fn end_registered_child(
 }
 
 /// Publishes the watcher's outcome, under the reap lock that `reap_state`
-/// holds.
+/// holds. The command's status goes out first in `PUBLISHED_LEADER_STATUS`,
+/// which the limit's watchdog reads without that lock.
 fn publish_end_outcome(reap_state: &mut ReapState, outcome: EndOutcome) {
+    PUBLISHED_LEADER_STATUS.store(
+        encode_published_status(outcome.leader_status),
+        Ordering::SeqCst,
+    );
     *reap_state = ReapState::Ended(outcome);
+}
+
+/// What the limit's watchdog needs of the published outcome, which is all
+/// `end_abruptly` decides from besides the signal the watchdog already has:
+/// the command's raw wait status, or that the command was not collected.
+/// It is one value, written once by `publish_end_outcome` before the outcome
+/// under the reap lock, so a watcher delayed while it still holds that lock
+/// cannot keep it from the watchdog. 0 until then; `set_forward_child_pid`
+/// clears it for the next child.
+static PUBLISHED_LEADER_STATUS: AtomicU64 = AtomicU64::new(0);
+const STATUS_PUBLISHED: u64 = 1 << 63;
+const STATUS_COLLECTED: u64 = 1 << 62;
+
+fn encode_published_status(leader_status: Option<libc::c_int>) -> u64 {
+    STATUS_PUBLISHED | leader_status.map_or(0, |status| STATUS_COLLECTED | u64::from(status as u32))
+}
+
+/// The command's status as the watcher published it: `None` before it did,
+/// `Some(None)` when it could not collect the command.
+fn published_leader_status() -> Option<Option<libc::c_int>> {
+    published_leader_status_from(PUBLISHED_LEADER_STATUS.load(Ordering::SeqCst))
+}
+
+fn published_leader_status_from(value: u64) -> Option<Option<libc::c_int>> {
+    (value & STATUS_PUBLISHED != 0)
+        .then(|| (value & STATUS_COLLECTED != 0).then_some(value as u32 as libc::c_int))
 }
 
 /// Who ends the process once the watcher has taken an ending signal: the main
@@ -1162,44 +1194,20 @@ fn start_end_watchdog(signal: libc::c_int, deadline: Instant, sigint_left_defaul
         .is_ok()
 }
 
-/// How long the limit waits at the deadline for the reap lock, which the
-/// watcher holds while it tears the group down by the same deadline.
-const END_OUTCOME_WAIT: Duration = Duration::from_millis(200);
-
-/// The limit's end, at the deadline. It ends the way the outcome the watcher
-/// published decides, as `end_abruptly` does for the watcher, so a SIGINT
-/// that killed the command still ends prismtty by SIGINT. When no outcome
-/// can be read in `END_OUTCOME_WAIT` (the watcher is still tearing down) the
-/// command was not collected, and the end is 128 plus `signal`.
+/// The limit's end, at the deadline. It ends the way the command's status
+/// that the watcher published decides, as `end_abruptly` does for the
+/// watcher, so a SIGINT that killed the command still ends prismtty by
+/// SIGINT; it reads that status without the reap lock. When the watcher has
+/// published nothing by the deadline, the command counts as not collected by
+/// then, and the end is 128 plus `signal`.
 fn end_at_deadline(signal: libc::c_int, sigint_left_default: bool) {
-    let outcome = published_end_outcome_within(END_OUTCOME_WAIT).unwrap_or(EndOutcome {
+    let outcome = EndOutcome {
         signal,
-        leader_status: None,
+        leader_status: published_leader_status().flatten(),
         deadline: Instant::now(),
         owner: EndOwner::Watcher,
-    });
+    };
     end_abruptly(&outcome, sigint_left_default);
-}
-
-/// The outcome the signal watcher published, taking the reap lock only
-/// within `limit`.
-fn published_end_outcome_within(limit: Duration) -> Option<EndOutcome> {
-    let until = Instant::now() + limit;
-    loop {
-        let state = match FORWARD_CHILD_LOCK.try_lock() {
-            Ok(state) => *state,
-            Err(std::sync::TryLockError::Poisoned(poisoned)) => *poisoned.into_inner(),
-            Err(std::sync::TryLockError::WouldBlock) if Instant::now() < until => {
-                thread::sleep(Duration::from_millis(1));
-                continue;
-            }
-            Err(std::sync::TryLockError::WouldBlock) => return None,
-        };
-        return match state {
-            ReapState::Ended(outcome) => Some(outcome),
-            _ => None,
-        };
-    }
 }
 
 /// Ends the process at once after an ending signal, as 1.4.0 did. SIGINT that
@@ -4989,6 +4997,21 @@ mod tests {
             super::end_at_deadline(signal, true);
         }
         println!("the limit did not end the process");
+    }
+
+    #[test]
+    fn the_status_published_for_the_limit_reads_back_as_written() {
+        assert_eq!(super::published_leader_status_from(0), None);
+        for status in [
+            None,
+            Some(0),
+            Some(libc::SIGINT),
+            Some(7 << 8),
+            Some(137 << 8),
+        ] {
+            let encoded = super::encode_published_status(status);
+            assert_eq!(super::published_leader_status_from(encoded), Some(status));
+        }
     }
 
     // When the limit ends the process, the 1.4.0 SIGINT rule still holds: a
