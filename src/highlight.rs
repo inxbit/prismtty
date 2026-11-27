@@ -3306,9 +3306,14 @@ fn plain_lines_before_prompt_redraw(
 /// feed from any column but the first: the terminal's output processing can
 /// turn it into CR LF, and so does newline mode. A character that is not
 /// ASCII and may not fit before the right edge can wrap to the next row, so
-/// it forgets the prompt. A stretch holding a character that is not
-/// ASCII is taken to cover two columns for each character, and a stretch
-/// that may not fit on the row is no prompt.
+/// it forgets the prompt. A stretch is taken to cover one column for each
+/// ASCII character and two for each other one, and a stretch that may not
+/// fit on the row is no prompt.
+///
+/// Right after a prompt holding characters that are not ASCII the column is
+/// not known, but the cursor is after the prompt's last cell: when that
+/// widest reading ends before the right edge, no character wrapped. An erase
+/// to the right (`CSI K`, `CSI 0 K`) then leaves the prompt whole.
 #[derive(Debug)]
 struct LastLine {
     /// The terminal's width, at least 1.
@@ -3317,10 +3322,16 @@ struct LastLine {
     column: Option<u32>,
     stretch: Vec<u8>,
     stretch_start: Option<u32>,
+    /// The most columns the stretch can cover.
+    stretch_width: u32,
     /// Continuation bytes still to come for the character being written.
     continuation_bytes: u8,
-    /// The columns of the prompt, from the first to one past the last.
+    /// The columns of the prompt, from the first to one past the last; the
+    /// last one is the widest reading for a prompt past ASCII.
     prompt: Option<(u32, u32)>,
+    /// True while the cursor is known to be right after the prompt, at a
+    /// column that is not known, and the prompt ends before the right edge.
+    after_prompt: bool,
 }
 
 impl LastLine {
@@ -3330,29 +3341,36 @@ impl LastLine {
             column: None,
             stretch: Vec::new(),
             stretch_start: None,
+            stretch_width: 0,
             continuation_bytes: 0,
             prompt: None,
+            after_prompt: false,
         }
     }
 
     fn line_feed(&mut self) {
         self.stretch.clear();
+        self.stretch_width = 0;
         self.continuation_bytes = 0;
         self.prompt = None;
+        self.after_prompt = false;
         self.column = self.column.filter(|column| *column == 0);
     }
 
     fn carriage_return(&mut self) {
         self.close_stretch();
+        self.after_prompt = false;
         self.column = Some(0);
     }
 
     fn tab(&mut self) {
         self.close_stretch();
+        self.after_prompt = false;
         self.column = None;
     }
 
     fn print(&mut self, byte: u8) {
+        self.after_prompt = false;
         if (0x80..=0xbf).contains(&byte) && self.continuation_bytes > 0 {
             // Part of the character before it.
             self.continuation_bytes -= 1;
@@ -3363,6 +3381,9 @@ impl LastLine {
             self.stretch_start = self.column;
         }
         self.stretch.push(byte);
+        self.stretch_width = self
+            .stretch_width
+            .saturating_add(if byte.is_ascii() { 1 } else { 2 });
         if byte.is_ascii() {
             self.continuation_bytes = 0;
             self.forget_prompt_from(self.column, self.column.map(|column| column + 1));
@@ -3406,6 +3427,11 @@ impl LastLine {
         // An empty parameter is 1 for a move and 0 for an erase; one too
         // large to read leaves the column unknown after a move.
         let value = bounded_parameter(parameters).unwrap_or(0);
+        if final_byte == b'K' && value == 0 && self.after_prompt {
+            // The erase starts after the prompt's last cell.
+            return;
+        }
+        self.after_prompt = false;
         let count = value.max(1);
         let known = value != u32::MAX;
         let last = self.columns - 1;
@@ -3452,20 +3478,15 @@ impl LastLine {
         }
         if let Some(start) = self.stretch_start {
             if looks_like_prompt_end(&self.stretch) {
-                let characters = self
-                    .stretch
-                    .iter()
-                    .filter(|byte| !(0x80..=0xbf).contains(*byte))
-                    .count();
-                let per_character = if self.stretch.is_ascii() { 1 } else { 2 };
-                let width = u32::try_from(characters * per_character).unwrap_or(u32::MAX);
-                let end = start.saturating_add(width);
+                let end = start.saturating_add(self.stretch_width);
                 if end <= self.columns {
                     self.prompt = Some((start, end));
+                    self.after_prompt = !self.stretch.is_ascii() && end < self.columns;
                 }
             }
         }
         self.stretch.clear();
+        self.stretch_width = 0;
     }
 
     fn shows_prompt(&mut self) -> bool {
