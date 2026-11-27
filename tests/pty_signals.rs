@@ -783,6 +783,8 @@ fn child_killed_by_a_real_time_signal_reports_128_plus_signal() {
     use std::process::{Command, Stdio};
 
     let home = tempfile::tempdir().expect("scratch home");
+    let config = home.path().join("empty.yml");
+    std::fs::write(&config, "rules: []\n").expect("empty config");
     for signal in [50, 64] {
         let script = format!("kill -{signal} $$");
         let bare = Command::new("sh")
@@ -801,6 +803,9 @@ fn child_killed_by_a_real_time_signal_reports_128_plus_signal() {
         let ptty = Command::new(env!("CARGO_BIN_EXE_ptty"))
             .env("HOME", home.path())
             .env("XDG_CONFIG_HOME", home.path())
+            .env("PRISMTTY_RUNTIME_DIR", home.path().join("runtime"))
+            .arg("-c")
+            .arg(&config)
             .arg("sh")
             .arg("-c")
             .arg(&script)
