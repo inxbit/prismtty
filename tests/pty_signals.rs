@@ -5044,23 +5044,45 @@ fn read_until_quiet(file: &mut File, quiet: Duration) {
     }
 }
 
+/// How long `fill` must see every write refused before it takes the pipe or
+/// terminal as full.
+const FULL_QUIET: Duration = Duration::from_millis(500);
+
 /// Writes to `file`, a non-blocking description of its own, until the pipe or
-/// terminal behind it holds no more.
+/// terminal behind it holds no more, and has held no more for `FULL_QUIET`.
+/// A first refusal is not enough on Linux: a pty's writes go into a flip
+/// buffer of 8 KiB that a kernel worker moves into the reading side's 4 KiB
+/// buffer later, on its own schedule, so room can come back after the first
+/// refusal (Linux 6.8: `pty_write_room` and `tty_buffer_set_limit(.., 8192)`
+/// in drivers/tty/pty.c, `queue_work` and `flush_to_ldisc` in
+/// drivers/tty/tty_buffer.c). Writing on until nothing has been taken for a
+/// while fills what that move frees.
 fn fill(file: &mut File) {
-    let deadline = Instant::now() + Duration::from_secs(5);
-    // Large writes first, then single bytes into what room a large write
-    // could not use.
-    for chunk in [&[b'f'; 4096][..], b"f"] {
-        loop {
-            match file.write(chunk) {
-                Ok(_) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
-                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
-                Err(error) => panic!("fill: {error}"),
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut last_taken = Instant::now();
+    while last_taken.elapsed() < FULL_QUIET {
+        // Large writes first, then single bytes into what room a large
+        // write could not use.
+        for chunk in [&[b'f'; 4096][..], b"f"] {
+            loop {
+                match file.write(chunk) {
+                    Ok(written) if written > 0 => last_taken = Instant::now(),
+                    Ok(_) => break,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(error) => panic!("fill: {error}"),
+                }
+                assert!(Instant::now() < deadline, "fill never stayed full");
             }
-            assert!(Instant::now() < deadline, "fill never blocked");
         }
+        thread::sleep(Duration::from_millis(10));
     }
+}
+
+/// Whether the pipe or terminal behind `file`, filled by `fill`, still holds
+/// no more: a one-byte non-blocking write is refused.
+fn still_full(file: &mut File) -> bool {
+    matches!(file.write(b"f"), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
 }
 
 /// The command answers SIGTERM with one short line and exits 0, so it is
@@ -5120,7 +5142,14 @@ fn the_end_is_limited_when_the_output_pipe_is_full() {
     send(run.pid, libc::SIGTERM);
     let status = run.wait(Duration::from_secs(15));
     let took = term_sent.elapsed();
+    // The run says something about the limit only if the pipe stayed full
+    // until the session ended.
+    let full = still_full(&mut filler);
     drop(read_end);
+    assert!(
+        full,
+        "the pipe was not full when the session ended: {status:?} after {took:?}"
+    );
     assert_eq!(
         (status.signal(), status.code()),
         (None, Some(128 + libc::SIGTERM)),
@@ -5165,8 +5194,15 @@ fn the_end_is_limited_when_the_terminal_is_full() {
     let removed = wait_for_condition(Duration::from_millis(5500), || !pid_file.exists());
     let removed_after = term_sent.elapsed();
     thread::sleep(Duration::from_secs(6).saturating_sub(term_sent.elapsed()));
+    // The run says something about the limit only if the terminal stayed
+    // full until the session ended; reading it again ends that.
+    let full = still_full(&mut filler);
     session.read_again();
     let status = session.wait(Duration::from_secs(10));
+    assert!(
+        full,
+        "the terminal was not full when the session ended: {status:?}"
+    );
     assert!(
         removed,
         "the pid file was still there {removed_after:?} after the signal"
