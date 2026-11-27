@@ -4896,6 +4896,70 @@ mod tests {
         }
     }
 
+    /// Runs the probe test `probe` alone in a copy of this test binary, for
+    /// `state`, and returns how that process ended and what it printed. For a
+    /// probe that ends its process itself.
+    fn run_ending_probe(probe: &str, state: &str) -> (std::process::ExitStatus, String) {
+        let module = module_path!()
+            .split_once("::")
+            .map_or(module_path!(), |(_, path)| path);
+        let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args([
+                "--exact",
+                &format!("{module}::{probe}"),
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(PROBE, format!("{probe}:{state}"))
+            .output()
+            .expect("run the probe");
+        (
+            output.status,
+            String::from_utf8_lossy(&output.stdout).into_owned(),
+        )
+    }
+
+    /// Publishes the watcher's outcome for a command that SIGINT killed, the
+    /// signal received being `state` (INT or TERM), and then runs the limit's
+    /// end at the deadline: as when the watcher, delayed after its reap, has
+    /// not yet ended the process itself.
+    #[test]
+    fn end_at_deadline_probe() {
+        let Some(state) = probe_state("end_at_deadline_probe") else {
+            return;
+        };
+        let signal = if state == "INT" {
+            libc::SIGINT
+        } else {
+            libc::SIGTERM
+        };
+        *super::forward_child_lock() = super::ReapState::Ended(super::EndOutcome {
+            signal,
+            leader_status: Some(libc::SIGINT),
+            deadline: Instant::now(),
+            owner: super::EndOwner::Watcher,
+        });
+        super::end_at_deadline(signal, true);
+        println!("the limit did not end the process");
+    }
+
+    // When the limit ends the process, the 1.4.0 SIGINT rule still holds: a
+    // SIGINT that PrismTTY was sent and that killed the command ends PrismTTY
+    // by SIGINT; with any other signal it exits with 128 plus that signal.
+    #[test]
+    fn the_limit_ends_by_sigint_when_the_sigint_it_was_sent_killed_the_command() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let (status, printed) = run_ending_probe("end_at_deadline_probe", "INT");
+        assert_eq!(status.signal(), Some(libc::SIGINT), "{status:?} {printed}");
+        let (status, printed) = run_ending_probe("end_at_deadline_probe", "TERM");
+        assert_eq!(
+            (status.signal(), status.code()),
+            (None, Some(128 + libc::SIGTERM)),
+            "{printed}"
+        );
+    }
+
     // The main thread's reap finds the command gone (ECHILD) when the watcher
     // reaped it first; it takes the code from the outcome published with that
     // reap instead of failing.
