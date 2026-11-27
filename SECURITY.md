@@ -95,3 +95,10 @@ examples that preserve only the token shape needed to reproduce the issue.
   byte that would introduce a string, `--sanitize` and `--strip-ansi` drop the
   ESC and show the introducer and the payload as text; with the ESC gone, the
   terminal runs no string control.
+- `--sanitize` and `--strip-ansi` protect a terminal that reads UTF-8. Both
+  keep every valid UTF-8 character, in any locale, and a terminal that reads
+  8-bit bytes instead can find a control in one: the last byte of U+201D
+  (`E2 80 9D`) is `9D`, which such a terminal reads as the start of an OSC
+  string. A character cut off at the end of the output (`F0 9D`) is passed as
+  it is too. With a locale that is not UTF-8 and an 8-bit terminal, these
+  flags do not keep every string control from reaching it.
