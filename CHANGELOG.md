@@ -13,9 +13,13 @@ All notable changes to PrismTTY are documented here.
   lines in the same read. Before, a read that held any cursor move was
   written unchanged as a whole. Now the complete lines before the line with
   the first cursor move are colored when all of these hold:
-  - The read's last line still looks like a prompt when the read ends. A
-    percentage such as `50% ` does not count, and neither does a prompt that
-    the same read writes over.
+  - The read's last line still shows its prompt when the read ends. A
+    percentage such as `50% ` does not count. PrismTTY follows the cursor on
+    that line with the terminal's width, and the read stays as it came when
+    a later write or erase may reach the prompt or the cursor may have left
+    its row: after a move that stops at the edge of the screen and comes
+    back over the prompt, after text that reaches the last column, or after
+    a character that is not ASCII, whose width it does not know.
   - Every other control in the read keeps the cursor on its row or below:
     moves along the row, erase in line and below, SGR, bracketed paste,
     cursor-key and keypad modes, and the window title or directory. A line
@@ -27,10 +31,13 @@ All notable changes to PrismTTY are documented here.
     margins, reverse wraparound (modes 45 and 1045), autowrap off, or a
     restore of saved modes. A mode counts as on after any form of a control
     that may set it, and as off again only after its exact reset or a full
-    reset (RIS).
+    reset (RIS). A scroll region set on the main screen counts until it is
+    reset there, for terminals that keep one region for each screen.
 
-  Any other read is written unchanged, as before. Piped and file output,
-  `profiles test` and the library's `Highlighter::highlight*` are unchanged.
+  Any other read with a cursor move is written unchanged, as before, and so
+  is every such read when PrismTTY cannot get the terminal's size. Piped and
+  file output, `profiles test` and the library's `Highlighter::highlight*`
+  are unchanged.
 
   Known limits:
   - If a later read moves the cursor back into one of those lines and
