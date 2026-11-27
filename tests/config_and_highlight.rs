@@ -4272,6 +4272,8 @@ impl Rendition {
 /// What an 8-bit VT terminal (the library's default model) draws from
 /// `output`: each visible byte with its rendition, and each C0 control it
 /// executes (CR, LF, VT, FF, BS, HT) with the rendition in effect there.
+/// This is a record of drawn bytes and controls, not a screen: it models no
+/// cursor movement, erasure or scrolling, which these fixtures do not need.
 /// C0 controls inside an escape, CSI or ESC intermediate are executed where
 /// they stand; inside an OSC, DCS, SOS, PM or APC payload they are data.
 /// `C2` before a raw `9B` is a character there.
@@ -4351,10 +4353,18 @@ fn drawn(output: &[u8]) -> Drawn {
                 if matches!(output[end], 0x18 | 0x1a) {
                     break;
                 }
+                // An ESC inside a CSI cancels it and starts a new control.
+                if output[end] == 0x1b {
+                    break;
+                }
                 executes(output[end], &rendition, &mut screen);
                 ascii &= output[end] < 0x80;
                 body.push(output[end]);
                 end += 1;
+            }
+            if output.get(end) == Some(&0x1b) {
+                index = end;
+                continue;
             }
             if output.get(end) == Some(&b'm') && ascii {
                 rendition.apply(&body);
@@ -4715,5 +4725,187 @@ fn noninteractive_highlight_is_unchanged_at_line_ends() {
             output.as_slice(),
             "the library and the pipe path agree"
         );
+    }
+}
+
+// Generated from the 1.4.0 library (c39cc8d): input, full reset, output.
+const RELEASE_INTERACTIVE_BYTES: &[(&[u8], bool, &[u8])] = &[
+    (b"\x1b[7mlink\x0bdown\x1b[0m\x0a", false, b"\x1b[7m\x1b[38;2;255;0;0mlink\x0bdown\x1b[0m\x1b[38;2;255;0;0m\x0a\x1b[39m"),
+    (b"\x1b[7mlink\x0bdown\x1b[0m\x0a", true, b"\x1b[7m\x1b[38;2;255;0;0mlink\x0bdown\x1b[0m\x1b[38;2;255;0;0m\x0a\x1b[0m"),
+    (b"\x1b[7mlink\x0cdown\x1b[0m\x0a", false, b"\x1b[7m\x1b[38;2;255;0;0mlink\x0cdown\x1b[0m\x1b[38;2;255;0;0m\x0a\x1b[39m"),
+    (b"\x1b[7mlink\x0cdown\x1b[0m\x0a", true, b"\x1b[7m\x1b[38;2;255;0;0mlink\x0cdown\x1b[0m\x1b[38;2;255;0;0m\x0a\x1b[0m"),
+    (b"\x1b[7mfailed\x1b[3\x0b1mnext\x1b[0m\x0a", false, b"\x1b[7m\x1b[38;2;255;0;0mfailed\x1b[3\x0b1m\x1b[38;2;255;0;0m\x1b[31mnext\x1b[0m\x0a"),
+    (b"\x1b[7mfailed\x1b[3\x0b1mnext\x1b[0m\x0a", true, b"\x1b[7m\x1b[38;2;255;0;0mfailed\x1b[3\x0b1m\x1b[38;2;255;0;0m\x1b[0m\x1b[7;31mnext\x1b[0m\x0a"),
+    (b"\x1b[7mfailed\x1b[3\x0c1mnext\x1b[0m\x0a", false, b"\x1b[7m\x1b[38;2;255;0;0mfailed\x1b[3\x0c1m\x1b[38;2;255;0;0m\x1b[31mnext\x1b[0m\x0a"),
+    (b"\x1b[7mfailed\x1b[3\x0c1mnext\x1b[0m\x0a", true, b"\x1b[7m\x1b[38;2;255;0;0mfailed\x1b[3\x0c1m\x1b[38;2;255;0;0m\x1b[0m\x1b[7;31mnext\x1b[0m\x0a"),
+    (b"\x1b[7mfailed\x1b\x0b[31mnext\x1b[0m\x0a", false, b"\x1b[7m\x1b[38;2;255;0;0mfailed\x1b\x0b[31m\x1b[38;2;255;0;0m\x1b[31mnext\x1b[0m\x0a"),
+    (b"\x1b[7mfailed\x1b\x0b[31mnext\x1b[0m\x0a", true, b"\x1b[7m\x1b[38;2;255;0;0mfailed\x1b\x0b[31m\x1b[38;2;255;0;0m\x1b[0m\x1b[7;31mnext\x1b[0m\x0a"),
+    (b"\x1b[7mfailed\x1b(\x0cBnext\x1b[0m\x0a", false, b"\x1b[7m\x1b[38;2;255;0;0mfailed\x1b(\x0cB\x1b[38;2;255;0;0m\x1b[39mnext\x1b[0m\x0a"),
+    (b"\x1b[7mfailed\x1b(\x0cBnext\x1b[0m\x0a", true, b"\x1b[7m\x1b[38;2;255;0;0mfailed\x1b(\x0cB\x1b[38;2;255;0;0m\x1b[0m\x1b[7mnext\x1b[0m\x0a"),
+    (b"\x1b[7mfailed\x1b[3\x081mnext\x1b[0m\x0a", false, b"\x1b[7m\x1b[38;2;255;0;0mfailed\x1b[3\x081m\x1b[38;2;255;0;0m\x1b[31mnext\x1b[0m\x0a"),
+    (b"\x1b[7mfailed\x1b[3\x081mnext\x1b[0m\x0a", true, b"\x1b[7m\x1b[38;2;255;0;0mfailed\x1b[3\x081m\x1b[38;2;255;0;0m\x1b[0m\x1b[7;31mnext\x1b[0m\x0a"),
+    (b"\x1b[7mfailed\x1b[3\x091mnext\x1b[0m\x0a", false, b"\x1b[7m\x1b[38;2;255;0;0mfailed\x1b[3\x091m\x1b[38;2;255;0;0m\x1b[31mnext\x1b[0m\x0a"),
+    (b"\x1b[7mfailed\x1b[3\x091mnext\x1b[0m\x0a", true, b"\x1b[7m\x1b[38;2;255;0;0mfailed\x1b[3\x091m\x1b[38;2;255;0;0m\x1b[0m\x1b[7;31mnext\x1b[0m\x0a"),
+    (b"\x1b[7mfailed\x1b\x08[31mnext\x1b[0m\x0a", false, b"\x1b[7m\x1b[38;2;255;0;0mfailed\x1b\x08[31m\x1b[38;2;255;0;0m\x1b[31mnext\x1b[0m\x0a"),
+    (b"\x1b[7mfailed\x1b\x08[31mnext\x1b[0m\x0a", true, b"\x1b[7m\x1b[38;2;255;0;0mfailed\x1b\x08[31m\x1b[38;2;255;0;0m\x1b[0m\x1b[7;31mnext\x1b[0m\x0a"),
+    (b"\x1b[53mlink\x0bdown\x1b[0m\x0a", false, b"\x1b[53m\x1b[38;2;255;0;0mlink\x0bdown\x1b[0m\x1b[38;2;255;0;0m\x0a\x1b[39m"),
+    (b"\x1b[53mlink\x0bdown\x1b[0m\x0a", true, b"\x1b[53m\x1b[38;2;255;0;0mlink\x0bdown\x1b[0m\x1b[38;2;255;0;0m\x0a\x1b[0m"),
+    (b"\x1b[53mlink\x0cdown\x1b[0m\x0a", false, b"\x1b[53m\x1b[38;2;255;0;0mlink\x0cdown\x1b[0m\x1b[38;2;255;0;0m\x0a\x1b[39m"),
+    (b"\x1b[53mlink\x0cdown\x1b[0m\x0a", true, b"\x1b[53m\x1b[38;2;255;0;0mlink\x0cdown\x1b[0m\x1b[38;2;255;0;0m\x0a\x1b[0m"),
+    (b"\x1b[53mfailed\x1b[3\x0b1mnext\x1b[0m\x0a", false, b"\x1b[53m\x1b[38;2;255;0;0mfailed\x1b[3\x0b1m\x1b[38;2;255;0;0m\x1b[31mnext\x1b[0m\x0a"),
+    (b"\x1b[53mfailed\x1b[3\x0b1mnext\x1b[0m\x0a", true, b"\x1b[53m\x1b[38;2;255;0;0mfailed\x1b[3\x0b1m\x1b[38;2;255;0;0m\x1b[0m\x1b[53;31mnext\x1b[0m\x0a"),
+    (b"\x1b[53mfailed\x1b[3\x0c1mnext\x1b[0m\x0a", false, b"\x1b[53m\x1b[38;2;255;0;0mfailed\x1b[3\x0c1m\x1b[38;2;255;0;0m\x1b[31mnext\x1b[0m\x0a"),
+    (b"\x1b[53mfailed\x1b[3\x0c1mnext\x1b[0m\x0a", true, b"\x1b[53m\x1b[38;2;255;0;0mfailed\x1b[3\x0c1m\x1b[38;2;255;0;0m\x1b[0m\x1b[53;31mnext\x1b[0m\x0a"),
+    (b"\x1b[53mfailed\x1b\x0b[31mnext\x1b[0m\x0a", false, b"\x1b[53m\x1b[38;2;255;0;0mfailed\x1b\x0b[31m\x1b[38;2;255;0;0m\x1b[31mnext\x1b[0m\x0a"),
+    (b"\x1b[53mfailed\x1b\x0b[31mnext\x1b[0m\x0a", true, b"\x1b[53m\x1b[38;2;255;0;0mfailed\x1b\x0b[31m\x1b[38;2;255;0;0m\x1b[0m\x1b[53;31mnext\x1b[0m\x0a"),
+    (b"\x1b[53mfailed\x1b(\x0cBnext\x1b[0m\x0a", false, b"\x1b[53m\x1b[38;2;255;0;0mfailed\x1b(\x0cB\x1b[38;2;255;0;0m\x1b[39mnext\x1b[0m\x0a"),
+    (b"\x1b[53mfailed\x1b(\x0cBnext\x1b[0m\x0a", true, b"\x1b[53m\x1b[38;2;255;0;0mfailed\x1b(\x0cB\x1b[38;2;255;0;0m\x1b[0m\x1b[53mnext\x1b[0m\x0a"),
+    (b"\x1b[53mfailed\x1b[3\x081mnext\x1b[0m\x0a", false, b"\x1b[53m\x1b[38;2;255;0;0mfailed\x1b[3\x081m\x1b[38;2;255;0;0m\x1b[31mnext\x1b[0m\x0a"),
+    (b"\x1b[53mfailed\x1b[3\x081mnext\x1b[0m\x0a", true, b"\x1b[53m\x1b[38;2;255;0;0mfailed\x1b[3\x081m\x1b[38;2;255;0;0m\x1b[0m\x1b[53;31mnext\x1b[0m\x0a"),
+    (b"\x1b[53mfailed\x1b[3\x091mnext\x1b[0m\x0a", false, b"\x1b[53m\x1b[38;2;255;0;0mfailed\x1b[3\x091m\x1b[38;2;255;0;0m\x1b[31mnext\x1b[0m\x0a"),
+    (b"\x1b[53mfailed\x1b[3\x091mnext\x1b[0m\x0a", true, b"\x1b[53m\x1b[38;2;255;0;0mfailed\x1b[3\x091m\x1b[38;2;255;0;0m\x1b[0m\x1b[53;31mnext\x1b[0m\x0a"),
+    (b"\x1b[53mfailed\x1b\x08[31mnext\x1b[0m\x0a", false, b"\x1b[53m\x1b[38;2;255;0;0mfailed\x1b\x08[31m\x1b[38;2;255;0;0m\x1b[31mnext\x1b[0m\x0a"),
+    (b"\x1b[53mfailed\x1b\x08[31mnext\x1b[0m\x0a", true, b"\x1b[53m\x1b[38;2;255;0;0mfailed\x1b\x08[31m\x1b[38;2;255;0;0m\x1b[0m\x1b[53;31mnext\x1b[0m\x0a"),
+    (b"\x1b[7mfailed\x1b]0;title\x0amore\x07next\x1b[0m\x0a", false, b"\x1b[7m\x1b[38;2;255;0;0mfailed\x1b]0;title\x0amore\x07\x1b[38;2;255;0;0m\x1b[39mnext\x1b[0m\x0a"),
+    (b"\x1b[7mfailed\x1b]0;title\x0amore\x07next\x1b[0m\x0a", true, b"\x1b[7m\x1b[38;2;255;0;0mfailed\x1b]0;title\x0amore\x07\x1b[38;2;255;0;0m\x1b[0m\x1b[7mnext\x1b[0m\x0a"),
+    (b"\x1b[7mfailed\x1bPq\x0amore\x1b\\next\x1b[0m\x0a", false, b"\x1b[7m\x1b[38;2;255;0;0mfailed\x1bPq\x0amore\x1b\\\x1b[38;2;255;0;0m\x1b[39mnext\x1b[0m\x0a"),
+    (b"\x1b[7mfailed\x1bPq\x0amore\x1b\\next\x1b[0m\x0a", true, b"\x1b[7m\x1b[38;2;255;0;0mfailed\x1bPq\x0amore\x1b\\\x1b[38;2;255;0;0m\x1b[0m\x1b[7mnext\x1b[0m\x0a"),
+    (b"\x1b[7mfailed\x1bXs\x0am\x1b\\next\x1b[0m\x0a", false, b"\x1b[7m\x1b[38;2;255;0;0mfailed\x1bXs\x0am\x1b\\\x1b[38;2;255;0;0m\x1b[39mnext\x1b[0m\x0a"),
+    (b"\x1b[7mfailed\x1bXs\x0am\x1b\\next\x1b[0m\x0a", true, b"\x1b[7m\x1b[38;2;255;0;0mfailed\x1bXs\x0am\x1b\\\x1b[38;2;255;0;0m\x1b[0m\x1b[7mnext\x1b[0m\x0a"),
+    (b"\x1b[7mfailed\x1b^p\x0am\x1b\\next\x1b[0m\x0a", false, b"\x1b[7m\x1b[38;2;255;0;0mfailed\x1b^p\x0am\x1b\\\x1b[38;2;255;0;0m\x1b[39mnext\x1b[0m\x0a"),
+    (b"\x1b[7mfailed\x1b^p\x0am\x1b\\next\x1b[0m\x0a", true, b"\x1b[7m\x1b[38;2;255;0;0mfailed\x1b^p\x0am\x1b\\\x1b[38;2;255;0;0m\x1b[0m\x1b[7mnext\x1b[0m\x0a"),
+    (b"\x1b[7mfailed\x1b_a\x0am\x1b\\next\x1b[0m\x0a", false, b"\x1b[7m\x1b[38;2;255;0;0mfailed\x1b_a\x0am\x1b\\\x1b[38;2;255;0;0m\x1b[39mnext\x1b[0m\x0a"),
+    (b"\x1b[7mfailed\x1b_a\x0am\x1b\\next\x1b[0m\x0a", true, b"\x1b[7m\x1b[38;2;255;0;0mfailed\x1b_a\x0am\x1b\\\x1b[38;2;255;0;0m\x1b[0m\x1b[7mnext\x1b[0m\x0a"),
+    (b"\x1b[7mfailed\xc2\x9b3\x0a1mnext\x1b[0m\x0a", false, b"\x1b[7m\x1b[38;2;255;0;0mfailed\xc2\x9b3\x0a1m\x1b[38;2;255;0;0m\x1b[31mnext\x1b[0m\x0a"),
+    (b"\x1b[7mfailed\xc2\x9b3\x0a1mnext\x1b[0m\x0a", true, b"\x1b[7m\x1b[38;2;255;0;0mfailed\xc2\x9b3\x0a1m\x1b[38;2;255;0;0m\x1b[0m\x1b[7;31mnext\x1b[0m\x0a"),
+    (b"\x1b[7mfailed\x1b[3\xc2\xb2\x0a1mnext\x1b[0m\x0a", false, b"\x1b[7m\x1b[38;2;255;0;0mfailed\x1b[3\xc2\xb2\x0a1m\x1b[38;2;255;0;0m\x1b[39mnext\x1b[0m\x0a"),
+    (b"\x1b[7mfailed\x1b[3\xc2\xb2\x0a1mnext\x1b[0m\x0a", true, b"\x1b[7m\x1b[38;2;255;0;0mfailed\x1b[3\xc2\xb2\x0a1m\x1b[38;2;255;0;0m\x1b[0m\x1b[7mnext\x1b[0m\x0a"),
+    (b"\x1b[7mfailed\x1b\x0a[3\xc2\xb2mnext\x1b[0m\x0a", false, b"\x1b[7m\x1b[38;2;255;0;0mfailed\x1b\x0a[3\xc2\xb2m\x1b[38;2;255;0;0m\x1b[39mnext\x1b[0m\x0a"),
+    (b"\x1b[7mfailed\x1b\x0a[3\xc2\xb2mnext\x1b[0m\x0a", true, b"\x1b[7m\x1b[38;2;255;0;0mfailed\x1b\x0a[3\xc2\xb2m\x1b[38;2;255;0;0m\x1b[0m\x1b[7mnext\x1b[0m\x0a"),
+    (b"\x1b[7mfailed\x1b\x0d[3\xc2\xb2mnext\x1b[0m\x0a", false, b"\x1b[7m\x1b[38;2;255;0;0mfailed\x1b\x0d[3\xc2\xb2m\x1b[38;2;255;0;0m\x1b[39mnext\x1b[0m\x0a"),
+    (b"\x1b[7mfailed\x1b\x0d[3\xc2\xb2mnext\x1b[0m\x0a", true, b"\x1b[7m\x1b[38;2;255;0;0mfailed\x1b\x0d[3\xc2\xb2m\x1b[38;2;255;0;0m\x1b[0m\x1b[7mnext\x1b[0m\x0a"),
+    (b"\x1b[7mfailed\x1b\x0a(\xc2\xb2Bnext\x1b[0m\x0a", false, b"\x1b[7m\x1b[38;2;255;0;0mfailed\x1b\x0a(\x1b[38;2;255;0;0m\x1b[39m\xc2\xb2Bnext\x1b[0m\x0a"),
+    (b"\x1b[7mfailed\x1b\x0a(\xc2\xb2Bnext\x1b[0m\x0a", true, b"\x1b[7m\x1b[38;2;255;0;0mfailed\x1b\x0a(\x1b[38;2;255;0;0m\x1b[0m\x1b[7m\xc2\xb2Bnext\x1b[0m\x0a"),
+    (b"\x1b[7mfailed\x1b(\x0a\xc2\xb2Bnext\x1b[0m\x0a", false, b"\x1b[7m\x1b[38;2;255;0;0mfailed\x1b(\x0a\x1b[38;2;255;0;0m\x1b[39m\xc2\xb2Bnext\x1b[0m\x0a"),
+    (b"\x1b[7mfailed\x1b(\x0a\xc2\xb2Bnext\x1b[0m\x0a", true, b"\x1b[7m\x1b[38;2;255;0;0mfailed\x1b(\x0a\x1b[38;2;255;0;0m\x1b[0m\x1b[7m\xc2\xb2Bnext\x1b[0m\x0a"),
+    (b"\x1b[7mfailed\x1b\x0d(\xc2\xb2Bnext\x1b[0m\x0a", false, b"\x1b[7m\x1b[38;2;255;0;0mfailed\x1b\x0d(\x1b[38;2;255;0;0m\x1b[39m\xc2\xb2Bnext\x1b[0m\x0a"),
+    (b"\x1b[7mfailed\x1b\x0d(\xc2\xb2Bnext\x1b[0m\x0a", true, b"\x1b[7m\x1b[38;2;255;0;0mfailed\x1b\x0d(\x1b[38;2;255;0;0m\x1b[0m\x1b[7m\xc2\xb2Bnext\x1b[0m\x0a"),
+    (b"\x1b[7mfailed\x1b[3\x0a\xc2\x9b1mnext\x1b[0m\x0a", false, b"\x1b[7m\x1b[38;2;255;0;0mfailed\x1b[3\x0a\x1b[38;2;255;0;0m\xc2\x9b1m\x1b[38;2;255;0;0m\x1b[39mnext\x1b[0m\x0a"),
+    (b"\x1b[7mfailed\x1b[3\x0a\xc2\x9b1mnext\x1b[0m\x0a", true, b"\x1b[7m\x1b[38;2;255;0;0mfailed\x1b[3\x0a\x1b[38;2;255;0;0m\xc2\x9b1m\x1b[38;2;255;0;0m\x1b[0m\x1b[1;7mnext\x1b[0m\x0a"),
+    (b"\x1b[7mfailed\x1b\x0a\xc2\x9b1mnext\x1b[0m\x0a", false, b"\x1b[7m\x1b[38;2;255;0;0mfailed\x1b\x0a\x1b[38;2;255;0;0m\xc2\x9b1m\x1b[38;2;255;0;0m\x1b[39mnext\x1b[0m\x0a"),
+    (b"\x1b[7mfailed\x1b\x0a\xc2\x9b1mnext\x1b[0m\x0a", true, b"\x1b[7m\x1b[38;2;255;0;0mfailed\x1b\x0a\x1b[38;2;255;0;0m\xc2\x9b1m\x1b[38;2;255;0;0m\x1b[0m\x1b[1;7mnext\x1b[0m\x0a"),
+    (b"\x1b[1mfailed\x0anext\x1b[0m\x0a", false, b"\x1b[1m\x1b[38;2;255;0;0mfailed\x0a\x1b[39mnext\x1b[0m\x0a"),
+    (b"\x1b[1mfailed\x0anext\x1b[0m\x0a", true, b"\x1b[1m\x1b[38;2;255;0;0mfailed\x0a\x1b[0m\x1b[1mnext\x1b[0m\x0a"),
+    (b"\x1b[1mfailed\x1b[3\x0a1mnext\x1b[0m\x0a", false, b"\x1b[1m\x1b[38;2;255;0;0mfailed\x1b[3\x0a1m\x1b[38;2;255;0;0m\x1b[31mnext\x1b[0m\x0a"),
+    (b"\x1b[1mfailed\x1b[3\x0a1mnext\x1b[0m\x0a", true, b"\x1b[1m\x1b[38;2;255;0;0mfailed\x1b[3\x0a1m\x1b[38;2;255;0;0m\x1b[0m\x1b[1;31mnext\x1b[0m\x0a"),
+    (b"\x1b[3mfailed\x0anext\x1b[0m\x0a", false, b"\x1b[3m\x1b[38;2;255;0;0mfailed\x0a\x1b[39mnext\x1b[0m\x0a"),
+    (b"\x1b[3mfailed\x0anext\x1b[0m\x0a", true, b"\x1b[3m\x1b[38;2;255;0;0mfailed\x0a\x1b[0m\x1b[3mnext\x1b[0m\x0a"),
+    (b"\x1b[3mfailed\x1b[3\x0a1mnext\x1b[0m\x0a", false, b"\x1b[3m\x1b[38;2;255;0;0mfailed\x1b[3\x0a1m\x1b[38;2;255;0;0m\x1b[31mnext\x1b[0m\x0a"),
+    (b"\x1b[3mfailed\x1b[3\x0a1mnext\x1b[0m\x0a", true, b"\x1b[3m\x1b[38;2;255;0;0mfailed\x1b[3\x0a1m\x1b[38;2;255;0;0m\x1b[0m\x1b[3;31mnext\x1b[0m\x0a"),
+    (b"\x1b[31mfailed\x0anext\x1b[0m\x0a", false, b"\x1b[31m\x1b[38;2;255;0;0mfailed\x0a\x1b[31mnext\x1b[0m\x0a"),
+    (b"\x1b[31mfailed\x0anext\x1b[0m\x0a", true, b"\x1b[31m\x1b[38;2;255;0;0mfailed\x0a\x1b[0m\x1b[31mnext\x1b[0m\x0a"),
+    (b"\x1b[31mfailed\x1b[3\x0a1mnext\x1b[0m\x0a", false, b"\x1b[31m\x1b[38;2;255;0;0mfailed\x1b[3\x0a1m\x1b[38;2;255;0;0m\x1b[31mnext\x1b[0m\x0a"),
+    (b"\x1b[31mfailed\x1b[3\x0a1mnext\x1b[0m\x0a", true, b"\x1b[31m\x1b[38;2;255;0;0mfailed\x1b[3\x0a1m\x1b[38;2;255;0;0m\x1b[0m\x1b[31mnext\x1b[0m\x0a"),
+    (b"\x1b[4;58;5;200mfailed\x0anext\x1b[0m\x0a", false, b"\x1b[4;58;5;200m\x1b[38;2;255;0;0mfailed\x0a\x1b[39mnext\x1b[0m\x0a"),
+    (b"\x1b[4;58;5;200mfailed\x0anext\x1b[0m\x0a", true, b"\x1b[4;58;5;200m\x1b[38;2;255;0;0mfailed\x0a\x1b[0m\x1b[4;58;5;200mnext\x1b[0m\x0a"),
+    (b"\x1b[4;58;5;200mfailed\x1b[3\x0a1mnext\x1b[0m\x0a", false, b"\x1b[4;58;5;200m\x1b[38;2;255;0;0mfailed\x1b[3\x0a1m\x1b[38;2;255;0;0m\x1b[31mnext\x1b[0m\x0a"),
+    (b"\x1b[4;58;5;200mfailed\x1b[3\x0a1mnext\x1b[0m\x0a", true, b"\x1b[4;58;5;200m\x1b[38;2;255;0;0mfailed\x1b[3\x0a1m\x1b[38;2;255;0;0m\x1b[0m\x1b[4;31;58;5;200mnext\x1b[0m\x0a"),
+];
+// Generated from the 1.4.0 library (c39cc8d): input, output.
+const RELEASE_PIPE_BYTES: &[(&[u8], &[u8])] = &[
+    (b"\x1b[7mfailed\x1b[3\x0a1mnext\x1b[0m\x0a", b"\x1b[7m\x1b[38;2;255;0;0mfailed\x1b[3\x0a1m\x1b[38;2;255;0;0m\x1b[0m\x1b[7;31mnext\x1b[0m\x0a"),
+    (b"\x1b[7mfailed\x1b\x0a[31mnext\x1b[0m\x0a", b"\x1b[7m\x1b[38;2;255;0;0mfailed\x1b\x0a[31m\x1b[38;2;255;0;0m\x1b[0m\x1b[7;31mnext\x1b[0m\x0a"),
+    (b"\x1b[9mlink\x0adown\x1b[0m\x0a", b"\x1b[9m\x1b[38;2;255;0;0mlink\x0adown\x1b[0m\x1b[38;2;255;0;0m\x1b[0m\x0a"),
+    (b"\x1b[7mfailed\x0anext \x1b[4mWARN\x0d\x0aok\x1b[0m\x0a", b"\x1b[7m\x1b[38;2;255;0;0mfailed\x1b[0m\x1b[7m\x0anext \x1b[4m\x1b[38;2;0;0;0;48;2;255;255;0mWARN\x1b[0m\x1b[4;7m\x0d\x0aok\x1b[0m\x0a"),
+];
+
+// Where the line-end rule does not apply, interactive output is 1.4.0's, byte
+// for byte: VT, FF, BS and HT; string payloads; `C2 9B`; a control with a byte
+// from 80 to FF, or one cut short by such a byte, even when a line end sits in
+// its ESC prefix; renditions that draw no blank cells.
+#[test]
+fn interactive_output_keeps_release_bytes_where_the_line_end_rule_does_not_apply() {
+    for (input, full_reset, expected) in RELEASE_INTERACTIVE_BYTES {
+        let output = interactive_line_end_output(input, *full_reset);
+        assert!(
+            output == *expected,
+            "full reset {full_reset}: {:?}\n  got {:?}\n want {:?}",
+            String::from_utf8_lossy(input),
+            String::from_utf8_lossy(&output),
+            String::from_utf8_lossy(expected)
+        );
+    }
+}
+
+#[test]
+fn noninteractive_output_keeps_release_bytes_at_line_ends() {
+    for (input, expected) in RELEASE_PIPE_BYTES {
+        let mut streaming = StreamingHighlighter::new(line_end_highlighter());
+        let mut output = streaming.push(input);
+        output.extend(streaming.finish());
+        assert!(
+            output == *expected,
+            "{:?}\n  got {:?}\n want {:?}",
+            String::from_utf8_lossy(input),
+            String::from_utf8_lossy(&output),
+            String::from_utf8_lossy(expected)
+        );
+    }
+}
+
+// The line-end decisions do not depend on where a read ends: every two-part
+// split of each fixture gives the output of one read. Two kinds of cut are
+// left out or checked by what is drawn instead:
+// - A cut inside a match ends the match, in 1.4.0 too, so fixtures whose
+//   match runs over a VT, FF or line-end control are not split.
+// - A cut between a CR and its LF makes each its own line end, each closed
+//   and reopened on its own; the cells and line ends are drawn the same.
+#[test]
+fn line_end_fixtures_give_one_output_at_every_read_split() {
+    let mut inputs: Vec<Vec<u8>> = RELEASE_INTERACTIVE_BYTES
+        .iter()
+        .filter(|(input, _, _)| !input.windows(4).any(|w| w == b"link"))
+        .map(|(input, _, _)| input.to_vec())
+        .collect();
+    for rendition in ["7", "4", "7;31;44"] {
+        for body in [
+            &b"failed\nnext"[..],
+            b"failed\r\nnext",
+            b"failed\x1b[3\n1mnext",
+            b"failed\x1b[3\r\n1mnext",
+            b"failed\x1b\r[2Knext",
+            b"failed\x1b(\nBnext",
+            b"failed\x9b3\n1mnext",
+        ] {
+            let mut input = format!("\x1b[{rendition}m").into_bytes();
+            input.extend_from_slice(body);
+            input.extend_from_slice(b"\x1b[0m\n");
+            inputs.push(input);
+        }
+    }
+    for input in &inputs {
+        for full_reset in [false, true] {
+            let whole = interactive_line_end_output(input, full_reset);
+            for cut in 1..input.len() {
+                let mut streaming = StreamingHighlighter::new_interactive(line_end_highlighter());
+                streaming.set_no_minimal_resets(full_reset);
+                let mut output = streaming.push(&input[..cut]);
+                output.extend(streaming.push(&input[cut..]));
+                output.extend(streaming.finish());
+                let context = format!(
+                    "cut {cut} of {:?}, full reset {full_reset}\n  got {:?}\n want {:?}",
+                    String::from_utf8_lossy(input),
+                    String::from_utf8_lossy(&output),
+                    String::from_utf8_lossy(&whole)
+                );
+                if input[cut - 1] == b'\r' && input[cut] == b'\n' {
+                    let (split, one) = (drawn(&output), drawn(&whole));
+                    assert_eq!(split.cells, one.cells, "{context}");
+                    assert_eq!(split.controls, one.controls, "{context}");
+                } else {
+                    assert!(output == whole, "{context}");
+                }
+            }
+        }
     }
 }

@@ -1324,3 +1324,114 @@ fn a_line_end_in_a_raw_9b_sequence_leaves_the_highlight_as_the_locale_reads_it()
         );
     }
 }
+
+/// Runs `ptty` around `sh -c "printf <format>"` on a PTY this test creates,
+/// with `rule` painted in its color, and returns the output once it is at
+/// least `expected_len` bytes long or five seconds have passed.
+fn ptty_printf_output(
+    locale: &str,
+    full_reset: bool,
+    rule: &str,
+    format: &str,
+    expected_len: usize,
+) -> Vec<u8> {
+    let home = tempfile::tempdir().expect("scratch home");
+    let runtime = home.path().join("runtime");
+    std::fs::create_dir(&runtime).expect("runtime dir");
+    std::fs::set_permissions(
+        &runtime,
+        std::os::unix::fs::PermissionsExt::from_mode(0o700),
+    )
+    .expect("runtime dir mode");
+    let config = home.path().join("rules.yml");
+    let color = if rule == "WARN" {
+        "b#ffff00 f#000000"
+    } else {
+        "f#ff0000"
+    };
+    std::fs::write(
+        &config,
+        format!("rules:\n  - description: rule\n    regex: '{rule}'\n    color: {color}\n"),
+    )
+    .expect("config");
+    let pair = native_pty_system()
+        .openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("openpty");
+    let mut builder = CommandBuilder::new(env!("CARGO_BIN_EXE_ptty"));
+    builder.env("LC_ALL", locale);
+    builder.env("HOME", home.path());
+    builder.env("XDG_CONFIG_HOME", home.path());
+    builder.env("PRISMTTY_RUNTIME_DIR", &runtime);
+    builder.arg("-c");
+    builder.arg(&config);
+    builder.args(["--rgb", "--no-auto-detect", "--no-dynamic-profile"]);
+    if full_reset {
+        builder.arg("--no-minimal-reset");
+    }
+    builder.args(["sh", "-c"]);
+    builder.arg(format!("printf '{format}'"));
+    let child = pair.slave.spawn_command(builder).expect("spawn ptty");
+    drop(pair.slave);
+    let session = PtySession::new(child, &*pair.master);
+    session
+        .capture()
+        .wait_until(Duration::from_secs(5), |out| out.len() >= expected_len)
+}
+
+/// A raw 9B sequence that ends in a command saving the rendition (`s`, mode
+/// 1048 or 1049, XTPUSHSGR), or one filling blank cells under a highlight
+/// that paints them (`J`, `K`, `X`, `@`, `P`, `L`, `M`, `S`, `T`), already has
+/// the highlight closed before it in 1.4.0. In a UTF-8 locale these bytes are
+/// text, so the line end inside one must not open the highlight again over
+/// the text after it: the output is 1.4.0's, byte for byte, in both locales
+/// and both reset modes.
+#[test]
+fn a_raw_9b_sequence_with_the_highlight_closed_before_it_keeps_release_bytes() {
+    // Generated from the released 1.4.0 ptty: locale, full reset, rule, printf format, output.
+    const RELEASE_RAW_9B_FAMILY: &[(&str, bool, &str, &str, &[u8])] = &[
+        ("en_US.UTF-8", false, "failed", "\\033[7mfailed\\233\\nsnext\\033[0m\\n", b"\x1b[7m\x1b[38;2;255;0;0mfailed\x1b[39m\x9b\x0d\x0as\x1b[38;2;255;0;0m\x1b[39mnext\x1b[0m\x0d\x0a"),
+        ("en_US.UTF-8", false, "failed", "\\033[7mfailed\\233?1049\\nhnext\\033[0m\\n", b"\x1b[7m\x1b[38;2;255;0;0mfailed\x1b[39m\x9b?1049\x0d\x0ah\x1b[38;2;255;0;0m\x1b[39mnext\x1b[0m\x0d\x0a"),
+        ("en_US.UTF-8", false, "failed", "\\033[7mfailed\\233?1048\\nhnext\\033[0m\\n", b"\x1b[7m\x1b[38;2;255;0;0mfailed\x1b[39m\x9b?1048\x0d\x0ah\x1b[38;2;255;0;0m\x1b[39mnext\x1b[0m\x0d\x0a"),
+        ("en_US.UTF-8", false, "failed", "\\033[7mfailed\\233\\n#{next\\033[0m\\n", b"\x1b[7m\x1b[38;2;255;0;0mfailed\x1b[39m\x9b\x0d\x0a#{\x1b[38;2;255;0;0m\x1b[39mnext\x1b[0m\x0d\x0a"),
+        ("en_US.UTF-8", false, "WARN", "WARN\\233\\nJnext\\n", b"\x1b[38;2;0;0;0;48;2;255;255;0mWARN\x1b[39;49m\x9b\x0d\x0aJ\x1b[38;2;0;0;0;48;2;255;255;0m\x1b[39;49mnext\x0d\x0a"),
+        ("en_US.UTF-8", false, "WARN", "WARN\\233\\nKnext\\n", b"\x1b[38;2;0;0;0;48;2;255;255;0mWARN\x1b[39;49m\x9b\x0d\x0aK\x1b[38;2;0;0;0;48;2;255;255;0m\x1b[39;49mnext\x0d\x0a"),
+        ("en_US.UTF-8", false, "WARN", "WARN\\233\\nXnext\\n", b"\x1b[38;2;0;0;0;48;2;255;255;0mWARN\x1b[39;49m\x9b\x0d\x0aX\x1b[38;2;0;0;0;48;2;255;255;0m\x1b[39;49mnext\x0d\x0a"),
+        ("en_US.UTF-8", false, "WARN", "WARN\\233\\n@next\\n", b"\x1b[38;2;0;0;0;48;2;255;255;0mWARN\x1b[39;49m\x9b\x0d\x0a@\x1b[38;2;0;0;0;48;2;255;255;0m\x1b[39;49mnext\x0d\x0a"),
+        ("en_US.UTF-8", false, "WARN", "WARN\\233\\nPnext\\n", b"\x1b[38;2;0;0;0;48;2;255;255;0mWARN\x1b[39;49m\x9b\x0d\x0aP\x1b[38;2;0;0;0;48;2;255;255;0m\x1b[39;49mnext\x0d\x0a"),
+        ("en_US.UTF-8", false, "WARN", "WARN\\233\\nLnext\\n", b"\x1b[38;2;0;0;0;48;2;255;255;0mWARN\x1b[39;49m\x9b\x0d\x0aL\x1b[38;2;0;0;0;48;2;255;255;0m\x1b[39;49mnext\x0d\x0a"),
+        ("en_US.UTF-8", false, "WARN", "WARN\\233\\nMnext\\n", b"\x1b[38;2;0;0;0;48;2;255;255;0mWARN\x1b[39;49m\x9b\x0d\x0aM\x1b[38;2;0;0;0;48;2;255;255;0m\x1b[39;49mnext\x0d\x0a"),
+        ("en_US.UTF-8", false, "WARN", "WARN\\233\\nSnext\\n", b"\x1b[38;2;0;0;0;48;2;255;255;0mWARN\x1b[39;49m\x9b\x0d\x0aS\x1b[38;2;0;0;0;48;2;255;255;0m\x1b[39;49mnext\x0d\x0a"),
+        ("en_US.UTF-8", false, "WARN", "WARN\\233\\nTnext\\n", b"\x1b[38;2;0;0;0;48;2;255;255;0mWARN\x1b[39;49m\x9b\x0d\x0aT\x1b[38;2;0;0;0;48;2;255;255;0m\x1b[39;49mnext\x0d\x0a"),
+        ("en_US.UTF-8", true, "failed", "\\033[7mfailed\\233\\nsnext\\033[0m\\n", b"\x1b[7m\x1b[38;2;255;0;0mfailed\x1b[0m\x1b[7m\x9b\x0d\x0as\x1b[38;2;255;0;0m\x1b[0m\x1b[7mnext\x1b[0m\x0d\x0a"),
+        ("en_US.UTF-8", true, "failed", "\\033[7mfailed\\233?1049\\nhnext\\033[0m\\n", b"\x1b[7m\x1b[38;2;255;0;0mfailed\x1b[0m\x1b[7m\x9b?1049\x0d\x0ah\x1b[38;2;255;0;0m\x1b[0m\x1b[7mnext\x1b[0m\x0d\x0a"),
+        ("en_US.UTF-8", true, "failed", "\\033[7mfailed\\233?1048\\nhnext\\033[0m\\n", b"\x1b[7m\x1b[38;2;255;0;0mfailed\x1b[0m\x1b[7m\x9b?1048\x0d\x0ah\x1b[38;2;255;0;0m\x1b[0m\x1b[7mnext\x1b[0m\x0d\x0a"),
+        ("en_US.UTF-8", true, "failed", "\\033[7mfailed\\233\\n#{next\\033[0m\\n", b"\x1b[7m\x1b[38;2;255;0;0mfailed\x1b[0m\x1b[7m\x9b\x0d\x0a#{\x1b[38;2;255;0;0m\x1b[0m\x1b[7mnext\x1b[0m\x0d\x0a"),
+        ("en_US.UTF-8", true, "WARN", "WARN\\233\\nJnext\\n", b"\x1b[38;2;0;0;0;48;2;255;255;0mWARN\x1b[0m\x9b\x0d\x0aJ\x1b[38;2;0;0;0;48;2;255;255;0m\x1b[0mnext\x0d\x0a"),
+        ("en_US.UTF-8", true, "WARN", "WARN\\233\\nKnext\\n", b"\x1b[38;2;0;0;0;48;2;255;255;0mWARN\x1b[0m\x9b\x0d\x0aK\x1b[38;2;0;0;0;48;2;255;255;0m\x1b[0mnext\x0d\x0a"),
+        ("en_US.UTF-8", true, "WARN", "WARN\\233\\nXnext\\n", b"\x1b[38;2;0;0;0;48;2;255;255;0mWARN\x1b[0m\x9b\x0d\x0aX\x1b[38;2;0;0;0;48;2;255;255;0m\x1b[0mnext\x0d\x0a"),
+        ("en_US.UTF-8", true, "WARN", "WARN\\233\\n@next\\n", b"\x1b[38;2;0;0;0;48;2;255;255;0mWARN\x1b[0m\x9b\x0d\x0a@\x1b[38;2;0;0;0;48;2;255;255;0m\x1b[0mnext\x0d\x0a"),
+        ("en_US.UTF-8", true, "WARN", "WARN\\233\\nPnext\\n", b"\x1b[38;2;0;0;0;48;2;255;255;0mWARN\x1b[0m\x9b\x0d\x0aP\x1b[38;2;0;0;0;48;2;255;255;0m\x1b[0mnext\x0d\x0a"),
+        ("en_US.UTF-8", true, "WARN", "WARN\\233\\nLnext\\n", b"\x1b[38;2;0;0;0;48;2;255;255;0mWARN\x1b[0m\x9b\x0d\x0aL\x1b[38;2;0;0;0;48;2;255;255;0m\x1b[0mnext\x0d\x0a"),
+        ("en_US.UTF-8", true, "WARN", "WARN\\233\\nMnext\\n", b"\x1b[38;2;0;0;0;48;2;255;255;0mWARN\x1b[0m\x9b\x0d\x0aM\x1b[38;2;0;0;0;48;2;255;255;0m\x1b[0mnext\x0d\x0a"),
+        ("en_US.UTF-8", true, "WARN", "WARN\\233\\nSnext\\n", b"\x1b[38;2;0;0;0;48;2;255;255;0mWARN\x1b[0m\x9b\x0d\x0aS\x1b[38;2;0;0;0;48;2;255;255;0m\x1b[0mnext\x0d\x0a"),
+        ("en_US.UTF-8", true, "WARN", "WARN\\233\\nTnext\\n", b"\x1b[38;2;0;0;0;48;2;255;255;0mWARN\x1b[0m\x9b\x0d\x0aT\x1b[38;2;0;0;0;48;2;255;255;0m\x1b[0mnext\x0d\x0a"),
+        ("C", false, "failed", "\\033[7mfailed\\233\\nsnext\\033[0m\\n", b"\x1b[7m\x1b[38;2;255;0;0mfailed\x1b[39m\x9b\x0d\x0as\x1b[38;2;255;0;0m\x1b[39mnext\x1b[0m\x0d\x0a"),
+        ("C", false, "WARN", "WARN\\233\\nKnext\\n", b"\x1b[38;2;0;0;0;48;2;255;255;0mWARN\x1b[39;49m\x9b\x0d\x0aK\x1b[38;2;0;0;0;48;2;255;255;0m\x1b[39;49mnext\x0d\x0a"),
+        ("C", true, "failed", "\\033[7mfailed\\233\\nsnext\\033[0m\\n", b"\x1b[7m\x1b[38;2;255;0;0mfailed\x1b[0m\x1b[7m\x9b\x0d\x0as\x1b[38;2;255;0;0m\x1b[0m\x1b[7mnext\x1b[0m\x0d\x0a"),
+        ("C", true, "WARN", "WARN\\233\\nKnext\\n", b"\x1b[38;2;0;0;0;48;2;255;255;0mWARN\x1b[0m\x9b\x0d\x0aK\x1b[38;2;0;0;0;48;2;255;255;0m\x1b[0mnext\x0d\x0a"),
+    ];
+    for (locale, full_reset, rule, format, expected) in RELEASE_RAW_9B_FAMILY {
+        let out = ptty_printf_output(locale, *full_reset, rule, format, expected.len());
+        assert!(
+            out == *expected,
+            "{locale} full reset {full_reset}: {format}\n  got {:?}\n want {:?}",
+            String::from_utf8_lossy(&out),
+            String::from_utf8_lossy(expected)
+        );
+    }
+}
