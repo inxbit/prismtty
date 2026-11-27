@@ -1256,10 +1256,39 @@ fn a_line_end_in_a_raw_9b_sequence_leaves_the_highlight_as_the_locale_reads_it()
     )
     .expect("config");
 
-    for (locale, expected) in [
-        ("en_US.UTF-8", &b"failed\x9b3\x1b[39m\r\n\x1b["[..]),
-        ("C", &b"failed\x1b[39m\x9b3\r\n1m\x1b["[..]),
+    const RED: &str = "\x1b[38;2;255;0;0m";
+    let utf8_minimal = format!("failed\u{9b}3\x1b[39m\r\n{RED}1m{RED}\x1b[39mnext");
+    let utf8_full = format!("failed\u{9b}3\x1b[0m\x1b[7m\r\n{RED}1m{RED}\x1b[0m\x1b[7mnext");
+    let eight_bit_minimal = "failed\x1b[39m\u{9b}3\r\n1m\x1b[".to_string();
+    let eight_bit_full = "failed\x1b[0m\x1b[7m\u{9b}3\r\n1m\x1b[".to_string();
+    // A raw 9B holding no line end keeps 1.4.0's bytes in either locale:
+    // inert text in UTF-8, the program's own red in an 8-bit locale.
+    let utf8_no_line_end = format!("failed\u{9b}31m{RED}\x1b[39mx");
+    let eight_bit_no_line_end = format!("failed\u{9b}31m{RED}\x1b[31mx");
+    for (locale, flags, printed, expected) in [
+        ("en_US.UTF-8", &[][..], "\\2333\\n1m", utf8_minimal),
+        (
+            "en_US.UTF-8",
+            &["--no-minimal-reset"][..],
+            "\\2333\\n1m",
+            utf8_full,
+        ),
+        ("C", &[][..], "\\2333\\n1m", eight_bit_minimal),
+        (
+            "C",
+            &["--no-minimal-reset"][..],
+            "\\2333\\n1m",
+            eight_bit_full,
+        ),
+        ("en_US.UTF-8", &[][..], "\\23331mx", utf8_no_line_end),
+        ("C", &[][..], "\\23331mx", eight_bit_no_line_end),
     ] {
+        // `\u{9b}` above stands for the raw byte 9B.
+        let expected: Vec<u8> = expected
+            .chars()
+            .map(|c| if c == '\u{9b}' { 0x9b } else { c as u8 })
+            .collect();
+        let expected = expected.as_slice();
         let pair = native_pty_system()
             .openpty(PtySize {
                 rows: 24,
@@ -1275,8 +1304,10 @@ fn a_line_end_in_a_raw_9b_sequence_leaves_the_highlight_as_the_locale_reads_it()
         builder.env("PRISMTTY_RUNTIME_DIR", &runtime);
         builder.arg("-c");
         builder.arg(&config);
-        builder.args(["--no-auto-detect", "--no-dynamic-profile", "sh", "-c"]);
-        builder.arg("printf '\\033[7mfailed\\2333\\n1mnext\\033[0m\\n'");
+        builder.args(["--rgb", "--no-auto-detect", "--no-dynamic-profile"]);
+        builder.args(flags);
+        builder.args(["sh", "-c"]);
+        builder.arg(format!("printf '\\033[7mfailed{printed}next\\033[0m\\n'"));
 
         let child = pair.slave.spawn_command(builder).expect("spawn ptty");
         drop(pair.slave);
@@ -1287,7 +1318,7 @@ fn a_line_end_in_a_raw_9b_sequence_leaves_the_highlight_as_the_locale_reads_it()
 
         assert!(
             contains_bytes(&out, expected),
-            "{locale}: expected {:?} in {:?}",
+            "{locale} {flags:?}: expected {:?} in {:?}",
             String::from_utf8_lossy(expected),
             String::from_utf8_lossy(&out)
         );
