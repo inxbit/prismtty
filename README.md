@@ -298,6 +298,12 @@ rules:
     color: f#00ffff
 ```
 
+Rules match bytes, not characters. A class like `[äöü]` is the set of bytes
+those letters are made of, so it also colors other letters that share one of
+those bytes, such as `é`, `ß` and `ñ`. To match characters, start the rule with
+`(*UTF)`, as in `regex: '(*UTF)[äöü]'`. Since 1.3.12 such a rule keeps working
+past bytes in the output that are not valid UTF-8.
+
 Native profile files add metadata:
 
 ```yaml
