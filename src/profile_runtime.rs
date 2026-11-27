@@ -3285,3 +3285,955 @@ mod tests {
         assert!(runtime.baseline_locked);
     }
 }
+
+/// Leaving a nested device: C-2b (`exit`, a device's own bracketed close and
+/// the parent's waiting prompt) and C-2c (Ctrl-], `quit`, telnet's own echo
+/// and close line). Witnesses from design reviews 44, 54 and 68, replayed at
+/// the runtime's seam the way a PTY delivers them.
+#[cfg(test)]
+mod leave_tests {
+    use super::ProfileRuntime;
+    use crate::profiles::ProfileStore;
+
+    const LOCAL: &[&str] = &["generic", "linux-unix"];
+    const CISCO: &[&str] = &["generic", "cisco"];
+    const JUNIPER: &[&str] = &["generic", "juniper"];
+    const ARISTA: &[&str] = &["generic", "arista"];
+    const BRACKET: &str = "[Connection to sw2 closed by foreign host]";
+
+    fn names(names: &[&str]) -> Vec<String> {
+        names.iter().map(|name| (*name).to_string()).collect()
+    }
+
+    /// Output as a PTY passes it on: `\n` becomes `\r\n`.
+    fn crlf(text: &str) -> String {
+        text.replace("\r\n", "\n").replace('\n', "\r\n")
+    }
+
+    /// How a terminal in canonical mode echoes typed bytes: control bytes as
+    /// `^X`.
+    fn echo(typed: &str) -> String {
+        typed
+            .chars()
+            .map(|ch| match ch {
+                ch if (ch as u32) < 0x20 => format!("^{}", ((ch as u8) + 0x40) as char),
+                ch => ch.to_string(),
+            })
+            .collect()
+    }
+
+    /// A local shell waiting at `user@laptop:~$ `.
+    fn local(store: &ProfileStore) -> ProfileRuntime {
+        let mut runtime = ProfileRuntime::new(names(LOCAL));
+        runtime.observe_output(b"user@laptop:~$ ", store);
+        runtime
+    }
+
+    /// Types `typed` and Enter, the way a person does: the keys are read
+    /// with their echo, Enter with its line end. Then each chunk of the reply
+    /// arrives in its own read. Returns the last profile change.
+    fn step(
+        runtime: &mut ProfileRuntime,
+        store: &ProfileStore,
+        typed: &str,
+        reply: &[&str],
+    ) -> Option<Vec<String>> {
+        let mut last = None;
+        runtime.observe_input(typed.as_bytes());
+        last = runtime
+            .observe_output(echo(typed).as_bytes(), store)
+            .or(last);
+        runtime.observe_input(b"\r");
+        last = runtime.observe_output(b"\r\n", store).or(last);
+        for chunk in reply {
+            last = runtime
+                .observe_output(crlf(chunk).as_bytes(), store)
+                .or(last);
+        }
+        last
+    }
+
+    /// A raw-mode program: it echoes nothing itself.
+    fn step_raw(
+        runtime: &mut ProfileRuntime,
+        store: &ProfileStore,
+        keys: &[u8],
+        reply: &[&str],
+    ) -> Option<Vec<String>> {
+        let mut last = None;
+        runtime.observe_input(keys);
+        for chunk in reply {
+            last = runtime.observe_output(chunk.as_bytes(), store).or(last);
+        }
+        last
+    }
+
+    /// `ssh sw1` (Cisco, `sw1#`), then `ssh -l admin sw2` (Junos).
+    fn cisco_then_juniper(store: &ProfileStore) -> ProfileRuntime {
+        let mut runtime = local(store);
+        assert_eq!(
+            step(
+                &mut runtime,
+                store,
+                "ssh sw1",
+                &["Cisco IOS Software\nsw1#"]
+            ),
+            Some(names(CISCO))
+        );
+        assert_eq!(
+            step(
+                &mut runtime,
+                store,
+                "ssh -l admin sw2",
+                &["--- JUNOS 22.4R3 Kernel 64-bit\nlab@sw2> "]
+            ),
+            Some(names(JUNIPER))
+        );
+        runtime
+    }
+
+    /// The same, with a nested shell entered on sw2 first.
+    fn cisco_then_juniper_shell(store: &ProfileStore) -> ProfileRuntime {
+        let mut runtime = cisco_then_juniper(store);
+        step(&mut runtime, store, "start shell", &["[admin@sw2 ~]$ "]);
+        runtime
+    }
+
+    /// Types `exit` and feeds `reply` (already in PTY form) split into reads
+    /// at `splits`.
+    fn exit_with(
+        runtime: &mut ProfileRuntime,
+        store: &ProfileStore,
+        reply: &str,
+        splits: &[usize],
+    ) -> Option<Vec<String>> {
+        let mut last = None;
+        runtime.observe_input(b"exit");
+        runtime.observe_output(b"exit", store);
+        runtime.observe_input(b"\r");
+        let bytes = reply.as_bytes();
+        let mut start = 0;
+        for &end in splits.iter().chain(std::iter::once(&bytes.len())) {
+            last = runtime.observe_output(&bytes[start..end], store).or(last);
+            start = end;
+        }
+        last
+    }
+
+    /// A key typed at the waiting prompt, read with its echo.
+    fn key(runtime: &mut ProfileRuntime, store: &ProfileStore) -> Option<Vec<String>> {
+        runtime.observe_input(b"s");
+        runtime.observe_output(b"s", store)
+    }
+
+    /// Asserts the child is still the active connection and answers a
+    /// command in its own colors.
+    fn assert_child_kept(runtime: &mut ProfileRuntime, store: &ProfileStore, child: &[&str]) {
+        step(
+            runtime,
+            store,
+            "show version",
+            &["Hostname: sw2\nlab@sw2> "],
+        );
+        assert_eq!(runtime.active_profiles(), names(child));
+    }
+
+    fn genuine_reply() -> String {
+        format!("\r\n{BRACKET}\r\nsw1#")
+    }
+
+    // C-2b, genuine closes.
+
+    #[test]
+    fn c2b_parent_prompt_waiting_after_the_bracket_returns_at_the_next_key() {
+        let store = ProfileStore::builtin();
+        let mut runtime = cisco_then_juniper(&store);
+        assert_eq!(exit_with(&mut runtime, &store, &genuine_reply(), &[]), None);
+        // The parent prompt waits; the key typed at it proves it.
+        assert_eq!(key(&mut runtime, &store), Some(names(CISCO)));
+        assert_eq!(runtime.stack_len(), 1);
+        step(
+            &mut runtime,
+            &store,
+            "how version",
+            &["Hostname: sw1\nsw1#"],
+        );
+        assert_eq!(runtime.active_profiles(), names(CISCO));
+    }
+
+    #[test]
+    fn c2b_genuine_close_bytes_split_at_every_position_return_alike() {
+        let store = ProfileStore::builtin();
+        let reply = genuine_reply();
+        for split in 1..reply.len() {
+            let mut runtime = cisco_then_juniper(&store);
+            assert_eq!(
+                exit_with(&mut runtime, &store, &reply, &[split]),
+                None,
+                "split at {split}"
+            );
+            assert_eq!(
+                key(&mut runtime, &store),
+                Some(names(CISCO)),
+                "split at {split}"
+            );
+            assert_eq!(runtime.stack_len(), 1, "split at {split}");
+        }
+    }
+
+    #[test]
+    fn c2b_nested_exits_return_one_level_each() {
+        let store = ProfileStore::builtin();
+        let mut runtime = cisco_then_juniper(&store);
+        assert_eq!(
+            step(
+                &mut runtime,
+                &store,
+                "ssh leaf3",
+                &["Arista Networks EOS version 4.31\nleaf3#"]
+            ),
+            Some(names(ARISTA))
+        );
+        exit_with(
+            &mut runtime,
+            &store,
+            "\r\n[Connection to leaf3 closed by foreign host]\r\nlab@sw2> ",
+            &[],
+        );
+        assert_eq!(key(&mut runtime, &store), Some(names(JUNIPER)));
+        runtime.observe_input(b"\x7f");
+        runtime.observe_output(b"\x08 \x08", &store);
+        exit_with(&mut runtime, &store, &genuine_reply(), &[]);
+        assert_eq!(key(&mut runtime, &store), Some(names(CISCO)));
+        assert_eq!(runtime.stack_len(), 1);
+    }
+
+    #[test]
+    fn c2b_colored_and_split_parent_prompts_are_the_parent_prompt() {
+        let store = ProfileStore::builtin();
+        // An ANSI-colored prompt: escape sequences are not part of the text.
+        let mut runtime = local(&store);
+        step(
+            &mut runtime,
+            &store,
+            "ssh core",
+            &["Cisco IOS Software\n\x1b[32msw1#\x1b[0m"],
+        );
+        step(
+            &mut runtime,
+            &store,
+            "ssh leaf",
+            &["--- JUNOS 22.4R3 Kernel 64-bit\nlab@sw2> "],
+        );
+        exit_with(
+            &mut runtime,
+            &store,
+            "\r\n[Connection to leaf closed by foreign host]\r\n\x1b[32msw1#\x1b[0m",
+            &[],
+        );
+        assert_eq!(key(&mut runtime, &store), Some(names(CISCO)));
+        // The prompt itself split across reads.
+        let mut runtime = cisco_then_juniper(&store);
+        exit_with(
+            &mut runtime,
+            &store,
+            &format!("\r\n{BRACKET}\r\nsw1#"),
+            &[47],
+        );
+        assert_eq!(key(&mut runtime, &store), Some(names(CISCO)));
+    }
+
+    #[test]
+    fn c2b_complete_parent_prompt_line_followed_by_output_returns_at_once() {
+        let store = ProfileStore::builtin();
+        let filler = format!("{}\r\n", "x".repeat(380));
+        for splits in [&[][..], &[50][..]] {
+            let mut runtime = cisco_then_juniper(&store);
+            assert_eq!(
+                exit_with(
+                    &mut runtime,
+                    &store,
+                    &format!("\r\n{BRACKET}\r\nsw1#\r\n{filler}"),
+                    splits
+                ),
+                Some(names(CISCO)),
+                "{splits:?}"
+            );
+        }
+    }
+
+    // C-2b, the unfinished line (review 68, must-change 1).
+
+    #[test]
+    fn c2b_unfinished_line_that_starts_like_the_parent_prompt_is_not_it() {
+        let store = ProfileStore::builtin();
+        let reply = format!("\r\n{BRACKET}\r\nsw1#backup\r\nlab@sw2> ");
+        let prefix_end = reply.find("backup").expect("prefix");
+        let mut splits: Vec<Vec<usize>> = vec![vec![], vec![prefix_end]];
+        splits.extend((1..reply.len()).map(|split| vec![split]));
+        for split in splits {
+            let mut runtime = cisco_then_juniper_shell(&store);
+            assert_eq!(
+                exit_with(&mut runtime, &store, &reply, &split),
+                None,
+                "split at {split:?}"
+            );
+            assert_child_kept(&mut runtime, &store, JUNIPER);
+            assert_eq!(runtime.stack_len(), 2, "split at {split:?}");
+        }
+    }
+
+    // C-2b, the 512-byte bound (review 68, must-change 2).
+
+    /// The reply whose parent prompt ends at byte `end` of the output read
+    /// after the Enter, with `filler` repeated on a line between.
+    fn reply_ending_at(end: usize, filler: &str) -> String {
+        let head = format!("\r\n{BRACKET}\r\n");
+        let tail = "\r\nsw1#";
+        let room = end - head.len() - tail.len();
+        let mut line = filler.repeat(room / filler.len());
+        line.push_str(&"x".repeat(room - line.len()));
+        let reply = format!("{head}{line}{tail}");
+        assert_eq!(reply.len(), end);
+        reply
+    }
+
+    #[test]
+    fn c2b_parent_prompt_must_end_within_512_bytes_in_any_read_grouping() {
+        let store = ProfileStore::builtin();
+        for filler in ["x", "\u{e9}", "\u{2500}"] {
+            for (end, returns) in [(511, true), (512, true), (513, false)] {
+                let reply = reply_ending_at(end, filler);
+                for splits in [
+                    &[][..],
+                    &[3][..],
+                    &[end - 4][..],
+                    &[end - 1][..],
+                    &[100, 300][..],
+                ] {
+                    let mut runtime = cisco_then_juniper(&store);
+                    exit_with(&mut runtime, &store, &reply, splits);
+                    let expected = returns.then(|| names(CISCO));
+                    assert_eq!(
+                        key(&mut runtime, &store),
+                        expected,
+                        "prompt ends at byte {end}, filler {filler:?}, splits {splits:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    // C-2b, time (review 54, must-change 7): real time, as the rule uses it.
+
+    fn close_shown_after(delay_ms: u64) -> Option<Vec<String>> {
+        let store = ProfileStore::builtin();
+        let mut runtime = cisco_then_juniper(&store);
+        runtime.observe_input(b"exit");
+        runtime.observe_output(b"exit", &store);
+        runtime.observe_input(b"\r");
+        runtime.observe_output(b"\r\n", &store);
+        std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+        runtime.observe_output(format!("{BRACKET}\r\nsw1#").as_bytes(), &store);
+        key(&mut runtime, &store)
+    }
+
+    #[test]
+    fn c2b_close_shown_within_three_seconds_returns() {
+        assert_eq!(close_shown_after(2_500), Some(names(CISCO)));
+    }
+
+    #[test]
+    fn c2b_close_shown_after_three_seconds_does_not_return() {
+        assert_eq!(close_shown_after(3_500), None);
+    }
+
+    // C-2b, what must not return (pinned to 1.4.1: the child stays).
+
+    #[test]
+    fn c2b_child_output_without_the_whole_evidence_keeps_the_child() {
+        let store = ProfileStore::builtin();
+        for (name, shell, reply) in [
+            // Review 44: a nested shell's logout text, then the child's prompt.
+            (
+                "subshell_logout",
+                true,
+                vec![format!("{BRACKET}\nlab@sw2> ")],
+            ),
+            (
+                "delayed_log",
+                true,
+                vec!["lab@sw2> ".to_string(), format!("\n{BRACKET}\nlab@sw2> ")],
+            ),
+            // Review 54: the child's prompt before or after the bracket.
+            (
+                "child_prompt_before_bracket",
+                true,
+                vec![format!("lab@sw2> \n{BRACKET}\nsw1#")],
+            ),
+            (
+                "child_prompt_after_bracket",
+                true,
+                vec![format!("{BRACKET}\nlab@sw2> \nsw1#")],
+            ),
+            (
+                "child_prompt_split",
+                false,
+                vec![format!("{BRACKET}\nlab@sw2> "), "\nsw1#".to_string()],
+            ),
+            (
+                "parent_prompt_changed",
+                false,
+                vec![format!("{BRACKET}\nsw1(config)#")],
+            ),
+            (
+                "renamed_hostname",
+                false,
+                vec![format!("{BRACKET}\ncore1#")],
+            ),
+            (
+                "show_run_hostname_only",
+                true,
+                vec![format!(
+                    "{BRACKET}\nCurrent configuration:\nhostname sw1\nlab@sw2> "
+                )],
+            ),
+            (
+                "long_logout_banner",
+                false,
+                vec![format!("Goodbye\n{}\n{BRACKET}\nsw1#", "x".repeat(500))],
+            ),
+            // Review 68: the natural declines.
+            (
+                "natural_hostname_only",
+                false,
+                vec![format!("{BRACKET}\nhostname sw1\nlab@sw2> ")],
+            ),
+            ("natural_parent_only", false, vec!["sw1#".to_string()]),
+            (
+                "natural_wrong_bracket",
+                false,
+                vec!["[Connection to sw3 closed by foreign host]\nsw1#".to_string()],
+            ),
+        ] {
+            let mut runtime = if shell {
+                cisco_then_juniper_shell(&store)
+            } else {
+                cisco_then_juniper(&store)
+            };
+            let chunks: Vec<&str> = reply.iter().map(String::as_str).collect();
+            assert_eq!(step(&mut runtime, &store, "exit", &chunks), None, "{name}");
+            assert_child_kept(&mut runtime, &store, JUNIPER);
+            assert_eq!(runtime.stack_len(), 2, "{name}");
+        }
+    }
+
+    #[test]
+    fn c2b_bracket_before_the_exit_is_stale() {
+        let store = ProfileStore::builtin();
+        let mut runtime = cisco_then_juniper(&store);
+        step(
+            &mut runtime,
+            &store,
+            "show run",
+            &[&format!("{BRACKET}\nlab@sw2> ")],
+        );
+        assert_eq!(step(&mut runtime, &store, "exit", &["sw1#"]), None);
+        assert_child_kept(&mut runtime, &store, JUNIPER);
+    }
+
+    #[test]
+    fn c2b_typeahead_and_same_hostname_children_keep_the_child() {
+        let store = ProfileStore::builtin();
+        for (name, leaf_banner) in [
+            // A line typed into the child before any prompt of it.
+            ("residual_typeahead", "Arista Networks EOS version 4.31\n"),
+            // A child showing its parent's exact prompt.
+            (
+                "same_hostname_live",
+                "Arista Networks EOS version 4.31\nRouter#",
+            ),
+        ] {
+            let mut runtime = local(&store);
+            step(
+                &mut runtime,
+                &store,
+                "ssh core",
+                &["Cisco IOS Software\nRouter#"],
+            );
+            assert_eq!(
+                step(&mut runtime, &store, "ssh leaf", &[leaf_banner]),
+                Some(names(ARISTA)),
+                "{name}"
+            );
+            step(&mut runtime, &store, "bash", &["[admin@Router ~]$ "]);
+            step(
+                &mut runtime,
+                &store,
+                "exit",
+                &["[Connection to leaf closed by foreign host]\nRouter#"],
+            );
+            step(
+                &mut runtime,
+                &store,
+                "show version",
+                &["Arista DCS-7050\nRouter#"],
+            );
+            assert_eq!(runtime.active_profiles(), names(ARISTA), "{name}");
+            assert_eq!(runtime.stack_len(), 2, "{name}");
+        }
+    }
+
+    // C-2b, the accepted limit: a still-connected child that prints the
+    // whole evidence. These pin the early switch, so it cannot drift
+    // silently.
+
+    #[test]
+    fn c2b_accepted_limit_child_printing_bracket_and_parent_prompt_line() {
+        let store = ProfileStore::builtin();
+        for (name, reply) in [
+            (
+                "saved_log_split_read",
+                [format!("{BRACKET}\nsw1#"), "\nlab@sw2> ".to_string()],
+            ),
+            (
+                "show_run_parent_line",
+                [
+                    format!("{BRACKET}\nCurrent configuration:\nhostname sw1\nbanner motd ^\nsw1#"),
+                    "\n^\nlab@sw2> ".to_string(),
+                ],
+            ),
+        ] {
+            let mut runtime = cisco_then_juniper_shell(&store);
+            let chunks: Vec<&str> = reply.iter().map(String::as_str).collect();
+            assert_eq!(
+                step(&mut runtime, &store, "exit", &chunks),
+                Some(names(CISCO)),
+                "{name}: the complete parent prompt line after the bracket"
+            );
+            assert_eq!(runtime.stack_len(), 1, "{name}");
+        }
+    }
+
+    // C-2c, genuine closes.
+
+    fn telnet_to_juniper(store: &ProfileStore, command: &str) -> ProfileRuntime {
+        let mut runtime = local(store);
+        assert_eq!(
+            step(
+                &mut runtime,
+                store,
+                command,
+                &[
+                    "Connected to r1.\nEscape character is '^]'.\n--- JUNOS 22.4R3 Kernel 64-bit\nlab@r1> "
+                ]
+            ),
+            Some(names(JUNIPER)),
+            "{command}"
+        );
+        runtime
+    }
+
+    #[test]
+    fn c2c_ctrl_bracket_quit_returns_to_the_profile_before_telnet() {
+        let store = ProfileStore::builtin();
+        for command in ["telnet r1", "telnet r1 2323", "telnet -l admin r1"] {
+            let mut runtime = telnet_to_juniper(&store, command);
+            assert_eq!(
+                step(
+                    &mut runtime,
+                    &store,
+                    "\x1dq",
+                    &["\ntelnet> q\nConnection closed.\nuser@laptop:~$ "]
+                ),
+                Some(names(LOCAL)),
+                "{command}"
+            );
+            assert_eq!(runtime.stack_len(), 0, "{command}");
+        }
+    }
+
+    #[test]
+    fn c2c_quit_pops_the_telnet_and_what_was_opened_inside_it() {
+        let store = ProfileStore::builtin();
+        let mut runtime = telnet_to_juniper(&store, "telnet a1");
+        assert_eq!(
+            step(&mut runtime, &store, "ssh b1", &["Cisco IOS Software\nb1#"]),
+            Some(names(CISCO))
+        );
+        assert_eq!(
+            step(
+                &mut runtime,
+                &store,
+                "\x1dq",
+                &["\ntelnet> q\nConnection closed.\nuser@laptop:~$ "]
+            ),
+            Some(names(LOCAL))
+        );
+        assert_eq!(runtime.stack_len(), 0);
+    }
+
+    #[test]
+    fn c2c_escape_announcement_split_at_every_position_is_still_read() {
+        let store = ProfileStore::builtin();
+        let banner = crlf(
+            "Trying 192.0.2.1...\nConnected to r1.\nEscape character is '^]'.\n--- JUNOS 22.4R3 Kernel 64-bit\nlab@r1> ",
+        );
+        let announcement = banner.find("Escape").expect("announcement");
+        let announcement_end = banner.find("--- JUNOS").expect("banner");
+        for split in announcement..announcement_end {
+            let mut runtime = local(&store);
+            runtime.observe_input(b"telnet r1\r");
+            runtime.observe_output(b"telnet r1\r\n", &store);
+            runtime.observe_output(&banner.as_bytes()[..split], &store);
+            runtime.observe_output(&banner.as_bytes()[split..], &store);
+            assert_eq!(
+                runtime.active_profiles(),
+                names(JUNIPER),
+                "split at {split}"
+            );
+            assert_eq!(
+                step(
+                    &mut runtime,
+                    &store,
+                    "\x1dq",
+                    &["\ntelnet> q\nConnection closed.\nuser@laptop:~$ "]
+                ),
+                Some(names(LOCAL)),
+                "split at {split}"
+            );
+        }
+    }
+
+    #[test]
+    fn c2c_echo_and_close_line_bounds_are_counted_in_bytes() {
+        let store = ProfileStore::builtin();
+        // From the Ctrl-]: `^]` echo, then output in flight, then telnet's
+        // `telnet> q` line, whose line end must come within 4,096 bytes.
+        for (echo_end, returns) in [(4_095, true), (4_096, true), (4_097, false)] {
+            let head = "^]";
+            let echo_line = "\r\ntelnet> q\r";
+            let room = echo_end - head.len() - echo_line.len();
+            let flight = format!("{}\r\n", "y".repeat(room - 2));
+            let output =
+                format!("{head}{flight}{echo_line}\nConnection closed.\r\nuser@laptop:~$ ");
+            assert_eq!(
+                output.find("telnet> q\r").expect("echo") + "telnet> q\r".len(),
+                echo_end
+            );
+            for splits in [&[][..], &[1_000][..], &[echo_end - 1][..]] {
+                let mut runtime = telnet_to_juniper(&store, "telnet r1");
+                runtime.observe_input(b"\x1dq\r");
+                let expected = returns.then(|| names(LOCAL));
+                assert_eq!(
+                    step_split(&mut runtime, &store, &output, splits),
+                    expected,
+                    "echo ends at byte {echo_end}, splits {splits:?}"
+                );
+            }
+        }
+        // After the echo's line end, the close line must start within 256
+        // bytes; blank lines may come between.
+        for (start, returns) in [(255, true), (256, true), (257, false)] {
+            let head = "^]\r\ntelnet> q\r";
+            let blanks = format!("\n{}\n", " ".repeat(start - 2));
+            assert_eq!(blanks.len(), start);
+            let output = format!("{head}{blanks}Connection closed.\r\nuser@laptop:~$ ");
+            for splits in [&[][..], &[head.len() + 10][..], &[head.len() + start][..]] {
+                let mut runtime = telnet_to_juniper(&store, "telnet r1");
+                runtime.observe_input(b"\x1dq\r");
+                let expected = returns.then(|| names(LOCAL));
+                assert_eq!(
+                    step_split(&mut runtime, &store, &output, splits),
+                    expected,
+                    "close line starts {start} bytes after the echo, splits {splits:?}"
+                );
+            }
+        }
+    }
+
+    fn step_split(
+        runtime: &mut ProfileRuntime,
+        store: &ProfileStore,
+        output: &str,
+        splits: &[usize],
+    ) -> Option<Vec<String>> {
+        let bytes = output.as_bytes();
+        let mut last = None;
+        let mut start = 0;
+        for &end in splits.iter().chain(std::iter::once(&bytes.len())) {
+            last = runtime.observe_output(&bytes[start..end], store).or(last);
+            start = end;
+        }
+        last
+    }
+
+    // C-2c, what must not return (pinned to 1.4.1).
+
+    #[test]
+    fn c2c_without_telnet_s_own_exchange_the_telnet_stays() {
+        let store = ProfileStore::builtin();
+        for (name, command, steps) in [
+            (
+                "no_telnet_command_prompt",
+                "telnet r1",
+                vec![("\x1dq", "Connection closed.\nlab@r1> ")],
+            ),
+            (
+                "rlogin_escape",
+                "telnet -r r1",
+                vec![("\x1dq", "Connection closed.\nlab@r1> ")],
+            ),
+            (
+                "other_escape",
+                "telnet -e ^X r1",
+                vec![("\x1dq", "\ntelnet> q\nConnection closed.\nlab@r1> ")],
+            ),
+            (
+                "over_budget_same_read",
+                "telnet r1",
+                vec![("\x1dq", "\ntelnet> q\n<300>\nConnection closed.\nlab@r1> ")],
+            ),
+            (
+                "telnet_subshell",
+                "telnet r1",
+                vec![
+                    ("\x1d!", "\ntelnet> !\nuser@laptop:~$ "),
+                    ("\x1dq", "\ntelnet> q\nConnection closed.\nuser@laptop:~$ "),
+                ],
+            ),
+            (
+                "suspended",
+                "telnet r1",
+                vec![
+                    (
+                        "\x1dz",
+                        "\ntelnet> z\n[1]+  Stopped telnet r1\nuser@laptop:~$ ",
+                    ),
+                    ("\x1dq", "Connection closed.\nuser@laptop:~$ "),
+                ],
+            ),
+            (
+                "stale_close",
+                "telnet r1",
+                vec![
+                    ("cat notes", "Connection closed.\nlab@r1> "),
+                    ("\x1dq", "\ntelnet> q\nlab@r1> "),
+                ],
+            ),
+            (
+                "stale_partial",
+                "telnet r1",
+                vec![("cat notes", "Connection closed."), ("\x1dq", "\nlab@r1> ")],
+            ),
+            (
+                "unsolicited_after_armed",
+                "telnet r1",
+                vec![
+                    ("\x1dq", "\ntelnet> q\nNo connection to close.\nlab@r1> "),
+                    ("cat notes", "Connection closed.\nlab@r1> "),
+                ],
+            ),
+            (
+                "close_command",
+                "telnet r1",
+                vec![("\x1dclose", "\ntelnet> close\nConnection closed.\ntelnet> ")],
+            ),
+        ] {
+            let mut runtime = telnet_to_juniper(&store, command);
+            for (typed, reply) in steps {
+                let reply = reply.replace("<300>", &"x".repeat(300));
+                step(&mut runtime, &store, typed, &[&reply]);
+            }
+            assert_eq!(runtime.active_profiles(), names(JUNIPER), "{name}");
+            assert_eq!(runtime.stack_len(), 1, "{name}");
+        }
+    }
+
+    #[test]
+    fn c2c_announced_other_escape_keeps_the_telnet_in_any_read_grouping() {
+        let store = ProfileStore::builtin();
+        for reply in [
+            &["\ntelnet> q\nConnection closed.\nlab@r1> "][..],
+            &["\ntel", "net> q\nConnec", "tion closed.\nlab@r1> "][..],
+        ] {
+            let mut runtime = local(&store);
+            step(
+                &mut runtime,
+                &store,
+                "telnet r1",
+                &[
+                    "Trying 192.0.2.1...\nConnected to r1.\nEscape character is '^X'.\n--- JUNOS 22.4R3 Kernel 64-bit\nlab@r1> ",
+                ],
+            );
+            step(&mut runtime, &store, "\x1dq", reply);
+            assert_eq!(runtime.active_profiles(), names(JUNIPER));
+        }
+    }
+
+    #[test]
+    fn c2c_telnet_echo_before_the_enter_is_not_the_echo() {
+        // audit-echo-before-enter: a raw-mode program prints `telnet> q` at
+        // the Ctrl-], before `q` and Enter are typed.
+        let store = ProfileStore::builtin();
+        let mut runtime = local(&store);
+        runtime.observe_input(b"telnet r1\r");
+        runtime.observe_output(
+            b"\r\nConnected to r1.\r\nEscape character is '^]'.\r\n--- JUNOS 22.4R3 Kernel 64-bit\r\nlab@r1> ",
+            &store,
+        );
+        step_raw(&mut runtime, &store, b"\x1d", &["\r\ntelnet> q\r\n"]);
+        step_raw(
+            &mut runtime,
+            &store,
+            b"q\r",
+            &["\r\nConnection closed.\r\nlab@r1> "],
+        );
+        assert_eq!(runtime.active_profiles(), names(JUNIPER));
+    }
+
+    #[test]
+    fn c2c_a_stack_change_earlier_in_the_exchange_cancels_it() {
+        let store = ProfileStore::builtin();
+        let two_telnets = |store: &ProfileStore| {
+            let mut runtime = local(store);
+            step(
+                &mut runtime,
+                store,
+                "telnet a1",
+                &[
+                    "Connected to a1.\nEscape character is '^]'.\n--- JUNOS 22.4R3 Kernel 64-bit\nlab@a1> ",
+                ],
+            );
+            assert_eq!(
+                step(
+                    &mut runtime,
+                    store,
+                    "telnet b1",
+                    &["Connected to b1.\nEscape character is '^]'.\nCisco IOS Software\nb1#"]
+                ),
+                Some(names(CISCO))
+            );
+            runtime
+        };
+        // audit-wrong-frame: b1's close in its own read, then the exchange.
+        let mut runtime = two_telnets(&store);
+        step_raw(
+            &mut runtime,
+            &store,
+            b"\x1d",
+            &["\r\nConnection closed by foreign host.\r\n"],
+        );
+        step_raw(
+            &mut runtime,
+            &store,
+            b"q\r",
+            &["\r\ntelnet> q\r\nConnection closed.\r\nlab@a1> "],
+        );
+        assert_eq!(runtime.active_profiles(), names(JUNIPER), "separate reads");
+        assert_eq!(runtime.stack_len(), 1, "separate reads");
+        // same_read_transition: all of it in one read, and split anywhere.
+        let output = "^]q\r\nConnection closed by foreign host.\r\ntelnet> q\r\nConnection closed.\r\nlab@a1> ";
+        for split in 0..output.len() {
+            let mut runtime = two_telnets(&store);
+            runtime.observe_input(b"\x1dq\r");
+            let splits: &[usize] = if split == 0 { &[] } else { &[split] };
+            step_split(&mut runtime, &store, output, splits);
+            assert_eq!(
+                runtime.active_profiles(),
+                names(JUNIPER),
+                "split at {split}"
+            );
+            assert_eq!(runtime.stack_len(), 1, "split at {split}");
+        }
+    }
+
+    #[test]
+    fn c2c_budget_after_an_ordinary_pop_is_spent() {
+        let store = ProfileStore::builtin();
+        let mut runtime = local(&store);
+        step(
+            &mut runtime,
+            &store,
+            "telnet a1",
+            &[
+                "Connected to a1.\nEscape character is '^]'.\n--- JUNOS 22.4R3 Kernel 64-bit\nlab@a1> ",
+            ],
+        );
+        step(
+            &mut runtime,
+            &store,
+            "telnet b1",
+            &["Connected to b1.\nEscape character is '^]'.\nCisco IOS Software\nb1#"],
+        );
+        step(
+            &mut runtime,
+            &store,
+            "\x1dq",
+            &["\ntelnet> q\nConnection closed by foreign host.\nlab@a1> "],
+        );
+        step(
+            &mut runtime,
+            &store,
+            "cat notes",
+            &["Connection closed.\nlab@a1> "],
+        );
+        assert_eq!(runtime.active_profiles(), names(JUNIPER));
+        assert_eq!(runtime.stack_len(), 1);
+    }
+
+    #[test]
+    fn c2c_outermost_telnet_behind_a_subshell_is_not_closed() {
+        let store = ProfileStore::builtin();
+        let mut runtime = local(&store);
+        step(
+            &mut runtime,
+            &store,
+            "telnet a1",
+            &[
+                "Connected to a1.\nEscape character is '^]'.\n--- JUNOS 22.4R3 Kernel 64-bit\nlab@a1> ",
+            ],
+        );
+        step(
+            &mut runtime,
+            &store,
+            "\x1d!",
+            &["\ntelnet> !\nuser@laptop:~$ "],
+        );
+        step(
+            &mut runtime,
+            &store,
+            "telnet b1",
+            &["Connected to b1.\nEscape character is '^]'.\nCisco IOS Software\nb1#"],
+        );
+        step(
+            &mut runtime,
+            &store,
+            "\x1dq",
+            &["\ntelnet> q\nConnection closed.\nuser@laptop:~$ "],
+        );
+        assert!(runtime.stack_len() >= 1, "a1's frame must survive");
+    }
+
+    #[test]
+    fn c2c_an_exchange_armed_across_a_rejected_switch_does_not_close() {
+        let store = ProfileStore::builtin();
+        let mut runtime = telnet_to_juniper(&store, "telnet r1");
+        runtime.observe_input(b"\x1d");
+        // The telnet's close is shown while the exchange is armed, and the
+        // session rejects the switch back (its rules failed to build).
+        assert_eq!(
+            runtime.observe_output(b"^]\r\nConnection closed by foreign host.\r\n", &store),
+            Some(names(LOCAL))
+        );
+        runtime.reject_transition();
+        assert_eq!(runtime.active_profiles(), names(JUNIPER));
+        assert_eq!(runtime.stack_len(), 1);
+        runtime.observe_input(b"q\r");
+        runtime.observe_output(
+            b"\r\ntelnet> q\r\nConnection closed.\r\nuser@laptop:~$ ",
+            &store,
+        );
+        assert_eq!(runtime.active_profiles(), names(JUNIPER));
+    }
+}
