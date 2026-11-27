@@ -42,6 +42,30 @@ const SANITIZE_SPLIT_STOP_SPACING: usize = 64;
 /// How many CSI parameters xterm keeps. Past them it ignores `;` and `:` and
 /// reads every further digit into the last parameter.
 const XTERM_MAX_CSI_PARAMETERS: usize = 30;
+/// The most parameters a removed prompt-echo SGR may hold and still leave an
+/// off behind: the Linux console keeps 16 and drops a CSI with more, Vim's
+/// libvterm keeps 16, xterm 30.
+const PROMPT_ECHO_OFF_SOURCE_MAX_PARAMETERS: usize = 16;
+/// The groups whose end the prompt-echo neutralizer writes in place of a
+/// removed SGR, as (attribute group of `SgrRendition`, or `None` for the
+/// background; off code), in ascending code order: italic, underline, blink,
+/// inverse, conceal, strike, background, overline. Each code ends that one
+/// group on every terminal that has it and is ignored by one that does not,
+/// so writing it where the group is already off changes nothing. Intensity
+/// (22 ends bold and faint together, which needs the terminal's state to be
+/// right), the foreground (the reset inserted before the command ends it),
+/// fonts (10 resets the Linux console's character mapping, which 0 leaves
+/// alone) and the rarer groups are not written.
+const PROMPT_ECHO_OFF_CODES: [(Option<u16>, u16); 8] = [
+    (Some(3), 23),
+    (Some(4), 24),
+    (Some(5), 25),
+    (Some(7), 27),
+    (Some(8), 28),
+    (Some(9), 29),
+    (None, 49),
+    (Some(53), 55),
+];
 const MAX_TENTATIVE_UTF8_SUFFIX_BYTES: usize = 2;
 const PCRE2_JIT_STACK_LIMIT_BYTES: usize = 32 * 1024;
 const PCRE2_MATCH_LIMIT: usize = 100_000;
@@ -1912,12 +1936,21 @@ impl StreamingHighlighter {
     fn emit_prompt_echo_passthrough(&mut self, input: &[u8]) -> Vec<u8> {
         let mut output = Vec::new();
         self.reset_interactive_overlay(&mut output);
-        output.extend(neutralize_prompt_echo_source_sgr(
+        let neutralized = neutralize_prompt_echo_source_sgr_on(
             input,
             &self.visible_line_tail,
             self.interactive_reset_mode(),
-        ));
-        self.observe_native_sgr_chunk(&AnsiChunk::new(output.clone()));
+            &self.native_sgr,
+        );
+        output.extend_from_slice(&neutralized.bytes);
+        if neutralized.offs.is_empty() && self.native_sgr.without_offs.is_none() {
+            self.observe_native_sgr_chunk(&AnsiChunk::new(output.clone()));
+        } else {
+            self.native_sgr.observe_prompt_echo(
+                &AnsiChunk::new(output.clone()),
+                &AnsiChunk::new(neutralized.without_offs()),
+            );
+        }
         output
     }
 
@@ -2070,15 +2103,32 @@ struct AnsiRange {
     ends_open_control: bool,
 }
 
-fn neutralize_prompt_echo_source_sgr(
+/// Takes the program's SGRs out of a prompt-echo line and resets the
+/// foreground before the command, as `prompt_echo_source_sgr_plan` decides.
+/// Each removed SGR leaves behind, where it stood, what it turns off of the
+/// groups in `PROMPT_ECHO_OFF_CODES`: a prompt that ends its own background,
+/// inverse or underline keeps that end. `rendition` is what the terminal
+/// shows before this output; it is followed through the controls the output
+/// keeps and writes, and decides only whether an off is worth writing: one
+/// written for a group already off changes nothing, and one not written
+/// leaves the group as before. No off is written once the program has used
+/// the SGR stack (`NativeSgrState::sgr_stack_used`).
+fn neutralize_prompt_echo_source_sgr_on(
     input: &[u8],
     previous_visible_tail: &[u8],
     reset_mode: ResetMode,
-) -> Vec<u8> {
-    let (mut remove_ranges, mut reset_positions) =
-        prompt_echo_source_sgr_plan(input, previous_visible_tail);
+    rendition: &NativeSgrState,
+) -> NeutralizedPromptEcho {
+    let PromptEchoSgrPlan {
+        mut remove_ranges,
+        mut reset_positions,
+        controls,
+    } = prompt_echo_source_sgr_plan_and_controls(input, previous_visible_tail);
     if remove_ranges.is_empty() {
-        return input.to_vec();
+        return NeutralizedPromptEcho {
+            bytes: input.to_vec(),
+            offs: Vec::new(),
+        };
     }
 
     remove_ranges.sort_unstable();
@@ -2086,30 +2136,51 @@ fn neutralize_prompt_echo_source_sgr(
     reset_positions.sort_unstable();
     reset_positions.dedup();
 
+    let mut terminal = rendition.clone();
+    let mut controls = controls.iter().peekable();
     let mut output = Vec::with_capacity(input.len());
+    let mut offs = Vec::new();
     let mut idx = 0usize;
     let mut remove_idx = 0usize;
     let mut reset_idx = 0usize;
 
     while idx < input.len() {
         while reset_positions.get(reset_idx) == Some(&idx) {
-            output.extend_from_slice(prompt_echo_source_sgr_reset(reset_mode));
+            let reset = prompt_echo_source_sgr_reset(reset_mode);
+            output.extend_from_slice(reset);
+            terminal.apply_sequence(reset);
             reset_idx += 1;
         }
+        while controls.next_if(|control| control.start < idx).is_some() {}
 
         if let Some((start, end)) = remove_ranges.get(remove_idx).copied() {
             if idx == start {
                 // A terminal runs the C0 controls it meets inside the
-                // sequence, so they stay where it was.
+                // sequence, so they stay where it was, and the off it
+                // leaves follows them.
                 output.extend(
                     input[start..end]
                         .iter()
                         .filter(|byte| matches!(byte, 0x00..=0x17 | 0x19 | 0x1c..=0x1f)),
                 );
+                let off = terminal.prompt_echo_off(&input[start..end]);
+                if !off.is_empty() {
+                    terminal.apply_prompt_echo_off(&off);
+                    offs.push((output.len(), output.len() + off.len()));
+                    output.extend(off);
+                }
                 idx = end;
                 remove_idx += 1;
                 continue;
             }
+        }
+
+        if let Some(control) = controls.next_if(|control| control.start == idx) {
+            let control = &input[control.start..control.end];
+            terminal.apply_sequence(control);
+            output.extend_from_slice(control);
+            idx += control.len();
+            continue;
         }
 
         output.push(input[idx]);
@@ -2121,7 +2192,71 @@ fn neutralize_prompt_echo_source_sgr(
         reset_idx += 1;
     }
 
-    output
+    NeutralizedPromptEcho {
+        bytes: output,
+        offs,
+    }
+}
+
+/// What `neutralize_prompt_echo_source_sgr_on` writes for a prompt-echo
+/// line, and where in it the offs are.
+struct NeutralizedPromptEcho {
+    bytes: Vec<u8>,
+    /// The `(start, end)` ranges of `bytes` that are offs, in order.
+    offs: Vec<(usize, usize)>,
+}
+
+impl NeutralizedPromptEcho {
+    /// The bytes without the offs: what 1.4.1 wrote for the line.
+    fn without_offs(&self) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(self.bytes.len());
+        let mut last = 0;
+        for (start, end) in &self.offs {
+            bytes.extend_from_slice(&self.bytes[last..*start]);
+            last = *end;
+        }
+        bytes.extend_from_slice(&self.bytes[last..]);
+        bytes
+    }
+}
+
+/// Whether the terminals PrismTTY writes for read the removed prompt-echo
+/// SGR `bytes` as the parser does for the groups of `PROMPT_ECHO_OFF_CODES`,
+/// so that an off taken from it is the source's own on every one of them:
+/// opened by ESC, no sub-parameter, at most
+/// `PROMPT_ECHO_OFF_SOURCE_MAX_PARAMETERS` parameters, each empty or a
+/// number up to 65535, and no extended color.
+///
+/// A C0 control between ESC and `[` is run in place and leaves the sequence
+/// a CSI, so it does not change this. Whether a C1 introducer runs depends
+/// on the encoding in force and on the terminal. The Linux console drops a
+/// whole CSI holding `:` outside 38, 48 and 58 or a 17th parameter, and
+/// keeps a parameter modulo 2^32 where the parser ignores one past 65535:
+/// `27;4294967303` is inverse off and on again there. It also takes the
+/// empty parameter of `38;;` as the mode where the parser reads a reset,
+/// and has no 58, so it reads 58's arguments as codes.
+fn is_plain_sgr(bytes: &[u8]) -> bool {
+    if bytes.first() != Some(&0x1b) {
+        return false;
+    }
+    let Some(body) = sgr_parameters(bytes) else {
+        return false;
+    };
+    if body.contains(&b':') {
+        return false;
+    }
+    let mut parameters = 0usize;
+    for parameter in body.split(|byte| *byte == b';') {
+        parameters += 1;
+        if parameters > PROMPT_ECHO_OFF_SOURCE_MAX_PARAMETERS {
+            return false;
+        }
+        if !parameter.is_empty() && matches!(parse_sgr_number(parameter), None | Some(38 | 48 | 58))
+        {
+            return false;
+        }
+    }
+    true
 }
 
 fn prompt_echo_source_sgr_reset(reset_mode: ResetMode) -> &'static [u8] {
@@ -2136,10 +2271,27 @@ fn prompt_echo_has_active_source_sgr(input: &[u8], previous_visible_tail: &[u8])
     !remove_ranges.is_empty()
 }
 
+/// The SGRs `prompt_echo_source_sgr_plan` removes and the positions of the
+/// resets it inserts, with every control of the input in order.
+#[derive(Default)]
+struct PromptEchoSgrPlan {
+    remove_ranges: Vec<(usize, usize)>,
+    reset_positions: Vec<usize>,
+    controls: Vec<AnsiRange>,
+}
+
 fn prompt_echo_source_sgr_plan(
     input: &[u8],
     previous_visible_tail: &[u8],
 ) -> (Vec<(usize, usize)>, Vec<usize>) {
+    let plan = prompt_echo_source_sgr_plan_and_controls(input, previous_visible_tail);
+    (plan.remove_ranges, plan.reset_positions)
+}
+
+fn prompt_echo_source_sgr_plan_and_controls(
+    input: &[u8],
+    previous_visible_tail: &[u8],
+) -> PromptEchoSgrPlan {
     // Most chunks carry no escape at all; skip building the visible-byte map
     // for them. Any ESC, raw C1 or UTF-8 C1 (`C2 xx`) form contains one of
     // these bytes.
@@ -2147,11 +2299,11 @@ fn prompt_echo_source_sgr_plan(
         .iter()
         .any(|byte| *byte == 0x1b || is_c1_control(*byte))
     {
-        return (Vec::new(), Vec::new());
+        return PromptEchoSgrPlan::default();
     }
     let (visible, ansi_ranges) = visible_byte_map_and_ansi_ranges(input);
     if visible.is_empty() || ansi_ranges.iter().all(|range| !range.is_sgr) {
-        return (Vec::new(), Vec::new());
+        return PromptEchoSgrPlan::default();
     }
 
     let mut remove_ranges = Vec::new();
@@ -2212,7 +2364,11 @@ fn prompt_echo_source_sgr_plan(
         line_start = line_end + 1;
     }
 
-    (remove_ranges, reset_positions)
+    PromptEchoSgrPlan {
+        remove_ranges,
+        reset_positions,
+        controls: ansi_ranges,
+    }
 }
 
 fn visible_byte_map_and_ansi_ranges(input: &[u8]) -> (Vec<VisibleByte>, Vec<AnsiRange>) {
@@ -4345,6 +4501,26 @@ fn pushes_rendition(bytes: &[u8]) -> bool {
     })
 }
 
+/// Reports whether `bytes` uses xterm's SGR stack: XTPUSHSGR (`CSI Pm # {`
+/// or `# p`) or XTPOPSGR (`CSI # }` or `# q`), with any parameters and in
+/// any introducer, including a raw C1 one the terminal may not run: taking
+/// one for a use only costs a prompt-echo off.
+///
+/// It deliberately also takes these finals after a private marker or
+/// another intermediate, as in `CSI ? # {` or `CSI ! # p`, which xterm's
+/// parser ignores (its `dec_table` and `csi_ex_table` send `#` to
+/// `CASE_CSI_IGNORE`). Such a false match only returns the session to
+/// 1.4.1's bytes; narrowing it needs that proof for every terminal with
+/// the stack, not only xterm.
+fn uses_sgr_stack(bytes: &[u8]) -> bool {
+    matches!(bytes.last(), Some(b'{' | b'p' | b'}' | b'q'))
+        && csi_body(bytes).is_some_and(|body| {
+            [b"#{", b"#p", b"#}", b"#q"]
+                .iter()
+                .any(|suffix| body.ends_with(*suffix))
+        })
+}
+
 /// Reports whether `bytes` is index (`ESC D`), next line (`ESC E`) or reverse
 /// index (`ESC M`), in the 7-bit form (with any C0 controls a terminal runs
 /// after the ESC) or either C1 form. Like a line feed, each scrolls a blank
@@ -4423,7 +4599,8 @@ fn collect_styled_spans(visible: &[u8], styles: &[Option<Style>]) -> Vec<StyledS
 /// after it switches back; modes 47 and 1047 switch screens without saving.
 /// CSI s and CSI u with no parameters save and restore like DECSC and DECRC,
 /// as they do while left and right margin mode is off, its default; that
-/// mode is not tracked.
+/// mode is not tracked. xterm's SGR stack is not tracked either; see
+/// `sgr_stack_used`.
 #[derive(Clone, Debug, Default)]
 struct NativeSgrState {
     rendition: SgrRendition,
@@ -4431,15 +4608,43 @@ struct NativeSgrState {
     /// terminal keeps apart.
     saved: [SgrRendition; 2],
     alternate_screen: bool,
+    /// Whether the program has pushed or popped xterm's SGR stack
+    /// (XTPUSHSGR, XTPOPSGR), in any spelling, or a pop without a push seen,
+    /// which can pop what was pushed before PrismTTY started. A later pop
+    /// may then bring back a rendition this state does not hold, so from
+    /// here on the prompt-echo neutralizer writes no off and every write is
+    /// 1.4.1's. xterm keeps the stack through RIS and DECSTR, and SGR 0 does
+    /// not touch it, so nothing clears this.
+    sgr_stack_used: bool,
+    /// This state as 1.4.1 tracks it, without the prompt-echo offs written
+    /// since the two last agreed; `None` while they agree. It is taken over
+    /// at the first use of the SGR stack.
+    without_offs: Option<Box<NativeSgrState>>,
 }
 
 impl NativeSgrState {
     fn apply_sequence(&mut self, bytes: &[u8]) {
+        if let Some(without_offs) = self.without_offs.as_deref_mut() {
+            without_offs.apply_sequence(bytes);
+        }
+        if uses_sgr_stack(bytes) {
+            if let Some(without_offs) = self.without_offs.take() {
+                *self = *without_offs;
+            }
+            self.sgr_stack_used = true;
+            return;
+        }
         if is_raw_c1_csi_the_terminal_does_not_run(bytes) {
             return;
         }
         match bytes {
-            _ if escape_final_byte(bytes) == Some(b'c') => *self = Self::default(),
+            _ if escape_final_byte(bytes) == Some(b'c') => {
+                *self = Self {
+                    sgr_stack_used: self.sgr_stack_used,
+                    without_offs: self.without_offs.take(),
+                    ..Self::default()
+                };
+            }
             _ if saves_cursor(bytes) => self.save(),
             _ if restores_cursor(bytes) => self.restore(),
             _ if is_soft_terminal_reset(bytes) => {
@@ -4468,6 +4673,57 @@ impl NativeSgrState {
                 None => self.rendition.apply_sequence(bytes),
             },
         }
+        if self
+            .without_offs
+            .as_deref()
+            .is_some_and(|without_offs| without_offs.agrees_with(self))
+        {
+            self.without_offs = None;
+        }
+    }
+
+    fn agrees_with(&self, other: &Self) -> bool {
+        self.rendition == other.rendition
+            && self.saved == other.saved
+            && self.alternate_screen == other.alternate_screen
+    }
+
+    /// Applies `off`, written in place of a removed prompt-echo SGR, to this
+    /// state only, so the state without offs keeps what 1.4.1 tracks.
+    fn apply_prompt_echo_off(&mut self, off: &[u8]) {
+        if self.without_offs.is_none() {
+            self.without_offs = Some(Box::new(self.clone()));
+        }
+        self.rendition.apply_sequence(off);
+    }
+
+    /// Follows a prompt-echo line written as `written`, which may begin
+    /// with PrismTTY's own restore after a highlight, while the state
+    /// without offs follows `without_offs`, the line as 1.4.1 wrote it after
+    /// that restore. A restore leaves the state it was written from as it
+    /// was, and 1.4.1 would have written its own from the state without
+    /// offs, so that state skips it.
+    fn observe_prompt_echo(&mut self, written: &AnsiChunk, without_offs: &AnsiChunk) {
+        let stack_used = self.sgr_stack_used;
+        let mut untouched = match self.without_offs.take() {
+            Some(untouched) => *untouched,
+            None => self.clone(),
+        };
+        for token in &written.tokens {
+            if let Token::Ansi(bytes) = token {
+                self.apply_sequence(bytes);
+            }
+        }
+        for token in &without_offs.tokens {
+            if let Token::Ansi(bytes) = token {
+                untouched.apply_sequence(bytes);
+            }
+        }
+        if self.sgr_stack_used && !stack_used {
+            *self = untouched;
+        } else if !untouched.agrees_with(self) {
+            self.without_offs = Some(Box::new(untouched));
+        }
     }
 
     fn save(&mut self) {
@@ -4484,8 +4740,14 @@ impl NativeSgrState {
 
     /// Whether the program's rendition draws on blank cells in the foreground
     /// color: inverse, strike-through, overline, or an underline with no
-    /// color of its own.
+    /// color of its own. While a prompt-echo off has ended one of these, it
+    /// is read from the state without offs, as 1.4.1 reads it: an off only
+    /// ever ends one of them, so a highlight closes exactly where 1.4.1
+    /// closes it, and an off changes what a restore writes, never when.
     fn draws_blank_cells_with_the_foreground(&self) -> bool {
+        if let Some(without_offs) = self.without_offs.as_deref() {
+            return without_offs.draws_blank_cells_with_the_foreground();
+        }
         let attributes = &self.rendition.attributes;
         [7, 9, 53]
             .iter()
@@ -4495,6 +4757,35 @@ impl NativeSgrState {
 
     fn restore_after_interactive_style(&self, style: &Style) -> Vec<u8> {
         self.rendition.restore_after_interactive_style(style)
+    }
+
+    /// The SGR left in place of the removed prompt-echo SGR `sequence` on a
+    /// terminal showing this rendition: the code from
+    /// `PROMPT_ECHO_OFF_CODES` of each group shown here that `sequence`,
+    /// read by the parser, leaves off, in ascending order. Empty when there
+    /// is none, when `sequence` is not plain (`is_plain_sgr`), and once the
+    /// SGR stack has been used.
+    fn prompt_echo_off(&self, sequence: &[u8]) -> Vec<u8> {
+        if self.sgr_stack_used || !is_plain_sgr(sequence) {
+            return Vec::new();
+        }
+        let mut after = self.rendition.clone();
+        after.apply_sequence(sequence);
+        let codes = PROMPT_ECHO_OFF_CODES
+            .iter()
+            .filter(|(group, _)| match group {
+                None => self.rendition.background.is_some() && after.background.is_none(),
+                Some(group) => {
+                    self.rendition.attributes.contains_key(group)
+                        && !after.attributes.contains_key(group)
+                }
+            })
+            .map(|(_, code)| code.to_string())
+            .collect::<Vec<_>>();
+        if codes.is_empty() {
+            return Vec::new();
+        }
+        format!("\x1b[{}m", codes.join(";")).into_bytes()
     }
 }
 
@@ -4582,7 +4873,7 @@ fn private_mode_number(mode: &[u8]) -> u32 {
 }
 
 /// The colors and attributes that SGR sequences have set.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct SgrRendition {
     foreground: Option<String>,
     background: Option<String>,
@@ -6131,6 +6422,23 @@ fn next_stateful_control_start(input: &[u8], mut start: usize) -> Option<usize> 
         }
     }
     None
+}
+
+/// `neutralize_prompt_echo_source_sgr_on` for a terminal showing the default
+/// rendition, as the neutralizer's unit tests drive it.
+#[cfg(test)]
+fn neutralize_prompt_echo_source_sgr(
+    input: &[u8],
+    previous_visible_tail: &[u8],
+    reset_mode: ResetMode,
+) -> Vec<u8> {
+    neutralize_prompt_echo_source_sgr_on(
+        input,
+        previous_visible_tail,
+        reset_mode,
+        &NativeSgrState::default(),
+    )
+    .bytes
 }
 
 #[cfg(test)]
@@ -11119,6 +11427,42 @@ rules:
         super::TERMINAL_READS_UTF8_IN_THIS_THREAD.with(|switch| switch.set(None));
     }
 
+    // Whether a C1 byte runs depends on the encoding the terminal is in and
+    // on the terminal itself, so a removed SGR opened by one writes no off
+    // in its place, in either locale class: the bytes are 1.4.1's. A raw
+    // `9B` in a UTF-8 locale is text and is not removed at all.
+    #[test]
+    fn prompt_echo_off_is_not_taken_from_an_sgr_opened_by_a_c1_byte() {
+        let highlighter =
+            Highlighter::from_config(PrismConfig::default()).expect("empty config compiles");
+
+        // Generated from the released 1.4.1 prismtty, stdin to a terminal,
+        // in the C and en_US.UTF-8 locales.
+        for (introducer, reads_utf8, expected) in [
+            (
+                b"\x9b".as_slice(),
+                false,
+                b"\x1b[44mR1# \x1b[39mshow int\r\n".as_slice(),
+            ),
+            (b"\x9b", true, b"\x1b[44mR1#\x9b0;1m show int\r\n"),
+            (b"\xc2\x9b", false, b"\x1b[44mR1# \x1b[39mshow int\r\n"),
+            (b"\xc2\x9b", true, b"\x1b[44mR1# \x1b[39mshow int\r\n"),
+        ] {
+            super::TERMINAL_READS_UTF8_IN_THIS_THREAD.with(|switch| switch.set(Some(reads_utf8)));
+            let mut streaming = StreamingHighlighter::new_interactive(highlighter.clone());
+            let mut input = b"\x1b[44mR1#".to_vec();
+            input.extend_from_slice(introducer);
+            input.extend_from_slice(b"0;1m show int\r\n");
+            let mut output = streaming.push(&input);
+            output.extend(streaming.finish());
+            assert_eq!(
+                output, expected,
+                "terminal reads UTF-8: {reads_utf8}, {introducer:02x?}"
+            );
+        }
+        super::TERMINAL_READS_UTF8_IN_THIS_THREAD.with(|switch| switch.set(None));
+    }
+
     // The tokenizer accepts the UTF-8 encoding of C1 CSI (`C2 9B`) as a
     // control, so every classifier must treat it exactly like `9B` and `ESC [`.
     #[test]
@@ -11598,6 +11942,85 @@ rules:
         ] {
             assert!(!super::saves_rendition(other), "{other:02x?}");
         }
+    }
+
+    // Every push and pop spelling counts as a use of the SGR stack, a raw C1
+    // one too; the color stack, the SGR report and DECSTR do not.
+    #[test]
+    fn sgr_stack_use_is_read_in_every_spelling() {
+        for stack in [
+            b"\x1b[#{".as_slice(),
+            b"\x1b[#p",
+            b"\x1b[1;4;30;31#{",
+            b"\x1b[;#p",
+            b"\x1b[#}",
+            b"\x1b[#q",
+            b"\x9b#p",
+            b"\xc2\x9b#q",
+            b"\x1b\x00[#}",
+            b"\x1b[#\n}",
+        ] {
+            assert!(super::uses_sgr_stack(stack), "{stack:02x?}");
+        }
+        for other in [
+            b"\x1b[#P".as_slice(),
+            b"\x1b[#Q",
+            b"\x1b[1;1;1;1#|",
+            b"\x1b[!p",
+            b"\x1b[p",
+            b"\x1b[{",
+            b"\x1b[#\x18",
+            b"\x1b7",
+        ] {
+            assert!(!super::uses_sgr_stack(other), "{other:02x?}");
+        }
+    }
+
+    // A deliberate over-match: xterm ignores `#` after a private marker or
+    // another intermediate, but taking these for a use of the stack only
+    // returns the session to 1.4.1's bytes. Narrowing it needs the parser
+    // proof for every terminal with the stack.
+    #[test]
+    fn sgr_stack_use_deliberately_over_matches_forms_xterm_ignores() {
+        for ignored_by_xterm in [
+            b"\x1b[?#{".as_slice(),
+            b"\x1b[!#p",
+            b"\x1b[>#}",
+            b"\x1b[1 #q",
+        ] {
+            assert!(
+                super::uses_sgr_stack(ignored_by_xterm),
+                "{ignored_by_xterm:02x?}"
+            );
+        }
+    }
+
+    // The state without offs lives while an off makes the two differ, ends
+    // when they agree again, and is taken over, for good, at a push.
+    #[test]
+    fn tracked_state_without_offs_follows_the_offs_and_the_sgr_stack() {
+        let mut state = NativeSgrState::default();
+        state.apply_sequence(b"\x1b[44m");
+        state.apply_prompt_echo_off(b"\x1b[49m");
+        assert!(state.rendition.background.is_none());
+        let without_offs = state
+            .without_offs
+            .as_deref()
+            .expect("kept while they differ");
+        assert_eq!(without_offs.rendition.background.as_deref(), Some("44"));
+        state.apply_sequence(b"\x1b[0m");
+        assert!(state.without_offs.is_none());
+
+        state.apply_sequence(b"\x1b[7m");
+        state.apply_prompt_echo_off(b"\x1b[27m");
+        state.apply_sequence(b"\x1b[#p");
+        assert!(state.sgr_stack_used);
+        assert!(state.without_offs.is_none());
+        assert!(state.rendition.attributes.contains_key(&7));
+        assert!(state.prompt_echo_off(b"\x1b[0m").is_empty());
+        state.apply_sequence(b"\x1bc");
+        assert!(state.sgr_stack_used);
+        assert!(state.prompt_echo_off(b"\x1b[0m").is_empty());
     }
 
     #[test]
