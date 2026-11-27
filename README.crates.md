@@ -218,16 +218,16 @@ PrismTTY is not stopped; on macOS a PrismTTY that leads its terminal's session
 also waits, as it exits, while output it wrote to that terminal is still
 unread. The exit code describes the command PrismTTY started, not the rest of
 its process group: 0 does not mean that every process in the group finished
-cleanly. PrismTTY acts on the first such signal it has recorded by the time the
-session has finished ending, also when that signal arrives while the session is
-ending; a later one does not replace it, and from then on PrismTTY keeps the
-signals caught until it exits. A session that no such signal ended gives the
-signals back to their previous actions as it ends. That handoff is not exact:
-the signals are given back one after another, so a signal that arrives during
-it can take its previous action or still be handled by PrismTTY, and one of
-these signals whose handling had begun but was not yet recorded when the
-session finished ending is not acted on. A signal that arrives after that takes
-its previous action, as before.
+cleanly. PrismTTY acts on the first such signal recorded before the final
+pending-signal check in its shutdown handoff, including one recorded while the
+session is ending; a later recorded one does not replace it. If none is
+recorded by that check, PrismTTY gives the signals back to their previous
+actions. Give-back and any reinstallation of PrismTTY's handlers each use one
+`sigaction` per signal, so a signal during either transition can take its
+previous action or reach PrismTTY's handler. A handler that entered earlier but
+records such a signal only after the final check has no taker; that signal does
+not change the session's otherwise determined result. After give-back completes
+without reinstallation, later signals take their previous actions.
 
 SIGUSR1 and SIGUSR2 sent to PrismTTY are passed to the command it started,
 alone, while it runs, unless PrismTTY inherited them ignored or blocked, and do

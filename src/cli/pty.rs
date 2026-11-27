@@ -149,27 +149,20 @@ const END_LIMIT: Duration = Duration::from_secs(4);
 /// 1. No End: nothing recorded. `SessionSignalWatcher::stop` gives the
 ///    signals back to their previous actions; from then on a signal takes
 ///    that action, as in 1.4.1.
-/// 2. Recorded, not taken: a handler recorded it (`record`; the first one
-///    wins, a later one changes nothing). `stop` keeps the signals caught,
-///    and takes the End itself after joining the watcher, if the watcher did
-///    not take it first.
-/// 3. Taken, not published: the watcher, at the top of its loop, or `stop`,
-///    after the join, won `take`; only one thread can. The taker runs
-///    `end_session_after_signal`. `stop` keeps the signals caught and joins
-///    the watcher, which returns once its End is published or ends the
-///    process.
+/// 2. Recorded, not taken: the first `record` wins. If recorded before
+///    `stop`'s final check, the watcher or `stop` takes it; `stop` may
+///    already be giving dispositions back.
+/// 3. Taken, not published: the watcher or `stop` won `take` and runs
+///    `end_session_after_signal`. If give-back began, `stop` may need to
+///    reinstall handlers before or after joining the watcher.
 /// 4. Published: the outcome is under the reap lock and its status in
 ///    `PUBLISHED_LEADER_STATUS`. Who ends the process follows from it.
 ///
-/// So once an End is recorded the signals stay caught until the process
-/// exits, and every End recorded before `stop` makes its last check is
-/// taken. Two boundaries remain. An End recorded while `stop` is giving the
-/// signals back: `stop` then catches the signals again and takes the End,
-/// but the signals are given back and caught again one `sigaction` at a
-/// time, so another signal in between takes its previous action. And a
-/// handler that was entered while installed but records its End only after
-/// `stop` made its last check: that End has no taker, and the session ends
-/// with the command's status, as it did in 1.4.1.
+/// An End recorded before `stop`'s final check is taken by the watcher or by
+/// `stop`. Give-back and any reinstallation each use one `sigaction` per
+/// signal, so another signal can take its previous action in between. A
+/// handler that records only after the final check has no taker; that End
+/// does not change the session's otherwise determined result.
 struct PendingEnd {
     signal: AtomicI32,
     taken: AtomicBool,

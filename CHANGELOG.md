@@ -47,16 +47,16 @@ All notable changes to PrismTTY are documented here.
   terminal is still unread. When PrismTTY was sent SIGINT and the command died
   from it, PrismTTY still ends by SIGINT, and a command that dies from SIGINT
   after PrismTTY was sent SIGTERM still gives 143. PrismTTY acts on the first
-  ending signal it has recorded by the time the session has finished ending,
-  also when that signal arrives while the session is ending; a later one does
-  not replace it, and from then on PrismTTY keeps the signals caught until it
-  exits. A session that no ending signal ended gives the signals back to their
-  previous actions as it ends. That handoff is not exact: the signals are given
-  back one after another, so a signal that arrives during it can take its
-  previous action or still be handled by PrismTTY, and an ending signal whose
-  handling had begun but was not yet recorded when the session finished ending
-  is not acted on, as in earlier releases. A signal that arrives after that
-  takes its previous action, as before.
+  ending signal recorded before the final pending-signal check in its shutdown
+  handoff, including one recorded while the session is ending; a later recorded
+  ending signal does not replace it. If none is recorded by that check,
+  PrismTTY gives the signals back to their previous actions. Give-back and any
+  reinstallation of PrismTTY's handlers each use one `sigaction` per signal, so
+  a signal during either transition can take its previous action or reach
+  PrismTTY's handler. A handler that entered earlier but records an ending
+  signal only after the final check has no taker; that signal does not change
+  the session's otherwise determined result. After give-back completes without
+  reinstallation, later signals take their previous actions.
 
   This changes two statements of the 1.4.0 entry below: a signal other than
   SIGINT sent to PrismTTY no longer always ends it with 128 plus that signal,
