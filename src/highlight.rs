@@ -3622,16 +3622,19 @@ impl ScrollRegion {
 /// stays on the last row when a line feed comes), left and right margins
 /// (mode 69), reverse wraparound (modes 45 and 1045: BS and `CSI D` at the
 /// first column step back onto the row above), autowrap off (mode 7: text
-/// past the margin overwrites the last column), and a restore of saved modes
-/// that can put the terminal on the alternate screen.
+/// past the margin overwrites the last column), a restore of saved modes
+/// that can put the terminal on the alternate screen, insert mode, and the
+/// states that make a row narrower than the width the read loop gives or
+/// turn bytes of a UTF-8 character into controls (see the fields).
 ///
 /// Setting is read liberally, clearing strictly. Any CSI form can set a
 /// hazard, C1 forms included, and so can a mode number at any position or
 /// past what a terminal keeps, a number too large to read, a restore of saved
 /// modes and a soft reset (DECSTR can leave autowrap off). A hazard is cleared
 /// only by the exact `ESC [` form, with plain decimal parameters, within the
-/// first `MAX_RESET_PARAMETERS`, or by RIS. The terminal is taken to start in
-/// the default modes; a mode it was already in is not seen.
+/// first `MAX_RESET_PARAMETERS`, or by RIS, and a row size or a screen size
+/// only by RIS. The terminal is taken to start in the default modes; a mode it
+/// was already in is not seen.
 ///
 /// Xterm keeps one scroll region for both screens (`top_marg` and `bot_marg`
 /// in its `TScreen`, which a switch of screens leaves alone), and that is
