@@ -3364,7 +3364,8 @@ mod tests {
             default.sa_sigaction = libc::SIG_DFL;
             libc::sigemptyset(&mut default.sa_mask);
             let mut handler = default;
-            handler.sa_sigaction = sigint_caught_by_the_test as libc::sighandler_t;
+            let caught: extern "C" fn(libc::c_int) = sigint_caught_by_the_test;
+            handler.sa_sigaction = caught as libc::sighandler_t;
 
             libc::sigaction(libc::SIGINT, &default, std::ptr::null_mut());
             libc::pthread_sigmask(libc::SIG_UNBLOCK, &sigint, std::ptr::null_mut());
