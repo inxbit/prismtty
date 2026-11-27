@@ -2,7 +2,50 @@
 
 All notable changes to PrismTTY are documented here.
 
-## Unreleased
+## 1.4.0 - unreleased
+
+### Changed
+
+- When the wrapped command is killed by SIGINT, PrismTTY now ends by SIGINT
+  too instead of exiting with status 130, unless it had already been sent
+  another signal or was started with SIGINT ignored or blocked (both below).
+  A shell stops a loop typed at its prompt after one Ctrl-C only when the
+  command it waited for was killed by SIGINT, so
+  `for i in 1 2 3; do prismtty -- sleep 10; done` went on to the next round
+  after Ctrl-C; at a zsh or bash prompt, and in a PrismTTY session around an
+  interactive shell, it now stops as it does without PrismTTY.
+
+  How PrismTTY ends depends on where the SIGINT went. When it reached the
+  command without passing through PrismTTY (Ctrl-C typed while PrismTTY
+  passes the keyboard on, or `kill -INT` sent to the command), PrismTTY first
+  draws the command's last output, restores the terminal and removes its pid
+  file. When PrismTTY itself was sent the SIGINT (Ctrl-C with stdin
+  redirected, or `kill -INT` sent to PrismTTY) and the command died from the
+  SIGINT that PrismTTY passed on, the end is as abrupt as the exit with 130 it
+  replaces: PrismTTY restores the terminal, collects the command and removes
+  its pid file, and output not yet drawn can be lost, such as a last line
+  without a line end, the reset of an open highlight colour, or its record in
+  the trace. When PrismTTY had been sent a different signal, such as SIGTERM,
+  and the command then died from SIGINT, PrismTTY still exits with 128 plus
+  the signal it was sent.
+
+  What a caller sees. In a shell, `$?` is still 130. Where PrismTTY now ends
+  by SIGINT, a program that reads the wait status itself sees a death by
+  SIGINT: Python's `subprocess` reports -2 instead of 130, and `make` prints
+  `Interrupt` instead of `Error 130`.
+
+  What stays as before. A command killed by SIGQUIT, SIGTERM, SIGHUP or a
+  crash is still reported as 128 plus the signal, and any signal other than
+  SIGINT that PrismTTY is sent still ends it with 128 plus that signal. A
+  command that handles SIGINT and exits keeps its exit code when the SIGINT
+  reached it directly; when PrismTTY was sent the SIGINT and passed it on,
+  PrismTTY exits with 130, as before. When SIGINT was ignored or blocked as
+  PrismTTY started (`cmd &` in a script ignores it), PrismTTY still exits with
+  130. A script that runs with the terminal on its stdin (`bash loop.sh`), and
+  a zsh or dash pipeline where PrismTTY is not the last command, still go on
+  after one Ctrl-C: those shells stop only when they receive the Ctrl-C
+  themselves, and while PrismTTY holds the terminal in raw mode it is
+  PrismTTY that receives it.
 
 ### Fixed
 
