@@ -2681,6 +2681,9 @@ fn wrapped_command_runs_with_few_descriptors_to_spare() {
         let mut ptty = ProcessGuard::new(command.spawn().expect("spawn ptty"));
         drop(command);
         drop(tty);
+        // On Linux the capture of the outer terminal ends only once no slave
+        // descriptor is left, this test's own included.
+        drop(pair.slave);
         let captures = match terminal_capture {
             Some(capture) => vec![capture],
             None => {
