@@ -210,6 +210,9 @@ pub struct StreamingHighlighter {
     /// True when the read loop holds bytes cut off at the end of the chunk
     /// being pushed (an unfinished control or character) for the next read.
     read_ends_mid_sequence: bool,
+    /// The terminal's height and width for the chunk being pushed, set by the
+    /// read loop before the push and dropped after it.
+    terminal_size: Option<(u16, u16)>,
     /// Terminal modes, followed through the output, that let the cursor go
     /// back to a cell already drawn; see [`LayoutModes`].
     layout_modes: LayoutModes,
@@ -1201,6 +1204,7 @@ impl StreamingHighlighter {
             pending_from_prompt_echo_remainder: false,
             pending_from_interactive_split: false,
             read_ends_mid_sequence: false,
+            terminal_size: None,
             layout_modes: LayoutModes::default(),
             line_rewritten_in_place: false,
             alternate_screen: false,
@@ -1225,6 +1229,7 @@ impl StreamingHighlighter {
             pending_from_prompt_echo_remainder: false,
             pending_from_interactive_split: false,
             read_ends_mid_sequence: false,
+            terminal_size: None,
             layout_modes: LayoutModes::default(),
             line_rewritten_in_place: false,
             alternate_screen: false,
@@ -1249,6 +1254,7 @@ impl StreamingHighlighter {
             pending_from_prompt_echo_remainder: false,
             pending_from_interactive_split: false,
             read_ends_mid_sequence: false,
+            terminal_size: None,
             layout_modes: LayoutModes::default(),
             line_rewritten_in_place: false,
             alternate_screen: false,
@@ -1273,6 +1279,7 @@ impl StreamingHighlighter {
             pending_from_prompt_echo_remainder: false,
             pending_from_interactive_split: false,
             read_ends_mid_sequence: false,
+            terminal_size: None,
             layout_modes: LayoutModes::default(),
             line_rewritten_in_place: false,
             alternate_screen: false,
@@ -1369,6 +1376,7 @@ impl StreamingHighlighter {
                 .oversized_string_controls
                 .consume_discarded(chunk.bytes())
             else {
+                self.terminal_size = None;
                 return Vec::new();
             };
             suffix
@@ -1386,7 +1394,9 @@ impl StreamingHighlighter {
         if self.passthrough_single_byte_chunks {
             self.layout_modes.observe(&chunk.tokens);
         }
-        self.push_combined_chunk(chunk)
+        let output = self.push_combined_chunk(chunk);
+        self.terminal_size = None;
+        output
     }
 
     fn push_combined_chunk(&mut self, mut combined: AnsiChunk) -> Vec<u8> {
@@ -1559,16 +1569,21 @@ impl StreamingHighlighter {
         self.read_ends_mid_sequence = cut;
     }
 
-    /// True while a scroll region is recorded whose extent depends on the
-    /// terminal's height, so the read loop passes the height before the next
-    /// chunk.
-    pub(crate) fn needs_terminal_rows(&self) -> bool {
-        matches!(self.layout_modes.scroll_region, ScrollRegion::Set { .. })
+    /// Whether the read loop should pass the terminal's size before pushing
+    /// `chunk`: the cursor-move bypass judges a read that holds a cursor move
+    /// against the terminal's height and width.
+    pub(crate) fn wants_terminal_size(&self, chunk: &AnsiChunk) -> bool {
+        self.passthrough_single_byte_chunks
+            && (!self.pending.is_empty()
+                || contains_cursor_positioning_sequence_tokens(&chunk.tokens))
     }
 
-    /// The terminal's height in rows, 0 when it is not known.
-    pub(crate) fn set_terminal_rows(&mut self, rows: u16) {
-        self.layout_modes.terminal_rows = rows;
+    /// The height and width of the terminal the output is written to, for the
+    /// next push only. Hidden: it is for the command line and the tests, not
+    /// part of the supported library API.
+    #[doc(hidden)]
+    pub fn set_terminal_size(&mut self, rows: u16, columns: u16) {
+        self.terminal_size = Some((rows, columns));
     }
 
     /// Returns the reset for an interactive highlight style that is still
@@ -1701,9 +1716,10 @@ impl StreamingHighlighter {
             // cursor back to a cell they were drawn on. A control still open at
             // the end of the read is not known yet, so it keeps the bypass. A
             // later read can still go back into those lines.
+            let (rows, _columns) = self.terminal_size.unwrap_or((0, 0));
             let split = if self.pending.is_empty()
                 && !self.read_ends_mid_sequence
-                && self.layout_modes.allow_promotion()
+                && self.layout_modes.allow_promotion(rows)
             {
                 plain_lines_before_prompt_redraw(&input.tokens, &self.visible_line_tail)
             } else {
@@ -3507,8 +3523,6 @@ enum ScrollRegion {
 #[derive(Clone, Debug, Default)]
 struct LayoutModes {
     scroll_region: ScrollRegion,
-    /// The terminal's height, 0 when unknown.
-    terminal_rows: u16,
     reverse_wrap: bool,
     reverse_wrap_any_line: bool,
     left_right_margins: bool,
@@ -3527,10 +3541,7 @@ impl LayoutModes {
 
     fn observe_control(&mut self, bytes: &[u8]) {
         if bytes == b"\x1bc" {
-            *self = Self {
-                terminal_rows: self.terminal_rows,
-                ..Self::default()
-            };
+            *self = Self::default();
             return;
         }
         let Some(body) = csi_body(bytes) else {
@@ -3606,8 +3617,10 @@ impl LayoutModes {
         }
     }
 
-    fn allow_promotion(&self) -> bool {
-        let rows = u32::from(self.terminal_rows);
+    /// Whether the modes let a read be promoted, on a terminal `rows` high
+    /// (0 when that is not known).
+    fn allow_promotion(&self, rows: u16) -> bool {
+        let rows = u32::from(rows);
         !self.reverse_wrap
             && !self.reverse_wrap_any_line
             && !self.left_right_margins

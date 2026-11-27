@@ -2825,9 +2825,10 @@ fn current_pty_size() -> PtySize {
     fallback_pty_size(pty_size_from_fd(stdin.as_fd()))
 }
 
-/// The height of the terminal PrismTTY writes to, 0 when it is not known.
-pub(super) fn output_terminal_rows() -> u16 {
-    pty_size_from_fd(io::stdout().as_fd()).map_or(0, |size| size.rows)
+/// The height and width of the terminal PrismTTY writes to, 0 for one that
+/// is not known.
+pub(super) fn output_terminal_size() -> (u16, u16) {
+    pty_size_from_fd(io::stdout().as_fd()).map_or((0, 0), |size| (size.rows, size.cols))
 }
 
 fn fallback_pty_size(size: Option<PtySize>) -> PtySize {
