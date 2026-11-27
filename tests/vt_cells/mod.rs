@@ -7,6 +7,12 @@
 //! 45 and 1045 (reverse wraparound, as xterm reads them) and 47, 1047 and 1049
 //! (alternate screen). Erases fill with the current background. Anything else
 //! is parsed and ignored, as a terminal ignores what it does not know.
+//!
+//! It is a focused model, not a general terminal oracle: one pair of scroll
+//! margins serves both screens, left and right margins (mode 69) and
+//! XTSAVE/XTRESTORE are not followed, and a blank cell takes only the
+//! background, never inverse or underline. The tests that turn on those
+//! judge by bytes: the read must come out as released 1.4.1 writes it.
 #![allow(dead_code)]
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

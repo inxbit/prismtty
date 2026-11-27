@@ -29,15 +29,27 @@ fn streaming() -> StreamingHighlighter {
     StreamingHighlighter::new_interactive(highlighter)
 }
 
-/// Pushes each read as one chunk, the way the read loop does, then finishes.
-fn render(reads: &[&[u8]]) -> Vec<u8> {
+/// The terminal the library tests write to, unless a test names its own.
+const ROWS: usize = 24;
+const COLUMNS: usize = 80;
+
+/// Pushes each read as one chunk, the way the read loop does, with the size
+/// of a terminal `rows` by `cols` that the read loop gives, then finishes.
+fn render_on(rows: usize, cols: usize, reads: &[&[u8]]) -> Vec<u8> {
+    let rows = u16::try_from(rows).expect("rows");
+    let cols = u16::try_from(cols).expect("cols");
     let mut streaming = streaming();
     let mut output = Vec::new();
     for read in reads {
+        streaming.set_terminal_size(rows, cols);
         output.extend(streaming.push(read));
     }
     output.extend(streaming.finish());
     output
+}
+
+fn render(reads: &[&[u8]]) -> Vec<u8> {
+    render_on(ROWS, COLUMNS, reads)
 }
 
 fn contains(haystack: &[u8], needle: &[u8]) -> bool {
@@ -57,7 +69,11 @@ fn concat(parts: &[&[u8]]) -> Vec<u8> {
 /// The read stays on the cursor-move bypass: released 1.4.1 writes these
 /// reads byte for byte as they came, and so must this one.
 fn assert_bypassed(name: &str, reads: &[&[u8]]) {
-    let output = render(reads);
+    assert_bypassed_on(name, ROWS, COLUMNS, reads);
+}
+
+fn assert_bypassed_on(name: &str, rows: usize, cols: usize, reads: &[&[u8]]) {
+    let output = render_on(rows, cols, reads);
     assert_eq!(
         output,
         joined(reads),
@@ -116,7 +132,7 @@ fn assert_only_errors_colored(
     reads: &[&[u8]],
     colored_rows: &[usize],
 ) {
-    let output = render(reads);
+    let output = render_on(rows, cols, reads);
     let shown = Screen::rendered(rows, cols, &output);
     let raw = Screen::rendered(rows, cols, &joined(reads));
     assert!(
@@ -160,7 +176,7 @@ fn assert_only_errors_colored(
 #[test]
 fn lines_that_share_a_read_with_a_prompt_redraw_are_colored() {
     let read = b"link is down error 192.0.2.1\r\nsecond error\r\n\x1b[1G\x1b[0Kuser@host ~ $ ";
-    let output = render(&[read]);
+    let output = render_on(6, 40, &[read]);
     assert!(
         output.ends_with(b"\x1b[1G\x1b[0Kuser@host ~ $ "),
         "the prompt redraw is written unchanged: {:?}",
@@ -249,7 +265,7 @@ fn a_mode_reset_lets_the_next_prompt_redraw_color_its_lines_again() {
         ("RIS", &[b"\x1b[?1045h\x1b[?7l\x1b[1;3r", b"\x1bc", read]),
     ];
     for (name, reads) in cases {
-        let output = render(reads);
+        let output = render_on(6, 24, reads);
         let screen = Screen::rendered(6, 24, &output);
         let row = (0..6)
             .find(|row| screen.text(*row).starts_with("error"))
@@ -531,12 +547,120 @@ fn prompt_shaped_tails_are_read_strictly() {
     }
 }
 
+/// A move stops at the edge of the screen, so where `CSI C`, `CSI D` and
+/// `CSI G` leave the cursor, and where text wraps, depends on the terminal's
+/// width. A read in which later text could land on the prompt, or leave the
+/// cursor on a row without it, keeps the bypass.
+#[test]
+fn moves_that_stop_at_the_edge_keep_the_bypass_review_70() {
+    let zsh_right_prompt: &[u8] = b"error\r\n\x1b[1G\x1b[0KHOST% \x1b[K\x1b[53C[0]\x1b[56D";
+    let cases: [(&str, usize, &[u8]); 10] = [
+        (
+            "right then left past both edges",
+            8,
+            b"error\r\n\x1b[1GR1# \x1b[999C\x1b[999Dworking",
+        ),
+        (
+            "a shorter overwrite after both edges",
+            8,
+            b"error\r\n\x1b[1GR1# \x1b[999C\x1b[999Dok",
+        ),
+        (
+            "a longer overwrite after both edges",
+            8,
+            b"error\r\n\x1b[1GR1# \x1b[99C\x1b[99Dworking-on-it",
+        ),
+        (
+            "large counts right, then left",
+            20,
+            b"error\r\n\x1b[1Gp$ \x1b[50C\x1b[40DOK",
+        ),
+        (
+            "left past the first column",
+            20,
+            b"error\r\n\x1b[1Gp$ \x1b[9Dx",
+        ),
+        (
+            "a column past the written text, then left",
+            8,
+            b"error\r\n\x1b[1Gp$ \x1b[30G\x1b[20Dx",
+        ),
+        (
+            "text past the last column wraps to the next row",
+            8,
+            b"error\r\n\x1b[1Gp$ \x1b[4Cxyz",
+        ),
+        (
+            "wide characters before the prompt",
+            80,
+            "error\r\n\x1b[1G\u{754c}\u{754c}\x1b[Kp$ \x1b[7Gx".as_bytes(),
+        ),
+        (
+            "combining marks before the prompt",
+            80,
+            "error\r\n\x1b[1Ge\u{301}e\u{301}\x1b[Kp$ \x1b[3Gx".as_bytes(),
+        ),
+        (
+            "a zsh right prompt drawn for a wider terminal",
+            40,
+            zsh_right_prompt,
+        ),
+    ];
+    for (name, cols, read) in cases {
+        assert_bypassed_on(name, 5, cols, &[read]);
+    }
+}
+
+/// A move that stops at the edge is followed as the terminal follows it, so a
+/// prompt that survives it still counts, and a zsh right prompt drawn for the
+/// terminal's width does too.
+#[test]
+fn moves_that_stop_at_the_edge_are_followed_exactly() {
+    assert_only_errors_colored(
+        "right and left past both edges, back after the prompt",
+        5,
+        20,
+        &[b"error\r\n\x1b[1Gp$ \x1b[K\x1b[99C\x1b[3D[0]\x1b[99D\x1b[3C"],
+        &[0],
+    );
+    assert_only_errors_colored(
+        "zsh right prompt at its width",
+        5,
+        80,
+        &[b"error\r\n\x1b[1G\x1b[0KHOST% \x1b[K\x1b[53C[0]\x1b[56D"],
+        &[0],
+    );
+}
+
+/// Without the terminal's size nothing tells where a move lands, so a read
+/// with a cursor move is written as it came, as in 1.4.1. A size counts for
+/// the push it was given for.
+#[test]
+fn a_read_pushed_without_the_terminal_size_keeps_the_bypass() {
+    let read: &[u8] = b"error\r\n\x1b[1G\x1b[0KR1# ";
+    let mut without_size = streaming();
+    let mut output = without_size.push(read);
+    output.extend(without_size.finish());
+    assert_eq!(output, read, "{:?}", String::from_utf8_lossy(&output));
+
+    let mut sized = streaming();
+    sized.set_terminal_size(24, 80);
+    let first = sized.push(read);
+    assert!(
+        contains(&first, b"\x1b[38"),
+        "{:?}",
+        String::from_utf8_lossy(&first)
+    );
+    let second = sized.push(read);
+    assert_eq!(second, read, "{:?}", String::from_utf8_lossy(&second));
+}
+
 /// Accepted limit: the lines are colored when they are written, and a later
 /// read that goes back into one and rewrites only part of it without
 /// erasing leaves color on the rest. Pinned so a change to it is seen.
 #[test]
 fn documented_limit_a_later_read_rewrites_part_of_a_colored_line() {
-    let up = render(&[b"error error\r\n\x1b[1Gp$ ", b"\x1b[1A\x1b[1GOK"]);
+    let up = render_on(6, 24, &[b"error error\r\n\x1b[1Gp$ ", b"\x1b[1A\x1b[1GOK"]);
     let screen = Screen::rendered(6, 24, &up);
     assert_eq!(screen.text(0), "OKror error");
     assert_eq!(
@@ -546,21 +670,29 @@ fn documented_limit_a_later_read_rewrites_part_of_a_colored_line() {
         String::from_utf8_lossy(&up)
     );
 
-    let shell = render(&[
-        b"error error\r\n\x1b[1G\x1b[0Kuser@host:~$ ",
-        b"\x1b[1;1HOK",
-    ]);
+    let shell = render_on(
+        6,
+        24,
+        &[
+            b"error error\r\n\x1b[1G\x1b[0Kuser@host:~$ ",
+            b"\x1b[1;1HOK",
+        ],
+    );
     let screen = Screen::rendered(6, 24, &shell);
     assert_eq!(screen.text(0), "OKror error");
     assert_eq!(red_text(&screen, 0), vec![2, 3, 4, 6, 7, 8, 9, 10]);
 
-    let restore = render(&[b"\x1b7", b"error error\r\n\x1b[1Gp$ ", b"\x1b8OK"]);
+    let restore = render_on(6, 24, &[b"\x1b7", b"error error\r\n\x1b[1Gp$ ", b"\x1b8OK"]);
     let screen = Screen::rendered(6, 24, &restore);
     assert_eq!(screen.text(0), "OKror error");
     assert_eq!(red_text(&screen, 0), vec![2, 3, 4, 6, 7, 8, 9, 10]);
 
     // An erase in the later read leaves nothing behind.
-    let erased = render(&[b"error error\r\n\x1b[1Gp$ ", b"\x1b[1A\x1b[1G\x1b[KOK"]);
+    let erased = render_on(
+        6,
+        24,
+        &[b"error error\r\n\x1b[1Gp$ ", b"\x1b[1A\x1b[1G\x1b[KOK"],
+    );
     let screen = Screen::rendered(6, 24, &erased);
     assert_eq!(screen.text(0), "OK");
     assert!(red_text(&screen, 0).is_empty());
@@ -574,7 +706,7 @@ fn documented_limit_a_mode_set_before_prismtty_started() {
     // In the default modes `CSI 11D` stops at the first column and `OK`
     // lands left of the prompt; with 1045 already on it steps back onto
     // the colored line.
-    let output = render(&[b"error\r\n\x1b[4Gp$ \x1b[11DOK"]);
+    let output = render_on(5, 8, &[b"error\r\n\x1b[4Gp$ \x1b[11DOK"]);
     let default_modes = Screen::rendered(5, 8, &output);
     assert_eq!(default_modes.text(0), "error");
     assert_eq!(default_modes.text(1), "OK p$");
@@ -623,6 +755,16 @@ fn run_in_pty(
     script: &str,
     during: impl FnOnce(&dyn portable_pty::MasterPty, &Path),
 ) -> Run {
+    run_in_pty_of(rows, 40, script, during)
+}
+
+/// As [`run_in_pty`], in a PTY `cols` wide.
+fn run_in_pty_of(
+    rows: u16,
+    cols: u16,
+    script: &str,
+    during: impl FnOnce(&dyn portable_pty::MasterPty, &Path),
+) -> Run {
     let dir = tempfile::tempdir().expect("tempdir");
     let home = dir.path().join("home");
     let runtime = dir.path().join("rt");
@@ -639,7 +781,7 @@ fn run_in_pty(
     let pair = native_pty_system()
         .openpty(PtySize {
             rows,
-            cols: 40,
+            cols,
             pixel_width: 0,
             pixel_height: 0,
         })
@@ -752,6 +894,31 @@ fn pty_output_written_with_its_prompt_redraw_in_one_write_is_colored() {
     }
     assert!(red_text(&screen, 2).is_empty());
     assert!(run.renders.ends_with(b"\x1b[1G\x1b[0Kuser@host ~ $ "));
+}
+
+#[test]
+fn pty_moves_that_stop_at_the_edge_are_judged_against_the_terminal_width() {
+    // Review 70's read in a PTY 8 columns wide: `CSI 999C` stops at the last
+    // column, `CSI 999D` at the first, and `working` writes over `R1# `.
+    let overwritten =
+        "printf 'error\\r\\n\\033[1GR1# \\033[999C\\033[999Dworking' | cat; sleep 0.2";
+    let run = run_in_pty_of(5, 8, overwritten, |_, _| {});
+    assert_eq!(run.reads.len(), 1, "one read: {:?}", run.reads);
+    assert_eq!(
+        run.renders,
+        run.reads.concat(),
+        "{:?}",
+        String::from_utf8_lossy(&run.renders)
+    );
+    // Back past the prompt instead, it survives and the line is colored.
+    let kept = "printf 'error\\r\\n\\033[1GR1# \\033[999C\\033[999D\\033[4C' | cat; sleep 0.2";
+    let run = run_in_pty_of(5, 8, kept, |_, _| {});
+    assert_eq!(run.reads.len(), 1, "one read: {:?}", run.reads);
+    assert!(
+        contains(&run.renders, b"\x1b[38;2;255;0;0m"),
+        "{:?}",
+        String::from_utf8_lossy(&run.renders)
+    );
 }
 
 #[test]
