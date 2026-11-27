@@ -213,6 +213,12 @@ prismtty --profile cisco < show-tech.txt
 journalctl -xe | prismtty --profile linux-unix
 ```
 
+When PrismTTY reads a file or a pipe, highlighting pauses while the alternate
+screen that full-screen programs such as `less` and `vim` draw on is active,
+and resumes when that screen is closed or the terminal is reset. Output that
+ends before then, such as a log cut off while a pager was open, stays
+unhighlighted from the switch on.
+
 A wrapped command runs in the current directory. Descriptors above 2 that the
 caller passes (`ptty cmd 3<file`, `ptty diff <(a) <(b)`) reach the command as
 they would without the wrapper. When stdin is not a terminal (a script, a CI
@@ -226,6 +232,12 @@ line ends are saved as the command wrote them; the command can change that
 setting. With the keyboard on a terminal and the output in a pipe
 (`ptty ssh host | tee log`) the PTY keeps its usual output settings, because
 the pipe usually leads back to that terminal.
+With stdin redirected and the output on a terminal (`ptty make </dev/null`),
+the PTY keeps its usual settings too, so a recording of that terminal's output
+holds an extra carriage return on each line (CR CR LF); on screen the lines
+look the same. This is on purpose: the PTY ends each line with CR LF itself, so
+the lines still start at the left edge if another program turns off the
+terminal's output processing during the session.
 
 A command killed by a signal is reported as 128 plus the signal number, as a
 shell does, with one exception: when SIGINT (Ctrl-C) kills the command,
@@ -270,7 +282,9 @@ Important options:
 - `--sanitize` strips window-title, clipboard (OSC 52), and other OSC/DCS string
   escapes from program output — hardening against escape injection from
   untrusted remote devices.
-- `--show-profile` prints profile selections and transitions to stderr.
+- `--show-profile` prints profile selections and transitions to stderr. With
+  auto-detection on, a selection that stays `generic` is not reported, so a
+  session that never leaves `generic` prints nothing.
 - `--local-echo` locally echoes printable typed keys for no-echo device sessions.
 - `--no-minimal-reset` uses full SGR resets in interactive streams for terminal
   emulators that ignore minimal foreground/background resets. It can also be
@@ -314,6 +328,12 @@ rules:
     color: f#00ffff
 ```
 
+Rules match bytes, not characters. A class like `[äöü]` is the set of bytes
+those letters are made of, so it also colors other letters that share one of
+those bytes, such as `é`, `ß` and `ñ`. To match characters, start the rule with
+`(*UTF)`, as in `regex: '(*UTF)[äöü]'`. Since 1.3.12 such a rule keeps working
+past bytes in the output that are not valid UTF-8.
+
 Native profile files add metadata:
 
 ```yaml
@@ -354,9 +374,22 @@ prismtty --reload
 The next output chunk in each running PrismTTY session reloads the active config.
 Only sessions watching the same runtime directory see the reload request.
 Set `PRISMTTY_RUNTIME_DIR` to override the runtime directory, which is useful for
-tests or isolated sessions. An existing directory is used as it is; one that
+tests or isolated sessions. An existing directory keeps its mode; one that
 other users can write to is refused, which only disables live reload for that
-session.
+session. PrismTTY owns `pids.d` and `reload` inside that directory: each
+session sets `pids.d` to mode 0700 and deletes every regular file in it whose
+name is not the number of a running process. Do not point the variable at a
+directory that has a `pids.d` or a `reload` of your own.
+
+The name `prismtty-<uid>` is easy to predict. In a temporary directory that
+other users can write to, such as `/tmp` on Linux without `TMPDIR` or a shared
+directory named by `TMPDIR`, another local user who creates that name first
+disables live reload for your sessions. Those sessions still show and
+highlight their output, and each prints `prismtty: live reload disabled for
+this session` and the reason. To avoid it, set `PRISMTTY_RUNTIME_DIR` to a
+private directory, such as one in your home, or set `TMPDIR` to a private one.
+The default temporary directory on macOS is a per-user one that only you can
+write to, also when `TMPDIR` is unset, so it is not affected.
 
 ## Built-In Profiles
 

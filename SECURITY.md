@@ -95,3 +95,24 @@ examples that preserve only the token shape needed to reproduce the issue.
   byte that would introduce a string, `--sanitize` and `--strip-ansi` drop the
   ESC and show the introducer and the payload as text; with the ESC gone, the
   terminal runs no string control.
+- `--sanitize` and `--strip-ansi` guard against string controls (OSC, DCS,
+  SOS, PM, APC) for a terminal that reads UTF-8. They do not remove every
+  terminal control: `--sanitize` keeps CSI sequences such as colors and
+  screen clears on purpose, as above, and both keep C0 controls such as BEL
+  and line ends. In plain text, a UTF-8 character that is not itself a C1
+  control passes both flags in any locale, even when one of its bytes is
+  `90`, `98`, `9D`, `9E` or `9F`, and a terminal that reads 8-bit bytes
+  instead reads that byte as a control: the last byte of U+201D (`E2 80 9D`)
+  is `9D`, the start of an OSC string there. A character cut off at the end
+  of the output (`F0 9D`) is passed as it is too. So on a terminal that reads
+  8-bit bytes, whatever the locale, these flags do not keep every string
+  control from reaching it.
+- Live reload uses `prismtty-<uid>` in the system temporary directory, a name
+  other local users can predict. When that directory is one others can write
+  to, such as `/tmp` on Linux without `TMPDIR` or a shared directory named by
+  `TMPDIR`, a user who creates the name first disables live reload for your
+  sessions. The sessions' output is not affected, and each prints
+  `prismtty: live reload disabled for this session` and the reason. Set
+  `PRISMTTY_RUNTIME_DIR` or `TMPDIR` to a private directory to avoid it. The
+  default temporary directory on macOS is per user, also with `TMPDIR` unset,
+  and is not affected.
