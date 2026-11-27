@@ -2,6 +2,44 @@
 
 All notable changes to PrismTTY are documented here.
 
+## 1.3.16 - 2026-11-26
+
+### Fixed
+
+- On Linux, a wrapped session ends when the wrapped command exits, as it
+  already does on macOS. A background job that the command left behind with
+  the terminal still open kept the session going: `sleep 600 &`, `disown` or
+  `setsid` before `exit` in a wrapped shell, or anything that ignores SIGHUP.
+  The terminal stayed in raw mode, Ctrl-C only printed `^C`, and the exit
+  status came only when the job let the terminal go. On Linux 6.8,
+  `prismtty -- sh -c 'trap "" HUP; sleep 6 & exit 3'` returned after 6 s; it
+  now returns at once with status 3, and everything the command itself
+  printed is drawn first. PrismTTY sends no signal to what the command leaves
+  behind.
+
+  This needs Linux 4.12 or newer. On an older kernel, and on WSL1, nothing
+  changes and such a job still keeps the session open, because there the
+  command's last output could be missed. The same holds when PrismTTY has no
+  file descriptors to spare for it.
+
+  What it costs. Output that a surviving background job writes after the
+  command has exited may not be shown, as on macOS. Launchers that start a
+  program in the background and exit (`ssh -f host cmd`, `setsid -f`,
+  `sudo -b`, a script that ends in `cmd &`) end the session when the launcher
+  exits, as they already do on macOS. A command that switches its terminal to
+  a line discipline other than the ordinary one (N_TTY) and holds output back
+  there can lose bytes it wrote. With file descriptors nearly exhausted, a
+  later configuration reload can find none left.
+
+### Documentation
+
+- Both READMEs show how to page a wrapped command's output,
+  `ptty cmd </dev/null | less -R`, and say what happens without the redirect:
+  PrismTTY and the pager both read the keyboard and set the terminal's modes,
+  and quitting the pager while the command still runs can leave the terminal
+  in the pager's mode until `stty sane`.
+- Both READMEs describe when a Linux session ends.
+
 ## 1.3.15 - 2026-11-26
 
 Version 1.3.14 was tagged but never published. One of its new tests compared
