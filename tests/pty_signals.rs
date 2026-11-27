@@ -3821,10 +3821,13 @@ fn wrapper_on_a_terminal_dies_from_sigint_after_restoring_it_when_its_command_di
 }
 
 /// What a shell prints for the loop typed at its prompt, from the typed line
-/// to the prompt that follows one Ctrl-C. `argv` starts the shell (or a
-/// wrapper around it) as the session leader of a fresh terminal with SIGINT at
-/// its default action; with `wrapped`, the loop runs its command under the
-/// wrapper.
+/// until one Ctrl-C has either brought the prompt back or let the next round
+/// start. `argv` starts the shell (or a wrapper around it) as the session
+/// leader of a fresh terminal with SIGINT at its default action; with
+/// `wrapped`, the loop runs its command under the wrapper. Each round's
+/// command prints READY and then waits until it is killed, so Ctrl-C is typed
+/// only once the first round's command runs, and no round can end on its own
+/// however slow the machine is.
 fn loop_after_one_ctrl_c(scratch: &Scratch, argv: &[&str], wrapped: bool) -> Vec<u8> {
     use std::os::unix::fs::OpenOptionsExt;
 
@@ -3868,6 +3871,7 @@ fn loop_after_one_ctrl_c(scratch: &Scratch, argv: &[&str], wrapped: bool) -> Vec
             .get(start..)
             .is_some_and(|tail| contains_bytes(tail, needle))
     };
+    let shown = || capture.wait_until(Duration::ZERO, |_| true);
 
     assert!(
         wait_for_condition(Duration::from_secs(10), || len_now() > 0),
@@ -3887,7 +3891,7 @@ fn loop_after_one_ctrl_c(scratch: &Scratch, argv: &[&str], wrapped: bool) -> Vec
     let start = len_now();
     type_text(
         format!(
-            "for i in 1 2 3; do {prefix}sh -c 'echo RE\"\"ADY; exec sleep 3'; echo IT\"\"ER $i; done; echo LOOP\"\"DONE\r"
+            "for i in 1 2 3; do {prefix}sh -c 'echo RE\"\"ADY; exec sleep 600'; echo IT\"\"ER $i; done; echo LOOP\"\"DONE\r"
         )
         .as_bytes(),
     );
@@ -3897,21 +3901,38 @@ fn loop_after_one_ctrl_c(scratch: &Scratch, argv: &[&str], wrapped: bool) -> Vec
     );
     let interrupted = len_now();
     type_text(b"\x03");
-    let back = seen_after(interrupted, b"PROMPT> ", Duration::from_secs(20));
-    let output = capture.wait_until(Duration::ZERO, |_| true)[start..].to_vec();
+    // Whichever comes first: the prompt (the loop stopped) or the next
+    // round's READY (it went on).
+    let settled = wait_for_condition(Duration::from_secs(20), || {
+        let output = shown();
+        output
+            .get(interrupted..)
+            .is_some_and(|tail| contains_bytes(tail, b"PROMPT> ") || contains_bytes(tail, b"READY"))
+    });
+    let output = shown()[start..].to_vec();
     assert!(
-        back,
-        "the shell did not come back to its prompt: {:?}",
+        settled,
+        "after Ctrl-C neither the prompt came back nor the next round started within 20 s: {:?}",
         String::from_utf8_lossy(&output)
     );
-    type_text(b"exit\r");
-    let _ = shell.wait_for_exit(Duration::from_secs(5));
+    if count_of(&output, b"READY") == 1 {
+        type_text(b"exit\r");
+        let _ = shell.wait_for_exit(Duration::from_secs(5));
+    }
     output
+}
+
+fn count_of(haystack: &[u8], needle: &[u8]) -> usize {
+    haystack
+        .windows(needle.len())
+        .filter(|window| *window == needle)
+        .count()
 }
 
 fn assert_loop_stopped(output: &[u8], what: &str) {
     assert!(
-        contains_bytes(output, b"READY")
+        count_of(output, b"READY") == 1
+            && contains_bytes(output, b"PROMPT> ")
             && !contains_bytes(output, b"ITER 2")
             && !contains_bytes(output, b"LOOPDONE"),
         "{what}: the loop went on after one Ctrl-C: {:?}",
@@ -4087,8 +4108,10 @@ fn a_command_killed_by_another_signal_still_reports_128_plus_the_signal() {
     }
 }
 
-/// SIGTERM sent to the wrapper ends it with 143 even when the command, which
-/// ignores SIGTERM, is then killed by SIGINT.
+/// SIGTERM sent to the wrapper ends it with 143 even when the command is then
+/// killed by SIGINT. The command sends the SIGTERM itself and answers the
+/// SIGTERM the wrapper forwards to it with SIGINT to itself, so the wrapper
+/// has received SIGTERM, and is waiting for the command, when SIGINT kills it.
 #[test]
 fn sigterm_to_the_wrapper_still_reports_143_when_the_command_then_dies_from_sigint() {
     use std::os::unix::process::ExitStatusExt;
@@ -4098,7 +4121,7 @@ fn sigterm_to_the_wrapper_still_reports_143_when_the_command_then_dies_from_sigi
     let run = run_redirected(
         &scratch,
         &[],
-        "trap '' TERM; kill -TERM $PPID; sleep 0.2; kill -INT $$; sleep 5",
+        "trap 'kill -INT $$' TERM; kill -TERM $PPID; while :; do sleep 1; done",
         EntrySigint::Default,
         None,
     );
