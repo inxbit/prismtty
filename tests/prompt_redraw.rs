@@ -670,17 +670,29 @@ fn a_read_pushed_without_the_terminal_size_keeps_the_bypass() {
     );
 }
 
-/// Xterm keeps one scroll region for both screens. A terminal that keeps
-/// one for each, as Microsoft documents for its console, still has the main
-/// screen's region after a reset on the alternate screen, so a region set on
-/// the main screen counts until an exact reset there, or RIS. Any form that
-/// may switch to the alternate screen counts as switching; only an exact
-/// switch back counts as back.
+/// Xterm keeps one scroll region for both screens: `top_marg` and
+/// `bot_marg` sit once in its `TScreen` (ptyx.h); `ToAlternate`,
+/// `FromAlternate` and `SwitchBufs` (charproc.c, screen.c) leave them alone,
+/// and the cursor that mode 1049 saves (`SavedCursor`, ptyx.h) holds none. So
+/// a region set on either screen still counts after a switch. A terminal that
+/// keeps one region for each screen, as Microsoft documents for its console,
+/// still has the main screen's region after a reset on the alternate screen,
+/// so a region set on the main screen counts until an exact reset there, or
+/// RIS. Any form that may switch to the alternate screen counts as
+/// switching; only an exact switch back counts as back.
 #[test]
 fn a_main_screen_region_counts_until_it_is_reset_there_review_70() {
     let region: &[u8] = b"\x1b[1;3r\x1b[8;1H";
     let read: &[u8] = &concat(&[b"error\r\n", PROMPT]);
-    let cases: [(&str, &[&[u8]]); 5] = [
+    let cases: [(&str, &[&[u8]]); 7] = [
+        (
+            "set on the alternate screen and left set, 1049",
+            &[b"\x1b[?1049h", b"\x1b[1;3r", b"\x1b[?1049l", read],
+        ),
+        (
+            "set on the alternate screen and left set, 47",
+            &[b"\x1b[?47h", b"\x1b[1;3r", b"\x1b[?47l", read],
+        ),
         (
             "reset on the alternate screen, 1049",
             &[region, b"\x1b[?1049h", b"\x1b[r", b"\x1b[?1049l", read],
