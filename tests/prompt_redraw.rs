@@ -655,6 +655,87 @@ fn a_read_pushed_without_the_terminal_size_keeps_the_bypass() {
     assert_eq!(second, read, "{:?}", String::from_utf8_lossy(&second));
 }
 
+/// Xterm keeps one scroll region for both screens. A terminal that keeps
+/// one for each, as Microsoft documents for its console, still has the main
+/// screen's region after a reset on the alternate screen, so a region set on
+/// the main screen counts until an exact reset there, or RIS. Any form that
+/// may switch to the alternate screen counts as switching; only an exact
+/// switch back counts as back.
+#[test]
+fn a_main_screen_region_counts_until_it_is_reset_there_review_70() {
+    let region: &[u8] = b"\x1b[1;3r\x1b[8;1H";
+    let read: &[u8] = &concat(&[b"error\r\n", PROMPT]);
+    let cases: [(&str, &[&[u8]]); 5] = [
+        (
+            "reset on the alternate screen, 1049",
+            &[region, b"\x1b[?1049h", b"\x1b[r", b"\x1b[?1049l", read],
+        ),
+        (
+            "reset on the alternate screen, 1047",
+            &[region, b"\x1b[?1047h", b"\x1b[r", b"\x1b[?1047l", read],
+        ),
+        (
+            "reset on the alternate screen, 47",
+            &[region, b"\x1b[?47h", b"\x1b[r", b"\x1b[?47l", read],
+        ),
+        (
+            "switched in the C1 form",
+            &[region, b"\xc2\x9b?1049h", b"\x1b[r", b"\x1b[?1049l", read],
+        ),
+        (
+            "switched back in the C1 form",
+            &[
+                region,
+                b"\x1b[?1049h",
+                b"\xc2\x9b?1049l",
+                b"\x1b[r",
+                b"\x1b[?1049l",
+                read,
+            ],
+        ),
+    ];
+    for (name, reads) in cases {
+        let output = render_on(8, 24, reads);
+        assert!(
+            output.ends_with(read) && !contains(&output, b"\x1b[38"),
+            "{name}: {:?}",
+            String::from_utf8_lossy(&output)
+        );
+    }
+
+    // A region set and reset on the alternate screen leaves the main one as
+    // it was, and an exact reset on the main screen clears it.
+    let recovered: [(&str, &[&[u8]]); 2] = [
+        (
+            "region only on the alternate screen",
+            &[
+                b"\x1b[?1049h",
+                b"\x1b[1;5r",
+                b"\x1b[r",
+                b"\x1b[?1049l",
+                read,
+            ],
+        ),
+        (
+            "reset on the main screen after the switch back",
+            &[region, b"\x1b[?1049h", b"\x1b[?1049l", b"\x1b[r", read],
+        ),
+    ];
+    for (name, reads) in recovered {
+        let output = render_on(8, 24, reads);
+        let screen = Screen::rendered(8, 24, &output);
+        let row = (0..8)
+            .find(|row| screen.text(*row).starts_with("error"))
+            .expect("error row");
+        assert_eq!(
+            red_text(&screen, row),
+            (0..5).collect::<Vec<_>>(),
+            "{name}: {:?}",
+            String::from_utf8_lossy(&output)
+        );
+    }
+}
+
 /// Accepted limit: the lines are colored when they are written, and a later
 /// read that goes back into one and rewrites only part of it without
 /// erasing leaves color on the rest. Pinned so a change to it is seen.
