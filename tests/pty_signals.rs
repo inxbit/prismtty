@@ -2337,13 +2337,15 @@ fn session_ends_at_command_exit() -> bool {
 
 /// A wrapped command that leaves a background job behind and then ends with
 /// `last`. The job ignores SIGHUP and SIGTERM, keeps the PTY slave open on
-/// its stdout and stderr, reports its pid and whether its stdout is that
-/// terminal, and then waits on a FIFO gate. When the gate opens it records
-/// that it is still alive and writes once more to the terminal. The command
+/// its stdout and stderr, and holds the write end of its `alive` FIFO for as
+/// long as it lives. It reports its pid and whether its stdout is that
+/// terminal, then waits on its FIFO gate. When the gate opens it records that
+/// it is still alive, writes once more to the terminal and exits. The command
 /// waits for the job's report before it prints its marker and ends.
 fn command_leaving_a_job_behind(last: &str) -> String {
     format!(
-        "sh -c 'trap \"\" HUP TERM; if [ -t 1 ]; then held=terminal; else held=none; fi; \
+        "sh -c 'exec 3>\"$1/alive\"; trap \"\" HUP TERM; \
+         if [ -t 1 ]; then held=terminal; else held=none; fi; \
          echo \"$$ $held\" > \"$1/ready\"; read gate < \"$1/gate\"; : > \"$1/released\"; \
          echo late' job \"$1\" &\n\
          read job < \"$1/ready\"\n\
@@ -2352,23 +2354,129 @@ fn command_leaving_a_job_behind(last: &str) -> String {
     )
 }
 
-/// A scratch directory for [`command_leaving_a_job_behind`]: its two FIFOs, an
-/// empty config and a private home and runtime directory for the wrapper.
-fn job_directory() -> tempfile::TempDir {
-    let dir = tempfile::tempdir().expect("job directory");
-    for fifo in ["ready", "gate"] {
-        let path =
-            std::ffi::CString::new(dir.path().join(fifo).into_os_string().into_encoded_bytes())
-                .expect("FIFO path");
-        // SAFETY: `path` is a valid NUL-terminated string for the call.
-        let made = unsafe { libc::mkfifo(path.as_ptr(), 0o600) };
-        assert_eq!(made, 0, "mkfifo {fifo}");
+/// The background job of [`command_leaving_a_job_behind`], reached only
+/// through its private FIFOs. It is ended by opening its gate and never by a
+/// signal to its pid, which can belong to another process once the job has
+/// exited. Dropping this, also while a failed test unwinds, opens the gate if
+/// the job still waits there and waits for the job to be gone.
+struct LeftJob {
+    dir: tempfile::TempDir,
+    /// The read end of the FIFO the job holds open for writing while it
+    /// lives: it reads EOF once the job is gone (or before it started).
+    alive: File,
+}
+
+impl LeftJob {
+    /// A scratch directory with the job's FIFOs, an empty config and a
+    /// private home and runtime directory for the wrapper.
+    fn new() -> Self {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let dir = tempfile::tempdir().expect("job directory");
+        for fifo in ["ready", "gate", "alive"] {
+            let path =
+                std::ffi::CString::new(dir.path().join(fifo).into_os_string().into_encoded_bytes())
+                    .expect("FIFO path");
+            // SAFETY: `path` is a valid NUL-terminated string for the call.
+            let made = unsafe { libc::mkfifo(path.as_ptr(), 0o600) };
+            assert_eq!(made, 0, "mkfifo {fifo}");
+        }
+        std::fs::write(dir.path().join("empty.yml"), "rules: []\n").expect("empty config");
+        for subdirectory in ["home", "runtime"] {
+            std::fs::create_dir(dir.path().join(subdirectory)).expect("private directory");
+        }
+        let alive = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(dir.path().join("alive"))
+            .expect("open the job's alive FIFO");
+        Self { dir, alive }
     }
-    std::fs::write(dir.path().join("empty.yml"), "rules: []\n").expect("empty config");
-    for subdirectory in ["home", "runtime"] {
-        std::fs::create_dir(dir.path().join(subdirectory)).expect("private directory");
+
+    fn path(&self) -> &std::path::Path {
+        self.dir.path()
     }
-    dir
+
+    /// Whether the job (which must have started) has exited.
+    fn is_gone(&mut self) -> bool {
+        let mut byte = [0_u8; 1];
+        matches!(self.alive.read(&mut byte), Ok(0))
+    }
+
+    /// Opens the gate if a process waits on it. Fails with ENXIO when none
+    /// does.
+    fn open_gate(&self) -> std::io::Result<()> {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        OpenOptions::new()
+            .write(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(self.path().join("gate"))?
+            .write_all(b"go\n")
+    }
+
+    /// Opens the gate and requires the job to say it saw it open, so it was
+    /// still alive then, and then to be gone. The job must be waiting on the
+    /// gate, so a gate nobody opens for reading within the bound is a failure.
+    fn release(&mut self) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            match self.open_gate() {
+                Ok(()) => break,
+                Err(error) if error.raw_os_error() == Some(libc::ENXIO) => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "the background job is not waiting on its gate"
+                    );
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("open the job's gate: {error}"),
+            }
+        }
+        assert!(
+            wait_for_condition(Duration::from_secs(10), || self
+                .path()
+                .join("released")
+                .exists()),
+            "the background job never saw its gate open"
+        );
+        assert!(
+            wait_for_condition(Duration::from_secs(10), || self.is_gone()),
+            "the background job did not exit after its gate opened"
+        );
+    }
+
+    /// Checks that the job the command left held the wrapped terminal.
+    fn assert_held_the_terminal(&self) {
+        let record = std::fs::read_to_string(self.path().join("job"))
+            .expect("the command did not record its background job");
+        assert_eq!(
+            record.split_whitespace().nth(1),
+            Some("terminal"),
+            "the background job's stdout was not the wrapped terminal: {record:?}"
+        );
+    }
+}
+
+impl Drop for LeftJob {
+    fn drop(&mut self) {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        if self.is_gone() {
+            return;
+        }
+        // A job still parked on its gate leaves through it; one still waiting
+        // to report on `ready` finds a reader there and goes on to the gate.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline && !self.is_gone() {
+            let _ = OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(self.path().join("ready"));
+            let _ = self.open_gate();
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
 }
 
 /// The wrapper's arguments for running `script` with `dir` as `$1`.
@@ -2379,40 +2487,6 @@ fn job_command_arguments(dir: &std::path::Path, script: &str) -> Vec<std::ffi::O
     arguments
 }
 
-/// Checks that the job the command left held the wrapped terminal.
-fn assert_job_held_the_terminal(dir: &std::path::Path) {
-    let record = std::fs::read_to_string(dir.join("job"))
-        .expect("the command did not record its background job");
-    assert_eq!(
-        record.split_whitespace().nth(1),
-        Some("terminal"),
-        "the background job's stdout was not the wrapped terminal: {record:?}"
-    );
-}
-
-/// Opens the job's gate. The job must be waiting on it, so a gate that no
-/// process has open for reading within the bound is a failure.
-fn open_job_gate(dir: &std::path::Path) {
-    use std::os::unix::fs::OpenOptionsExt;
-
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let mut gate = loop {
-        match OpenOptions::new()
-            .write(true)
-            .custom_flags(libc::O_NONBLOCK)
-            .open(dir.join("gate"))
-        {
-            Ok(gate) => break gate,
-            Err(error) if Instant::now() < deadline => {
-                assert_eq!(error.raw_os_error(), Some(libc::ENXIO), "open the gate");
-                thread::sleep(Duration::from_millis(10));
-            }
-            Err(error) => panic!("the background job is not waiting on its gate: {error}"),
-        }
-    };
-    gate.write_all(b"go\n").expect("open the job's gate");
-}
-
 /// Waits for the wrapper to end while the job left behind holds the
 /// terminal and returns its status. Where the session ends at the command's
 /// exit, the wrapper must return with the job still waiting on its gate, and
@@ -2420,12 +2494,12 @@ fn open_job_gate(dir: &std::path::Path) {
 /// does not, the gate is opened first and the wrapper ends at the terminal's
 /// EOF, as before.
 fn wrapper_status_leaving_a_job<T>(
-    dir: &std::path::Path,
+    job: &mut LeftJob,
     mut wait_for_exit: impl FnMut(Duration) -> Option<T>,
 ) -> T {
     let ends_at_exit = session_ends_at_command_exit();
     if !ends_at_exit {
-        open_job_gate(dir);
+        job.release();
     }
     let status = wait_for_exit(Duration::from_secs(20)).unwrap_or_else(|| {
         if ends_at_exit {
@@ -2437,13 +2511,9 @@ fn wrapper_status_leaving_a_job<T>(
         panic!("the wrapper did not exit after its background job let the terminal go")
     });
     if ends_at_exit {
-        open_job_gate(dir);
+        job.release();
     }
-    assert!(
-        wait_for_condition(Duration::from_secs(10), || dir.join("released").exists()),
-        "the background job never saw its gate open"
-    );
-    assert_job_held_the_terminal(dir);
+    job.assert_held_the_terminal();
     status
 }
 
@@ -2479,23 +2549,22 @@ fn without_csi(bytes: &[u8]) -> Vec<u8> {
 /// Runs `script` under the wrapper on a terminal of its own and returns the
 /// wrapper's exit status and everything that reached the terminal.
 fn run_on_terminal_leaving_a_job(script: &str) -> (u32, Vec<u8>) {
-    let dir = job_directory();
-    let _job_guard = PidGuard::from_marker(dir.path().join("job"));
+    let mut job = LeftJob::new();
     let pair = native_pty_system()
         .openpty(PtySize::default())
         .expect("openpty");
     let mut builder = CommandBuilder::new(env!("CARGO_BIN_EXE_ptty"));
-    builder.env("HOME", dir.path().join("home"));
-    builder.env("XDG_CONFIG_HOME", dir.path().join("home"));
-    builder.env("PRISMTTY_RUNTIME_DIR", dir.path().join("runtime"));
-    builder.args(job_command_arguments(dir.path(), script));
+    builder.env("HOME", job.path().join("home"));
+    builder.env("XDG_CONFIG_HOME", job.path().join("home"));
+    builder.env("PRISMTTY_RUNTIME_DIR", job.path().join("runtime"));
+    builder.args(job_command_arguments(job.path(), script));
     let child = pair
         .slave
         .spawn_command(builder)
         .expect("spawn interactive ptty");
     drop(pair.slave);
     let mut ptty = PtySession::new(child, &*pair.master);
-    let status = wrapper_status_leaving_a_job(dir.path(), |timeout| ptty.wait_for_exit(timeout));
+    let status = wrapper_status_leaving_a_job(&mut job, |timeout| ptty.wait_for_exit(timeout));
     (status, without_csi(&completed_output(ptty.capture())))
 }
 
@@ -2525,14 +2594,13 @@ fn session_ends_with_the_command_while_its_background_job_holds_the_terminal_wit
  {
     use std::process::{Command, Stdio};
 
-    let dir = job_directory();
-    let _job_guard = PidGuard::from_marker(dir.path().join("job"));
+    let mut job = LeftJob::new();
     let script = command_leaving_a_job_behind("printf '%s\\n' eos-last-marker; exit 7");
     let ptty = Command::new(env!("CARGO_BIN_EXE_ptty"))
-        .env("HOME", dir.path().join("home"))
-        .env("XDG_CONFIG_HOME", dir.path().join("home"))
-        .env("PRISMTTY_RUNTIME_DIR", dir.path().join("runtime"))
-        .args(job_command_arguments(dir.path(), &script))
+        .env("HOME", job.path().join("home"))
+        .env("XDG_CONFIG_HOME", job.path().join("home"))
+        .env("PRISMTTY_RUNTIME_DIR", job.path().join("runtime"))
+        .args(job_command_arguments(job.path(), &script))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -2542,7 +2610,7 @@ fn session_ends_with_the_command_while_its_background_job_holds_the_terminal_wit
     let stdout = ptty.child_mut().stdout.take().expect("piped stdout");
     let stdout_fd = stdout.as_raw_fd();
     let capture = CaptureTask::from_reader(stdout, stdout_fd);
-    let status = wrapper_status_leaving_a_job(dir.path(), |timeout| ptty.wait_for_exit(timeout));
+    let status = wrapper_status_leaving_a_job(&mut job, |timeout| ptty.wait_for_exit(timeout));
     let output = without_csi(&completed_output(&capture));
     assert_eq!(
         status.code(),
@@ -2579,6 +2647,36 @@ fn session_reports_a_command_killed_while_its_background_job_holds_the_terminal(
     }
 }
 
+// A test that fails while the job it left still waits on its gate ends the
+// job through the gate as its fixture is dropped, not by a signal to a pid
+// that could belong to another process by then.
+#[test]
+fn left_job_leaves_through_its_gate_when_its_test_ends_early() {
+    use std::process::{Command, Stdio};
+
+    let job = LeftJob::new();
+    let alive = job.alive.try_clone().expect("keep the alive FIFO");
+    let status = Command::new("sh")
+        .args(["-c", &command_leaving_a_job_behind("exit 0"), "sh"])
+        .arg(job.path())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .expect("run the command");
+    assert!(status.success(), "the command failed: {status:?}");
+    let mut byte = [0_u8; 1];
+    assert!(
+        matches!((&alive).read(&mut byte), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
+        "the job is not waiting on its gate"
+    );
+    drop(job);
+    assert!(
+        matches!((&alive).read(&mut byte), Ok(0)),
+        "the job outlived its fixture"
+    );
+}
+
 // A last word with no line end is held back by the live highlighter in case
 // the command continues it. When the command exits instead, the word is
 // drawn once, as the session ends.
@@ -2599,115 +2697,241 @@ fn held_back_last_word_is_drawn_once_when_the_command_exits_leaving_a_job() {
     );
 }
 
-/// The lowest descriptor the command under [`TIGHT_DESCRIPTOR_LIMIT`] may
-/// still get: every lower one is taken before the wrapper starts.
+/// The lowest descriptor the wrapper under [`TIGHT_DESCRIPTOR_LIMIT`] may
+/// still get: descriptors 3 to one below it are taken when it starts.
 const TIGHT_DESCRIPTOR_FLOOR: libc::c_int = 55;
 /// A limit on open descriptors that leaves the wrapper just what it needs.
 const TIGHT_DESCRIPTOR_LIMIT: libc::rlim_t = 64;
+/// The wrapped command for the tight-limit test: it counts the descriptors
+/// from 3 to below the floor that it inherited (the caller's descriptors
+/// reach the command), then prints its word and exits 23.
+const COUNT_INHERITED_DESCRIPTORS: &str = "inherited=0; fd=3; while [ $fd -lt 55 ]; do \
+     if [ -e /dev/fd/$fd ]; then inherited=$((inherited+1)); fi; fd=$((fd+1)); done; \
+     printf 'inherited=%s\\n' \"$inherited\"; printf own-word; exit 23";
+
+/// Starts the wrapper as a caller short of descriptors would: from a child
+/// forked by hand that closes every descriptor above stderr, opens
+/// /dev/null on every one from 3 to below [`TIGHT_DESCRIPTOR_FLOOR`] without
+/// close-on-exec, lowers RLIMIT_NOFILE to [`TIGHT_DESCRIPTOR_LIMIT`] and
+/// execs. Nothing of the test process (std's close-on-exec descriptors,
+/// other tests' files) can leave a gap among them at the exec. `stdio`
+/// becomes the wrapper's 0, 1 and 2; with `terminal`, its stdin becomes its
+/// controlling terminal in a session of its own. Returns the child's pid.
+fn spawn_wrapper_short_of_descriptors(
+    arguments: &[std::ffi::OsString],
+    home: &std::path::Path,
+    runtime: &std::path::Path,
+    stdio: [libc::c_int; 3],
+    terminal: bool,
+) -> libc::pid_t {
+    use std::ffi::CString;
+
+    let program = CString::new(env!("CARGO_BIN_EXE_ptty")).expect("program path");
+    let argv: Vec<CString> = std::iter::once(program.clone())
+        .chain(
+            arguments
+                .iter()
+                .map(|argument| CString::new(argument.as_encoded_bytes()).expect("argument")),
+        )
+        .collect();
+    let home = home.as_os_str().as_encoded_bytes();
+    let runtime = runtime.as_os_str().as_encoded_bytes();
+    let envp: Vec<CString> = [
+        b"PATH=/usr/bin:/bin".to_vec(),
+        [b"HOME=".as_slice(), home].concat(),
+        [b"XDG_CONFIG_HOME=".as_slice(), home].concat(),
+        [b"PRISMTTY_RUNTIME_DIR=".as_slice(), runtime].concat(),
+        b"TERM=xterm-256color".to_vec(),
+    ]
+    .into_iter()
+    .map(|entry| CString::new(entry).expect("environment entry"))
+    .collect();
+    let argv_pointers: Vec<*const libc::c_char> = argv
+        .iter()
+        .map(|argument| argument.as_ptr())
+        .chain(std::iter::once(std::ptr::null()))
+        .collect();
+    let envp_pointers: Vec<*const libc::c_char> = envp
+        .iter()
+        .map(|entry| entry.as_ptr())
+        .chain(std::iter::once(std::ptr::null()))
+        .collect();
+    let mut current = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: `current` is a valid, exclusively borrowed rlimit for the call.
+    let got = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut current) };
+    assert_eq!(got, 0, "getrlimit");
+    let highest = libc::c_int::try_from(current.rlim_cur.min(65_536)).unwrap_or(65_536);
+    let limit = libc::rlimit {
+        rlim_cur: TIGHT_DESCRIPTOR_LIMIT,
+        rlim_max: TIGHT_DESCRIPTOR_LIMIT,
+    };
+
+    // SAFETY: fork has no memory-safety preconditions. Between fork and exec
+    // the child calls only async-signal-safe functions (setsid, dup2, ioctl,
+    // close, open, setrlimit, execve, _exit) on data prepared before the fork,
+    // and allocates nothing.
+    let pid = unsafe { libc::fork() };
+    assert!(pid >= 0, "fork: {}", std::io::Error::last_os_error());
+    if pid == 0 {
+        // SAFETY: see the fork above.
+        unsafe {
+            if terminal && libc::setsid() == -1 {
+                libc::_exit(126);
+            }
+            for (target, fd) in stdio.into_iter().enumerate() {
+                if libc::dup2(fd, target as libc::c_int) == -1 {
+                    libc::_exit(126);
+                }
+            }
+            if terminal && libc::ioctl(0, libc::TIOCSCTTY as _, 0) == -1 {
+                libc::_exit(126);
+            }
+            for fd in 3..highest {
+                libc::close(fd);
+            }
+            loop {
+                let fd = libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY);
+                if fd < 0 {
+                    libc::_exit(126);
+                }
+                if fd >= TIGHT_DESCRIPTOR_FLOOR {
+                    libc::close(fd);
+                    break;
+                }
+            }
+            if libc::setrlimit(libc::RLIMIT_NOFILE, &limit) == -1 {
+                libc::_exit(126);
+            }
+            libc::execve(
+                program.as_ptr(),
+                argv_pointers.as_ptr(),
+                envp_pointers.as_ptr(),
+            );
+            libc::_exit(127);
+        }
+    }
+    pid
+}
+
+/// Waits for this test's own child `pid` and returns its exit status; kills
+/// and reaps it if it has not exited in time. The pid cannot be reused while
+/// the child is unreaped, so the kill reaches only that child.
+fn wait_for_own_child(pid: libc::pid_t, timeout: Duration) -> Option<libc::c_int> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let mut status = 0;
+        // SAFETY: `status` is a valid, exclusively borrowed int for the call.
+        let waited = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+        if waited == pid {
+            return Some(status);
+        }
+        if Instant::now() >= deadline {
+            // SAFETY: kill and waitpid have no memory-safety preconditions;
+            // `pid` is this test's unreaped child.
+            unsafe {
+                libc::kill(pid, libc::SIGKILL);
+                libc::waitpid(pid, &mut status, 0);
+            }
+            return None;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// A pipe as two owned files: (read end, write end).
+fn pipe_files() -> (File, File) {
+    let mut fds = [0; 2];
+    // SAFETY: `fds` is a valid array of two c_int that pipe fills on success.
+    assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe");
+    // SAFETY: both descriptors were just created and nothing else owns them.
+    unsafe { (File::from_raw_fd(fds[0]), File::from_raw_fd(fds[1])) }
+}
 
 // A wrapper that starts with few descriptors to spare still runs the command
 // and reports its status and output. The early end at the command's exit is
 // optional: its two descriptors are taken only once everything the session
 // needs is open, and the session goes without it when they are not there.
+// The command reports how many of descriptors 3 to 54 it inherited, which
+// shows that the wrapper really started with only those above to spare.
 #[test]
 fn wrapped_command_runs_with_few_descriptors_to_spare() {
     use std::os::unix::fs::OpenOptionsExt;
-    use std::os::unix::process::CommandExt;
-    use std::process::{Command, Stdio};
 
     for terminal in [false, true] {
-        let dir = job_directory();
+        let dir = tempfile::tempdir().expect("scratch directory");
+        std::fs::write(dir.path().join("empty.yml"), "rules: []\n").expect("empty config");
+        for subdirectory in ["home", "runtime"] {
+            std::fs::create_dir(dir.path().join(subdirectory)).expect("private directory");
+        }
+        let mut arguments = job_command_arguments(dir.path(), COUNT_INHERITED_DESCRIPTORS);
+        arguments.pop();
         let pair = native_pty_system()
             .openpty(PtySize::default())
             .expect("openpty");
-        let mut command = Command::new(env!("CARGO_BIN_EXE_ptty"));
-        command
-            .env("HOME", dir.path().join("home"))
-            .env("XDG_CONFIG_HOME", dir.path().join("home"))
-            .env("PRISMTTY_RUNTIME_DIR", dir.path().join("runtime"))
-            .args(job_command_arguments(
-                dir.path(),
-                "sleep 0.1; printf own-word; exit 23",
-            ));
-        let (terminal_capture, tty) = if terminal {
+        let null = File::open("/dev/null").expect("open /dev/null");
+        let (captures, child_ends, pid) = if terminal {
             let tty = OpenOptions::new()
                 .read(true)
                 .write(true)
                 .custom_flags(libc::O_NOCTTY)
                 .open(pair.master.tty_name().expect("outer PTY tty name"))
                 .expect("open outer slave tty");
-            command
-                .stdin(Stdio::from(tty.try_clone().expect("stdin tty")))
-                .stdout(Stdio::from(tty.try_clone().expect("stdout tty")))
-                .stderr(Stdio::from(tty.try_clone().expect("stderr tty")));
-            (Some(CaptureTask::from_master(&*pair.master)), Some(tty))
+            let capture = CaptureTask::from_master(&*pair.master);
+            let fd = tty.as_raw_fd();
+            let pid = spawn_wrapper_short_of_descriptors(
+                &arguments,
+                &dir.path().join("home"),
+                &dir.path().join("runtime"),
+                [fd, fd, fd],
+                true,
+            );
+            (vec![capture], vec![tty], pid)
         } else {
-            command
-                .stdin(Stdio::null())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped());
-            (None, None)
-        };
-        // SAFETY: the closure runs in the forked child before exec and calls
-        // only async-signal-safe functions (setsid, ioctl, open, close,
-        // setrlimit); it allocates nothing.
-        unsafe {
-            command.pre_exec(move || {
-                if terminal
-                    && (libc::setsid() == -1 || libc::ioctl(0, libc::TIOCSCTTY as _, 0) == -1)
-                {
-                    return Err(std::io::Error::last_os_error());
-                }
-                loop {
-                    let fd = libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY);
-                    if fd < 0 {
-                        return Err(std::io::Error::last_os_error());
-                    }
-                    if fd >= TIGHT_DESCRIPTOR_FLOOR {
-                        libc::close(fd);
-                        break;
-                    }
-                }
-                let limit = libc::rlimit {
-                    rlim_cur: TIGHT_DESCRIPTOR_LIMIT,
-                    rlim_max: TIGHT_DESCRIPTOR_LIMIT,
-                };
-                if libc::setrlimit(libc::RLIMIT_NOFILE, &limit) == -1 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
-        let mut ptty = ProcessGuard::new(command.spawn().expect("spawn ptty"));
-        drop(command);
-        drop(tty);
-        // On Linux the capture of the outer terminal ends only once no slave
-        // descriptor is left, this test's own included.
-        drop(pair.slave);
-        let captures = match terminal_capture {
-            Some(capture) => vec![capture],
-            None => {
-                let stdout = ptty.child_mut().stdout.take().expect("piped stdout");
-                let stderr = ptty.child_mut().stderr.take().expect("piped stderr");
-                let (stdout_fd, stderr_fd) = (stdout.as_raw_fd(), stderr.as_raw_fd());
+            let (stdout_read, stdout_write) = pipe_files();
+            let (stderr_read, stderr_write) = pipe_files();
+            let pid = spawn_wrapper_short_of_descriptors(
+                &arguments,
+                &dir.path().join("home"),
+                &dir.path().join("runtime"),
+                [
+                    null.as_raw_fd(),
+                    stdout_write.as_raw_fd(),
+                    stderr_write.as_raw_fd(),
+                ],
+                false,
+            );
+            let (stdout_fd, stderr_fd) = (stdout_read.as_raw_fd(), stderr_read.as_raw_fd());
+            (
                 vec![
-                    CaptureTask::from_reader(stdout, stdout_fd),
-                    CaptureTask::from_reader(stderr, stderr_fd),
-                ]
-            }
+                    CaptureTask::from_reader(stdout_read, stdout_fd),
+                    CaptureTask::from_reader(stderr_read, stderr_fd),
+                ],
+                vec![stdout_write, stderr_write],
+                pid,
+            )
         };
-        let output = ptty.wait_for_exit(Duration::from_secs(20)).map(|status| {
-            let output: Vec<u8> = captures.iter().flat_map(completed_output).collect();
-            (status, output)
-        });
-        let (status, output) =
-            output.unwrap_or_else(|| panic!("terminal stdin {terminal}: the wrapper did not exit"));
+        // The captures end only once no other copy of their write ends or of
+        // the outer slave is left, this test's own included.
+        drop(child_ends);
+        drop(null);
+        drop(pair.slave);
+        let status = wait_for_own_child(pid, Duration::from_secs(20))
+            .unwrap_or_else(|| panic!("terminal stdin {terminal}: the wrapper did not exit"));
+        let output: Vec<u8> = captures.iter().flat_map(completed_output).collect();
         let output = without_csi(&output);
-        assert_eq!(
-            status.code(),
-            Some(23),
+        assert!(
+            contains_bytes(&output, b"inherited=52"),
+            "terminal stdin {terminal}: the wrapper did not start with descriptors 3 to 54 \
+             taken, or the command did not get them; output: {:?}",
+            String::from_utf8_lossy(&output)
+        );
+        assert!(
+            libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 23,
             "terminal stdin {terminal}: the command's status was lost under a tight \
-             descriptor limit; output: {:?}",
+             descriptor limit (wait status {status:#x}); output: {:?}",
             String::from_utf8_lossy(&output)
         );
         assert!(

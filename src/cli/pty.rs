@@ -4606,15 +4606,28 @@ mod tests {
         }
     }
 
-    /// Everything the exit pipe receives until its write end is closed.
+    /// Everything the exit pipe receives until its write end is closed. A
+    /// write end left open fails here, after a bound, instead of blocking the
+    /// test.
     fn exit_pipe_bytes(mut exit_read: std::fs::File) -> Vec<u8> {
         use std::io::Read;
 
+        let deadline = Instant::now() + Duration::from_secs(10);
         let mut bytes = Vec::new();
-        exit_read
-            .read_to_end(&mut bytes)
-            .expect("read the exit pipe");
-        bytes
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let timeout = libc::c_int::try_from(remaining.as_millis()).unwrap_or(libc::c_int::MAX);
+            let [revents] =
+                super::poll_input([std::os::fd::AsRawFd::as_raw_fd(&exit_read)], timeout)
+                    .expect("poll the exit pipe");
+            assert!(revents != 0, "the exit pipe's write end was left open");
+            let mut chunk = [0_u8; 16];
+            let read = exit_read.read(&mut chunk).expect("read the exit pipe");
+            if read == 0 {
+                return bytes;
+            }
+            bytes.extend_from_slice(&chunk[..read]);
+        }
     }
 
     // The waiter can report the exit before or after the read loop's pipe is
