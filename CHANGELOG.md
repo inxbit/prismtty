@@ -11,26 +11,36 @@ All notable changes to PrismTTY are documented here.
   it would show: when its style paints blank cells, or when the program's own
   inverse, strike-through, overline or underline without a color of its own
   draws blank cells in the foreground color. The highlight now closes right
-  before the CR or LF and opens again right after it. This holds for a CR or
-  LF in the text and for one the terminal runs inside an escape or control
-  sequence, such as `ESC [ 3 LF 1 m`: that sequence is kept whole, and the
-  highlight closes before all of it. Text is drawn in the same colors as
-  before. Piped and file output, `profiles test` and the library's
-  `Highlighter::highlight*` are unchanged.
+  before the CR or LF:
+  - For a CR or LF in the text under such a program rendition, it opens again
+    right after the line end. A highlight whose own style paints blank cells
+    closes there as before and opens again at the next text it matches.
+  - For a CR or LF the terminal runs inside an escape or control sequence,
+    such as `ESC [ 3 LF 1 m`, it closes before the whole sequence, which is
+    kept whole, and opens again right after it.
+
+  Text is drawn in the same colors as before. Piped and file output,
+  `profiles test` and the library's `Highlighter::highlight*` are unchanged.
 
   What this covers, and what it does not:
 
   - The rule is for CR and LF only. VT and FF keep their bytes, because some
     terminals draw them as characters.
   - In a UTF-8 locale a sequence opened by a raw `9B` is text to the
-    terminal, so only the line ends inside it leave the highlight. A terminal
-    that reads 8-bit bytes behind a UTF-8 locale, the mismatch `SECURITY.md`
-    describes, runs that sequence as a control, and the bytes now written
-    inside it end it early, so it is drawn differently than before.
-  - `C2 9B`, a control sequence with a byte from 80 to FF in it, and the
-    payload of an OSC, DCS, SOS, PM or APC string keep their bytes.
-  - `CSI K` right after a line feed still erases in the highlight color, as
-    before; that is a separate issue.
+    terminal, so only the line ends inside it leave the highlight. When the
+    highlight already closes before such a sequence, because it saves the
+    rendition or fills blank cells, its bytes are kept. A terminal that reads
+    8-bit bytes behind a UTF-8 locale, the mismatch `SECURITY.md` describes,
+    runs that sequence as a control, and the bytes now written inside it end
+    it early, so it is drawn differently than before.
+  - Only a whole control sequence in ASCII counts. `C2 9B`, a sequence with a
+    byte from 80 to FF in it or cut short by one before its final byte, and
+    the payload of an OSC, DCS, SOS, PM or APC string keep their bytes, even
+    when a line end sits in the sequence.
+  - `CSI K` right after a line feed still erases in the color of a
+    foreground-only highlight that meets such a program rendition, as before;
+    that is a separate issue. A highlight whose style paints blank cells
+    already closes before it.
   - A line that wraps at the right margin has no byte to act on and is drawn
     as before.
 
