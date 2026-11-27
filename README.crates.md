@@ -202,7 +202,9 @@ Important options:
 - `--strip-ansi` removes existing ANSI before PrismTTY styles output.
 - `--sanitize` strips window-title, clipboard (OSC 52), and other OSC/DCS
   string escapes from program output while preserving normal CSI/SGR styling.
-- `--show-profile` prints profile selections and transitions to stderr.
+- `--show-profile` prints profile selections and transitions to stderr. With
+  auto-detection on, a selection that stays `generic` is not reported, so a
+  session that never leaves `generic` prints nothing.
 - `--local-echo` locally echoes printable typed keys for no-echo device
   sessions. Do not use it at hidden prompts; it will echo typed secrets.
 - `--no-minimal-reset` uses full SGR resets in interactive streams for terminal

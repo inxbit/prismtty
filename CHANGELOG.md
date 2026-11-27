@@ -533,7 +533,10 @@ differs from what 1.3.14 would have been.
   `profiles validate good.yml broken.yml` reported success having read only
   the first file.
 - Write the `--benchmark` report, and the `--show-profile` report for a
-  forced profile, when the input is empty.
+  forced profile, when the input is empty. (Note of 2026-11-27: this line
+  first said both reports are written for any empty input; it was narrowed on
+  2026-11-18. With auto-detection on, a run that stays on `generic`, empty or
+  not, prints no `--show-profile` line.)
 - Wait for input when the filter inherits a non-blocking stdin, instead of
   exiting with "Resource temporarily unavailable".
 - Let an exclusive rule style all of its own capture groups. With colors on
