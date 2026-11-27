@@ -4,6 +4,25 @@ All notable changes to PrismTTY are documented here.
 
 ## 1.5.1 - 2026-11-27
 
+### Changed
+
+- In a UTF-8 locale an isolated invalid raw byte in ordinary text, a byte
+  from 80 to 9F that is not part of a UTF-8 character (from a cut character
+  or a legacy code page), is ordinary text, as on a terminal that reads
+  UTF-8. The ordinary text after it is no longer held back to the line end,
+  lost at the end of the output or past 16 KiB, left unhighlighted, or
+  removed by `--sanitize` and `--strip-ansi`, and profile detection reads it.
+  A byte from that range inside an ESC, CSI or string that is already open
+  still belongs to that control and may be removed with it; a raw `9C` no
+  longer ends a 7-bit string. The locale is inferred from the text of
+  `LC_ALL`, `LC_CTYPE` and `LANG` (the first that is not empty must name
+  UTF-8), not checked. On a terminal that reads 8-bit bytes behind a UTF-8
+  locale this lets C1 controls, an OSC 52 opened by a raw `9D` included,
+  through both flags; see SECURITY.md. Other locales are unchanged.
+- In a UTF-8 locale a highlight no longer widens over an invalid byte, no
+  color is taken from the UTF-8 form `C2 9B`, and when a filter processes
+  the bytes it drops a `C2` that begins no character.
+
 ### Fixed
 
 - In interactive output, a prompt with a colored background, or drawn in
@@ -54,6 +73,18 @@ All notable changes to PrismTTY are documented here.
   - A removed reset's other effects are not reproduced: on a terminal where
     SGR 0 also closes an OSC 8 hyperlink, such as WezTerm, the link still goes
     on over the typed command.
+
+### Known limits
+
+- In default mode, after an ESC and a byte from 80 up, which a terminal like
+  xterm ignores while it holds the ESC open, a highlight can end an OSC
+  string the terminal opened there, and the `^` written for an unfinished
+  ESC at the end of the output can start a PM string. 1.4.1 does both after
+  `ESC FF`; in a UTF-8 locale a raw byte from 80 to 9F now does too.
+  `--sanitize` drops the ESC in both cases.
+- On a terminal `--sanitize` does not neutralize every incomplete control at
+  the end of input: an unfinished ESC can reach the terminal, and the next
+  program to write there can finish it.
 
 ## 1.5.0 - 2026-11-27
 
