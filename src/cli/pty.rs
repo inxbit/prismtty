@@ -1138,9 +1138,9 @@ fn wait_for_the_claimed_exit() -> ! {
 
 /// Bounds the end of a session from outside every thread that can block in
 /// it: at `deadline`, unless the main thread has claimed the exit, the
-/// process ends abruptly with 128 plus `signal`, as 1.4.0 did. Returns false
-/// when its thread cannot be started; the end is then abrupt at once.
-fn start_end_watchdog(signal: libc::c_int, deadline: Instant) -> bool {
+/// process ends abruptly (see `end_at_deadline`). Returns false when its
+/// thread cannot be started; the end is then abrupt at once.
+fn start_end_watchdog(signal: libc::c_int, deadline: Instant, sigint_left_default: bool) -> bool {
     thread::Builder::new()
         .name("end limit".to_owned())
         .spawn(move || {
@@ -1151,14 +1151,19 @@ fn start_end_watchdog(signal: libc::c_int, deadline: Instant) -> bool {
                 }
                 thread::sleep(deadline - now);
             }
-            if claim_exit(EXIT_ABRUPTLY) {
-                unregister_before_exit();
-                // SAFETY: _exit never returns and skips destructors by design: the terminal
-                // was restored when the signal was taken, and the pid file removed above.
-                unsafe { libc::_exit(128 + signal) }
-            }
+            end_at_deadline(signal, sigint_left_default);
         })
         .is_ok()
+}
+
+/// The limit's end, at the deadline, with 128 plus `signal`, as 1.4.0 did.
+fn end_at_deadline(signal: libc::c_int, _sigint_left_default: bool) {
+    if claim_exit(EXIT_ABRUPTLY) {
+        unregister_before_exit();
+        // SAFETY: _exit never returns and skips destructors by design: the terminal was
+        // restored when the signal was taken, and the pid file removed above.
+        unsafe { libc::_exit(128 + signal) }
+    }
 }
 
 /// Ends the process at once after an ending signal, as 1.4.0 did. SIGINT that
@@ -1192,7 +1197,7 @@ fn end_session_after_signal(
     sigint_left_default: bool,
 ) {
     let deadline = Instant::now() + END_LIMIT;
-    let bounded = start_end_watchdog(signal, deadline);
+    let bounded = start_end_watchdog(signal, deadline, sigint_left_default);
     if let Err(error) = terminate_raw_mode_from_signal_state(raw_mode_state) {
         warn(format_args!(
             "prismtty: could not restore terminal before exit: {error}"
