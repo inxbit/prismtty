@@ -2,6 +2,20 @@
 
 All notable changes to PrismTTY are documented here.
 
+## 1.3.17 - 2026-11-27
+
+### Fixed
+
+- On Linux, a wrapped command killed by a real-time signal (32 to 64) is
+  reported with exit status 128 plus the signal number, like any other signal
+  death. PrismTTY printed `terminal mode error: EINVAL: Invalid argument` and
+  exited 1: on Linux 6.8, `prismtty -- sh -c 'kill -50 $$'` gave 1 with that
+  message and now gives 178 with no message. macOS has no real-time signals
+  and is not affected.
+
+  A failure to collect the command's exit status is now reported as an I/O
+  error instead of a terminal mode error.
+
 ## 1.3.16 - 2026-11-26
 
 ### Fixed
