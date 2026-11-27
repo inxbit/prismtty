@@ -3465,11 +3465,6 @@ fn plain_lines_before_prompt_redraw(
 /// it forgets the prompt. A stretch is taken to cover one column for each
 /// ASCII character and two for each other one, and a stretch that may not
 /// fit on the row is no prompt.
-///
-/// Right after a prompt holding characters that are not ASCII the column is
-/// not known, but the cursor is after the prompt's last cell: when that
-/// widest reading ends before the right edge, no character wrapped. An erase
-/// to the right (`CSI K`, `CSI 0 K`) then leaves the prompt whole.
 #[derive(Debug)]
 struct LastLine {
     /// The terminal's width, at least 1.
@@ -3485,9 +3480,6 @@ struct LastLine {
     /// The columns of the prompt, from the first to one past the last; the
     /// last one is the widest reading for a prompt past ASCII.
     prompt: Option<(u32, u32)>,
-    /// True while the cursor is known to be right after the prompt, at a
-    /// column that is not known, and the prompt ends before the right edge.
-    after_prompt: bool,
 }
 
 impl LastLine {
@@ -3500,7 +3492,6 @@ impl LastLine {
             stretch_width: 0,
             continuation_bytes: 0,
             prompt: None,
-            after_prompt: false,
         }
     }
 
@@ -3509,24 +3500,20 @@ impl LastLine {
         self.stretch_width = 0;
         self.continuation_bytes = 0;
         self.prompt = None;
-        self.after_prompt = false;
         self.column = self.column.filter(|column| *column == 0);
     }
 
     fn carriage_return(&mut self) {
         self.close_stretch();
-        self.after_prompt = false;
         self.column = Some(0);
     }
 
     fn tab(&mut self) {
         self.close_stretch();
-        self.after_prompt = false;
         self.column = None;
     }
 
     fn print(&mut self, byte: u8) {
-        self.after_prompt = false;
         if (0x80..=0xbf).contains(&byte) && self.continuation_bytes > 0 {
             // Part of the character before it.
             self.continuation_bytes -= 1;
@@ -3583,11 +3570,6 @@ impl LastLine {
         // An empty parameter is 1 for a move and 0 for an erase; one too
         // large to read leaves the column unknown after a move.
         let value = bounded_parameter(parameters).unwrap_or(0);
-        if final_byte == b'K' && value == 0 && self.after_prompt {
-            // The erase starts after the prompt's last cell.
-            return;
-        }
-        self.after_prompt = false;
         let count = value.max(1);
         let known = value != u32::MAX;
         let last = self.columns - 1;
@@ -3637,7 +3619,6 @@ impl LastLine {
                 let end = start.saturating_add(self.stretch_width);
                 if end <= self.columns {
                     self.prompt = Some((start, end));
-                    self.after_prompt = !self.stretch.is_ascii() && end < self.columns;
                 }
             }
         }
