@@ -7,11 +7,10 @@ use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-#[cfg(any(target_os = "linux", test))]
 use std::sync::atomic::AtomicBool;
 use std::sync::{
     Arc, Mutex,
-    atomic::{AtomicI32, AtomicUsize, Ordering},
+    atomic::{AtomicI32, AtomicU64, AtomicUsize, Ordering},
     mpsc::{self, SyncSender},
 };
 use std::thread;
@@ -120,6 +119,132 @@ const TERMINATING_SIGNALS: [libc::c_int; 13] = [
     libc::SIGIO,
 ];
 const JOB_CONTROL_SIGNALS: [libc::c_int; 3] = [libc::SIGTSTP, libc::SIGTTIN, libc::SIGTTOU];
+
+/// Whether `signal` is a message for the wrapped command. SIGUSR1 and SIGUSR2
+/// sent to prismtty go to the command it started, alone, and the session goes
+/// on. Async-signal-safe.
+fn is_message_signal(signal: libc::c_int) -> bool {
+    signal == libc::SIGUSR1 || signal == libc::SIGUSR2
+}
+
+/// Whether `signal` ends the session: every caught terminating signal except
+/// the two messages. Async-signal-safe.
+fn is_end_signal(signal: libc::c_int) -> bool {
+    !is_message_signal(signal) && TERMINATING_SIGNALS.contains(&signal)
+}
+
+/// How long the end of a session may take once the signal watcher has taken
+/// an ending signal: the 1.4.0 teardown's two windows of `CHILD_EXIT_GRACE`.
+/// The normal end that returns the command's own exit code must be over by
+/// then too; past it, the end is abrupt.
+const END_LIMIT: Duration = Duration::from_secs(4);
+
+/// The ending signal (End) the handlers recorded, and whether a thread has
+/// taken it. The watcher acts on it before any byte queued in the self-pipe:
+/// the pipe only wakes the watcher, and its nonblocking write fails once a
+/// burst of messages has filled it, while this state does not.
+///
+/// The handoff of an End, in one session:
+///
+/// 1. No End: nothing recorded. `SessionSignalWatcher::stop` gives the
+///    signals back to their previous actions; from then on a signal takes
+///    that action, as in 1.4.1.
+/// 2. Recorded, not taken: the first `record` wins. If recorded before
+///    `stop`'s final check, the watcher or `stop` takes it; `stop` may
+///    already be giving dispositions back.
+/// 3. Taken, not published: the watcher or `stop` won `take` and runs
+///    `end_session_after_signal`. If give-back began, `stop` may need to
+///    reinstall handlers before or after joining the watcher.
+/// 4. Published: the outcome is under the reap lock and its status in
+///    `PUBLISHED_LEADER_STATUS`. Who ends the process follows from it.
+///
+/// An End recorded before `stop`'s final check is taken by the watcher or by
+/// `stop`. Give-back and any reinstallation each use one `sigaction` per
+/// signal, so another signal can take its previous action in between. A
+/// handler that records only after the final check has no taker; that End
+/// does not change the session's otherwise determined result.
+struct PendingEnd {
+    signal: AtomicI32,
+    taken: AtomicBool,
+}
+
+impl PendingEnd {
+    const fn new() -> Self {
+        Self {
+            signal: AtomicI32::new(0),
+            taken: AtomicBool::new(false),
+        }
+    }
+
+    /// Async-signal-safe: called from signal handlers.
+    fn record(&self, signal: libc::c_int) {
+        let _ = self
+            .signal
+            .compare_exchange(0, signal, Ordering::SeqCst, Ordering::SeqCst);
+    }
+
+    fn get(&self) -> Option<libc::c_int> {
+        let signal = self.signal.load(Ordering::SeqCst);
+        (signal != 0).then_some(signal)
+    }
+
+    /// The recorded End, for the one thread that takes it.
+    fn take(&self) -> Option<libc::c_int> {
+        let signal = self.get()?;
+        self.taken
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .ok()
+            .map(|_| signal)
+    }
+
+    fn clear(&self) {
+        self.taken.store(false, Ordering::SeqCst);
+        self.signal.store(0, Ordering::SeqCst);
+    }
+}
+
+static PENDING_END: PendingEnd = PendingEnd::new();
+
+/// Test only: an ending signal to record at the watcher's stop byte, after
+/// its last check, as a handler can while the session stops.
+#[cfg(test)]
+static END_TO_RECORD_AT_STOP: AtomicI32 = AtomicI32::new(0);
+
+#[cfg(test)]
+fn record_end_at_stop_for_test(pending_end: &PendingEnd) {
+    let signal = END_TO_RECORD_AT_STOP.swap(0, Ordering::SeqCst);
+    if signal != 0 {
+        pending_end.record(signal);
+    }
+}
+
+/// Test only: when armed, holds the next End at the entry of its path, as a
+/// slow step can, until released (for ten seconds at most).
+#[cfg(test)]
+struct EndEntryPause {
+    armed: std::sync::atomic::AtomicBool,
+    entered: std::sync::atomic::AtomicBool,
+    released: std::sync::atomic::AtomicBool,
+}
+
+#[cfg(test)]
+static END_ENTRY_PAUSE: EndEntryPause = EndEntryPause {
+    armed: std::sync::atomic::AtomicBool::new(false),
+    entered: std::sync::atomic::AtomicBool::new(false),
+    released: std::sync::atomic::AtomicBool::new(false),
+};
+
+#[cfg(test)]
+fn pause_at_end_entry_for_test() {
+    if END_ENTRY_PAUSE.armed.swap(false, Ordering::SeqCst) {
+        END_ENTRY_PAUSE.entered.store(true, Ordering::SeqCst);
+        let until = Instant::now() + Duration::from_secs(10);
+        while !END_ENTRY_PAUSE.released.load(Ordering::SeqCst) && Instant::now() < until {
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+}
+
 const RAW_SIGNAL_STOP_BYTE: u8 = 0;
 const RESIZE_STOP_BYTE: u8 = b'q';
 const RESIZE_WAKE_BYTE: u8 = b'r';
@@ -190,26 +315,97 @@ impl SignalPipeSlot {
     }
 }
 static FORWARD_CHILD_PID: AtomicI32 = AtomicI32::new(0);
-/// Serializes signal forwarding with reaping the wrapped child. It holds the
-/// child's raw wait status once the main thread has reaped it: `reap_child`
-/// writes it under this lock before it clears `FORWARD_CHILD_PID`, so the
-/// signal watcher, which reads it under this lock when it finds the pid
-/// already cleared, sees the status that went with that reap. A reap by the
-/// watcher itself uses its own status directly. `set_forward_child_pid`
-/// clears it when the next child is registered.
-static FORWARD_CHILD_LOCK: Mutex<Option<libc::c_int>> = Mutex::new(None);
+/// Serializes signal forwarding with reaping the wrapped child, and holds
+/// what became of it. Whoever reaps the child writes that here under this
+/// lock, in the same critical section as the reap and before it clears
+/// `FORWARD_CHILD_PID`, so whoever takes the lock next sees the reap and its
+/// result together. `set_forward_child_pid` resets it when the next child is
+/// registered.
+static FORWARD_CHILD_LOCK: Mutex<ReapState> = Mutex::new(ReapState::Unreaped);
 
-fn forward_child_lock() -> std::sync::MutexGuard<'static, Option<libc::c_int>> {
+/// What became of the registered child.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReapState {
+    Unreaped,
+    /// The main thread reaped it, with this raw wait status.
+    Reaped(libc::c_int),
+    /// The signal watcher ended the session after an ending signal.
+    Ended(EndOutcome),
+}
+
+/// How the signal watcher ended a session. It is published once, under the
+/// reap lock in the critical section of the watcher's reap, and never changes;
+/// the watcher and the main thread both take the final exit from it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct EndOutcome {
+    /// The ending signal prismtty was sent.
+    signal: libc::c_int,
+    /// The command's raw wait status, when it was reaped.
+    leader_status: Option<libc::c_int>,
+    /// When the end must be over: `END_LIMIT` after the watcher took the
+    /// signal.
+    deadline: Instant,
+    /// Who ends the process.
+    owner: EndOwner,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EndOwner {
+    /// The command exited by itself: the main thread finishes the normal end
+    /// and exits with the command's code, unless the deadline passes first.
+    NormalEnd,
+    /// The watcher ends the process at once, as 1.4.0 did.
+    Watcher,
+}
+
+impl EndOutcome {
+    /// The status of an abrupt end: 128 plus the signal prismtty was sent.
+    fn abrupt_code(&self) -> u8 {
+        128u8.saturating_add(self.signal as u8)
+    }
+
+    /// How the child ended, for the main thread's reap.
+    fn child_exit(&self) -> ChildExit {
+        ChildExit {
+            code: self
+                .leader_status
+                .map_or_else(|| self.abrupt_code(), exit_code_from_wait),
+            wait_status: self.leader_status,
+        }
+    }
+}
+
+/// The command exited by itself when its reaped status is an ordinary exit,
+/// whenever that happened: prismtty's SIGKILL can only leave WIFSIGNALED. The
+/// normal end is left to the main thread only when it is bounded, that is
+/// when the limit's watchdog runs.
+fn end_owner(leader_status: Option<libc::c_int>, normal_end_bounded: bool) -> EndOwner {
+    match leader_status {
+        Some(status) if normal_end_bounded && libc::WIFEXITED(status) => EndOwner::NormalEnd,
+        _ => EndOwner::Watcher,
+    }
+}
+
+fn forward_child_lock() -> std::sync::MutexGuard<'static, ReapState> {
     FORWARD_CHILD_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// Registers the wrapped child for signal forwarding. A status published for
+/// The outcome the signal watcher published, if it ended the session.
+fn published_end_outcome() -> Option<EndOutcome> {
+    match *forward_child_lock() {
+        ReapState::Ended(outcome) => Some(outcome),
+        _ => None,
+    }
+}
+
+/// Registers the wrapped child for signal forwarding. What was published for
 /// an earlier child belongs to that child, so it is dropped here.
 fn set_forward_child_pid(pid: libc::pid_t) {
-    let mut reaped_status = forward_child_lock();
-    *reaped_status = None;
+    let mut reap_state = forward_child_lock();
+    *reap_state = ReapState::Unreaped;
+    PUBLISHED_LEADER_STATUS.store(0, Ordering::SeqCst);
     FORWARD_CHILD_PID.store(pid, Ordering::SeqCst);
 }
 
@@ -323,7 +519,12 @@ fn close_slave_after_child_exit(
         let exit = wait_for_child_exit_without_reaping(pid as libc::pid_t);
         drop(slave);
         if let Some(reporter) = reporter.as_mut() {
-            reporter.exited = exit.is_ok_and(child_has_exited);
+            reporter.exited = match exit {
+                Ok(si_code) => child_has_exited(si_code),
+                // Reaped before this wait began: the signal watcher took it
+                // after an ending signal. It has exited all the same.
+                Err(error) => error.raw_os_error() == Some(libc::ECHILD),
+            };
         }
     });
     notice
@@ -791,14 +992,20 @@ fn reap_child(
 ) -> Result<ChildExit, CliError> {
     if let Some(pid) = child.process_id() {
         let pid = pid as libc::pid_t;
-        wait_for_child_exit_without_reaping(pid)?;
-        let mut reaped_status = forward_child_lock();
+        // This wait fails with ECHILD when the signal watcher reaped the
+        // child first; the outcome it published says how the child ended.
+        let waited = wait_for_child_exit_without_reaping(pid);
+        let mut reap_state = forward_child_lock();
+        if let ReapState::Ended(outcome) = *reap_state {
+            return Ok(outcome.child_exit());
+        }
+        waited?;
         let mut status: libc::c_int = 0;
         // SAFETY: `status` is a valid, exclusively borrowed c_int for the call.
         let reaped = if unsafe { libc::waitpid(pid, &mut status, 0) } == -1 {
             Err(io::Error::last_os_error())
         } else {
-            *reaped_status = Some(status);
+            *reap_state = ReapState::Reaped(status);
             Ok(ChildExit {
                 code: exit_code_from_wait(status),
                 wait_status: Some(status),
@@ -831,13 +1038,16 @@ fn terminate_and_reap_child(child: &mut Box<dyn portable_pty::Child + Send + Syn
         let _ = child.try_wait();
         return;
     };
-    terminate_and_reap_process_group(pid as libc::pid_t, libc::SIGHUP);
+    terminate_and_reap_process_group(pid as libc::pid_t, libc::SIGHUP, Instant::now() + END_LIMIT);
 }
 
-/// Returns the leader's raw wait status when this call reaped it.
+/// Returns the leader's raw wait status when this call reaped it. The leader
+/// has `CHILD_EXIT_GRACE` to exit, never past `deadline`; then the group is
+/// killed and the leader reaped until `deadline`.
 fn terminate_and_reap_process_group(
     pid: libc::pid_t,
     initial_signal: libc::c_int,
+    deadline: Instant,
 ) -> Option<libc::c_int> {
     // SAFETY: kill has no memory-safety preconditions; `pid` is the wrapped session leader, so
     // `-pid` is its process group.
@@ -845,8 +1055,8 @@ fn terminate_and_reap_process_group(
         libc::kill(-pid, initial_signal);
     }
     let mut status: libc::c_int = 0;
-    let deadline = Instant::now() + CHILD_EXIT_GRACE;
-    while Instant::now() < deadline {
+    let grace_end = (Instant::now() + CHILD_EXIT_GRACE).min(deadline);
+    while Instant::now() < grace_end {
         match child_exit_is_waitable(pid) {
             Ok(true) => {
                 // Keep the leader waitable until the final group signal so its
@@ -871,8 +1081,7 @@ fn terminate_and_reap_process_group(
         libc::kill(-pid, libc::SIGKILL);
         libc::kill(pid, libc::SIGKILL);
     }
-    let reap_deadline = Instant::now() + CHILD_EXIT_GRACE;
-    while Instant::now() < reap_deadline {
+    while Instant::now() < deadline {
         // SAFETY: `status` is a valid, exclusively borrowed c_int for the call.
         match unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) } {
             0 => thread::sleep(Duration::from_millis(20)),
@@ -886,11 +1095,17 @@ fn terminate_and_reap_process_group(
 
 /// Claims failure-path cleanup under the same lock used by signal forwarding.
 /// A signal watcher either wins the lock and owns termination, or waits until
-/// this path has reaped the child and cleared the registered pid.
+/// this path has reaped the child and cleared the registered pid. A child
+/// that was already reaped is left alone: its group was torn down then, and
+/// its group id may since belong to other processes.
 fn terminate_and_reap_registered_child(child: &mut Box<dyn portable_pty::Child + Send + Sync>) {
-    let _guard = forward_child_lock();
+    let reap_state = forward_child_lock();
+    if *reap_state != ReapState::Unreaped {
+        return;
+    }
     FORWARD_CHILD_PID.store(0, Ordering::SeqCst);
     terminate_and_reap_child(child);
+    drop(reap_state);
 }
 
 /// Passes a fallible post-spawn setup step through; on failure, terminates and
@@ -930,19 +1145,210 @@ fn process_group_exists(pid: libc::pid_t) -> bool {
     io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
-/// Forwards a terminating signal to the wrapped PTY process group, allows a
-/// bounded graceful exit, then kills any signal-immune descendants and reaps
-/// the process-group leader before the wrapper exits from its signal watcher.
-/// Returns the leader's raw wait status: from this reap, or the one
-/// `reap_child` left when the main thread reaped the leader first.
-fn terminate_and_reap_forwarded_child(signal: libc::c_int) -> Option<libc::c_int> {
-    let reaped_status = forward_child_lock();
+/// Passes a message signal to the command prismtty started, and to nothing
+/// else in its group, while that command is registered and not yet reaped.
+fn forward_message_to_command(signal: libc::c_int) {
+    let _guard = forward_child_lock();
     let pid = FORWARD_CHILD_PID.load(Ordering::SeqCst);
-    if pid <= 0 {
-        return *reaped_status;
+    if pid > 0 {
+        // SAFETY: kill has no memory-safety preconditions; `pid` was read under
+        // `forward_child_lock`, which serializes it with reaping.
+        unsafe {
+            libc::kill(pid, signal);
+        }
     }
-    FORWARD_CHILD_PID.store(0, Ordering::SeqCst);
-    terminate_and_reap_process_group(pid, signal)
+}
+
+/// Forwards an ending signal to the wrapped PTY process group, allows a
+/// bounded graceful exit, then kills any signal-immune descendants and reaps
+/// the process-group leader, as 1.4.0 did, all by `deadline`. Publishes the
+/// outcome in the same critical section as the reap, and returns it. The
+/// leader's status is the one this reap took, or the one `reap_child` left
+/// when the main thread reaped the leader first, in which case no group
+/// signal is sent.
+fn end_registered_child(
+    signal: libc::c_int,
+    deadline: Instant,
+    normal_end_bounded: bool,
+) -> EndOutcome {
+    let mut reap_state = forward_child_lock();
+    let pid = FORWARD_CHILD_PID.load(Ordering::SeqCst);
+    let leader_status = if pid > 0 {
+        FORWARD_CHILD_PID.store(0, Ordering::SeqCst);
+        terminate_and_reap_process_group(pid, signal, deadline)
+    } else if let ReapState::Reaped(status) = *reap_state {
+        Some(status)
+    } else {
+        None
+    };
+    let outcome = EndOutcome {
+        signal,
+        leader_status,
+        deadline,
+        owner: end_owner(leader_status, normal_end_bounded),
+    };
+    publish_end_outcome(&mut reap_state, outcome);
+    outcome
+}
+
+/// Publishes the watcher's outcome, under the reap lock that `reap_state`
+/// holds. The command's status goes out first in `PUBLISHED_LEADER_STATUS`,
+/// which the limit's watchdog reads without that lock.
+fn publish_end_outcome(reap_state: &mut ReapState, outcome: EndOutcome) {
+    PUBLISHED_LEADER_STATUS.store(
+        encode_published_status(outcome.leader_status),
+        Ordering::SeqCst,
+    );
+    *reap_state = ReapState::Ended(outcome);
+}
+
+/// What the limit's watchdog needs of the published outcome, which is all
+/// `end_abruptly` decides from besides the signal the watchdog already has:
+/// the command's raw wait status, or that the command was not collected.
+/// It is one value, written once by `publish_end_outcome` before the outcome
+/// under the reap lock, so a watcher delayed while it still holds that lock
+/// cannot keep it from the watchdog. 0 until then; `set_forward_child_pid`
+/// clears it for the next child.
+static PUBLISHED_LEADER_STATUS: AtomicU64 = AtomicU64::new(0);
+const STATUS_PUBLISHED: u64 = 1 << 63;
+const STATUS_COLLECTED: u64 = 1 << 62;
+
+fn encode_published_status(leader_status: Option<libc::c_int>) -> u64 {
+    STATUS_PUBLISHED | leader_status.map_or(0, |status| STATUS_COLLECTED | u64::from(status as u32))
+}
+
+/// The command's status as the watcher published it: `None` before it did,
+/// `Some(None)` when it could not collect the command.
+fn published_leader_status() -> Option<Option<libc::c_int>> {
+    published_leader_status_from(PUBLISHED_LEADER_STATUS.load(Ordering::SeqCst))
+}
+
+fn published_leader_status_from(value: u64) -> Option<Option<libc::c_int>> {
+    (value & STATUS_PUBLISHED != 0)
+        .then(|| (value & STATUS_COLLECTED != 0).then_some(value as u32 as libc::c_int))
+}
+
+/// Who ends the process once the watcher has taken an ending signal: the main
+/// thread after a normal end, or an abrupt exit from the watcher or the
+/// limit's watchdog. Only the first claim counts.
+static EXIT_CLAIM: AtomicI32 = AtomicI32::new(0);
+const EXIT_AFTER_NORMAL_END: i32 = 1;
+const EXIT_ABRUPTLY: i32 = 2;
+
+fn claim_exit(by: i32) -> bool {
+    EXIT_CLAIM
+        .compare_exchange(0, by, Ordering::SeqCst, Ordering::SeqCst)
+        .is_ok()
+}
+
+/// Waits for the thread that claimed the exit to end the process.
+fn wait_for_the_claimed_exit() -> ! {
+    loop {
+        thread::park();
+    }
+}
+
+/// Bounds the end of a session from outside every thread that can block in
+/// it: at `deadline`, unless the main thread has claimed the exit, the
+/// process ends abruptly (see `end_at_deadline`). Returns false when its
+/// thread cannot be started; the end is then abrupt at once.
+fn start_end_watchdog(signal: libc::c_int, deadline: Instant, sigint_left_default: bool) -> bool {
+    thread::Builder::new()
+        .name("end limit".to_owned())
+        .spawn(move || {
+            loop {
+                let now = Instant::now();
+                if now >= deadline {
+                    break;
+                }
+                thread::sleep(deadline - now);
+            }
+            end_at_deadline(signal, sigint_left_default);
+        })
+        .is_ok()
+}
+
+/// The limit's end, at the deadline. It ends the way the command's status
+/// that the watcher published decides, as `end_abruptly` does for the
+/// watcher, so a SIGINT that killed the command still ends prismtty by
+/// SIGINT; it reads that status without the reap lock. When the watcher has
+/// published nothing by the deadline (it has not collected the command, or
+/// collected it only an instant before and not yet published), the end is
+/// 128 plus `signal`.
+fn end_at_deadline(signal: libc::c_int, sigint_left_default: bool) {
+    let outcome = EndOutcome {
+        signal,
+        leader_status: published_leader_status().flatten(),
+        deadline: Instant::now(),
+        owner: EndOwner::Watcher,
+    };
+    end_abruptly(&outcome, sigint_left_default);
+}
+
+/// Ends the process at once after an ending signal, as 1.4.0 did. SIGINT that
+/// killed the command it was forwarded to (Ctrl-C with stdin redirected,
+/// `kill -INT`) ends prismtty the same way; anything else exits with 128 plus
+/// the signal prismtty was sent, whatever the command then died from.
+fn end_abruptly(outcome: &EndOutcome, sigint_left_default: bool) -> ! {
+    if !claim_exit(EXIT_ABRUPTLY) {
+        wait_for_the_claimed_exit();
+    }
+    // This runs on the watcher, the limit's or the stopping thread, not in a
+    // signal handler.
+    unregister_before_exit();
+    if outcome.signal == libc::SIGINT
+        && sigint_left_default
+        && killed_by_sigint(outcome.leader_status)
+    {
+        die_from_signal(libc::SIGINT);
+    }
+    // SAFETY: _exit never returns and skips destructors by design: the terminal was restored,
+    // the child reaped or given up on, and the pid file removed above.
+    unsafe { libc::_exit(128 + outcome.signal) }
+}
+
+/// The watcher's side of an ending signal. The limit is armed first, before
+/// anything here that can block; then the terminal is restored and the group
+/// torn down as in 1.4.0. A command that exited by itself leaves the rest of
+/// the end to the main thread; anything else ends the process here.
+fn end_session_after_signal(
+    signal: libc::c_int,
+    raw_mode_state: &Mutex<RawModeLifecycle>,
+    sigint_left_default: bool,
+) {
+    #[cfg(test)]
+    pause_at_end_entry_for_test();
+    let deadline = Instant::now() + END_LIMIT;
+    let bounded = start_end_watchdog(signal, deadline, sigint_left_default);
+    if let Err(error) = terminate_raw_mode_from_signal_state(raw_mode_state) {
+        warn(format_args!(
+            "prismtty: could not restore terminal before exit: {error}"
+        ));
+    }
+    let outcome = end_registered_child(signal, deadline, bounded);
+    if outcome.owner == EndOwner::Watcher {
+        end_abruptly(&outcome, sigint_left_default);
+    }
+}
+
+/// How the process ends after the watcher took an ending signal, decided by
+/// the main thread from the one published outcome once the watcher has been
+/// joined. `normal_end` is the command's code when the normal end completed.
+/// The main thread claims the exit only after its last step that can block,
+/// and when it loses the claim the watchdog is ending the process.
+fn exit_after_end_signal(outcome: &EndOutcome, normal_end: Option<u8>) -> ExitCode {
+    let _ = io::stdout().flush();
+    let _ = io::stderr().flush();
+    let (claim, code) = match normal_end {
+        Some(code) if outcome.owner == EndOwner::NormalEnd && Instant::now() < outcome.deadline => {
+            (EXIT_AFTER_NORMAL_END, code)
+        }
+        _ => (EXIT_ABRUPTLY, outcome.abrupt_code()),
+    };
+    if !claim_exit(claim) {
+        wait_for_the_claimed_exit();
+    }
+    ExitCode::from(code)
 }
 
 fn wake_main_loop_after_input_failure() {
@@ -1057,7 +1463,19 @@ pub(super) fn run_command(options: Options, command: Vec<OsString>) -> Result<Ex
     // Read before prismtty blocks or handles any signal, so this is the
     // caller's choice and not prismtty's own.
     let sigint_left_default = caller_left_sigint_default();
-    match run_session(options, command, sigint_left_default)? {
+    let session = run_session(options, command, sigint_left_default);
+    // Read once the signal watcher has been joined: when it took an ending
+    // signal, its outcome decides how this process ends. A session that
+    // failed after that ends abruptly, without an error message, as 1.4.0's
+    // watcher ended it.
+    if let Some(outcome) = published_end_outcome() {
+        let normal_end = match session {
+            Ok(SessionEnd::Exit(code)) => Some(code),
+            _ => None,
+        };
+        return Ok(exit_after_end_signal(&outcome, normal_end));
+    }
+    match session? {
         SessionEnd::Exit(code) => Ok(ExitCode::from(code)),
         SessionEnd::Interrupted => {
             // The session's locals are dropped: the terminal is restored, the
@@ -2428,6 +2846,9 @@ impl Drop for RawModeGuard {
 }
 
 extern "C" fn restore_raw_mode_for_signal(signal: libc::c_int) {
+    if is_end_signal(signal) {
+        PENDING_END.record(signal);
+    }
     RAW_MODE_SIGNAL_PIPE.notify(signal as u8);
 }
 
@@ -2567,11 +2988,13 @@ struct SessionSignalWatcher {
     thread: Option<thread::JoinHandle<()>>,
     previous_signal_handlers: Vec<(libc::c_int, libc::sigaction)>,
     raw_mode_state: SharedRawModeState,
+    sigint_left_default: bool,
 }
 
 impl SessionSignalWatcher {
     fn start(raw_mode_state: SharedRawModeState, sigint_left_default: bool) -> io::Result<Self> {
         ensure_child_is_reapable()?;
+        PENDING_END.clear();
         let (read_fd, write_fd) = pipe_fds()?;
         if let Err(error) = set_fd_nonblocking(write_fd) {
             close_fd(read_fd);
@@ -2611,6 +3034,7 @@ impl SessionSignalWatcher {
             thread: Some(thread),
             previous_signal_handlers,
             raw_mode_state,
+            sigint_left_default,
         })
     }
 
@@ -2620,10 +3044,25 @@ impl SessionSignalWatcher {
                 "prismtty: could not restore terminal during cleanup: {error}"
             ));
         }
-        restore_signal_handlers(&self.previous_signal_handlers);
-        self.previous_signal_handlers.clear();
-        // Handlers are restored, so no new one starts; wait out any that is
-        // mid-write before the descriptor is closed (or leak it if one stalls).
+        // See `PendingEnd` for the handoff. With an End recorded (taken or
+        // not, published or not) the process is on its way out: its signals
+        // stay caught, with nothing left to act on them, so a second SIGTERM
+        // or a late SIGUSR1 cannot kill it by signal before it has removed
+        // its pid file and returned its status. With none, the signals are
+        // given back first, as in 1.4.1.
+        let handlers = mem::take(&mut self.previous_signal_handlers);
+        let mut given_back = false;
+        if PENDING_END.get().is_none() {
+            restore_signal_handlers(&handlers);
+            given_back = true;
+            if PENDING_END.get().is_some() {
+                // Recorded while they were being given back.
+                catch_signals_again(&handlers);
+                given_back = false;
+            }
+        }
+        // Wait out any handler that is mid-write before the descriptor is
+        // closed (or leak it if one stalls).
         let closable = RAW_MODE_SIGNAL_PIPE.disarm();
         if self.write_fd >= 0 {
             write_signal_byte(self.write_fd, RAW_SIGNAL_STOP_BYTE);
@@ -2632,8 +3071,21 @@ impl SessionSignalWatcher {
             }
             self.write_fd = -1;
         }
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
+        let Some(thread) = self.thread.take() else {
+            return;
+        };
+        let _ = thread.join();
+        // An End that a handler recorded and the watcher did not take (it
+        // came after the watcher's last check) is taken here, on the stopping
+        // thread: the session is ending, its command has been reaped or given
+        // up on, and that decides the status as for any end.
+        if PENDING_END.get().is_some() {
+            if given_back {
+                catch_signals_again(&handlers);
+            }
+            if let Some(signal) = PENDING_END.take() {
+                end_session_after_signal(signal, &self.raw_mode_state, self.sigint_left_default);
+            }
         }
     }
 }
@@ -2641,6 +3093,15 @@ impl SessionSignalWatcher {
 impl Drop for SessionSignalWatcher {
     fn drop(&mut self) {
         self.stop();
+    }
+}
+
+/// Puts prismtty's handler back on the signals in `handlers`, once an End
+/// was recorded after they were given back. The self-pipe is disarmed by
+/// then, so the handler only records, and the End is already recorded.
+fn catch_signals_again(handlers: &[(libc::c_int, libc::sigaction)]) {
+    for (signal, _) in handlers {
+        let _ = install_signal_handler(*signal, restore_raw_mode_for_signal, libc::SA_RESTART);
     }
 }
 
@@ -2687,102 +3148,116 @@ fn handle_session_signals(
     raw_mode_state: SharedRawModeState,
     sigint_left_default: bool,
 ) {
-    handle_session_signals_with(read_fd, &raw_mode_state, sigint_left_default, || {
-        with_terminal_restored_for_job_control(
-            || suspend_raw_mode_from_signal_state(&raw_mode_state),
-            || {
-                forward_signal_to_child(libc::SIGSTOP as u8);
-                // SAFETY: raise has no memory-safety preconditions; SIGSTOP cannot be
-                // caught and raw mode was restored just before.
-                unsafe {
-                    // Target the calling thread so Linux delivers the
-                    // stop before this worker can continue and reapply
-                    // raw mode. A process-directed kill may return
-                    // while SIGSTOP is still pending.
-                    libc::raise(libc::SIGSTOP);
-                }
-                forward_signal_to_child(libc::SIGCONT as u8);
-            },
-            || reapply_raw_mode_from_signal_state(&raw_mode_state),
-        )
-    });
+    handle_session_signals_with(
+        read_fd,
+        &PENDING_END,
+        &raw_mode_state,
+        || {
+            with_terminal_restored_for_job_control(
+                || suspend_raw_mode_from_signal_state(&raw_mode_state),
+                || {
+                    forward_signal_to_child(libc::SIGSTOP as u8);
+                    // SAFETY: raise has no memory-safety preconditions; SIGSTOP cannot be
+                    // caught and raw mode was restored just before.
+                    unsafe {
+                        // Target the calling thread so Linux delivers the
+                        // stop before this worker can continue and reapply
+                        // raw mode. A process-directed kill may return
+                        // while SIGSTOP is still pending.
+                        libc::raise(libc::SIGSTOP);
+                    }
+                    forward_signal_to_child(libc::SIGCONT as u8);
+                },
+                || reapply_raw_mode_from_signal_state(&raw_mode_state),
+            )
+        },
+        forward_message_to_command,
+        |signal| end_session_after_signal(signal, &raw_mode_state, sigint_left_default),
+    );
 }
 
 /// Acts on the signal numbers the handlers queue in the self-pipe until the
-/// stop byte arrives. `stop_for_job_control` performs one supervised stop and
-/// returns once the wrapper has been continued. `sigint_left_default` says
-/// whether the caller left SIGINT at its default action and unblocked.
+/// stop byte arrives. An ending signal recorded in `pending_end` outranks
+/// every queued byte: `end_session` takes it, and the watcher stops once that
+/// returns (the main thread then finishes the session). A message queued
+/// behind it is not delivered. `forward_message` passes on SIGUSR1 and
+/// SIGUSR2, and `stop_for_job_control` performs one supervised stop and
+/// returns once the wrapper has been continued.
 fn handle_session_signals_with(
     read_fd: RawFd,
+    pending_end: &PendingEnd,
     raw_mode_state: &Mutex<RawModeLifecycle>,
-    sigint_left_default: bool,
     mut stop_for_job_control: impl FnMut() -> io::Result<()>,
+    mut forward_message: impl FnMut(libc::c_int),
+    mut end_session: impl FnMut(libc::c_int),
 ) {
     let mut pending = VecDeque::new();
     let mut resumed_at = None;
-    while let Some(bytes) = read_signal_bytes(read_fd) {
-        pending.extend(bytes);
-        while let Some(signal) = pending.pop_front() {
-            if signal == RAW_SIGNAL_STOP_BYTE {
-                close_fd(read_fd);
-                return;
+    loop {
+        if pending_end.get().is_some() {
+            // Taken here, or already by another thread, which then ends
+            // the session.
+            if let Some(signal) = pending_end.take() {
+                end_session(signal);
             }
-            let signal = libc::c_int::from(signal);
-            if TERMINATING_SIGNALS.contains(&signal) {
-                if let Err(error) = terminate_raw_mode_from_signal_state(raw_mode_state) {
-                    warn(format_args!(
-                        "prismtty: could not restore terminal before exit: {error}"
-                    ));
-                }
-                let child_status = terminate_and_reap_forwarded_child(signal);
-                // This runs on the watcher thread, not in the signal handler.
-                unregister_before_exit();
-                // SIGINT that killed the command it was forwarded to (Ctrl-C
-                // with stdin redirected, `kill -INT`) ends prismtty the same
-                // way. Any other signal keeps 128 plus that signal, whatever
-                // the command then died from, as does a command that handled
-                // SIGINT.
-                if signal == libc::SIGINT && sigint_left_default && killed_by_sigint(child_status) {
-                    die_from_signal(libc::SIGINT);
-                }
-                // SAFETY: _exit never returns and skips destructors by design: the terminal was
-                // restored, the child reaped and the pid file removed above.
-                unsafe {
-                    libc::_exit(128 + signal);
-                }
-            }
-            if signal == libc::SIGCONT {
-                if let Err(error) = reassert_raw_mode_from_signal_state(raw_mode_state) {
-                    warn(format_args!(
-                        "prismtty: could not reapply raw terminal mode: {error}"
-                    ));
-                }
-                RESIZE_SIGNAL_PIPE.notify(RESIZE_WAKE_BYTE);
-                continue;
-            }
-            if JOB_CONTROL_SIGNALS.contains(&signal) {
-                if is_stale_stop_request(signal, resumed_at, || {
-                    owns_terminal(libc::STDIN_FILENO) == Some(true)
-                }) {
+            break;
+        }
+        let Some(signal) = pending.pop_front() else {
+            match read_signal_bytes(read_fd) {
+                Some(bytes) => {
+                    pending.extend(bytes);
                     continue;
                 }
-                if let Err(error) = stop_for_job_control() {
-                    warn(format_args!(
-                        "prismtty: job-control terminal transition failed: {error}"
-                    ));
-                }
-                // A resize while stopped signalled the shell, which owned the
-                // terminal then, so check the size again.
-                RESIZE_SIGNAL_PIPE.notify(RESIZE_WAKE_BYTE);
-                // Stop requests queued before the resume were satisfied by
-                // this stop, just as SIGCONT discards pending stop signals.
-                // Replaying them would stop the wrapper again right after
-                // `fg`: a background read of the terminal raises SIGTTIN
-                // each time it restarts, queueing a burst of them.
-                pending.extend(ready_signal_bytes(read_fd));
-                pending.retain(|byte| !JOB_CONTROL_SIGNALS.contains(&libc::c_int::from(*byte)));
-                resumed_at = Some(Instant::now());
+                None => break,
             }
+        };
+        if signal == RAW_SIGNAL_STOP_BYTE {
+            #[cfg(test)]
+            record_end_at_stop_for_test(pending_end);
+            break;
+        }
+        let signal = libc::c_int::from(signal);
+        if is_end_signal(signal) {
+            // The handler recorded it before it wrote this byte; a byte that
+            // came alone counts all the same.
+            pending_end.record(signal);
+            continue;
+        }
+        if is_message_signal(signal) {
+            forward_message(signal);
+            continue;
+        }
+        if signal == libc::SIGCONT {
+            if let Err(error) = reassert_raw_mode_from_signal_state(raw_mode_state) {
+                warn(format_args!(
+                    "prismtty: could not reapply raw terminal mode: {error}"
+                ));
+            }
+            RESIZE_SIGNAL_PIPE.notify(RESIZE_WAKE_BYTE);
+            continue;
+        }
+        if JOB_CONTROL_SIGNALS.contains(&signal) {
+            if is_stale_stop_request(signal, resumed_at, || {
+                owns_terminal(libc::STDIN_FILENO) == Some(true)
+            }) {
+                continue;
+            }
+            if let Err(error) = stop_for_job_control() {
+                warn(format_args!(
+                    "prismtty: job-control terminal transition failed: {error}"
+                ));
+            }
+            // A resize while stopped signalled the shell, which owned the
+            // terminal then, so check the size again.
+            RESIZE_SIGNAL_PIPE.notify(RESIZE_WAKE_BYTE);
+            // Stop requests queued before the resume were satisfied by this
+            // stop, just as SIGCONT discards pending stop signals. Replaying
+            // them would stop the wrapper again right after `fg`: a
+            // background read of the terminal raises SIGTTIN each time it
+            // restarts, queueing a burst of them.
+            pending.extend(ready_signal_bytes(read_fd));
+            pending.retain(|byte| !JOB_CONTROL_SIGNALS.contains(&libc::c_int::from(*byte)));
+            resumed_at = Some(Instant::now());
         }
     }
     close_fd(read_fd);
@@ -3441,7 +3916,7 @@ mod tests {
         if probe_state("registration_probe").is_none() {
             return;
         }
-        *super::forward_child_lock() = Some(libc::SIGINT);
+        *super::forward_child_lock() = super::ReapState::Reaped(libc::SIGINT);
         super::set_forward_child_pid(0);
         println!("published={:?}", *super::forward_child_lock());
     }
@@ -3455,7 +3930,7 @@ mod tests {
     fn registering_a_child_drops_the_status_published_for_the_last_one() {
         assert!(super::killed_by_sigint(Some(libc::SIGINT)));
         let printed = run_probe("registration_probe", "after an earlier session");
-        assert!(printed.contains("published=None"), "{printed}");
+        assert!(printed.contains("published=Unreaped"), "{printed}");
     }
 
     // AUDIT G5: exit codes above 255 must clamp, not wrap to a misleading 0.
@@ -4320,13 +4795,547 @@ mod tests {
         let state = Mutex::new(super::RawModeLifecycle::Inactive);
         let mut stops = 0;
 
-        super::handle_session_signals_with(read_fd, &state, true, || {
-            stops += 1;
-            Ok(())
-        });
+        super::handle_session_signals_with(
+            read_fd,
+            &super::PendingEnd::new(),
+            &state,
+            || {
+                stops += 1;
+                Ok(())
+            },
+            |_| panic!("no message was sent"),
+            |_| panic!("no ending signal was sent"),
+        );
 
         assert_eq!(stops, 1, "stale stop requests stopped the wrapper again");
         super::close_fd(write_fd);
+    }
+
+    // The self-pipe only wakes the watcher, and a burst of messages can fill
+    // it so that the byte of a later ending signal is lost. The ending signal
+    // is recorded beside the pipe, and it is taken before any queued message.
+    #[test]
+    fn an_ending_signal_outranks_queued_messages_and_a_full_signal_pipe() {
+        let (read_fd, write_fd) = super::pipe_fds().expect("signal pipe");
+        super::set_fd_nonblocking(write_fd).expect("nonblocking write end");
+        let message = [libc::SIGUSR1 as u8];
+        let mut queued = 0;
+        // SAFETY: `message` is valid for reads of one byte and `write_fd` is our pipe end.
+        while unsafe { libc::write(write_fd, message.as_ptr().cast(), 1) } == 1 {
+            queued += 1;
+        }
+        let pending_end = super::PendingEnd::new();
+        pending_end.record(libc::SIGTERM);
+        // The handler's byte for the ending signal cannot be written now.
+        super::write_signal_byte(write_fd, libc::SIGTERM as u8);
+        let state = Mutex::new(super::RawModeLifecycle::Inactive);
+        let mut forwarded = 0;
+        let mut ended = Vec::new();
+
+        super::handle_session_signals_with(
+            read_fd,
+            &pending_end,
+            &state,
+            || panic!("no job-control signal was sent"),
+            |_| forwarded += 1,
+            |signal| ended.push(signal),
+        );
+
+        assert!(queued > 0, "the pipe took no message byte");
+        assert_eq!(ended, [libc::SIGTERM]);
+        assert_eq!(forwarded, 0, "messages were forwarded before the end");
+        super::close_fd(write_fd);
+    }
+
+    // An ending signal that arrives while messages are queued is taken before
+    // the rest of them.
+    #[test]
+    fn an_ending_signal_is_taken_before_the_messages_still_queued() {
+        let (read_fd, write_fd) = super::pipe_fds().expect("signal pipe");
+        for _ in 0..32 {
+            super::write_signal_byte(write_fd, libc::SIGUSR1 as u8);
+        }
+        let pending_end = super::PendingEnd::new();
+        let state = Mutex::new(super::RawModeLifecycle::Inactive);
+        let mut forwarded = 0;
+        let mut ended = Vec::new();
+
+        super::handle_session_signals_with(
+            read_fd,
+            &pending_end,
+            &state,
+            || panic!("no job-control signal was sent"),
+            |_| {
+                forwarded += 1;
+                // SIGTERM arrives while the first message is passed on.
+                if forwarded == 1 {
+                    pending_end.record(libc::SIGTERM);
+                }
+            },
+            |signal| ended.push(signal),
+        );
+
+        assert_eq!(ended, [libc::SIGTERM]);
+        assert_eq!(
+            forwarded, 1,
+            "queued messages were passed on before the end"
+        );
+        super::close_fd(write_fd);
+    }
+
+    // A byte of an ending signal that nothing recorded still ends the session,
+    // after the messages queued before it.
+    #[test]
+    fn an_ending_signal_byte_alone_ends_the_session_after_earlier_messages() {
+        let (read_fd, write_fd) = super::pipe_fds().expect("signal pipe");
+        for byte in [libc::SIGUSR1, libc::SIGUSR2, libc::SIGHUP, libc::SIGUSR1] {
+            super::write_signal_byte(write_fd, byte as u8);
+        }
+        let state = Mutex::new(super::RawModeLifecycle::Inactive);
+        let mut forwarded = Vec::new();
+        let mut ended = Vec::new();
+
+        super::handle_session_signals_with(
+            read_fd,
+            &super::PendingEnd::new(),
+            &state,
+            || panic!("no job-control signal was sent"),
+            |signal| forwarded.push(signal),
+            |signal| ended.push(signal),
+        );
+
+        assert_eq!(forwarded, [libc::SIGUSR1, libc::SIGUSR2]);
+        assert_eq!(ended, [libc::SIGHUP]);
+        super::close_fd(write_fd);
+    }
+
+    // Two threads can race to take the same End: the watcher at the top of
+    // its loop and the stopping thread after joining it. Only one wins, and
+    // a watcher that finds the End taken stops without acting on it.
+    #[test]
+    fn a_recorded_end_is_taken_by_one_thread_only() {
+        let pending_end = super::PendingEnd::new();
+        assert_eq!(pending_end.take(), None);
+        pending_end.record(libc::SIGTERM);
+        let start = std::sync::Barrier::new(4);
+        let taken: Vec<_> = std::thread::scope(|scope| {
+            let takers: Vec<_> = (0..4)
+                .map(|_| {
+                    scope.spawn(|| {
+                        start.wait();
+                        pending_end.take()
+                    })
+                })
+                .collect();
+            takers
+                .into_iter()
+                .filter_map(|taker| taker.join().ok().flatten())
+                .collect()
+        });
+        assert_eq!(taken, [libc::SIGTERM]);
+        assert_eq!(pending_end.get(), Some(libc::SIGTERM));
+
+        let (read_fd, write_fd) = super::pipe_fds().expect("signal pipe");
+        super::write_signal_byte(write_fd, libc::SIGUSR1 as u8);
+        let state = Mutex::new(super::RawModeLifecycle::Inactive);
+        let mut forwarded = 0;
+        super::handle_session_signals_with(
+            read_fd,
+            &pending_end,
+            &state,
+            || panic!("no job-control signal was sent"),
+            |_| forwarded += 1,
+            |_| panic!("an End another thread took was taken again"),
+        );
+        assert_eq!(forwarded, 0);
+        super::close_fd(write_fd);
+    }
+
+    #[test]
+    fn the_first_ending_signal_recorded_wins() {
+        let pending_end = super::PendingEnd::new();
+        assert_eq!(pending_end.get(), None);
+        pending_end.record(libc::SIGTERM);
+        pending_end.record(libc::SIGHUP);
+        assert_eq!(pending_end.get(), Some(libc::SIGTERM));
+    }
+
+    #[test]
+    fn messages_are_sigusr1_and_sigusr2_and_every_other_caught_signal_ends_the_session() {
+        for signal in super::TERMINATING_SIGNALS {
+            let message = signal == libc::SIGUSR1 || signal == libc::SIGUSR2;
+            assert_eq!(super::is_message_signal(signal), message, "signal {signal}");
+            assert_eq!(super::is_end_signal(signal), !message, "signal {signal}");
+        }
+        for signal in [libc::SIGCONT, libc::SIGTSTP, libc::SIGWINCH, libc::SIGKILL] {
+            assert!(!super::is_end_signal(signal), "signal {signal}");
+            assert!(!super::is_message_signal(signal), "signal {signal}");
+        }
+    }
+
+    // The raw wait status decides: an ordinary exit, whenever it happened and
+    // whatever its code, leaves the end to the main thread, as long as the
+    // watchdog bounds it. A signal death, or no status at all, does not.
+    #[test]
+    fn the_command_exited_by_itself_only_with_an_ordinary_exit_status() {
+        use super::EndOwner::{NormalEnd, Watcher};
+
+        let exited = |code: libc::c_int| code << 8;
+        assert_eq!(super::end_owner(Some(exited(0)), true), NormalEnd);
+        assert_eq!(super::end_owner(Some(exited(7)), true), NormalEnd);
+        assert_eq!(super::end_owner(Some(exited(137)), true), NormalEnd);
+        assert_eq!(super::end_owner(Some(exited(7)), false), Watcher);
+        assert_eq!(super::end_owner(Some(libc::SIGTERM), true), Watcher);
+        assert_eq!(super::end_owner(Some(libc::SIGKILL), true), Watcher);
+        assert_eq!(super::end_owner(None, true), Watcher);
+        assert!(libc::WIFEXITED(exited(7)) && libc::WEXITSTATUS(exited(7)) == 7);
+    }
+
+    /// An outcome as the watcher publishes it for a command that exited 0.
+    fn ended_with_exit_0() -> super::ReapState {
+        super::ReapState::Ended(super::EndOutcome {
+            signal: libc::SIGTERM,
+            leader_status: Some(0),
+            deadline: Instant::now() + super::END_LIMIT,
+            owner: super::EndOwner::NormalEnd,
+        })
+    }
+
+    /// Spawns `program` with `args` in a session of its own, as the wrapper
+    /// spawns its command, and returns it with its PTY, which the caller
+    /// keeps open: closing it would hang the command up.
+    fn spawn_command(
+        program: &str,
+        args: &[&str],
+    ) -> (
+        Box<dyn portable_pty::Child + Send + Sync>,
+        portable_pty::PtyPair,
+    ) {
+        let pair = portable_pty::native_pty_system()
+            .openpty(portable_pty::PtySize::default())
+            .expect("openpty");
+        let mut builder = portable_pty::CommandBuilder::new(program);
+        builder.args(args);
+        builder.cwd("/");
+        let child =
+            super::spawn_with_pty_slave(&builder, &*pair.master, false, &[]).expect("spawn");
+        (child, pair)
+    }
+
+    /// Publishes the watcher's end while a live decoy is registered, then runs
+    /// the failure cleanup of a stream error, and prints whether the decoy
+    /// was signalled.
+    #[test]
+    fn cleanup_after_end_probe() {
+        if probe_state("cleanup_after_end_probe").is_none() {
+            return;
+        }
+        let (mut child, _pty) = spawn_command("sleep", &["5"]);
+        let pid = child.process_id().expect("decoy pid") as libc::pid_t;
+        super::set_forward_child_pid(pid);
+        {
+            let mut reap_state = super::forward_child_lock();
+            super::FORWARD_CHILD_PID.store(0, Ordering::SeqCst);
+            *reap_state = ended_with_exit_0();
+        }
+        super::terminate_and_reap_registered_child(&mut child);
+        std::thread::sleep(Duration::from_millis(300));
+        // Alive means neither waitable nor reaped.
+        // SAFETY: siginfo_t is a plain C struct; all-zero bytes are a valid value that waitid
+        // overwrites.
+        let mut info = unsafe { std::mem::zeroed::<libc::siginfo_t>() };
+        // SAFETY: `info` is valid for the call; WNOWAIT leaves the decoy unreaped.
+        let waited = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                pid as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
+        // SAFETY: waitid returned 0, so `info` is populated.
+        let alive = waited == 0 && unsafe { info.si_pid() } == 0;
+        println!("decoy-exited={}", !alive);
+        // SAFETY: kill has no memory-safety preconditions; `pid` is this probe's own child,
+        // not reaped yet.
+        unsafe {
+            libc::kill(-pid, libc::SIGKILL);
+            libc::kill(pid, libc::SIGKILL);
+        }
+        let _ = child.wait();
+    }
+
+    // After the watcher reaped the command and killed its group, a stream
+    // error's cleanup must not signal that group again: its id may belong to
+    // other processes by then. The decoy is a live command in that place.
+    #[test]
+    fn cleanup_after_the_watcher_ended_the_session_signals_nothing() {
+        let printed = run_probe("cleanup_after_end_probe", "after the watcher's reap");
+        assert!(printed.contains("decoy-exited=false"), "{printed}");
+    }
+
+    /// Reaps a finished command the way the watcher does, publishes the
+    /// outcome, and prints what the main thread's reap makes of it.
+    #[test]
+    fn reap_after_end_probe() {
+        if probe_state("reap_after_end_probe").is_none() {
+            return;
+        }
+        let (mut child, _pty) = spawn_command("sh", &["-c", "exit 7"]);
+        let pid = child.process_id().expect("command pid") as libc::pid_t;
+        super::set_forward_child_pid(pid);
+        let mut status = 0;
+        {
+            let mut reap_state = super::forward_child_lock();
+            super::FORWARD_CHILD_PID.store(0, Ordering::SeqCst);
+            // SAFETY: `status` is a valid, exclusively borrowed c_int for the call.
+            assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+            *reap_state = super::ReapState::Ended(super::EndOutcome {
+                signal: libc::SIGTERM,
+                leader_status: Some(status),
+                deadline: Instant::now() + super::END_LIMIT,
+                owner: super::end_owner(Some(status), true),
+            });
+        }
+        match super::reap_child(&mut child) {
+            Ok(exit) => println!("code={} status={:?}", exit.code, exit.wait_status),
+            Err(error) => println!("error={error}"),
+        }
+    }
+
+    /// Runs the probe test `probe` alone in a copy of this test binary, for
+    /// `state`, and returns how that process ended and what it printed. For a
+    /// probe that ends its process itself.
+    fn run_ending_probe(probe: &str, state: &str) -> (std::process::ExitStatus, String) {
+        let module = module_path!()
+            .split_once("::")
+            .map_or(module_path!(), |(_, path)| path);
+        let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args([
+                "--exact",
+                &format!("{module}::{probe}"),
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(PROBE, format!("{probe}:{state}"))
+            .output()
+            .expect("run the probe");
+        (
+            output.status,
+            String::from_utf8_lossy(&output.stdout).into_owned(),
+        )
+    }
+
+    /// Publishes the watcher's outcome for a command that SIGINT killed, the
+    /// signal received being INT or TERM, and then runs the limit's end at
+    /// the deadline: as when the watcher, delayed after its reap, has not yet
+    /// ended the process itself. With `LOCKED_INT` the watcher is delayed
+    /// while it still holds the reap lock, for longer than the limit would
+    /// ever wait for it.
+    #[test]
+    fn end_at_deadline_probe() {
+        let Some(state) = probe_state("end_at_deadline_probe") else {
+            return;
+        };
+        let signal = if state == "TERM" {
+            libc::SIGTERM
+        } else {
+            libc::SIGINT
+        };
+        let outcome = super::EndOutcome {
+            signal,
+            leader_status: Some(libc::SIGINT),
+            deadline: Instant::now(),
+            owner: super::EndOwner::Watcher,
+        };
+        let mut reap_state = super::forward_child_lock();
+        super::publish_end_outcome(&mut reap_state, outcome);
+        if state == "LOCKED_INT" {
+            let limit = std::thread::spawn(move || super::end_at_deadline(signal, true));
+            std::thread::sleep(Duration::from_millis(1500));
+            drop(reap_state);
+            let _ = limit.join();
+        } else {
+            drop(reap_state);
+            super::end_at_deadline(signal, true);
+        }
+        println!("the limit did not end the process");
+    }
+
+    #[test]
+    fn the_status_published_for_the_limit_reads_back_as_written() {
+        assert_eq!(super::published_leader_status_from(0), None);
+        for status in [
+            None,
+            Some(0),
+            Some(libc::SIGINT),
+            Some(7 << 8),
+            Some(137 << 8),
+        ] {
+            let encoded = super::encode_published_status(status);
+            assert_eq!(super::published_leader_status_from(encoded), Some(status));
+        }
+    }
+
+    /// Starts the signal watcher as a session does, publishes that the main
+    /// thread reaped the command (`exit 0`, or `killed` by SIGKILL), and stops
+    /// the watcher while a SIGTERM is recorded at its stop byte: after the
+    /// watcher's last check, as a handler can record one while the session
+    /// stops. Prints the outcome published then.
+    #[test]
+    fn end_at_stop_probe() {
+        let Some(state) = probe_state("end_at_stop_probe") else {
+            return;
+        };
+        let raw_mode = Arc::new(Mutex::new(super::RawModeLifecycle::Inactive));
+        let mut watcher =
+            super::SessionSignalWatcher::start(Arc::clone(&raw_mode), true).expect("watcher");
+        let status = if state == "killed" { libc::SIGKILL } else { 0 };
+        *super::forward_child_lock() = super::ReapState::Reaped(status);
+        super::END_TO_RECORD_AT_STOP.store(libc::SIGTERM, Ordering::SeqCst);
+        watcher.stop();
+        println!("outcome={:?}", super::published_end_outcome());
+    }
+
+    // An ending signal that a handler records while the session stops, after
+    // the watcher's last check, is still taken: its command was reaped, so
+    // the command's status decides as for any end. A command that exited 0
+    // gives 0 through the normal end; one that was killed gives 128 plus the
+    // signal received.
+    #[test]
+    fn an_ending_signal_recorded_while_the_session_stops_is_taken() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let printed = run_probe("end_at_stop_probe", "exit 0");
+        assert!(
+            printed.contains("signal: 15")
+                && printed.contains("leader_status: Some(0)")
+                && printed.contains("NormalEnd"),
+            "{printed}"
+        );
+        let (status, printed) = run_ending_probe("end_at_stop_probe", "killed");
+        assert_eq!(
+            (status.signal(), status.code()),
+            (None, Some(128 + libc::SIGTERM)),
+            "{printed}"
+        );
+    }
+
+    static PRIOR_USR1_RAN: AtomicBool = AtomicBool::new(false);
+
+    extern "C" fn prior_usr1(_: libc::c_int) {
+        PRIOR_USR1_RAN.store(true, Ordering::SeqCst);
+    }
+
+    /// Gives SIGUSR1 an action of its own, as a caller can, starts the signal
+    /// watcher, lets it take SIGTERM and holds that End at the entry of its
+    /// path, before anything is published, and meanwhile stops the session
+    /// from another thread. Prints whether a SIGUSR1 sent then ran the prior
+    /// action and whether the End was published yet, then lets the End go on,
+    /// which ends the process.
+    #[test]
+    fn stop_during_end_probe() {
+        if probe_state("stop_during_end_probe").is_none() {
+            return;
+        }
+        let prior: extern "C" fn(libc::c_int) = prior_usr1;
+        // SIGTERM at its default and unblocked, whatever the runner left, so
+        // that the watcher catches it; the watcher thread inherits this
+        // thread's mask.
+        // SAFETY: the handler is an `extern "C" fn(c_int)` that only stores to an atomic; the set
+        // is a stack-local sigset_t initialized before use. Only this probe runs in this process.
+        unsafe {
+            libc::signal(libc::SIGTERM, libc::SIG_DFL);
+            libc::signal(libc::SIGUSR1, prior as libc::sighandler_t);
+            let mut set = std::mem::zeroed::<libc::sigset_t>();
+            libc::sigemptyset(&mut set);
+            libc::sigaddset(&mut set, libc::SIGTERM);
+            libc::sigaddset(&mut set, libc::SIGUSR1);
+            libc::pthread_sigmask(libc::SIG_UNBLOCK, &set, std::ptr::null_mut());
+        }
+        let raw_mode = Arc::new(Mutex::new(super::RawModeLifecycle::Inactive));
+        let watcher = super::SessionSignalWatcher::start(raw_mode, true).expect("watcher");
+        super::END_ENTRY_PAUSE.armed.store(true, Ordering::SeqCst);
+        // SAFETY: kill has no memory-safety preconditions; the target is this probe's own process.
+        unsafe {
+            libc::kill(libc::getpid(), libc::SIGTERM);
+        }
+        let until = Instant::now() + Duration::from_secs(5);
+        while !super::END_ENTRY_PAUSE.entered.load(Ordering::SeqCst) && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let entered = super::END_ENTRY_PAUSE.entered.load(Ordering::SeqCst);
+        let stopper = std::thread::spawn(move || {
+            let mut watcher = watcher;
+            watcher.stop();
+        });
+        // Time for stop to give the signals back, or keep them, and then
+        // wait for the watcher.
+        std::thread::sleep(Duration::from_millis(300));
+        // SAFETY: kill has no memory-safety preconditions; the target is this probe's own process.
+        unsafe {
+            libc::kill(libc::getpid(), libc::SIGUSR1);
+        }
+        std::thread::sleep(Duration::from_millis(100));
+        println!(
+            "entered={entered} prior_ran={} unpublished={}",
+            PRIOR_USR1_RAN.load(Ordering::SeqCst),
+            super::published_end_outcome().is_none()
+        );
+        super::END_ENTRY_PAUSE
+            .released
+            .store(true, Ordering::SeqCst);
+        let _ = stopper.join();
+        println!("the End did not end the process");
+    }
+
+    // While an End is in progress (taken, not yet published), stopping the
+    // session keeps the signals caught: a SIGUSR1 with a default action
+    // could otherwise kill PrismTTY before its pid file is removed and its
+    // status returned. The End then ends the process with 128 plus SIGTERM.
+    #[test]
+    fn signals_stay_caught_while_an_end_is_in_progress() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let (status, printed) = run_ending_probe("stop_during_end_probe", "TERM");
+        assert!(
+            printed.contains("entered=true prior_ran=false unpublished=true"),
+            "{printed}"
+        );
+        assert_eq!(
+            (status.signal(), status.code()),
+            (None, Some(128 + libc::SIGTERM)),
+            "{printed}"
+        );
+    }
+
+    // When the limit ends the process, the 1.4.0 SIGINT rule still holds: a
+    // SIGINT that PrismTTY was sent and that killed the command ends PrismTTY
+    // by SIGINT; with any other signal it exits with 128 plus that signal.
+    #[test]
+    fn the_limit_ends_by_sigint_when_the_sigint_it_was_sent_killed_the_command() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let (status, printed) = run_ending_probe("end_at_deadline_probe", "INT");
+        assert_eq!(status.signal(), Some(libc::SIGINT), "{status:?} {printed}");
+        // The same while the watcher, delayed, still holds the reap lock.
+        let (status, printed) = run_ending_probe("end_at_deadline_probe", "LOCKED_INT");
+        assert_eq!(status.signal(), Some(libc::SIGINT), "{status:?} {printed}");
+        let (status, printed) = run_ending_probe("end_at_deadline_probe", "TERM");
+        assert_eq!(
+            (status.signal(), status.code()),
+            (None, Some(128 + libc::SIGTERM)),
+            "{printed}"
+        );
+    }
+
+    // The main thread's reap finds the command gone (ECHILD) when the watcher
+    // reaped it first; it takes the code from the outcome published with that
+    // reap instead of failing.
+    #[test]
+    fn the_main_thread_takes_the_code_from_the_watchers_reap() {
+        let printed = run_probe("reap_after_end_probe", "after the watcher's reap");
+        assert!(printed.contains("code=7"), "{printed}");
     }
 
     #[test]
