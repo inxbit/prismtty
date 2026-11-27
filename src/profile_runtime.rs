@@ -9,9 +9,11 @@ const PROFILE_STACK_LIMIT: usize = 8;
 /// name, a password, a one-time code, and the Enter that redraws a prompt.
 const REMOTE_ATTEMPT_LINE_GRACE: u8 = 4;
 /// Bytes of visible output after a typed `exit` within which the parent's
-/// prompt must end, counted from the first output read after the Enter, as
-/// the terminal receives them (escape sequences are not counted).
+/// prompt must end, counted after the echo of the exit line, as the terminal
+/// receives them (escape sequences are not counted).
 const EXIT_CONFIRM_WINDOW: usize = 512;
+/// Room for the echo of the exit line itself before the window starts.
+const EXIT_ECHO_LIMIT: usize = 16;
 /// Time after a typed `exit` in which the connection's end must be shown. A
 /// device's own client prints its close line one round trip after the
 /// session ends; three seconds leaves room for a slow link.
@@ -149,17 +151,26 @@ struct ExitIntent {
     depth: usize,
     /// When the exit was typed.
     armed_at: std::time::Instant,
-    /// Visible output bytes since the Enter, at most one past
-    /// `EXIT_CONFIRM_WINDOW`: enough to see whether a line ends within it.
+    /// The typed word, lowercase: its echo is not counted.
+    word: String,
+    /// Visible output bytes since the Enter, at most one past the window
+    /// and the echo: enough to see whether a line ends within the window.
     seen: Vec<u8>,
+    /// Where the window starts in `seen`: after the echo of the exit line,
+    /// once that line has ended. Typed slowly, the echo came before the
+    /// Enter; typed fast or pasted, it comes after.
+    origin: Option<usize>,
     /// How much of `seen` has been read as complete lines, in output order.
     scanned: usize,
     /// The bracketed close naming this connection's target has been seen.
     bracket_seen: bool,
     /// The parent's prompt is the waiting line: the unterminated end of the
-    /// output, after the bracket. A key typed at it, before any more output,
-    /// confirms it.
+    /// output, after the bracket.
     parent_waiting: bool,
+    /// A key was typed at the waiting parent prompt: the next output must
+    /// begin with its echo, or the prompt was not waiting (a line that goes
+    /// on, still in flight).
+    echo_expected: Option<u8>,
 }
 
 /// From a Ctrl-] that reaches a tracked default-escape telnet: the command
@@ -248,10 +259,6 @@ pub(crate) struct ProfileRuntime {
     line_start_prompt: Option<Option<String>>,
     exit_intent: Option<ExitIntent>,
     telnet_exchange: Option<TelnetExchange>,
-    /// A pop made by a key typed at the parent's waiting prompt, reported
-    /// with the next read, and the state to roll back to if it is rejected.
-    pending_transition: Option<Vec<String>>,
-    pending_rollback: Option<ProfileTransitionState>,
     /// The unterminated last line of a read that may begin a telnet
     /// client's escape announcement (bounded).
     telnet_announcement_partial: String,
@@ -288,8 +295,6 @@ impl ProfileRuntime {
             line_start_prompt: None,
             exit_intent: None,
             telnet_exchange: None,
-            pending_transition: None,
-            pending_rollback: None,
             telnet_announcement_partial: String::new(),
             stack_generation: 0,
             pending_telnet_escape: None,
@@ -308,8 +313,13 @@ impl ProfileRuntime {
 
     pub(crate) fn observe_input(&mut self, input: &[u8]) {
         for byte in input {
-            if self.exit_intent.is_some() {
-                self.exit_key_typed();
+            // A key, not part of an escape sequence such as a paste marker or
+            // a focus report.
+            if self.exit_intent.is_some()
+                && self.input_escape_state == InputEscapeState::None
+                && *byte != 0x1b
+            {
+                self.exit_key_typed(*byte);
             }
             self.observe_telnet_command_byte(*byte);
             match self.input_escape_state {
@@ -359,8 +369,15 @@ impl ProfileRuntime {
             if self.line_start_prompt.is_none() && !matches!(byte, b'\r' | b'\n') {
                 let prompt = self.waiting_prompt_now();
                 // A connection waiting at its parent's exact prompt text cannot
-                // be told apart from that parent, so C-2b stops trusting it.
-                if let (Some(prompt), Some(frame)) = (prompt.as_ref(), self.stack.last_mut()) {
+                // be told apart from that parent, so C-2b stops trusting it;
+                // unless that prompt is the parent's own, after the bracket.
+                let confirming = self
+                    .exit_intent
+                    .as_ref()
+                    .is_some_and(|intent| intent.echo_expected.is_some());
+                if let (Some(prompt), Some(frame), false) =
+                    (prompt.as_ref(), self.stack.last_mut(), confirming)
+                {
                     if frame.parent_prompt.as_ref() == Some(prompt) {
                         frame.parent_prompt = None;
                     }
@@ -384,7 +401,6 @@ impl ProfileRuntime {
                 }
                 0x17 => self.invalidate_input_line(),
                 b'\r' | b'\n' => {
-                    self.exit_intent = None;
                     if self.input_line_reliable {
                         self.submit_input_line();
                     } else if let Some(attempt) = self.unreliable_remote_attempt.take() {
@@ -622,15 +638,8 @@ impl ProfileRuntime {
         // profile-state graph (not the 64 KiB detection window) so a failed
         // highlighter build can roll back the proposed transition cheaply.
         self.transition_rollback = None;
-        // A pop made by a key since the last read is reported with this read
-        // and rolls back to the state from before it.
-        let rollback = self
-            .pending_rollback
-            .take()
-            .unwrap_or_else(|| self.transition_state());
+        let rollback = self.transition_state();
         let transition = self.observe_output_inner(visible_output, store);
-        let transition = transition.or_else(|| self.pending_transition.take());
-        self.pending_transition = None;
         self.note_child_prompt();
         if transition.is_some() {
             self.transition_rollback = Some(rollback);
@@ -997,26 +1006,34 @@ impl ProfileRuntime {
         if let Some(frame) = self.stack.last_mut().filter(|frame| !frame.prompt_seen) {
             frame.typed_before_prompt = true;
         }
-        if matches!(
-            typed.trim().to_ascii_lowercase().as_str(),
-            "exit" | "quit" | "logout"
-        ) && self.stack.last().is_some_and(|frame| {
-            frame.target.is_some()
-                && frame.parent_prompt.is_some()
-                && frame.prompt_seen
-                && !frame.typed_before_prompt
-                && matches!(
-                    frame.close_policy,
-                    ClosePolicy::SshLike | ClosePolicy::Telnet | ClosePolicy::TelnetOtherEscape
-                )
-        }) {
+        let word = typed.trim().to_ascii_lowercase();
+        let confirming = self
+            .exit_intent
+            .as_ref()
+            .is_some_and(|intent| intent.echo_expected.is_some());
+        if matches!(word.as_str(), "exit" | "quit" | "logout")
+            && !confirming
+            && self.stack.last().is_some_and(|frame| {
+                frame.target.is_some()
+                    && frame.parent_prompt.is_some()
+                    && frame.prompt_seen
+                    && !frame.typed_before_prompt
+                    && matches!(
+                        frame.close_policy,
+                        ClosePolicy::SshLike | ClosePolicy::Telnet | ClosePolicy::TelnetOtherEscape
+                    )
+            })
+        {
             self.exit_intent = Some(ExitIntent {
                 depth: self.stack.len(),
                 armed_at: std::time::Instant::now(),
+                word,
                 seen: Vec::new(),
+                origin: None,
                 scanned: 0,
                 bracket_seen: false,
                 parent_waiting: false,
+                echo_expected: None,
             });
         }
         self.input_line = typed;
@@ -1038,25 +1055,64 @@ impl ProfileRuntime {
     /// line naming the top connection ends it only when, reading the output
     /// since the Enter line by line in the order it came, the first prompt
     /// after that line is the one its parent showed when the connection was
-    /// opened, ending within the first `EXIT_CONFIRM_WINDOW` bytes and shown
-    /// within `EXIT_CONFIRM_TIME`. The first prompt decides either way. A
-    /// complete line decides at once. The unterminated last line is the
-    /// waiting prompt only once a key is typed at it before more output
-    /// arrives (`exit_key_typed`); a line that goes on is judged when it
-    /// ends. Bytes are counted as they arrive, so read grouping does not
-    /// change the result.
+    /// opened, ending within the first `EXIT_CONFIRM_WINDOW` bytes after the
+    /// echo of the exit line and shown within `EXIT_CONFIRM_TIME`. The first
+    /// prompt decides either way. A complete line decides at once. The
+    /// unterminated last line is the waiting prompt only once a key typed at
+    /// it comes back as the next output (`exit_key_typed`); a line that goes
+    /// on is judged when it ends. Bytes are counted as they arrive, so read
+    /// grouping and typing speed do not change the result.
     fn confirm_exit_close(&mut self, visible: &[u8]) -> Option<Option<Vec<String>>> {
-        let expired = self.exit_intent.as_ref()?.armed_at.elapsed() > EXIT_CONFIRM_TIME;
-        let Some((target, parent_prompt)) = self.exit_intent_frame().filter(|_| !expired) else {
+        let Some((target, parent_prompt)) = self.exit_intent_frame() else {
             self.exit_intent = None;
             return None;
         };
         let intent = self.exit_intent.as_mut()?;
+        if let Some(expected) = intent.echo_expected {
+            let first = visible.first()?;
+            let echoed = match expected {
+                b'\r' | b'\n' => matches!(first, b'\r' | b'\n'),
+                byte => *first == byte,
+            };
+            self.exit_intent = None;
+            return echoed.then(|| self.pop_exited_connection());
+        }
+        if intent.armed_at.elapsed() > EXIT_CONFIRM_TIME {
+            self.exit_intent = None;
+            return None;
+        }
         intent.parent_waiting = false;
-        let room = (EXIT_CONFIRM_WINDOW + 1).saturating_sub(intent.seen.len());
+        let room = (EXIT_ECHO_LIMIT + EXIT_CONFIRM_WINDOW + 1).saturating_sub(intent.seen.len());
         intent
             .seen
             .extend_from_slice(&visible[..visible.len().min(room)]);
+        if intent.origin.is_none() {
+            let Some(end) = intent
+                .seen
+                .iter()
+                .position(|byte| matches!(byte, b'\r' | b'\n'))
+            else {
+                if intent.seen.len() > EXIT_ECHO_LIMIT {
+                    intent.origin = Some(0);
+                }
+                return None;
+            };
+            let first = String::from_utf8_lossy(&intent.seen[..end]);
+            let first = first.trim();
+            let origin = if first.is_empty() || first.eq_ignore_ascii_case(&intent.word) {
+                let crlf = intent.seen[end] == b'\r' && intent.seen.get(end + 1) == Some(&b'\n');
+                if intent.seen[end] == b'\r' && end + 1 == intent.seen.len() {
+                    // The `\n` of the echo's line end may follow.
+                    return None;
+                }
+                end + 1 + usize::from(crlf)
+            } else {
+                0
+            };
+            intent.origin = Some(origin);
+            intent.scanned = origin;
+        }
+        let origin = intent.origin.unwrap_or(0);
         let mut decision = None;
         while let Some(length) = intent.seen[intent.scanned..]
             .iter()
@@ -1071,7 +1127,7 @@ impl ProfileRuntime {
             } else if !line.trim().is_empty() && looks_like_prompt_detection_boundary(&line) {
                 decision = Some(
                     intent.bracket_seen
-                        && end <= EXIT_CONFIRM_WINDOW
+                        && end - origin <= EXIT_CONFIRM_WINDOW
                         && waiting_prompt_text(&line) == parent_prompt,
                 );
                 break;
@@ -1086,7 +1142,7 @@ impl ProfileRuntime {
                 self.exit_intent = None;
                 None
             }
-            None if intent.seen.len() > EXIT_CONFIRM_WINDOW => {
+            None if intent.seen.len() - origin > EXIT_CONFIRM_WINDOW => {
                 // Nothing that ends past the window can confirm.
                 self.exit_intent = None;
                 None
@@ -1100,23 +1156,21 @@ impl ProfileRuntime {
         }
     }
 
-    /// A key typed while an exit intent is set: if the parent's prompt is
-    /// the waiting line, the connection ended. Any other key, typed at the
-    /// child's prompt or ahead of the output, ends the intent.
-    fn exit_key_typed(&mut self) {
-        let waiting = self
-            .exit_intent
-            .as_ref()
-            .is_some_and(|intent| intent.parent_waiting)
-            && self.exit_intent_frame().is_some();
-        self.exit_intent = None;
-        if !waiting {
+    /// A key typed while an exit intent is set. At the parent's waiting
+    /// prompt it is expected back as the next output: that proves the prompt
+    /// was waiting. Any other key, typed at the child's prompt or ahead of
+    /// the output, ends the intent.
+    fn exit_key_typed(&mut self, byte: u8) {
+        let Some(intent) = self.exit_intent.as_mut() else {
+            return;
+        };
+        if intent.echo_expected.is_some() {
             return;
         }
-        let snapshot = self.transition_state();
-        if let Some(profiles) = self.pop_exited_connection() {
-            self.pending_transition = Some(profiles);
-            self.pending_rollback.get_or_insert(snapshot);
+        if intent.parent_waiting {
+            intent.echo_expected = Some(byte);
+        } else {
+            self.exit_intent = None;
         }
     }
 
