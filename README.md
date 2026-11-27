@@ -381,12 +381,15 @@ session sets `pids.d` to mode 0700 and deletes every regular file in it whose
 name is not the number of a running process. Do not point the variable at a
 directory that has a `pids.d` or a `reload` of your own.
 
-On Linux without `TMPDIR` the default directory is `/tmp/prismtty-<uid>`, a
-name any local user can predict. Another local user who creates it first
+The name `prismtty-<uid>` is easy to predict. In a temporary directory that
+other users can write to, such as `/tmp` on Linux without `TMPDIR` or a shared
+directory named by `TMPDIR`, another local user who creates that name first
 disables live reload for your sessions. Those sessions still show and
 highlight their output, and each prints `prismtty: live reload disabled for
-this session` and the reason. Set `PRISMTTY_RUNTIME_DIR` to a private directory, such as one
-in your home, to avoid this.
+this session` and the reason. To avoid it, set `PRISMTTY_RUNTIME_DIR` to a
+private directory, such as one in your home, or set `TMPDIR` to a private one.
+The default temporary directory on macOS is a per-user one that only you can
+write to, also when `TMPDIR` is unset, so it is not affected.
 
 ## Built-In Profiles
 

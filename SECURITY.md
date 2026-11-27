@@ -103,8 +103,12 @@ examples that preserve only the token shape needed to reproduce the issue.
   string there. A character cut off at the end of the output (`F0 9D`) is
   passed as it is too. With a locale that is not UTF-8 and an 8-bit terminal,
   these flags do not keep every string control from reaching it.
-- On Linux without `TMPDIR`, live reload uses `/tmp/prismtty-<uid>`, a name
-  other local users can predict. One who creates it first disables live
-  reload for your sessions. The sessions' output is not affected, and each
-  prints `prismtty: live reload disabled for this session` and the reason.
-  Set `PRISMTTY_RUNTIME_DIR` to a private directory to avoid it.
+- Live reload uses `prismtty-<uid>` in the system temporary directory, a name
+  other local users can predict. When that directory is one others can write
+  to, such as `/tmp` on Linux without `TMPDIR` or a shared directory named by
+  `TMPDIR`, a user who creates the name first disables live reload for your
+  sessions. The sessions' output is not affected, and each prints
+  `prismtty: live reload disabled for this session` and the reason. Set
+  `PRISMTTY_RUNTIME_DIR` or `TMPDIR` to a private directory to avoid it. The
+  default temporary directory on macOS is per user, also with `TMPDIR` unset,
+  and is not affected.
