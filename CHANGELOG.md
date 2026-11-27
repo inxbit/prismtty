@@ -33,10 +33,12 @@ All notable changes to PrismTTY are documented here.
     8-bit bytes behind a UTF-8 locale, the mismatch `SECURITY.md` describes,
     runs that sequence as a control, and the bytes now written inside it end
     it early, so it is drawn differently than before.
-  - Only a whole control sequence in ASCII counts. `C2 9B`, a sequence with a
-    byte from 80 to FF in it or cut short by one before its final byte, and
-    the payload of an OSC, DCS, SOS, PM or APC string keep their bytes, even
-    when a line end sits in the sequence.
+  - Only a whole control sequence that is ASCII after its introducer counts.
+    The introducer is `ESC`, or a raw `9B` where the locale is not UTF-8.
+    `C2 9B`, a sequence with a byte from 80 to FF after its introducer or cut
+    short by one before its final byte, and the payload of an OSC, DCS, SOS,
+    PM or APC string keep their bytes, even when a line end sits in the
+    sequence.
   - `CSI K` right after a line feed still erases in the color of a
     foreground-only highlight that meets such a program rendition, as before;
     that is a separate issue. A highlight whose style paints blank cells
