@@ -10595,9 +10595,10 @@ rules:
     }
 
     // A color after the prompt is taken out and the foreground reset before
-    // the typed command, so the command is not drawn in it. A raw `9B`
-    // sequence sets no color on a terminal that reads UTF-8: it stays, it
-    // does not count as a color left active, and no reset is written for it.
+    // the typed command, so the command is not drawn in it. On a terminal
+    // that reads UTF-8 a raw `9B` is an isolated invalid byte in ordinary
+    // text: it sets no color and is the first byte of the typed command, so
+    // a color in front of it is taken out before it.
     #[test]
     fn prompt_color_is_neutralized_only_for_controls_the_terminal_runs() {
         let highlighter =
@@ -10615,8 +10616,8 @@ rules:
             (b"\x9b31mshow", false, true, b"\x1b[0mshow"),
             (b"\x1b[31mshow", true, false, b"\x1b[39mshow"),
             (b"\x1b[31mshow", false, false, b"\x1b[39mshow"),
-            // The 7-bit color is still active where `9B 0 m` is not a reset.
-            (b"\x1b[31m\x9b0mshow", true, false, b"\x9b0m\x1b[39mshow"),
+            // Where `9B 0 m` is text, the 7-bit color goes before it.
+            (b"\x1b[31m\x9b0mshow", true, false, b"\x1b[39m\x9b0mshow"),
             (b"\x1b[31m\x9b0mshow", false, false, b"\x1b[31m\x9b0mshow"),
         ] {
             super::TERMINAL_READS_UTF8_IN_THIS_THREAD.with(|switch| switch.set(Some(reads_utf8)));

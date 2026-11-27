@@ -1000,32 +1000,49 @@ fn filtered_modes_preserve_invalid_binary_and_all_partial_utf8_prefixes_at_eof()
     }
 }
 
+// Outside a UTF-8 locale a raw `9D` opens the OSC an 8-bit terminal reads,
+// which both filters remove, and a raw `9B` the CSI that only `--strip-ansi`
+// removes. In a UTF-8 locale each is an isolated invalid byte in ordinary
+// text, as on a terminal that reads UTF-8, and both filters keep it and the
+// text after it.
 #[test]
 fn raw_c1_filtering_contract_matches_strip_and_sanitize_modes() {
     let mut empty_config = tempfile::NamedTempFile::new().expect("empty config");
     writeln!(empty_config, "rules: []").expect("write empty config");
     let input = b"safe\x9d0;hidden\x07after\x9b31mred\x9b0m\n";
 
-    for (args, expected) in [
-        (vec!["--strip-ansi"], b"safeafterred\n".as_slice()),
+    for (locale, args, expected) in [
+        ("C", vec!["--strip-ansi"], b"safeafterred\n".as_slice()),
         (
+            "C",
             vec!["--sanitize"],
             b"safeafter\x9b31mred\x9b0m\n".as_slice(),
         ),
         (
+            "C",
             vec!["--strip-ansi", "--sanitize"],
             b"safeafterred\n".as_slice(),
         ),
+        ("en_US.UTF-8", vec!["--strip-ansi"], input.as_slice()),
+        ("en_US.UTF-8", vec!["--sanitize"], input.as_slice()),
+        (
+            "en_US.UTF-8",
+            vec!["--strip-ansi", "--sanitize"],
+            input.as_slice(),
+        ),
     ] {
         let mut cmd = Command::cargo_bin("prismtty").expect("binary exists");
-        cmd.args(args)
+        cmd.args(&args)
             .arg("--config")
             .arg(empty_config.path())
+            .env_remove("LC_CTYPE")
+            .env_remove("LANG")
+            .env("LC_ALL", locale)
             .write_stdin(input.as_slice());
         let output = cmd.output().expect("command runs");
 
         assert!(output.status.success(), "{output:?}");
-        assert_eq!(output.stdout, expected);
+        assert_eq!(output.stdout, expected, "{locale} {args:?}");
     }
 }
 
@@ -1174,7 +1191,9 @@ fn sanitize_drops_escapes_that_latin1_characters_would_complete() {
 // UTF-8 or as a lone raw byte, and Alacritty ignores any byte from 80 up
 // there, so ESC C2 80 ] and ESC 80 ] open an OSC. --sanitize drops the ESC
 // and reads the control on its own. A string control is still dropped with
-// its string, and with the chain that reached it.
+// its string, and with the chain that reached it. In a UTF-8 locale a raw
+// byte after the ESC is text, so it stays where the 8-bit reading drops it
+// with the control it starts: the SS2 `8E` in front of `n`.
 #[test]
 fn sanitize_drops_escapes_that_c1_controls_follow() {
     let mut empty_config = tempfile::NamedTempFile::new().expect("empty config");
@@ -1190,21 +1209,35 @@ fn sanitize_drops_escapes_that_c1_controls_follow() {
         k\x00\x8e]52;c;U0VDUkVU\x07lm\
         n\x9b1mo\n";
 
-    for (input, expected) in [
-        (input.as_slice(), expected.as_slice()),
+    let in_utf8 = {
+        let at = expected
+            .windows(3)
+            .position(|window| window == b"lmn")
+            .expect("the SS2 case")
+            + 2;
+        [&expected[..at], b"\x8e", &expected[at..]].concat()
+    };
+
+    for (locale, input, expected) in [
+        ("C", input.as_slice(), expected.as_slice()),
+        ("en_US.UTF-8", input.as_slice(), in_utf8.as_slice()),
         // A chain cut off by the end of the input is dropped whole too.
-        (b"a\x1b[1\x1b\xc2\x9b\x1b]0;t\x07", b"a"),
+        ("C", b"a\x1b[1\x1b\xc2\x9b\x1b]0;t\x07", b"a"),
+        ("en_US.UTF-8", b"a\x1b[1\x1b\xc2\x9b\x1b]0;t\x07", b"a"),
     ] {
         let mut cmd = Command::cargo_bin("ct")
             .unwrap_or_else(|_| Command::cargo_bin("prismtty").expect("binary exists"));
         cmd.arg("--sanitize")
             .arg("--config")
             .arg(empty_config.path())
+            .env_remove("LC_CTYPE")
+            .env_remove("LANG")
+            .env("LC_ALL", locale)
             .write_stdin(input);
         let output = cmd.output().expect("command runs");
 
         assert!(output.status.success(), "{output:?}");
-        assert_eq!(output.stdout, expected, "{:02x?}", output.stdout);
+        assert_eq!(output.stdout, expected, "{locale}: {:02x?}", output.stdout);
     }
 }
 
@@ -1249,8 +1282,17 @@ fn sanitize_drops_csis_that_could_switch_xterm_out_of_utf8() {
         \x1b[?1;042l\xe2\x80\x9dg\xc2\x9b?42r\x9b?1:42hh\x1b[1;31mi\x1b[0m\n";
     let expected = b"a\xe2\x80\x9d0;t\x07b\xc2\x802h\xe2\x80\x9dc\xc2\xb2h\xe2\x80\x9dd\
         \xc3\x9ee\xe2\x80\x9df\xe2\x80\x9dgh\x1b[1;31mi\x1b[0m\n";
+    // In a UTF-8 locale the raw `9B` is an isolated invalid byte, not a CSI,
+    // so `9B ?1:42h` is text there and stays.
+    let in_utf8 = b"a\xe2\x80\x9d0;t\x07b\xc2\x802h\xe2\x80\x9dc\xc2\xb2h\xe2\x80\x9dd\
+        \xc3\x9ee\xe2\x80\x9df\xe2\x80\x9dg\x9b?1:42hh\x1b[1;31mi\x1b[0m\n";
 
-    for (sanitize, expected) in [(true, expected.as_slice()), (false, input.as_slice())] {
+    for (locale, sanitize, expected) in [
+        ("C", true, expected.as_slice()),
+        ("C", false, input.as_slice()),
+        ("en_US.UTF-8", true, in_utf8.as_slice()),
+        ("en_US.UTF-8", false, input.as_slice()),
+    ] {
         let mut cmd = Command::cargo_bin("ct")
             .unwrap_or_else(|_| Command::cargo_bin("prismtty").expect("binary exists"));
         if sanitize {
@@ -1258,11 +1300,14 @@ fn sanitize_drops_csis_that_could_switch_xterm_out_of_utf8() {
         }
         cmd.arg("--config")
             .arg(empty_config.path())
+            .env_remove("LC_CTYPE")
+            .env_remove("LANG")
+            .env("LC_ALL", locale)
             .write_stdin(input.as_slice());
         let output = cmd.output().expect("command runs");
 
         assert!(output.status.success(), "{output:?}");
-        assert_eq!(output.stdout, expected, "{:02x?}", output.stdout);
+        assert_eq!(output.stdout, expected, "{locale}: {:02x?}", output.stdout);
     }
 }
 
@@ -1879,12 +1924,11 @@ fn config_that_paints_up_green() -> tempfile::NamedTempFile {
 // A raw byte from 90, 98, 9D, 9E or 9F opens a string control only on a
 // terminal that is not in UTF-8 mode. On a UTF-8 terminal it is an invalid
 // byte, and line noise, a legacy code page or a UTF-8 character cut in half
-// all produce one with no terminator to follow: it used to swallow every
-// later byte of the session. When the locale says UTF-8, such a string ends
-// at the end of its line, so one stray byte costs at most the rest of that
-// line.
+// all produce one with no terminator to follow. When the locale says UTF-8,
+// such a byte in ordinary text is text in every mode: it and the rest of its
+// line are kept, and highlighted, by default and by both filters.
 #[test]
-fn in_a_utf8_locale_a_stray_raw_c1_string_opener_costs_one_line_at_most() {
+fn in_a_utf8_locale_a_stray_raw_c1_byte_is_ordinary_text_in_every_mode() {
     let config = config_that_paints_up_green();
     let highlighted_up = "\u{1b}[38;2;0;255;0mup\u{1b}[0m";
 
@@ -1898,31 +1942,20 @@ fn in_a_utf8_locale_a_stray_raw_c1_string_opener_costs_one_line_at_most() {
             &[("LANG", "C.UTF-8")][..],
             &[("LC_CTYPE", "UTF-8"), ("LANG", "C")][..],
         ] {
-            // Default mode is transparent: every byte arrives, in order, and
-            // the lines after the stray byte are highlighted again.
+            // Every byte arrives, in order, and the lines after the stray
+            // byte are highlighted again.
             let mut expected = b"line1\nfoo ".to_vec();
             expected.push(opener);
             expected.extend_from_slice(b" bar\nGi0/1 is ");
             expected.extend_from_slice(highlighted_up.as_bytes());
             expected.extend_from_slice(b"\nline4\n");
-            assert_eq!(
-                filter_with_locale(config.path(), &[], locale, &input),
-                expected,
-                "default mode, opener {opener:#x}, {locale:?}"
-            );
-
-            // `--sanitize` still removes the opener and what it may hide,
-            // but only to the end of that line.
-            assert_eq!(
-                String::from_utf8_lossy(&filter_with_locale(
-                    config.path(),
-                    &["--sanitize"],
-                    locale,
-                    &input
-                )),
-                format!("line1\nfoo \nGi0/1 is {highlighted_up}\nline4\n"),
-                "--sanitize, opener {opener:#x}, {locale:?}"
-            );
+            for flags in [&[][..], &["--sanitize"][..], &["--strip-ansi"][..]] {
+                assert_eq!(
+                    filter_with_locale(config.path(), flags, locale, &input),
+                    expected,
+                    "{flags:?}, opener {opener:#x}, {locale:?}"
+                );
+            }
         }
     }
 }
@@ -1951,6 +1984,404 @@ fn outside_a_utf8_locale_a_raw_c1_string_still_runs_to_its_terminator() {
     }
 }
 
+// Locale values the CLI reads as UTF-8: the first nonempty one of LC_ALL,
+// LC_CTYPE and LANG names the UTF-8 codeset. It is read from the
+// environment text only: nothing checks that the locale exists or that the
+// terminal agrees, so `bogus.UTF-8` counts.
+const UTF8_LOCALES: &[&[(&str, &str)]] = &[
+    &[("LC_ALL", "en_US.UTF-8")],
+    &[("LC_ALL", ""), ("LC_CTYPE", "en_US.UTF-8")],
+    &[("LANG", "bogus.UTF-8")],
+    &[("LC_CTYPE", "UTF-8"), ("LANG", "C")],
+    &[("LANG", "C.utf8")],
+];
+
+// Values it does not: none at all, C, a named locale with another codeset,
+// and a nonempty one of those ahead of a UTF-8 one.
+const EIGHT_BIT_LOCALES: &[&[(&str, &str)]] = &[
+    &[],
+    &[("LC_ALL", "C")],
+    &[("LC_ALL", "en_US.ISO8859-1")],
+    &[("LC_ALL", "C"), ("LANG", "en_US.UTF-8")],
+    &[
+        ("LC_ALL", ""),
+        ("LC_CTYPE", "POSIX"),
+        ("LANG", "en_US.UTF-8"),
+    ],
+];
+
+const UP_GREEN: &[u8] = b"\x1b[38;2;0;255;0mup\x1b[0m";
+
+/// Runs prismtty with `args` and only the given locale variables, and
+/// returns its output once it has succeeded.
+fn prismtty_in_locale(
+    args: &[&str],
+    locale: &[(&str, &str)],
+    input: &[u8],
+) -> std::process::Output {
+    let mut command = Command::cargo_bin("prismtty").expect("binary exists");
+    command
+        .args(args)
+        .env_remove("LC_ALL")
+        .env_remove("LC_CTYPE")
+        .env_remove("LANG");
+    for (name, value) in locale {
+        command.env(name, value);
+    }
+    let output = command
+        .write_stdin(input.to_vec())
+        .output()
+        .expect("command runs");
+    assert!(output.status.success(), "{output:?}");
+    output
+}
+
+// In a UTF-8 locale an isolated invalid raw byte from 80 to 9F in ordinary
+// text is text in every mode, as on a terminal that reads UTF-8. Inside an
+// ESC, CSI or string that is already open the enclosing control decides:
+// both filters drop an ESC in front of the byte, so `ESC 9D ]52` is no OSC
+// 52, and a raw `9C` no longer ends a 7-bit string. When a filter processes
+// the bytes it drops a `C2` that begins no character, so a removal cannot
+// put `C2 9D` together. No rendition is learned from `C2 9B`. Outside a
+// UTF-8 locale every case keeps its 1.4.1 bytes.
+#[test]
+fn an_isolated_raw_c1_byte_in_ordinary_text_follows_the_locale() {
+    let config = config_that_paints_up_green();
+    let stav = b"Stav: dr\x9e\xed, rest of line up\nnext up\n".to_vec();
+    let stav_kept = [
+        b"Stav: dr\x9e\xed, rest of line ".as_slice(),
+        UP_GREEN,
+        b"\nnext ",
+        UP_GREEN,
+        b"\n",
+    ]
+    .concat();
+    let osc52 = b"A\x1b\x9d]52;c;QUJD\x07B\n".to_vec();
+    let st_in_osc = b"A\x1b]0;x\x9cSECRET\x07B\n".to_vec();
+    let st_in_osc_at_eof = b"A\x1b]0;x\x9cSECRET".to_vec();
+    let lone_c2 = b"A\xc2\x1b]0;x\x07\x9d0;PWNED\x07B\n".to_vec();
+    let ss2_lone_c2 = b"A\xc2\x8e\xc2\x1b\x9d0;x\x07B\n".to_vec();
+    let c2_csi = b"a\xc2\x9b8m up visible\n".to_vec();
+    let c2_csi_not_learned = [b"a\xc2\x9b8m ".as_slice(), UP_GREEN, b" visible\n"].concat();
+    let c2_csi_learned = [b"a\xc2\x9b8m ".as_slice(), UP_GREEN, b"\x1b[8m visible\n"].concat();
+    let c2_csi_stripped = [b"a ".as_slice(), UP_GREEN, b" visible\n"].concat();
+
+    let cases: Vec<(&str, &Vec<u8>, &[&str], Vec<u8>, Vec<u8>)> = vec![
+        (
+            "raw 9E and its line",
+            &stav,
+            &[],
+            stav_kept.clone(),
+            b"Stav: dr".to_vec(),
+        ),
+        (
+            "raw 9E and its line",
+            &stav,
+            &["--sanitize"],
+            stav_kept.clone(),
+            b"Stav: dr".to_vec(),
+        ),
+        (
+            "raw 9E and its line",
+            &stav,
+            &["--strip-ansi"],
+            stav_kept.clone(),
+            b"Stav: dr".to_vec(),
+        ),
+        ("ESC 9D ]52", &osc52, &[], osc52.clone(), osc52.clone()),
+        (
+            "ESC 9D ]52",
+            &osc52,
+            &["--sanitize"],
+            b"A\x9d]52;c;QUJD\x07B\n".to_vec(),
+            b"AB\n".to_vec(),
+        ),
+        (
+            "ESC 9D ]52",
+            &osc52,
+            &["--strip-ansi"],
+            b"A\x9d]52;c;QUJD\x07B\n".to_vec(),
+            b"AB\n".to_vec(),
+        ),
+        (
+            "raw 9C in a 7-bit OSC",
+            &st_in_osc,
+            &[],
+            st_in_osc.clone(),
+            st_in_osc.clone(),
+        ),
+        (
+            "raw 9C in a 7-bit OSC",
+            &st_in_osc,
+            &["--sanitize"],
+            b"AB\n".to_vec(),
+            b"ASECRET\x07B\n".to_vec(),
+        ),
+        (
+            "raw 9C in a 7-bit OSC",
+            &st_in_osc,
+            &["--strip-ansi"],
+            b"AB\n".to_vec(),
+            b"ASECRET\x07B\n".to_vec(),
+        ),
+        (
+            "raw 9C in a 7-bit OSC at EOF",
+            &st_in_osc_at_eof,
+            &[],
+            b"A".to_vec(),
+            st_in_osc_at_eof.clone(),
+        ),
+        (
+            "raw 9C in a 7-bit OSC at EOF",
+            &st_in_osc_at_eof,
+            &["--sanitize"],
+            b"A".to_vec(),
+            b"ASECRET".to_vec(),
+        ),
+        (
+            "raw 9C in a 7-bit OSC at EOF",
+            &st_in_osc_at_eof,
+            &["--strip-ansi"],
+            b"A".to_vec(),
+            b"ASECRET".to_vec(),
+        ),
+        (
+            "lone C2, removed OSC, raw 9D",
+            &lone_c2,
+            &[],
+            lone_c2.clone(),
+            lone_c2.clone(),
+        ),
+        (
+            "lone C2, removed OSC, raw 9D",
+            &lone_c2,
+            &["--sanitize"],
+            b"A\x9d0;PWNED\x07B\n".to_vec(),
+            b"A\xc2B\n".to_vec(),
+        ),
+        (
+            "lone C2, removed OSC, raw 9D",
+            &lone_c2,
+            &["--strip-ansi"],
+            b"A\x9d0;PWNED\x07B\n".to_vec(),
+            b"A\xc2B\n".to_vec(),
+        ),
+        (
+            "SS2, lone C2, ESC 9D",
+            &ss2_lone_c2,
+            &[],
+            ss2_lone_c2.clone(),
+            ss2_lone_c2.clone(),
+        ),
+        (
+            "SS2, lone C2, ESC 9D",
+            &ss2_lone_c2,
+            &["--sanitize"],
+            b"A\xc2\x8e\x9d0;x\x07B\n".to_vec(),
+            b"A\xc2\x8e\xc2B\n".to_vec(),
+        ),
+        (
+            "SS2, lone C2, ESC 9D",
+            &ss2_lone_c2,
+            &["--strip-ansi"],
+            b"A\x9d0;x\x07B\n".to_vec(),
+            b"A\xc2B\n".to_vec(),
+        ),
+        (
+            "C2 9B rendition",
+            &c2_csi,
+            &[],
+            c2_csi_not_learned.clone(),
+            c2_csi_learned.clone(),
+        ),
+        (
+            "C2 9B rendition",
+            &c2_csi,
+            &["--sanitize"],
+            c2_csi_not_learned.clone(),
+            c2_csi_learned.clone(),
+        ),
+        (
+            "C2 9B rendition",
+            &c2_csi,
+            &["--strip-ansi"],
+            c2_csi_stripped.clone(),
+            c2_csi_stripped.clone(),
+        ),
+    ];
+    for (name, input, flags, in_utf8, in_eight_bit) in &cases {
+        for (locales, expected) in [(UTF8_LOCALES, in_utf8), (EIGHT_BIT_LOCALES, in_eight_bit)] {
+            for locale in locales {
+                let output = filter_with_locale(config.path(), flags, locale, input);
+                assert!(
+                    output == *expected,
+                    "{name} {flags:?} {locale:?}:\n  got {output:02x?}\n want {expected:02x?}"
+                );
+            }
+        }
+    }
+}
+
+// Profile detection reads the text the terminal shows: in a UTF-8 locale the
+// bytes after a raw `9B` or `9D` are text, so JUNOS there selects the juniper
+// profile; outside one they are inside a control and select nothing.
+#[test]
+fn profile_detection_reads_a_raw_c1_byte_as_text_in_a_utf8_locale() {
+    let mut empty_config = tempfile::NamedTempFile::new().expect("empty config");
+    writeln!(empty_config, "rules: []").expect("write empty config");
+    let config = empty_config.path().to_str().expect("UTF-8 path");
+
+    for input in [
+        b"\x9bJUNOS\n".as_slice(),
+        b"\x9d0;JUNOS 23.4\x07plain output\n".as_slice(),
+    ] {
+        for (locales, selects) in [(UTF8_LOCALES, true), (EIGHT_BIT_LOCALES, false)] {
+            for locale in locales {
+                let output =
+                    prismtty_in_locale(&["--show-profile", "--config", config], locale, input);
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                assert_eq!(
+                    stderr.contains("juniper"),
+                    selects,
+                    "{input:02x?} {locale:?}: {stderr:?}"
+                );
+            }
+        }
+    }
+}
+
+// Benchmark mode highlights through the same path: its output is the one
+// without it, and the report still reaches stderr.
+#[test]
+fn benchmark_mode_reads_a_raw_c1_byte_as_the_locale_does() {
+    let config = config_that_paints_up_green();
+    let config = config.path().to_str().expect("UTF-8 path");
+    let input = b"Stav: dr\x9e\xed, rest of line up\nnext up\n";
+
+    for locale in [&[("LC_ALL", "en_US.UTF-8")][..], &[("LC_ALL", "C")][..]] {
+        let plain = prismtty_in_locale(
+            &["--rgb", "--no-auto-detect", "--config", config],
+            locale,
+            input,
+        );
+        let benchmark = prismtty_in_locale(
+            &[
+                "--benchmark",
+                "--rgb",
+                "--no-auto-detect",
+                "--config",
+                config,
+            ],
+            locale,
+            input,
+        );
+        assert_eq!(benchmark.stdout, plain.stdout, "{locale:?}");
+        assert!(
+            String::from_utf8_lossy(&benchmark.stderr)
+                .contains("Benchmark results (time spent, match count):"),
+            "{locale:?}: {:?}",
+            benchmark.stderr
+        );
+    }
+    let in_utf8 = prismtty_in_locale(
+        &[
+            "--benchmark",
+            "--rgb",
+            "--no-auto-detect",
+            "--config",
+            config,
+        ],
+        &[("LC_ALL", "en_US.UTF-8")],
+        input,
+    );
+    assert!(
+        in_utf8
+            .stdout
+            .starts_with(b"Stav: dr\x9e\xed, rest of line \x1b[38;2;0;255;0mup"),
+        "{:02x?}",
+        in_utf8.stdout
+    );
+}
+
+// Around the 512-byte hold of a trailing token, the 1 KiB cap on an
+// unfinished control and the 16 KiB cap on a string, the text after a stray
+// raw byte is kept whole in a UTF-8 locale, in every mode.
+#[test]
+fn text_after_a_raw_c1_byte_is_kept_whole_around_every_buffer_limit() {
+    let config = config_that_paints_up_green();
+    for stray in *b"\x90\x9b\x9d\x9e" {
+        for len in [511, 512, 513, 1023, 1024, 1025, 16383, 16384, 16385] {
+            let mut input = vec![b'a', stray];
+            input.resize(input.len() + len, b'x');
+            input.extend_from_slice(b"\nnext\n");
+            for flags in [&[][..], &["--sanitize"][..], &["--strip-ansi"][..]] {
+                let output =
+                    filter_with_locale(config.path(), flags, &[("LC_ALL", "en_US.UTF-8")], &input);
+                assert!(
+                    output == input,
+                    "{stray:#x}, {len} bytes, {flags:?}: {} bytes out",
+                    output.len()
+                );
+            }
+        }
+    }
+}
+
+// Known limit, stated in SECURITY.md (T3b): after an ESC, a terminal that
+// ignores an invalid byte there, as xterm does, still holds the ESC open,
+// and `]` after the byte opens an OSC. PrismTTY reads the raw byte as text,
+// as it reads FF there, so a highlight in the text after it ends that OSC,
+// here an OSC 52 the input never ended. 1.4.1 writes the same after ESC FF.
+#[test]
+fn known_limit_t3b_a_highlight_ends_an_osc_opened_after_esc_and_a_raw_byte() {
+    let config = config_that_paints_up_green();
+    for (locale, stray) in [
+        (&[("LC_ALL", "en_US.UTF-8")][..], 0x9d),
+        (&[("LC_ALL", "en_US.UTF-8")][..], 0xff),
+        (&[("LC_ALL", "C")][..], 0xff),
+    ] {
+        let input = [b"A\x1b".as_slice(), &[stray], b"]52;c;QUJD up\nmore text\n"].concat();
+        let expected = [
+            b"A\x1b".as_slice(),
+            &[stray],
+            b"]52;c;QUJD ",
+            UP_GREEN,
+            b"\nmore text\n",
+        ]
+        .concat();
+        assert_eq!(
+            filter_with_locale(config.path(), &[], locale, &input),
+            expected,
+            "{stray:#x} {locale:?}"
+        );
+    }
+}
+
+// Known limit, stated in SECURITY.md (T4): at the end of input PrismTTY
+// writes an unfinished ESC as `^`. After ESC and a raw byte, which a
+// terminal like xterm ignores there, that `^` ends the first ESC as `ESC ^`,
+// which opens a PM string. 1.4.1 writes the same after ESC FF.
+#[test]
+fn known_limit_t4_a_caret_at_the_end_of_input_finishes_esc_and_a_raw_byte() {
+    let config = config_that_paints_up_green();
+    for (locale, stray) in [
+        (&[("LC_ALL", "en_US.UTF-8")][..], 0x9e),
+        (&[("LC_ALL", "en_US.UTF-8")][..], 0xff),
+        (&[("LC_ALL", "C")][..], 0xff),
+    ] {
+        let input = [b"log\x1b".as_slice(), &[stray], b"\x1b"].concat();
+        let expected = [b"log\x1b".as_slice(), &[stray], b"^"].concat();
+        assert_eq!(
+            filter_with_locale(config.path(), &[], locale, &input),
+            expected,
+            "{stray:#x} {locale:?}"
+        );
+    }
+}
+
+// Outside a UTF-8 locale a raw `9D` opens an OSC, and its payload is not
+// text for profile detection. In a UTF-8 locale the same bytes are text:
+// see `profile_detection_reads_a_raw_c1_byte_as_text_in_a_utf8_locale`.
 #[test]
 fn raw_c1_string_payload_is_not_used_for_profile_detection() {
     let mut empty_config = tempfile::NamedTempFile::new().expect("empty config");
@@ -1960,6 +2391,9 @@ fn raw_c1_string_payload_is_not_used_for_profile_detection() {
     cmd.arg("--show-profile")
         .arg("--config")
         .arg(empty_config.path())
+        .env_remove("LC_CTYPE")
+        .env_remove("LANG")
+        .env("LC_ALL", "C")
         .write_stdin(b"\x9d0;JUNOS 23.4\x07plain output\n".as_slice());
     let output = cmd.output().expect("command runs");
     let stderr = String::from_utf8(output.stderr).expect("stderr is UTF-8");
