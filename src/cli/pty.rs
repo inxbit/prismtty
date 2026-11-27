@@ -7,7 +7,6 @@ use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-#[cfg(any(target_os = "linux", test))]
 use std::sync::atomic::AtomicBool;
 use std::sync::{
     Arc, Mutex,
@@ -140,32 +139,70 @@ fn is_end_signal(signal: libc::c_int) -> bool {
 /// then too; past it, the end is abrupt.
 const END_LIMIT: Duration = Duration::from_secs(4);
 
-/// The ending signal the handlers recorded. The watcher acts on it before any
-/// byte queued in the self-pipe: the pipe only wakes the watcher, and its
-/// nonblocking write fails once a burst of messages has filled it, while this
-/// state does not. The first ending signal recorded wins; one that arrives
-/// while the end is under way changes nothing.
-struct PendingEnd(AtomicI32);
+/// The ending signal (End) the handlers recorded, and whether a thread has
+/// taken it. The watcher acts on it before any byte queued in the self-pipe:
+/// the pipe only wakes the watcher, and its nonblocking write fails once a
+/// burst of messages has filled it, while this state does not.
+///
+/// The handoff of an End, in one session:
+///
+/// 1. No End: nothing recorded. `SessionSignalWatcher::stop` gives the
+///    signals back to their previous actions; from then on a signal takes
+///    that action, as in 1.4.1.
+/// 2. Recorded, not taken: a handler recorded it (`record`; the first one
+///    wins, a later one changes nothing). `stop` keeps the signals caught,
+///    and takes the End itself after joining the watcher, if the watcher did
+///    not take it first.
+/// 3. Taken, not published: the watcher, at the top of its loop, or `stop`,
+///    after the join, won `take`; only one thread can. The taker runs
+///    `end_session_after_signal`. `stop` keeps the signals caught and joins
+///    the watcher, which returns once its End is published or ends the
+///    process.
+/// 4. Published: the outcome is under the reap lock and its status in
+///    `PUBLISHED_LEADER_STATUS`. Who ends the process follows from it.
+///
+/// So once an End is recorded the signals stay caught until the process
+/// exits, and every End recorded while a handler is installed is taken. The
+/// one boundary: an End recorded while `stop` is giving the signals back.
+/// `stop` then catches the signals again at once and takes the End, but a
+/// signal in the instant between takes its previous action.
+struct PendingEnd {
+    signal: AtomicI32,
+    taken: AtomicBool,
+}
 
 impl PendingEnd {
     const fn new() -> Self {
-        Self(AtomicI32::new(0))
+        Self {
+            signal: AtomicI32::new(0),
+            taken: AtomicBool::new(false),
+        }
     }
 
     /// Async-signal-safe: called from signal handlers.
     fn record(&self, signal: libc::c_int) {
         let _ = self
-            .0
+            .signal
             .compare_exchange(0, signal, Ordering::SeqCst, Ordering::SeqCst);
     }
 
     fn get(&self) -> Option<libc::c_int> {
-        let signal = self.0.load(Ordering::SeqCst);
+        let signal = self.signal.load(Ordering::SeqCst);
         (signal != 0).then_some(signal)
     }
 
+    /// The recorded End, for the one thread that takes it.
+    fn take(&self) -> Option<libc::c_int> {
+        let signal = self.get()?;
+        self.taken
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .ok()
+            .map(|_| signal)
+    }
+
     fn clear(&self) {
-        self.0.store(0, Ordering::SeqCst);
+        self.taken.store(false, Ordering::SeqCst);
+        self.signal.store(0, Ordering::SeqCst);
     }
 }
 
@@ -1238,8 +1275,9 @@ fn start_end_watchdog(signal: libc::c_int, deadline: Instant, sigint_left_defaul
 /// that the watcher published decides, as `end_abruptly` does for the
 /// watcher, so a SIGINT that killed the command still ends prismtty by
 /// SIGINT; it reads that status without the reap lock. When the watcher has
-/// published nothing by the deadline, the command counts as not collected by
-/// then, and the end is 128 plus `signal`.
+/// published nothing by the deadline (it has not collected the command, or
+/// collected it only an instant before and not yet published), the end is
+/// 128 plus `signal`.
 fn end_at_deadline(signal: libc::c_int, sigint_left_default: bool) {
     let outcome = EndOutcome {
         signal,
@@ -1258,7 +1296,8 @@ fn end_abruptly(outcome: &EndOutcome, sigint_left_default: bool) -> ! {
     if !claim_exit(EXIT_ABRUPTLY) {
         wait_for_the_claimed_exit();
     }
-    // This runs on the watcher or the limit's thread, not in a signal handler.
+    // This runs on the watcher, the limit's or the stopping thread, not in a
+    // signal handler.
     unregister_before_exit();
     if outcome.signal == libc::SIGINT
         && sigint_left_default
@@ -3008,16 +3047,23 @@ impl SessionSignalWatcher {
                 "prismtty: could not restore terminal during cleanup: {error}"
             ));
         }
-        // After an ending signal the process is on its way out: its signals
+        // See `PendingEnd` for the handoff. With an End recorded (taken or
+        // not, published or not) the process is on its way out: its signals
         // stay caught, with nothing left to act on them, so a second SIGTERM
-        // or a late SIGUSR1 cannot kill it by signal before it has removed its
-        // pid file and returned its status. Otherwise the signals are given
-        // back first, as in 1.4.1: from then on one takes its default action.
-        let ended = published_end_outcome().is_some();
-        if !ended {
-            restore_signal_handlers(&self.previous_signal_handlers);
+        // or a late SIGUSR1 cannot kill it by signal before it has removed
+        // its pid file and returned its status. With none, the signals are
+        // given back first, as in 1.4.1.
+        let handlers = mem::take(&mut self.previous_signal_handlers);
+        let mut given_back = false;
+        if PENDING_END.get().is_none() {
+            restore_signal_handlers(&handlers);
+            given_back = true;
+            if PENDING_END.get().is_some() {
+                // Recorded while they were being given back.
+                catch_signals_again(&handlers);
+                given_back = false;
+            }
         }
-        self.previous_signal_handlers.clear();
         // Wait out any handler that is mid-write before the descriptor is
         // closed (or leak it if one stalls).
         let closable = RAW_MODE_SIGNAL_PIPE.disarm();
@@ -3032,12 +3078,15 @@ impl SessionSignalWatcher {
             return;
         };
         let _ = thread.join();
-        // An ending signal that a handler recorded while it was still
-        // installed, after the watcher's last check, is taken here, on the
-        // stopping thread: the session is ending, its command has been reaped
-        // or given up on, and that decides the status as for any end.
-        if !ended && published_end_outcome().is_none() {
-            if let Some(signal) = PENDING_END.get() {
+        // An End that a handler recorded and the watcher did not take (it
+        // came after the watcher's last check) is taken here, on the stopping
+        // thread: the session is ending, its command has been reaped or given
+        // up on, and that decides the status as for any end.
+        if PENDING_END.get().is_some() {
+            if given_back {
+                catch_signals_again(&handlers);
+            }
+            if let Some(signal) = PENDING_END.take() {
                 end_session_after_signal(signal, &self.raw_mode_state, self.sigint_left_default);
             }
         }
@@ -3047,6 +3096,15 @@ impl SessionSignalWatcher {
 impl Drop for SessionSignalWatcher {
     fn drop(&mut self) {
         self.stop();
+    }
+}
+
+/// Puts prismtty's handler back on the signals in `handlers`, once an End
+/// was recorded after they were given back. The self-pipe is disarmed by
+/// then, so the handler only records, and the End is already recorded.
+fn catch_signals_again(handlers: &[(libc::c_int, libc::sigaction)]) {
+    for (signal, _) in handlers {
+        let _ = install_signal_handler(*signal, restore_raw_mode_for_signal, libc::SA_RESTART);
     }
 }
 
@@ -3139,8 +3197,12 @@ fn handle_session_signals_with(
     let mut pending = VecDeque::new();
     let mut resumed_at = None;
     loop {
-        if let Some(signal) = pending_end.get() {
-            end_session(signal);
+        if pending_end.get().is_some() {
+            // Taken here, or already by another thread, which then ends
+            // the session.
+            if let Some(signal) = pending_end.take() {
+                end_session(signal);
+            }
             break;
         }
         let Some(signal) = pending.pop_front() else {
@@ -4841,6 +4903,48 @@ mod tests {
 
         assert_eq!(forwarded, [libc::SIGUSR1, libc::SIGUSR2]);
         assert_eq!(ended, [libc::SIGHUP]);
+        super::close_fd(write_fd);
+    }
+
+    // Two threads can race to take the same End: the watcher at the top of
+    // its loop and the stopping thread after joining it. Only one wins, and
+    // a watcher that finds the End taken stops without acting on it.
+    #[test]
+    fn a_recorded_end_is_taken_by_one_thread_only() {
+        let pending_end = super::PendingEnd::new();
+        assert_eq!(pending_end.take(), None);
+        pending_end.record(libc::SIGTERM);
+        let start = std::sync::Barrier::new(4);
+        let taken: Vec<_> = std::thread::scope(|scope| {
+            let takers: Vec<_> = (0..4)
+                .map(|_| {
+                    scope.spawn(|| {
+                        start.wait();
+                        pending_end.take()
+                    })
+                })
+                .collect();
+            takers
+                .into_iter()
+                .filter_map(|taker| taker.join().ok().flatten())
+                .collect()
+        });
+        assert_eq!(taken, [libc::SIGTERM]);
+        assert_eq!(pending_end.get(), Some(libc::SIGTERM));
+
+        let (read_fd, write_fd) = super::pipe_fds().expect("signal pipe");
+        super::write_signal_byte(write_fd, libc::SIGUSR1 as u8);
+        let state = Mutex::new(super::RawModeLifecycle::Inactive);
+        let mut forwarded = 0;
+        super::handle_session_signals_with(
+            read_fd,
+            &pending_end,
+            &state,
+            || panic!("no job-control signal was sent"),
+            |_| forwarded += 1,
+            |_| panic!("an End another thread took was taken again"),
+        );
+        assert_eq!(forwarded, 0);
         super::close_fd(write_fd);
     }
 
