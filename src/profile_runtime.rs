@@ -8,11 +8,30 @@ const PROFILE_STACK_LIMIT: usize = 8;
 /// Lines typed after a remote command before its attempt expires: a user
 /// name, a password, a one-time code, and the Enter that redraws a prompt.
 const REMOTE_ATTEMPT_LINE_GRACE: u8 = 4;
+/// Bytes of visible output after a typed `exit` within which the parent's
+/// prompt must end, counted from the first output read after the Enter, as
+/// the terminal receives them (escape sequences are not counted).
+const EXIT_CONFIRM_WINDOW: usize = 512;
+/// Time after a typed `exit` in which the connection's end must be shown. A
+/// device's own client prints its close line one round trip after the
+/// session ends; three seconds leaves room for a slow link.
+const EXIT_CONFIRM_TIME: std::time::Duration = std::time::Duration::from_secs(3);
+/// Output allowed between telnet's command echo and its close line.
+const TELNET_EXCHANGE_WINDOW: usize = 256;
+/// Output allowed between the Ctrl-] and the end of telnet's command echo:
+/// device output already in flight when the escape was typed comes first.
+const TELNET_ESCAPE_ECHO_WINDOW: usize = 4096;
+/// The longest unterminated line kept to finish a telnet client's
+/// `Escape character is 'X'.` announcement in the next read.
+const TELNET_ANNOUNCEMENT_LIMIT: usize = 64;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ClosePolicy {
     SshLike,
     Telnet,
+    /// Telnet started with `-e`, `-E` or `-r`: Ctrl-] does not open its
+    /// command prompt.
+    TelnetOtherEscape,
     Screen,
     Serial,
     Generic,
@@ -25,16 +44,23 @@ enum CloseMarkerKind {
     Screen,
     Serial,
     Logout,
+    /// `[Connection to X closed by foreign host]` from a device's own client;
+    /// handled only through `confirm_exit_close`.
+    ForeignHostBracket,
 }
 
 impl ClosePolicy {
     fn accepts(self, marker: CloseMarkerKind) -> bool {
+        if marker == CloseMarkerKind::ForeignHostBracket {
+            return false;
+        }
         self == ClosePolicy::Generic
             || marker == CloseMarkerKind::Logout
             || matches!(
                 (self, marker),
                 (ClosePolicy::SshLike, CloseMarkerKind::SshLike)
                     | (ClosePolicy::Telnet, CloseMarkerKind::Telnet)
+                    | (ClosePolicy::TelnetOtherEscape, CloseMarkerKind::Telnet)
                     | (ClosePolicy::Screen, CloseMarkerKind::Screen)
                     | (ClosePolicy::Serial, CloseMarkerKind::Serial)
             )
@@ -88,6 +114,69 @@ struct ProfileFrame {
     /// A remote command was typed inside this connection, so a close message
     /// that names no known target may belong to that nested attempt.
     nested_attempt_seen: bool,
+    /// The prompt that waited where the command opening this connection was
+    /// typed: what the parent shows again once the connection has ended.
+    parent_prompt: Option<String>,
+    /// A default-escape telnet whose `telnet> !` subshell or `z` suspend
+    /// handed the keyboard to a local shell: Ctrl-] may not reach it now.
+    telnet_keyboard_lost: bool,
+    /// A prompt has waited while this connection was the innermost one.
+    prompt_seen: bool,
+    /// A line was typed into this connection before any prompt of it was
+    /// seen: what it typed into is unknown, so its exit is not trusted.
+    typed_before_prompt: bool,
+    /// The escape character the telnet client announced, for telnet frames.
+    telnet_escape: TelnetEscape,
+}
+
+/// What a telnet client said its escape character is.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum TelnetEscape {
+    /// No `Escape character is` line was seen.
+    #[default]
+    Unknown,
+    /// `Escape character is '^]'.`
+    Default,
+    /// Another character, or none, announced or set on the command line.
+    Other,
+}
+
+/// A reliably typed `exit`, `quit` or `logout` on a connection whose parent
+/// prompt is known, waiting for proof that the connection ended.
+#[derive(Clone, Debug)]
+struct ExitIntent {
+    /// Stack depth when the exit was typed: the connection it may end.
+    depth: usize,
+    /// When the exit was typed.
+    armed_at: std::time::Instant,
+    /// Visible output bytes since the Enter, at most one past
+    /// `EXIT_CONFIRM_WINDOW`: enough to see whether a line ends within it.
+    seen: Vec<u8>,
+    /// How much of `seen` has been read as complete lines, in output order.
+    scanned: usize,
+    /// The bracketed close naming this connection's target has been seen.
+    bracket_seen: bool,
+    /// The parent's prompt is the waiting line: the unterminated end of the
+    /// output, after the bracket. A key typed at it, before any more output,
+    /// confirms it.
+    parent_waiting: bool,
+}
+
+/// From a Ctrl-] that reaches a tracked default-escape telnet: the command
+/// typed at telnet's prompt and the output since that byte.
+#[derive(Clone, Debug)]
+struct TelnetExchange {
+    /// The command typed so far, at most 8 bytes.
+    command: String,
+    /// Set when Enter submitted `quit` or a prefix of it: the length of
+    /// `seen` then, since telnet's echo of the command ends after it.
+    enter_at: Option<usize>,
+    /// Visible output bytes since the Ctrl-], at most what the two windows
+    /// and a close line need.
+    seen: Vec<u8>,
+    /// The stack as it was at the Ctrl-]: any frame pushed or popped since
+    /// cancels the exchange.
+    stack_generation: u64,
 }
 
 /// How firmly output identified the active profile's device.
@@ -150,6 +239,26 @@ pub(crate) struct ProfileRuntime {
     pending_prompt_profiles: Option<Vec<String>>,
     pending_prompt_hits: usize,
     transition_rollback: Option<ProfileTransitionState>,
+    /// Visible output since the last line terminator (bounded).
+    last_output_line: String,
+    /// The prompt that waited where the pending attempt was typed.
+    pending_parent_prompt: Option<(RemoteAttempt, String)>,
+    /// The waiting prompt when the first key of the current input line
+    /// arrived (`None` until then): edits and history keys cannot hide it.
+    line_start_prompt: Option<Option<String>>,
+    exit_intent: Option<ExitIntent>,
+    telnet_exchange: Option<TelnetExchange>,
+    /// A pop made by a key typed at the parent's waiting prompt, reported
+    /// with the next read, and the state to roll back to if it is rejected.
+    pending_transition: Option<Vec<String>>,
+    pending_rollback: Option<ProfileTransitionState>,
+    /// The unterminated last line of a read that may begin a telnet
+    /// client's escape announcement (bounded).
+    telnet_announcement_partial: String,
+    /// Counts every frame push and pop.
+    stack_generation: u64,
+    /// What the client of a pending telnet attempt announced.
+    pending_telnet_escape: Option<TelnetEscape>,
 }
 
 impl ProfileRuntime {
@@ -174,6 +283,16 @@ impl ProfileRuntime {
             pending_prompt_profiles: None,
             pending_prompt_hits: 0,
             transition_rollback: None,
+            last_output_line: String::new(),
+            pending_parent_prompt: None,
+            line_start_prompt: None,
+            exit_intent: None,
+            telnet_exchange: None,
+            pending_transition: None,
+            pending_rollback: None,
+            telnet_announcement_partial: String::new(),
+            stack_generation: 0,
+            pending_telnet_escape: None,
         }
     }
 
@@ -189,6 +308,10 @@ impl ProfileRuntime {
 
     pub(crate) fn observe_input(&mut self, input: &[u8]) {
         for byte in input {
+            if self.exit_intent.is_some() {
+                self.exit_key_typed();
+            }
+            self.observe_telnet_command_byte(*byte);
             match self.input_escape_state {
                 InputEscapeState::Esc => {
                     self.input_escape_state = match *byte {
@@ -233,6 +356,17 @@ impl ProfileRuntime {
                 InputEscapeState::None => {}
             }
 
+            if self.line_start_prompt.is_none() && !matches!(byte, b'\r' | b'\n') {
+                let prompt = self.waiting_prompt_now();
+                // A connection waiting at its parent's exact prompt text cannot
+                // be told apart from that parent, so C-2b stops trusting it.
+                if let (Some(prompt), Some(frame)) = (prompt.as_ref(), self.stack.last_mut()) {
+                    if frame.parent_prompt.as_ref() == Some(prompt) {
+                        frame.parent_prompt = None;
+                    }
+                }
+                self.line_start_prompt = Some(prompt);
+            }
             match byte {
                 0x1b => self.input_escape_state = InputEscapeState::Esc,
                 0x03 => {
@@ -240,6 +374,8 @@ impl ProfileRuntime {
                     self.input_line_reliable = true;
                     self.unreliable_remote_attempt = None;
                     self.pending_remote = None;
+                    self.exit_intent = None;
+                    self.line_start_prompt = None;
                 }
                 0x15 => {
                     self.input_line.clear();
@@ -248,13 +384,17 @@ impl ProfileRuntime {
                 }
                 0x17 => self.invalidate_input_line(),
                 b'\r' | b'\n' => {
+                    self.exit_intent = None;
                     if self.input_line_reliable {
                         self.submit_input_line();
                     } else if let Some(attempt) = self.unreliable_remote_attempt.take() {
-                        self.arm_remote_attempt(attempt);
+                        let parent_prompt = self.line_start_prompt.clone().flatten();
+                        self.arm_remote_attempt(attempt.clone());
+                        self.pending_parent_prompt = parent_prompt.map(|prompt| (attempt, prompt));
                     } else {
                         self.age_pending_remote();
                     }
+                    self.line_start_prompt = None;
                     self.input_line.clear();
                     self.input_line_reliable = true;
                     self.unreliable_remote_attempt = None;
@@ -280,6 +420,185 @@ impl ProfileRuntime {
         }
     }
 
+    /// Follows telnet's command mode: Ctrl-] then one command line.
+    fn observe_telnet_command_byte(&mut self, byte: u8) {
+        if byte == 0x1d {
+            let stack_generation = self.stack_generation;
+            self.telnet_exchange = self
+                .default_escape_telnet_reachable()
+                .then(|| TelnetExchange {
+                    command: String::new(),
+                    enter_at: None,
+                    seen: Vec::new(),
+                    stack_generation,
+                });
+            return;
+        }
+        let Some(exchange) = self.telnet_exchange.as_mut() else {
+            return;
+        };
+        if exchange.enter_at.is_some() {
+            // The command was submitted; a later Enter ends the exchange.
+            if matches!(byte, b'\r' | b'\n') {
+                self.telnet_exchange = None;
+            }
+            return;
+        }
+        match byte {
+            b'\r' | b'\n' => {
+                let command = exchange.command.trim().to_ascii_lowercase();
+                if command.starts_with('!') || command == "z" {
+                    // A local shell owns the keyboard now (`!` subshell, `z`
+                    // suspend); this rule cannot tell when telnet has it again.
+                    if let Some(outermost) = self.outermost_default_escape_telnet() {
+                        self.stack[outermost].telnet_keyboard_lost = true;
+                    }
+                    self.telnet_exchange = None;
+                } else if !command.is_empty() && "quit".starts_with(&command) {
+                    // Not `close`: it leaves telnet's own `telnet>` prompt
+                    // waiting, so the keyboard does not return to the parent.
+                    exchange.command = command;
+                    exchange.enter_at = Some(exchange.seen.len());
+                } else {
+                    self.telnet_exchange = None;
+                }
+            }
+            0x08 | 0x7f => {
+                exchange.command.pop();
+            }
+            byte if (byte.is_ascii_graphic() || byte == b' ') && exchange.command.len() < 8 => {
+                exchange.command.push(byte as char);
+            }
+            _ => self.telnet_exchange = None,
+        }
+    }
+
+    fn outermost_default_escape_telnet(&self) -> Option<usize> {
+        self.stack.iter().position(|frame| {
+            frame.close_policy == ClosePolicy::Telnet
+                && frame.telnet_escape == TelnetEscape::Default
+        })
+    }
+
+    /// Ctrl-] is known to open a tracked telnet's command prompt: every
+    /// telnet in the stack said which escape it uses, one of them uses
+    /// Ctrl-], and no local shell took the keyboard from it.
+    fn default_escape_telnet_reachable(&self) -> bool {
+        let telnets = || {
+            self.stack.iter().filter(|frame| {
+                matches!(
+                    frame.close_policy,
+                    ClosePolicy::Telnet | ClosePolicy::TelnetOtherEscape
+                )
+            })
+        };
+        if telnets()
+            .any(|frame| frame.telnet_keyboard_lost || frame.telnet_escape == TelnetEscape::Unknown)
+        {
+            return false;
+        }
+        self.outermost_default_escape_telnet().is_some()
+            || (self
+                .pending_remote
+                .as_ref()
+                .is_some_and(|pending| pending.policy == ClosePolicy::Telnet)
+                && self.pending_telnet_escape == Some(TelnetEscape::Default))
+    }
+
+    /// Reads a telnet client's `Escape character is 'X'.` line into the
+    /// pending attempt or the innermost telnet frame that has none yet. The
+    /// line may arrive across reads: a bounded unterminated tail is kept.
+    fn note_telnet_escape(&mut self, text: &str) {
+        let pending_telnet = self
+            .pending_remote
+            .as_ref()
+            .is_some_and(|pending| pending.policy == ClosePolicy::Telnet);
+        let unknown_frame = self.stack.last().is_some_and(|frame| {
+            frame.close_policy == ClosePolicy::Telnet
+                && frame.telnet_escape == TelnetEscape::Unknown
+        });
+        if !pending_telnet && !unknown_frame {
+            self.telnet_announcement_partial.clear();
+            return;
+        }
+        let mut combined = std::mem::take(&mut self.telnet_announcement_partial);
+        combined.push_str(text);
+        let complete_end = combined.rfind(is_line_terminator).map_or(0, |end| end + 1);
+        for line in combined[..complete_end].split(is_line_terminator) {
+            let line = line.trim().to_ascii_lowercase();
+            let Some(value) = line
+                .strip_prefix("escape character is '")
+                .and_then(|rest| rest.strip_suffix("'."))
+            else {
+                continue;
+            };
+            let escape = if value == "^]" {
+                TelnetEscape::Default
+            } else {
+                TelnetEscape::Other
+            };
+            if pending_telnet {
+                self.pending_telnet_escape = Some(escape);
+            } else if let Some(frame) = self.stack.last_mut().filter(|frame| {
+                frame.close_policy == ClosePolicy::Telnet
+                    && frame.telnet_escape == TelnetEscape::Unknown
+            }) {
+                frame.telnet_escape = escape;
+            }
+        }
+        let tail = &combined[complete_end..];
+        if tail.len() <= TELNET_ANNOUNCEMENT_LIMIT {
+            self.telnet_announcement_partial = tail.to_string();
+        }
+    }
+
+    /// A prompt waiting after this read, while a connection is the innermost
+    /// one, is that connection's. A child that shows its parent's exact
+    /// prompt cannot be told apart from it, so C-2b stops trusting it.
+    fn note_child_prompt(&mut self) {
+        if self
+            .exit_intent
+            .as_ref()
+            .is_some_and(|intent| intent.parent_waiting)
+        {
+            return;
+        }
+        let Some(prompt) = self.waiting_prompt_now() else {
+            return;
+        };
+        if let Some(frame) = self.stack.last_mut() {
+            frame.prompt_seen = true;
+            if frame.parent_prompt.as_ref() == Some(&prompt) {
+                frame.parent_prompt = None;
+            }
+        }
+    }
+
+    /// The last output line, when it is a waiting prompt.
+    fn waiting_prompt_now(&self) -> Option<String> {
+        let prompt = self.last_output_line.trim_end();
+        (!prompt.is_empty() && looks_like_prompt_detection_boundary(prompt)).then(|| {
+            prompt
+                .trim_start_matches(|ch: char| ch.is_ascii_control())
+                .to_string()
+        })
+    }
+
+    /// The prompt left on the line once the echo of `typed` is taken off it.
+    fn waiting_prompt_before(&self, typed: &str) -> Option<String> {
+        let line = self.last_output_line.as_str();
+        let echoed = (0..=typed.len())
+            .rev()
+            .find(|len| typed.is_char_boundary(*len) && line.ends_with(&typed[..*len]))
+            .unwrap_or(0);
+        let prompt = line[..line.len() - echoed].trim_end();
+        (!prompt.is_empty() && looks_like_prompt_detection_boundary(prompt)).then(|| {
+            prompt
+                .trim_start_matches(|ch: char| ch.is_ascii_control())
+                .to_string()
+        })
+    }
+
     fn invalidate_input_line(&mut self) {
         if self.input_line_reliable {
             self.unreliable_remote_attempt =
@@ -303,8 +622,16 @@ impl ProfileRuntime {
         // profile-state graph (not the 64 KiB detection window) so a failed
         // highlighter build can roll back the proposed transition cheaply.
         self.transition_rollback = None;
-        let rollback = self.transition_state();
+        // A pop made by a key since the last read is reported with this read
+        // and rolls back to the state from before it.
+        let rollback = self
+            .pending_rollback
+            .take()
+            .unwrap_or_else(|| self.transition_state());
         let transition = self.observe_output_inner(visible_output, store);
+        let transition = transition.or_else(|| self.pending_transition.take());
+        self.pending_transition = None;
+        self.note_child_prompt();
         if transition.is_some() {
             self.transition_rollback = Some(rollback);
         }
@@ -318,6 +645,42 @@ impl ProfileRuntime {
     ) -> Option<Vec<String>> {
         let text = String::from_utf8_lossy(visible_output);
         if text.is_empty() {
+            return None;
+        }
+
+        match text.rfind(is_line_terminator) {
+            Some(end) => {
+                self.last_output_line.clear();
+                self.last_output_line.push_str(&text[end + 1..]);
+            }
+            None => self.last_output_line.push_str(&text),
+        }
+        trim_to_recent_chars(&mut self.last_output_line, 512);
+        self.note_telnet_escape(&text);
+        if let Some(transition) = self.confirm_exit_close(visible_output) {
+            self.output_window.push_str(&text);
+            self.output_window_lower
+                .push_str(&text.to_ascii_lowercase());
+            return transition;
+        }
+        if self.telnet_quit_confirmed(visible_output) {
+            self.clear_output_window();
+            self.clear_pending_prompt();
+            if let Some(outermost) = self.outermost_default_escape_telnet() {
+                self.pending_remote = None;
+                let before = self.active_profiles.clone();
+                while self.stack.len() > outermost {
+                    self.pop_profile();
+                }
+                return (self.active_profiles != before).then(|| self.active_profiles.clone());
+            }
+            if self
+                .pending_remote
+                .as_ref()
+                .is_some_and(|pending| pending.policy == ClosePolicy::Telnet)
+            {
+                self.pending_remote = None;
+            }
             return None;
         }
 
@@ -618,11 +981,238 @@ impl ProfileRuntime {
     }
 
     fn submit_input_line(&mut self) {
-        match self.typed_remote_attempt(self.input_line.trim_start()) {
-            Some(attempt) => self.arm_remote_attempt(attempt),
+        let typed = std::mem::take(&mut self.input_line);
+        match self.typed_remote_attempt(typed.trim_start()) {
+            Some(attempt) => {
+                let parent_prompt = self
+                    .line_start_prompt
+                    .clone()
+                    .flatten()
+                    .or_else(|| self.waiting_prompt_before(&typed));
+                self.arm_remote_attempt(attempt.clone());
+                self.pending_parent_prompt = parent_prompt.map(|prompt| (attempt, prompt));
+            }
             None => self.age_pending_remote(),
         }
+        if let Some(frame) = self.stack.last_mut().filter(|frame| !frame.prompt_seen) {
+            frame.typed_before_prompt = true;
+        }
+        if matches!(
+            typed.trim().to_ascii_lowercase().as_str(),
+            "exit" | "quit" | "logout"
+        ) && self.stack.last().is_some_and(|frame| {
+            frame.target.is_some()
+                && frame.parent_prompt.is_some()
+                && frame.prompt_seen
+                && !frame.typed_before_prompt
+                && matches!(
+                    frame.close_policy,
+                    ClosePolicy::SshLike | ClosePolicy::Telnet | ClosePolicy::TelnetOtherEscape
+                )
+        }) {
+            self.exit_intent = Some(ExitIntent {
+                depth: self.stack.len(),
+                armed_at: std::time::Instant::now(),
+                seen: Vec::new(),
+                scanned: 0,
+                bracket_seen: false,
+                parent_waiting: false,
+            });
+        }
+        self.input_line = typed;
         self.remember_local_client();
+    }
+
+    /// The connection an exit intent may end: its target and the prompt its
+    /// parent showed, while it is still the top frame.
+    fn exit_intent_frame(&self) -> Option<(String, String)> {
+        let intent = self.exit_intent.as_ref()?;
+        let frame = self
+            .stack
+            .last()
+            .filter(|_| self.stack.len() == intent.depth)?;
+        Some((frame.target.clone()?, frame.parent_prompt.clone()?))
+    }
+
+    /// C-2b: after a typed exit, a `[Connection to X closed by foreign host]`
+    /// line naming the top connection ends it only when, reading the output
+    /// since the Enter line by line in the order it came, the first prompt
+    /// after that line is the one its parent showed when the connection was
+    /// opened, ending within the first `EXIT_CONFIRM_WINDOW` bytes and shown
+    /// within `EXIT_CONFIRM_TIME`. The first prompt decides either way. A
+    /// complete line decides at once. The unterminated last line is the
+    /// waiting prompt only once a key is typed at it before more output
+    /// arrives (`exit_key_typed`); a line that goes on is judged when it
+    /// ends. Bytes are counted as they arrive, so read grouping does not
+    /// change the result.
+    fn confirm_exit_close(&mut self, visible: &[u8]) -> Option<Option<Vec<String>>> {
+        let expired = self.exit_intent.as_ref()?.armed_at.elapsed() > EXIT_CONFIRM_TIME;
+        let Some((target, parent_prompt)) = self.exit_intent_frame().filter(|_| !expired) else {
+            self.exit_intent = None;
+            return None;
+        };
+        let intent = self.exit_intent.as_mut()?;
+        intent.parent_waiting = false;
+        let room = (EXIT_CONFIRM_WINDOW + 1).saturating_sub(intent.seen.len());
+        intent
+            .seen
+            .extend_from_slice(&visible[..visible.len().min(room)]);
+        let mut decision = None;
+        while let Some(length) = intent.seen[intent.scanned..]
+            .iter()
+            .position(|byte| matches!(byte, b'\r' | b'\n'))
+        {
+            let start = intent.scanned;
+            let end = start + length;
+            intent.scanned = end + 1;
+            let line = String::from_utf8_lossy(&intent.seen[start..end]);
+            if is_foreign_host_bracket(&line, &target) {
+                intent.bracket_seen = true;
+            } else if !line.trim().is_empty() && looks_like_prompt_detection_boundary(&line) {
+                decision = Some(
+                    intent.bracket_seen
+                        && end <= EXIT_CONFIRM_WINDOW
+                        && waiting_prompt_text(&line) == parent_prompt,
+                );
+                break;
+            }
+        }
+        match decision {
+            Some(true) => {
+                self.exit_intent = None;
+                Some(self.pop_exited_connection())
+            }
+            Some(false) => {
+                self.exit_intent = None;
+                None
+            }
+            None if intent.seen.len() > EXIT_CONFIRM_WINDOW => {
+                // Nothing that ends past the window can confirm.
+                self.exit_intent = None;
+                None
+            }
+            None => {
+                let rest = String::from_utf8_lossy(&intent.seen[intent.scanned..]);
+                intent.parent_waiting =
+                    intent.bracket_seen && waiting_prompt_text(&rest) == parent_prompt;
+                None
+            }
+        }
+    }
+
+    /// A key typed while an exit intent is set: if the parent's prompt is
+    /// the waiting line, the connection ended. Any other key, typed at the
+    /// child's prompt or ahead of the output, ends the intent.
+    fn exit_key_typed(&mut self) {
+        let waiting = self
+            .exit_intent
+            .as_ref()
+            .is_some_and(|intent| intent.parent_waiting)
+            && self.exit_intent_frame().is_some();
+        self.exit_intent = None;
+        if !waiting {
+            return;
+        }
+        let snapshot = self.transition_state();
+        if let Some(profiles) = self.pop_exited_connection() {
+            self.pending_transition = Some(profiles);
+            self.pending_rollback.get_or_insert(snapshot);
+        }
+    }
+
+    fn pop_exited_connection(&mut self) -> Option<Vec<String>> {
+        self.pending_remote = None;
+        self.clear_output_window();
+        self.clear_pending_prompt();
+        let before = self.active_profiles.clone();
+        self.pop_profile();
+        (self.active_profiles != before).then(|| self.active_profiles.clone())
+    }
+
+    /// C-2c: after the Ctrl-], telnet's own `telnet> COMMAND` line must end
+    /// within `TELNET_ESCAPE_ECHO_WINDOW` bytes, after the Enter that
+    /// submitted the command, and the first non-blank line after it must be
+    /// a bare `Connection closed.` that starts within another
+    /// `TELNET_EXCHANGE_WINDOW` bytes. Lines are read in the order they came:
+    /// a close message before the echo changes the stack first (the
+    /// close-marker path), which cancels the exchange. Returns whether the
+    /// exchange completed.
+    fn telnet_quit_confirmed(&mut self, visible: &[u8]) -> bool {
+        let Some(exchange) = self.telnet_exchange.as_mut() else {
+            return false;
+        };
+        if exchange.stack_generation != self.stack_generation {
+            self.telnet_exchange = None;
+            return false;
+        }
+        let limit = TELNET_ESCAPE_ECHO_WINDOW + TELNET_EXCHANGE_WINDOW + 64;
+        let room = limit.saturating_sub(exchange.seen.len());
+        exchange
+            .seen
+            .extend_from_slice(&visible[..visible.len().min(room)]);
+        let enter_at = exchange.enter_at;
+        let echo = format!("telnet> {}", exchange.command);
+        let mut offset = 0usize;
+        let mut echo_end = None;
+        let mut decided = None;
+        for piece in exchange
+            .seen
+            .split_inclusive(|byte| matches!(byte, b'\r' | b'\n'))
+        {
+            let start = offset;
+            offset += piece.len();
+            if !matches!(piece.last(), Some(b'\r' | b'\n')) {
+                break;
+            }
+            let line = String::from_utf8_lossy(piece).trim().to_ascii_lowercase();
+            match echo_end {
+                None => {
+                    if !observed_close_markers(&line).is_empty() {
+                        // A close message before telnet's echo: the stack
+                        // changes first, and the exchange with it.
+                        decided = Some(false);
+                        break;
+                    }
+                    // The echo ends with the line end that follows the
+                    // user's Enter; a `telnet> q` line already complete
+                    // before it is not this command's echo.
+                    if line == echo && enter_at.is_some_and(|enter_at| offset > enter_at) {
+                        if offset > TELNET_ESCAPE_ECHO_WINDOW {
+                            decided = Some(false);
+                            break;
+                        }
+                        echo_end = Some(offset);
+                    }
+                }
+                Some(end) => {
+                    if line.is_empty() {
+                        continue;
+                    }
+                    decided = Some(
+                        matches!(line.as_str(), "connection closed" | "connection closed.")
+                            && start - end <= TELNET_EXCHANGE_WINDOW,
+                    );
+                    break;
+                }
+            }
+        }
+        match decided {
+            Some(confirmed) => {
+                self.telnet_exchange = None;
+                confirmed
+            }
+            None => {
+                // The echo line must end within the first window; the close
+                // line must start within one more window after it.
+                let bound = echo_end.map_or(TELNET_ESCAPE_ECHO_WINDOW, |end| {
+                    end + TELNET_EXCHANGE_WINDOW
+                });
+                if offset > bound || exchange.seen.len() >= limit {
+                    self.telnet_exchange = None;
+                }
+                false
+            }
+        }
     }
 
     /// `sftp` or `mysql` started by name where the local baseline's profiles
@@ -663,6 +1253,8 @@ impl ProfileRuntime {
     }
 
     fn arm_remote_attempt(&mut self, attempt: RemoteAttempt) {
+        self.pending_parent_prompt = None;
+        self.pending_telnet_escape = None;
         self.pending_remote = Some(attempt);
         self.pending_remote_lines = 0;
         if let Some(frame) = self.stack.last_mut() {
@@ -761,11 +1353,17 @@ impl ProfileRuntime {
             .position(|frame| frame.profiles == profiles)
         {
             self.stack.truncate(stack_index);
+            self.stack_generation += 1;
+            self.telnet_exchange = None;
+            self.exit_intent = None;
             self.active_profiles = profiles;
             return Some(self.active_profiles.clone());
         }
         if profiles == self.baseline_profiles {
             self.stack.clear();
+            self.stack_generation += 1;
+            self.telnet_exchange = None;
+            self.exit_intent = None;
             self.active_profiles = self.baseline_profiles.clone();
             return Some(self.active_profiles.clone());
         }
@@ -785,6 +1383,8 @@ impl ProfileRuntime {
 
     fn pop_profile(&mut self) -> Option<Vec<String>> {
         self.active_evidence = ActiveEvidence::Weak;
+        self.exit_intent = None;
+        self.stack_generation += 1;
         let next = self
             .stack
             .pop()
@@ -845,13 +1445,30 @@ impl ProfileRuntime {
             // it and collapse the oldest interior nesting level instead.
             self.stack.remove(1);
         }
+        let parent_prompt = self
+            .pending_parent_prompt
+            .as_ref()
+            .filter(|(attempt, _)| *attempt == remote_attempt)
+            .map(|(_, prompt)| prompt.clone());
+        self.exit_intent = None;
         self.stack.push(ProfileFrame {
             profiles: self.active_profiles.clone(),
             close_policy: remote_attempt.policy,
             target: remote_attempt.target,
             unresolved_detection,
             nested_attempt_seen: false,
+            parent_prompt,
+            telnet_keyboard_lost: false,
+            prompt_seen: false,
+            typed_before_prompt: false,
+            telnet_escape: match remote_attempt.policy {
+                ClosePolicy::TelnetOtherEscape => TelnetEscape::Other,
+                ClosePolicy::Telnet => self.pending_telnet_escape.take().unwrap_or_default(),
+                _ => TelnetEscape::Unknown,
+            },
         });
+        self.stack_generation += 1;
+        self.telnet_exchange = None;
     }
 
     fn clear_pending_prompt(&mut self) {
@@ -894,7 +1511,7 @@ fn remote_attempt(line: &str, openssh_client: bool) -> Option<RemoteAttempt> {
         .map(|word| word.as_str())
         .or_else(|| line.split_whitespace().next())?
         .to_ascii_lowercase();
-    let policy = match command.as_str() {
+    let mut policy = match command.as_str() {
         "ssh" | "mosh" => ClosePolicy::SshLike,
         "telnet" => ClosePolicy::Telnet,
         "screen" => ClosePolicy::Screen,
@@ -924,6 +1541,9 @@ fn remote_attempt(line: &str, openssh_client: bool) -> Option<RemoteAttempt> {
             continue;
         }
         if !options_ended && word.starts_with('-') {
+            if command == "telnet" && telnet_option_changes_escape(word) {
+                policy = ClosePolicy::TelnetOtherEscape;
+            }
             skip_option_value = remote_option_takes_value(&command, word);
             no_session |= remote_option_opens_no_session(&command, word);
             force_tty |= command == "ssh" && ssh_option_flags(word).contains(&'t');
@@ -950,6 +1570,41 @@ fn remote_attempt(line: &str, openssh_client: bool) -> Option<RemoteAttempt> {
         return None;
     }
     Some(RemoteAttempt { policy, target })
+}
+
+/// `[Connection to X closed by foreign host]` naming `target`.
+fn is_foreign_host_bracket(line: &str, target: &str) -> bool {
+    observed_close_markers(&line.to_ascii_lowercase())
+        .iter()
+        .any(|marker| {
+            marker.kind == CloseMarkerKind::ForeignHostBracket
+                && marker.target.as_deref() == Some(target)
+        })
+}
+
+/// A prompt line as it is compared: trailing blanks and leading control
+/// characters dropped.
+fn waiting_prompt_text(line: &str) -> &str {
+    line.trim_end()
+        .trim_start_matches(|ch: char| ch.is_ascii_control())
+}
+
+/// `-e` (another escape character), `-E` (none) and `-r` (rlogin-style `~`)
+/// among a telnet option word's flags, up to the first flag that takes a
+/// value.
+fn telnet_option_changes_escape(option: &str) -> bool {
+    let Some(flags) = option.strip_prefix('-') else {
+        return false;
+    };
+    for flag in flags.chars() {
+        if matches!(flag, 'e' | 'E' | 'r') {
+            return true;
+        }
+        if remote_option_word_takes_value("telnet", &format!("-{flag}")) {
+            return false;
+        }
+    }
+    false
 }
 
 fn remote_option_opens_no_session(command: &str, option: &str) -> bool {
@@ -1095,7 +1750,7 @@ fn remote_option_word_takes_value(command: &str, option: &str) -> bool {
                 | "-w"
         ),
         "mosh" => matches!(option, "-p" | "--port" | "--ssh"),
-        "telnet" => matches!(option, "-l"),
+        "telnet" => matches!(option, "-e" | "-k" | "-l" | "-n" | "-S" | "-s" | "-X"),
         "screen" => matches!(option, "-c" | "-d" | "-m" | "-S" | "-T"),
         "cu" => matches!(option, "-l" | "-s"),
         "minicom" => matches!(option, "-D" | "-b" | "-c" | "-t"),
@@ -1147,6 +1802,15 @@ fn observed_close_markers(text: &str) -> Vec<ObservedCloseMarker> {
                 Some(ObservedCloseMarker {
                     kind: CloseMarkerKind::SshLike,
                     target: None,
+                })
+            } else if let Some(target) = line
+                .strip_prefix("[connection to ")
+                .and_then(|rest| rest.strip_suffix(" closed by foreign host]"))
+                .filter(|target| !target.is_empty() && !target.contains(char::is_whitespace))
+            {
+                Some(ObservedCloseMarker {
+                    kind: CloseMarkerKind::ForeignHostBracket,
+                    target: Some(normalize_remote_target(target)),
                 })
             } else if let Some(target) = ssh_close_target(line) {
                 Some(ObservedCloseMarker {
@@ -1261,7 +1925,7 @@ fn contains_remote_open_failure(text: &str, policy: ClosePolicy) -> bool {
                         .iter()
                         .any(|failure| line.ends_with(failure)))
             }
-            ClosePolicy::Telnet => {
+            ClosePolicy::Telnet | ClosePolicy::TelnetOtherEscape => {
                 line.starts_with("telnet: unable to connect to remote host:")
                     || line.starts_with("telnet: could not resolve ")
             }
@@ -4115,6 +4779,25 @@ mod leave_tests {
                 &["\ntelnet> q\nConnection closed.\nuser@laptop:~$ "],
             );
             assert_eq!(runtime.active_profiles(), names(JUNIPER), "{command}");
+        }
+    }
+
+    #[test]
+    fn c2c_telnet_option_values_keep_the_target() {
+        for (command, policy) in [
+            ("telnet -e ^X r1", super::ClosePolicy::TelnetOtherEscape),
+            ("telnet -l admin r1 2323", super::ClosePolicy::Telnet),
+            ("telnet -r r1", super::ClosePolicy::TelnetOtherEscape),
+            ("telnet -n trace.log r1", super::ClosePolicy::Telnet),
+        ] {
+            assert_eq!(
+                super::remote_attempt(command, false),
+                Some(super::RemoteAttempt {
+                    policy,
+                    target: Some("r1".to_string()),
+                }),
+                "{command}"
+            );
         }
     }
 
