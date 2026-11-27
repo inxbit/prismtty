@@ -1435,3 +1435,37 @@ fn a_raw_9b_sequence_with_the_highlight_closed_before_it_keeps_release_bytes() {
         );
     }
 }
+
+#[path = "support/screen.rs"]
+mod screen;
+
+/// Through a real PTY: a wrapped program's blue prompt that resets its own
+/// style right after the prompt (the audit's ESC-6 form a). The blue ends
+/// where the program ended it, so the space after the prompt, the typed
+/// command, the next output line and the next prompt are plain, in both
+/// reset modes; 1.4.1 left all of them blue.
+#[test]
+fn prompt_background_ends_where_the_program_ends_it() {
+    let format = "\\033[44mR1#\\033[0m show \\033[1mint\\r\\nnext output here\\r\\nR1#";
+    for (full_reset, reset) in [(false, "\x1b[39m"), (true, "\x1b[0m")] {
+        let expected =
+            format!("\x1b[44mR1#\x1b[49m {reset}show int\r\r\nnext output here\r\r\nR1#");
+        let out = ptty_printf_output("en_US.UTF-8", full_reset, "nomatch", format, expected.len());
+        assert!(
+            out == expected.as_bytes(),
+            "full reset {full_reset}\n  got {:?}\n want {:?}",
+            String::from_utf8_lossy(&out),
+            expected
+        );
+        assert_eq!(
+            screen::shown(&out),
+            screen::runs(&[
+                (0, "R1#", "bg=44"),
+                (0, " show int", ""),
+                (1, "next output here", ""),
+                (2, "R1#", ""),
+            ]),
+            "full reset {full_reset}"
+        );
+    }
+}
