@@ -184,6 +184,7 @@ pub(super) fn highlight_stream<R: Read, W: Write>(
             next_profile_names,
         );
     }
+    prepare_layout_state(&mut session, &chunk_filter);
     session.push(writer, &trace, &first_chunk)?;
     if let Some(warning) = session.slow_rule_warning() {
         super::diagnostic(format_args!("{warning}"));
@@ -298,6 +299,7 @@ pub(super) fn highlight_stream<R: Read, W: Write>(
                 }
             }
         }
+        prepare_layout_state(&mut session, &chunk_filter);
         session.push(writer, &trace, &chunk)?;
         if let Some(warning) = session.slow_rule_warning() {
             super::diagnostic(format_args!("{warning}"));
@@ -901,6 +903,21 @@ fn write_benchmark_report(
         }
     }
     writeln!(out, "Processed {input_bytes} bytes in {elapsed_secs:.3}s")
+}
+
+/// Before a chunk is pushed: whether the read loop carries bytes cut off at
+/// its end into the next read, and, while a scroll region is recorded, the
+/// terminal's height. The cursor-move bypass colors the output lines of a
+/// read that ends with a prompt redraw only when it knows both.
+fn prepare_layout_state(session: &mut HighlightSession<'_>, chunk_filter: &ChunkFilterState) {
+    session
+        .streaming
+        .set_read_ends_mid_sequence(!chunk_filter.carry.is_empty());
+    if session.streaming.needs_terminal_rows() {
+        session
+            .streaming
+            .set_terminal_rows(super::pty::output_terminal_rows());
+    }
 }
 
 fn prepare_chunk(

@@ -207,6 +207,12 @@ pub struct StreamingHighlighter {
     /// which is capped and can age the control out of a long rewritten line,
     /// and NOT reset per chunk, since a redraw spans several reads.
     line_rewritten_in_place: bool,
+    /// True when the read loop holds bytes cut off at the end of the chunk
+    /// being pushed (an unfinished control or character) for the next read.
+    read_ends_mid_sequence: bool,
+    /// Terminal modes, followed through the output, that let the cursor go
+    /// back to a cell already drawn; see [`LayoutModes`].
+    layout_modes: LayoutModes,
     alternate_screen: bool,
     passthrough_single_byte_chunks: bool,
     prompt_echo_passthrough: bool,
@@ -1194,6 +1200,8 @@ impl StreamingHighlighter {
             oversized_string_controls: OversizedStringControlFilter::default(),
             pending_from_prompt_echo_remainder: false,
             pending_from_interactive_split: false,
+            read_ends_mid_sequence: false,
+            layout_modes: LayoutModes::default(),
             line_rewritten_in_place: false,
             alternate_screen: false,
             passthrough_single_byte_chunks: false,
@@ -1216,6 +1224,8 @@ impl StreamingHighlighter {
             oversized_string_controls: OversizedStringControlFilter::default(),
             pending_from_prompt_echo_remainder: false,
             pending_from_interactive_split: false,
+            read_ends_mid_sequence: false,
+            layout_modes: LayoutModes::default(),
             line_rewritten_in_place: false,
             alternate_screen: false,
             passthrough_single_byte_chunks: true,
@@ -1238,6 +1248,8 @@ impl StreamingHighlighter {
             oversized_string_controls: OversizedStringControlFilter::default(),
             pending_from_prompt_echo_remainder: false,
             pending_from_interactive_split: false,
+            read_ends_mid_sequence: false,
+            layout_modes: LayoutModes::default(),
             line_rewritten_in_place: false,
             alternate_screen: false,
             passthrough_single_byte_chunks: false,
@@ -1260,6 +1272,8 @@ impl StreamingHighlighter {
             oversized_string_controls: OversizedStringControlFilter::default(),
             pending_from_prompt_echo_remainder: false,
             pending_from_interactive_split: false,
+            read_ends_mid_sequence: false,
+            layout_modes: LayoutModes::default(),
             line_rewritten_in_place: false,
             alternate_screen: false,
             passthrough_single_byte_chunks: true,
@@ -1365,7 +1379,14 @@ impl StreamingHighlighter {
         let mut combined = std::mem::take(&mut self.pending);
         combined.extend_from_slice(&incoming);
         let filtered = self.oversized_string_controls.filter_reassembled(&combined);
-        self.push_combined_chunk(AnsiChunk::new(filtered))
+        let chunk = AnsiChunk::new(filtered);
+        // Before the chunk is written: a prompt-echo prefix that the branches
+        // below pass through can set a mode ahead of the part the cursor-move
+        // bypass judges. A setter in that part is off the promotion list.
+        if self.passthrough_single_byte_chunks {
+            self.layout_modes.observe(&chunk.tokens);
+        }
+        self.push_combined_chunk(chunk)
     }
 
     fn push_combined_chunk(&mut self, mut combined: AnsiChunk) -> Vec<u8> {
@@ -1532,6 +1553,24 @@ impl StreamingHighlighter {
         output
     }
 
+    /// Tells the highlighter whether the read loop carries bytes cut off at the
+    /// end of the next chunk into the read after it.
+    pub(crate) fn set_read_ends_mid_sequence(&mut self, cut: bool) {
+        self.read_ends_mid_sequence = cut;
+    }
+
+    /// True while a scroll region is recorded whose extent depends on the
+    /// terminal's height, so the read loop passes the height before the next
+    /// chunk.
+    pub(crate) fn needs_terminal_rows(&self) -> bool {
+        matches!(self.layout_modes.scroll_region, ScrollRegion::Set { .. })
+    }
+
+    /// The terminal's height in rows, 0 when it is not known.
+    pub(crate) fn set_terminal_rows(&mut self, rows: u16) {
+        self.layout_modes.terminal_rows = rows;
+    }
+
     /// Returns the reset for an interactive highlight style that is still
     /// active, or nothing when none is (always the case for noninteractive
     /// streams). A caller about to wait for more input uses it so the terminal
@@ -1656,6 +1695,31 @@ impl StreamingHighlighter {
             && !contains_alternate_screen_enable_tokens(&input.tokens)
             && contains_cursor_positioning_sequence_tokens(&input.tokens)
         {
+            // Output lines that share the read with a prompt redrawn on its
+            // own row keep their colors when nothing in this part of the read,
+            // and no terminal mode the output has set up to here, can take the
+            // cursor back to a cell they were drawn on. A control still open at
+            // the end of the read is not known yet, so it keeps the bypass. A
+            // later read can still go back into those lines.
+            let split = if self.pending.is_empty()
+                && !self.read_ends_mid_sequence
+                && self.layout_modes.allow_promotion()
+            {
+                plain_lines_before_prompt_redraw(&input.tokens, &self.visible_line_tail)
+            } else {
+                None
+            };
+            if let Some(split) = split {
+                let lines = input.prefix(split);
+                let rest = AnsiChunk::from_slice(&input.bytes()[split..]);
+                // As for a bypassed read, a highlight left open by an earlier
+                // read is closed first.
+                let mut output = Vec::new();
+                self.reset_interactive_overlay(&mut output);
+                output.extend(self.highlight_interactive_output_chunk(&lines));
+                output.extend(self.emit_cursor_positioning_passthrough(&rest));
+                return output;
+            }
             return self.emit_cursor_positioning_passthrough(input);
         }
 
@@ -3114,6 +3178,497 @@ fn alternate_screen_command(bytes: &[u8]) -> Option<bool> {
     let has_alternate_screen_mode =
         private_mode_numbers(&modes).any(|mode| matches!(mode, 47 | 1047 | 1049));
     has_alternate_screen_mode.then_some(enable)
+}
+
+/// Byte length of the leading plain lines of a read that the cursor-move
+/// bypass would write unchanged, or `None` to keep the bypass for the whole
+/// read.
+///
+/// Only a read whose every control is SGR or on the short list of
+/// [`is_same_row_redraw_control`] qualifies, and whose text holds no control
+/// byte but LF, CR and HT: none of them moves the cursor up or erases above its
+/// row, so a row the cursor leaves downward is not touched again in this read.
+/// Of the complete lines before the line that holds the first cursor move, the
+/// leading run of plain lines (printable text and SGR, then optional CRs, then
+/// LF) is promoted. A tab is not plain: from the last column it leaves the
+/// cursor there and cancels the pending wrap, so the next character
+/// overwrites that column. Neither is a line that reads as a prompt and an
+/// echoed command: a read without cursor controls would give it to the
+/// prompt-echo handling, which this path skips. The first line that is not
+/// plain, and everything after it, is written unchanged. `line_tail` is the
+/// visible line the read continues. The read's last line must still show a
+/// prompt when the read ends; see [`LastLine`].
+fn plain_lines_before_prompt_redraw(tokens: &[Token], line_tail: &[u8]) -> Option<usize> {
+    let mut offset = 0;
+    let mut split = 0;
+    let mut cut = false;
+    let mut line_is_plain = true;
+    let mut line_has_cr = false;
+    let mut visible_line = line_tail.to_vec();
+    let mut last_line = LastLine::default();
+    for token in tokens {
+        match token {
+            Token::Ansi(bytes) => {
+                let sgr = is_plain_sgr_sequence(bytes);
+                if !sgr && !is_same_row_redraw_control(bytes) {
+                    return None;
+                }
+                cut |= is_cursor_positioning_sequence(bytes);
+                line_is_plain &= sgr && !line_has_cr;
+                last_line.control(bytes);
+                offset += bytes.len();
+            }
+            Token::Text(text) => {
+                for byte in text.iter() {
+                    match *byte {
+                        b'\n' => {
+                            if line_is_plain
+                                && !cut
+                                && !contains_prompt_echo_in_visible_line(&visible_line)
+                            {
+                                split = offset + 1;
+                            } else {
+                                cut = true;
+                            }
+                            line_is_plain = true;
+                            line_has_cr = false;
+                            visible_line.clear();
+                            last_line.line_feed();
+                        }
+                        b'\r' => {
+                            line_has_cr = true;
+                            last_line.carriage_return();
+                        }
+                        b'\t' => {
+                            line_is_plain = false;
+                            visible_line.push(b'\t');
+                            last_line.tab();
+                        }
+                        0x20..=0x7e | 0x80..=0xff => {
+                            line_is_plain &= !line_has_cr;
+                            visible_line.push(*byte);
+                            last_line.print(*byte);
+                        }
+                        // BS, every other C0 control and DEL.
+                        _ => return None,
+                    }
+                    offset += 1;
+                }
+            }
+        }
+    }
+    (split > 0 && last_line.shows_prompt()).then_some(split)
+}
+
+/// The read's last line, followed closely enough to tell whether a prompt is
+/// still on it when the read ends: zsh draws `host% `, then its right prompt
+/// further right, then moves back; a device CLI draws `R1# ` after `CSI G`. A
+/// stretch of text between CRs and cursor moves that looks like a prompt tail
+/// is remembered with the columns it covers. Text written over those columns
+/// later, an erase that reaches them, or a write or erase at a column that is
+/// not known forgets it. Columns count one per character from the last CR or
+/// `CSI G`, so a wide character counts as one.
+#[derive(Debug, Default)]
+struct LastLine {
+    /// The cursor column, `None` until a CR or `CSI G` fixes it.
+    column: Option<u32>,
+    stretch: Vec<u8>,
+    stretch_start: Option<u32>,
+    /// The columns of the prompt, from the first to one past the last.
+    prompt: Option<(u32, u32)>,
+}
+
+impl LastLine {
+    fn line_feed(&mut self) {
+        self.stretch.clear();
+        self.prompt = None;
+    }
+
+    fn carriage_return(&mut self) {
+        self.close_stretch();
+        self.column = Some(0);
+    }
+
+    fn tab(&mut self) {
+        self.close_stretch();
+        self.column = self.column.map(|column| (column / 8 + 1).saturating_mul(8));
+    }
+
+    fn print(&mut self, byte: u8) {
+        // A UTF-8 continuation byte belongs to the character before it.
+        if (0x80..=0xbf).contains(&byte) {
+            self.stretch.push(byte);
+            return;
+        }
+        if self.stretch.is_empty() {
+            self.stretch_start = self.column;
+        }
+        self.forget_prompt_from(self.column, self.column.map(|column| column + 1));
+        self.stretch.push(byte);
+        self.column = self.column.map(|column| column.saturating_add(1));
+    }
+
+    fn control(&mut self, bytes: &[u8]) {
+        let Some((&final_byte, parameters)) = bytes
+            .strip_prefix(b"\x1b[")
+            .and_then(|body| body.split_last())
+        else {
+            return;
+        };
+        if !matches!(final_byte, b'G' | b'C' | b'D' | b'K' | b'J') {
+            return;
+        }
+        self.close_stretch();
+        // An empty parameter is 1 for a move and 0 for an erase; one too
+        // large to read leaves the column unknown after a move.
+        let value = bounded_parameter(parameters).unwrap_or(0);
+        let count = value.max(1);
+        let known = value != u32::MAX;
+        match final_byte {
+            b'G' => self.column = known.then(|| count - 1),
+            b'C' => {
+                self.column = self
+                    .column
+                    .filter(|_| known)
+                    .map(|column| column.saturating_add(count))
+            }
+            b'D' => self.column = self.column.map(|column| column.saturating_sub(count)),
+            // Erase in line: 0 to the right, 1 to the left, 2 the whole line.
+            // Erase below starts at the cursor as well.
+            _ => match (final_byte, value) {
+                (b'K', 1) => self.forget_prompt_from(Some(0), self.column.map(|c| c + 1)),
+                (b'K', 2) => self.prompt = None,
+                _ => self.forget_prompt_from(self.column, Some(u32::MAX)),
+            },
+        }
+    }
+
+    /// Forgets the prompt if the columns from `start` to before `end`
+    /// overlap it, or if they are not known.
+    fn forget_prompt_from(&mut self, start: Option<u32>, end: Option<u32>) {
+        let Some((prompt_start, prompt_end)) = self.prompt else {
+            return;
+        };
+        match (start, end) {
+            (Some(start), Some(end)) if end <= prompt_start || start >= prompt_end => {}
+            _ => self.prompt = None,
+        }
+    }
+
+    fn close_stretch(&mut self) {
+        if self.stretch.is_empty() {
+            return;
+        }
+        if let Some(start) = self.stretch_start {
+            if looks_like_prompt_end(&self.stretch) {
+                let characters = self
+                    .stretch
+                    .iter()
+                    .filter(|byte| !(0x80..=0xbf).contains(*byte))
+                    .count();
+                let width = u32::try_from(characters).unwrap_or(u32::MAX);
+                self.prompt = Some((start, start.saturating_add(width)));
+            }
+        }
+        self.stretch.clear();
+    }
+
+    fn shows_prompt(&mut self) -> bool {
+        self.close_stretch();
+        self.prompt.is_some()
+    }
+}
+
+/// A prompt tail that is not a percentage: `Downloading 50% ` passes
+/// [`looks_like_prompt_tail`] but is a progress display.
+fn looks_like_prompt_end(stretch: &[u8]) -> bool {
+    let trimmed = trim_ascii_whitespace_end(stretch);
+    let percentage = trimmed
+        .strip_suffix(b"%")
+        .and_then(|rest| rest.last())
+        .is_some_and(u8::is_ascii_digit);
+    !percentage && looks_like_prompt_tail(stretch)
+}
+
+/// The number one decimal parameter spells as a terminal reads it, with
+/// leading zeros; `None` for an empty one, `u32::MAX` for one past 65535.
+fn bounded_parameter(digits: &[u8]) -> Option<u32> {
+    if digits.is_empty() {
+        return None;
+    }
+    if !digits.iter().all(u8::is_ascii_digit) {
+        return Some(u32::MAX);
+    }
+    let zeros = digits.iter().take_while(|digit| **digit == b'0').count();
+    let significant = &digits[zeros..];
+    if significant.len() > 5 {
+        return Some(u32::MAX);
+    }
+    let value = significant
+        .iter()
+        .fold(0, |value, digit| value * 10 + u32::from(digit - b'0'));
+    Some(if value > 65_535 { u32::MAX } else { value })
+}
+
+/// The controls other than SGR that a read may hold and still have its
+/// leading output lines highlighted: same-row moves (`CSI G`, `CSI C`,
+/// `CSI D`), erase in line (`CSI K`, `CSI 0K`, `CSI 1K`, `CSI 2K`), erase below
+/// (`CSI J`, `CSI 0J`), bracketed paste and cursor-key mode (`CSI ? 2004 h/l`,
+/// `CSI ? 1 h/l`), keypad mode (`ESC =`, `ESC >`) and a window title or
+/// working directory (OSC 0, 1, 2 or 7, UTF-8, ended by BEL or `ESC \`).
+/// Exact bytes only: the `ESC [` introducer with nothing between ESC and `[`,
+/// decimal parameters, no intermediate bytes. Everything else, the C1 forms
+/// included, keeps the bypass.
+fn is_same_row_redraw_control(bytes: &[u8]) -> bool {
+    if bytes == b"\x1b=" || bytes == b"\x1b>" {
+        return true;
+    }
+    if let Some(body) = bytes.strip_prefix(b"\x1b]") {
+        let Some(payload) = body
+            .strip_suffix(b"\x07")
+            .or_else(|| body.strip_suffix(b"\x1b\\"))
+        else {
+            return false;
+        };
+        let Ok(payload) = std::str::from_utf8(payload) else {
+            return false;
+        };
+        let Some((id, text)) = payload.split_once(';') else {
+            return false;
+        };
+        return matches!(id, "0" | "1" | "2" | "7")
+            && !text.chars().any(|c| {
+                matches!(
+                    c,
+                    '\u{07}' | '\u{18}' | '\u{1a}' | '\u{1b}' | '\u{80}'..='\u{9f}'
+                )
+            });
+    }
+    let Some((&final_byte, parameters)) = bytes
+        .strip_prefix(b"\x1b[")
+        .and_then(|body| body.split_last())
+    else {
+        return false;
+    };
+    match final_byte {
+        b'G' | b'C' | b'D' => parameters.iter().all(u8::is_ascii_digit),
+        b'K' => matches!(parameters, b"" | b"0" | b"1" | b"2"),
+        b'J' => matches!(parameters, b"" | b"0"),
+        b'h' | b'l' => matches!(parameters, b"?2004" | b"?1"),
+        _ => false,
+    }
+}
+
+fn is_plain_sgr_sequence(bytes: &[u8]) -> bool {
+    bytes
+        .strip_prefix(b"\x1b[")
+        .and_then(|body| body.split_last())
+        .is_some_and(|(&final_byte, parameters)| {
+            final_byte == b'm'
+                && parameters
+                    .iter()
+                    .all(|byte| byte.is_ascii_digit() || matches!(*byte, b';' | b':'))
+        })
+}
+
+/// Parameters a reset is read from. Xterm keeps 30; a reset is taken only
+/// well inside that, where a terminal that keeps fewer reads it too.
+const MAX_RESET_PARAMETERS: usize = 16;
+
+/// How the scroll region the output set stands.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum ScrollRegion {
+    /// The whole screen: as at the start, or after an exact reset.
+    #[default]
+    Whole,
+    /// Set by `CSI t ; b r`, with 0 for a value left out. It is the whole
+    /// screen only when it spans the terminal's height.
+    Set { top: u32, bottom: u32 },
+    /// Set by a form whose effect is not known. Only an exact reset clears it.
+    Unknown,
+}
+
+/// Terminal modes, followed through the output, under which a line feed, a
+/// backward move or text past the margin can land on a cell that is already
+/// drawn: a scroll region that is not the whole screen (a cursor below it
+/// stays on the last row when a line feed comes), left and right margins
+/// (mode 69), reverse wraparound (modes 45 and 1045: BS and `CSI D` at the
+/// first column step back onto the row above), autowrap off (mode 7: text
+/// past the margin overwrites the last column), and a restore of saved modes
+/// that can put the terminal on the alternate screen.
+///
+/// Setting is read liberally, clearing strictly. Any CSI form can set a
+/// hazard, C1 forms included, and so can a mode number at any position or
+/// past what a terminal keeps, a number too large to read, a restore of saved
+/// modes and a soft reset (DECSTR can leave autowrap off). A hazard is cleared
+/// only by the exact `ESC [` form, with plain decimal parameters, within the
+/// first `MAX_RESET_PARAMETERS`, or by RIS. The terminal is taken to start in
+/// the default modes; a mode it was already in is not seen.
+#[derive(Clone, Debug, Default)]
+struct LayoutModes {
+    scroll_region: ScrollRegion,
+    /// The terminal's height, 0 when unknown.
+    terminal_rows: u16,
+    reverse_wrap: bool,
+    reverse_wrap_any_line: bool,
+    left_right_margins: bool,
+    autowrap_off: bool,
+    alternate_screen_restored: bool,
+}
+
+impl LayoutModes {
+    fn observe(&mut self, tokens: &[Token]) {
+        for token in tokens {
+            if let Token::Ansi(bytes) = token {
+                self.observe_control(bytes);
+            }
+        }
+    }
+
+    fn observe_control(&mut self, bytes: &[u8]) {
+        if bytes == b"\x1bc" {
+            *self = Self {
+                terminal_rows: self.terminal_rows,
+                ..Self::default()
+            };
+            return;
+        }
+        let Some(body) = csi_body(bytes) else {
+            return;
+        };
+        let Some((&final_byte, parameters)) = body.split_last() else {
+            return;
+        };
+        let exact =
+            bytes.starts_with(b"\x1b[") && bytes[2..].iter().all(|b| (0x20..0x7f).contains(b));
+        match (final_byte, parameters.strip_prefix(b"?")) {
+            (b'p', None) if parameters == b"!" => self.autowrap_off = true,
+            (b'r', Some(modes)) => self.restore_private_modes(modes),
+            (b'r', None) => self.scroll_region = scroll_region_set_by(parameters, exact),
+            (b'h' | b'l', Some(modes)) => self.set_private_modes(modes, final_byte == b'h', exact),
+            _ => {}
+        }
+    }
+
+    fn set_private_modes(&mut self, modes: &[u8], set: bool, exact: bool) {
+        for mode in liberal_mode_numbers(modes) {
+            match (mode, set) {
+                (None, true) => {
+                    self.reverse_wrap = true;
+                    self.reverse_wrap_any_line = true;
+                    self.left_right_margins = true;
+                }
+                (None, false) | (Some(7), false) => self.autowrap_off = true,
+                (Some(45), true) => self.reverse_wrap = true,
+                (Some(1045), true) => self.reverse_wrap_any_line = true,
+                (Some(69), true) => self.left_right_margins = true,
+                _ => {}
+            }
+        }
+        if !exact
+            || !modes
+                .iter()
+                .all(|byte| byte.is_ascii_digit() || *byte == b';')
+        {
+            return;
+        }
+        for mode in private_mode_numbers(modes).take(MAX_RESET_PARAMETERS) {
+            match (mode, set) {
+                (7, true) => self.autowrap_off = false,
+                (45, false) => self.reverse_wrap = false,
+                (1045, false) => self.reverse_wrap_any_line = false,
+                (69, false) => self.left_right_margins = false,
+                (47 | 1047 | 1049, false) => self.alternate_screen_restored = false,
+                _ => {}
+            }
+        }
+    }
+
+    /// XTRESTORE: the restored values are not known, so each tracked mode it
+    /// names counts as on, and a screen mode as the alternate screen.
+    fn restore_private_modes(&mut self, modes: &[u8]) {
+        for mode in liberal_mode_numbers(modes) {
+            match mode {
+                Some(7) => self.autowrap_off = true,
+                Some(45) => self.reverse_wrap = true,
+                Some(1045) => self.reverse_wrap_any_line = true,
+                Some(69) => self.left_right_margins = true,
+                Some(47 | 1047 | 1049) => self.alternate_screen_restored = true,
+                Some(_) => {}
+                None => {
+                    self.autowrap_off = true;
+                    self.reverse_wrap = true;
+                    self.reverse_wrap_any_line = true;
+                    self.left_right_margins = true;
+                    self.alternate_screen_restored = true;
+                }
+            }
+        }
+    }
+
+    fn allow_promotion(&self) -> bool {
+        let rows = u32::from(self.terminal_rows);
+        !self.reverse_wrap
+            && !self.reverse_wrap_any_line
+            && !self.left_right_margins
+            && !self.autowrap_off
+            && !self.alternate_screen_restored
+            && match self.scroll_region {
+                ScrollRegion::Whole => true,
+                ScrollRegion::Set { top, bottom } => {
+                    top <= 1 && rows > 0 && (bottom == 0 || bottom == rows)
+                }
+                ScrollRegion::Unknown => false,
+            }
+    }
+}
+
+/// Every reading of a private mode list a terminal could make: each
+/// parameter on its own, however many there are, and xterm's, which folds
+/// the ones past its limit into the last. `None` is a number too large to
+/// read, which could be any mode.
+fn liberal_mode_numbers(modes: &[u8]) -> impl Iterator<Item = Option<u32>> + '_ {
+    let plain = modes
+        .iter()
+        .all(|byte| byte.is_ascii_digit() || *byte == b';');
+    let each = modes.split(|byte| *byte == b';').map(move |mode| {
+        if !plain {
+            return None;
+        }
+        match bounded_parameter(mode) {
+            Some(u32::MAX) => None,
+            value => Some(value.unwrap_or(0)),
+        }
+    });
+    let folded = private_mode_numbers(modes).filter(move |_| plain).map(Some);
+    each.chain(folded)
+}
+
+/// The scroll region after `CSI parameters r`. Only the exact form with at
+/// most two plain parameters, each one a terminal can read, sets a known
+/// region; anything else leaves it unknown, never the whole screen.
+fn scroll_region_set_by(parameters: &[u8], exact: bool) -> ScrollRegion {
+    if !exact
+        || !parameters
+            .iter()
+            .all(|byte| byte.is_ascii_digit() || *byte == b';')
+    {
+        return ScrollRegion::Unknown;
+    }
+    let values: Vec<Option<u32>> = parameters
+        .split(|byte| *byte == b';')
+        .map(bounded_parameter)
+        .collect();
+    if values.len() > 2 || values.contains(&Some(u32::MAX)) {
+        return ScrollRegion::Unknown;
+    }
+    let top = values.first().copied().flatten().unwrap_or(0);
+    let bottom = values.get(1).copied().flatten().unwrap_or(0);
+    if top <= 1 && bottom == 0 {
+        ScrollRegion::Whole
+    } else {
+        ScrollRegion::Set { top, bottom }
+    }
 }
 
 fn contains_cursor_positioning_sequence_tokens(tokens: &[Token]) -> bool {
