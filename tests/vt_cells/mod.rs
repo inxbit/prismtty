@@ -422,11 +422,21 @@ impl Screen {
                         45 => self.reverse_wrap = on,
                         1045 => self.reverse_wrap_any = on,
                         47 | 1047 | 1049 if on != self.on_alt => {
+                            // 1049 also saves the cursor on the way in and
+                            // restores it on the way out.
+                            if *mode == 1049 && on {
+                                self.saved = Some((self.x, self.y, self.attrs));
+                            }
                             self.on_alt = on;
                             if on {
                                 self.alt = (0..self.rows)
                                     .map(|_| Row::new(self.cols, Attrs::default()))
                                     .collect();
+                            }
+                            if *mode == 1049 && !on {
+                                let (x, y, attrs) = self.saved.unwrap_or((0, 0, Attrs::default()));
+                                (self.x, self.y, self.attrs) = (x, y, attrs);
+                                self.pending_wrap = false;
                             }
                         }
                         _ => {}

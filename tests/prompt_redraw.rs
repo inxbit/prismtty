@@ -854,7 +854,7 @@ fn reads_after_a_layout_state_the_tracker_must_see_stay_on_the_bypass_review_77(
 #[test]
 fn layout_states_that_are_reset_or_change_nothing_let_the_lines_be_colored() {
     let read: &[u8] = b"error\r\n\x1b[1GR# ";
-    let cases: [(&str, &[&[u8]]); 13] = [
+    let cases: [(&str, &[&[u8]]); 12] = [
         ("double width, then RIS", &[b"\x1b#6", b"\x1bc", read]),
         ("single width alone", &[b"\x1b#5", read]),
         ("screen alignment test", &[b"\x1b#8", read]),
@@ -868,7 +868,6 @@ fn layout_states_that_are_reset_or_change_nothing_let_the_lines_be_colored() {
         ),
         ("title stack", &[b"\x1b[22;0t", b"\x1b[23;0t", read]),
         ("size report", &[b"\x1b[18t", read]),
-        ("no status line", &[b"\x1b[0$~", read]),
         ("keypad mode", &[b"\x1b=", b"\x1b>", read]),
         (
             "a line feed from the first column",
@@ -910,6 +909,128 @@ fn a_read_with_text_past_ascii_keeps_the_bypass_until_the_terminal_reads_utf8() 
     ];
     for (name, read) in cases {
         assert_bypassed(name, &[read]);
+    }
+}
+
+/// Only controls on the table of controls proved to leave later output
+/// drawn as it would be without them may come before a promoted read: any
+/// other one, known or not, keeps every later read on the bypass until RIS.
+/// VT52 mode (`CSI ? 2 l`) turns the terminal's parser over to VT52, where
+/// `ESC [` starts nothing and the added SGR bytes would show as text
+/// (xterm: charproc.c, VTPrsTbl.c); Tektronix mode (`CSI ? 38 h`) leaves
+/// the VT parser altogether.
+#[test]
+fn reads_after_a_control_off_the_table_stay_on_the_bypass_until_ris_review_79() {
+    let read: &[u8] = b"error\r\n\x1b[1GR# ";
+    let cases: [(&str, &[&[u8]]); 26] = [
+        ("VT52 mode, the read before", &[b"\x1b[?2l", read]),
+        (
+            "VT52 mode, several reads before",
+            &[b"\x1b[?2l", b"one\r\n", b"\x1b[?25h", b"two\r\n", read],
+        ),
+        ("Tektronix mode, the read before", &[b"\x1b[?38h", read]),
+        (
+            "Tektronix mode, several reads before",
+            &[b"\x1b[?38h", b"one\r\n", b"\x1b[?25h", b"two\r\n", read],
+        ),
+        ("VT52 mode restored", &[b"\x1b[?2s", b"\x1b[?2r", read]),
+        ("Tektronix mode restored", &[b"\x1b[?38r", read]),
+        ("column mode restored", &[b"\x1b[?3r", read]),
+        ("a private mode not on the table", &[b"\x1b[?1234h", read]),
+        (
+            "a listed mode beside one that is not",
+            &[b"\x1b[?25;2l", read],
+        ),
+        ("an ANSI mode not on the table", &[b"\x1b[20h", read]),
+        ("an escape not on the table", &[b"\x1bn", read]),
+        ("a character set designated", &[b"\x1b(0", read]),
+        ("shift out in the text", &[b"x\x0e", b"\x0f", read]),
+        ("a DCS string", &[b"\x1bP$qm\x1b\\", read]),
+        ("an APC string", &[b"\x1b_Ga=d\x1b\\", read]),
+        ("an SGR in the C1 form", &[b"\xc2\x9b1m", read]),
+        (
+            "a CSI with an intermediate not on the table",
+            &[b"\x1b[1\"q", read],
+        ),
+        ("a CSI final not on the table", &[b"\x1b[1z", read]),
+        (
+            "an image in OSC 1337",
+            &[b"\x1b]1337;File=inline=1:AA==\x07", read],
+        ),
+        ("a font change", &[b"\x1b]50;fixed\x07", read]),
+        ("no status line", &[b"\x1b[0$~", read]),
+        ("a window moved", &[b"\x1b[3;0;0t", read]),
+        ("a soft reset leaves autowrap off", &[b"\x1b[!p", read]),
+        (
+            "an ESC in the C1 form inside UTF-8 text",
+            &["\u{85}".as_bytes(), read],
+        ),
+        ("RIS, then VT52 mode", &[b"\x1bc", b"\x1b[?2l", read]),
+        (
+            "VT52 mode, then the alternate screen and back",
+            &[b"\x1b[?2l", b"\x1b[?1049h", b"\x1b[?1049l", read],
+        ),
+    ];
+    for (name, reads) in cases {
+        assert_bypassed_on(name, 6, 24, reads);
+    }
+}
+
+/// The controls on the table let the next prompt redraw color its lines:
+/// those a shell, a line editor, a pager or vim send, and RIS after one
+/// that is not on the table.
+#[test]
+fn reads_after_controls_on_the_table_let_the_lines_be_colored_review_79() {
+    let read: &[u8] = b"error\r\n\x1b[1GR# ";
+    let cases: [(&str, &[&[u8]]); 18] = [
+        ("VT52 mode, then RIS", &[b"\x1b[?2l", b"\x1bc", read]),
+        ("Tektronix mode, then RIS", &[b"\x1b[?38h", b"\x1bc", read]),
+        ("cursor shown and hidden", &[b"\x1b[?25l", b"\x1b[?25h", read]),
+        (
+            "mouse and focus reporting",
+            &[b"\x1b[?1000h\x1b[?1002h\x1b[?1006h\x1b[?1004h", b"\x1b[?1006l\x1b[?1002l\x1b[?1000l\x1b[?1004l", read],
+        ),
+        ("bracketed paste and cursor keys", &[b"\x1b[?2004h\x1b[?1h\x1b=", b"\x1b[?2004l\x1b[?1l\x1b>", read]),
+        ("cursor shape", &[b"\x1b[2 q", read]),
+        ("key modifier options", &[b"\x1b[>4;2m\x1b[?4m", b"\x1b[>4m", read]),
+        ("keyboard protocol push and pop", &[b"\x1b[>1u\x1b[?u", b"\x1b[<u", read]),
+        (
+            "vim's compatibility probe",
+            &[b"\x1b[3;1H\x1bPzz\x1b\\\x1b[0%m\x1b[6n", read],
+        ),
+        ("device queries", &[b"\x1b[c\x1b[>c\x1b[5n\x1b[?1$p", read]),
+        (
+            "save and restore the cursor",
+            &[b"\x1b7\x1b[5;5H\x1b8\x1b[s\x1b[u", read],
+        ),
+        ("the alternate screen and back", &[b"\x1b[?1049h", b"hello\x1b[?1049l", read]),
+        (
+            "titles, directory, links and marks",
+            &[b"\x1b]0;t\x07\x1b]7;file://h/p\x07\x1b]8;;http://h\x1b\\\x1b]8;;\x1b\\\x1b]133;A\x07", read],
+        ),
+        ("colors set and queried", &[b"\x1b]11;?\x07\x1b]4;1;#ff0000\x07\x1b]104\x07", read]),
+        ("G0 back to ASCII", &[b"\x1b(B\x1b[m", read]),
+        ("tab stops", &[b"\x1bH\x1b[3g", read]),
+        ("edits that leave no mode", &[b"\x1b[2@\x1b[3P\x1b[2X\x1b[1L\x1b[1M\x1b[S\x1b[T", read]),
+        ("a soft reset, then autowrap on", &[b"\x1b[!p", b"\x1b[?7h", read]),
+    ];
+    for (name, reads) in cases {
+        let output = render_on(6, 24, reads);
+        let screen = Screen::rendered(6, 24, &output);
+        let row = (0..6)
+            .find(|row| screen.text(*row).starts_with("error"))
+            .unwrap_or_else(|| {
+                panic!(
+                    "{name}: no error row: {:?}",
+                    String::from_utf8_lossy(&output)
+                )
+            });
+        assert_eq!(
+            red_text(&screen, row),
+            (0..5).collect::<Vec<_>>(),
+            "{name}: {:?}",
+            String::from_utf8_lossy(&output)
+        );
     }
 }
 
@@ -1270,14 +1391,12 @@ fn pty_characters_past_ascii_are_judged_as_a_utf8_terminal_draws_them() {
     }
 }
 
-/// A prompt holding characters past ASCII has a width not known to a
-/// column, but at most two columns for each of them. When an erase to the
-/// right comes right after it and that bound ends before the right edge, the
-/// cursor is after the prompt however wide its characters are, and the erase
-/// leaves it whole.
+/// A prompt holding characters past ASCII has a width PrismTTY does not
+/// know, so nothing after it can be placed: an erase after it forgets it,
+/// as any other control does, and the read keeps the bypass.
 #[test]
-fn pty_a_unicode_prompt_followed_by_an_erase_to_the_right_is_colored_review_77() {
-    let colored: [(&str, u16, &[u8]); 6] = [
+fn pty_a_unicode_prompt_followed_by_an_erase_keeps_the_bypass_review_79() {
+    let after_erase: [(&str, u16, &[u8]); 6] = [
         (
             "then CSI K",
             80,
@@ -1309,9 +1428,14 @@ fn pty_a_unicode_prompt_followed_by_an_erase_to_the_right_is_colored_review_77()
             "error\r\n\x1b[4G\u{276f} \x1b[K".as_bytes(),
         ),
     ];
-    for (name, cols, read) in colored {
+    for (name, cols, read) in after_erase {
         let run = pty_one_read(5, cols, read);
-        assert_errors_colored(name, 5, usize::from(cols), &run, read);
+        assert_eq!(
+            run.renders,
+            read,
+            "{name}: {:?}",
+            String::from_utf8_lossy(&run.renders)
+        );
     }
     let raw: [(&str, u16, &[u8]); 6] = [
         (
