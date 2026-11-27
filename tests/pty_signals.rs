@@ -1300,67 +1300,27 @@ fn interactive_command_gets_the_iterm_guard_environment() {
 }
 
 fn assert_terminal_restored_after(signal: libc::c_int) {
-    use nix::sys::termios::{LocalFlags, tcgetattr};
+    use std::os::unix::process::ExitStatusExt;
 
-    let pair = native_pty_system()
-        .openpty(PtySize::default())
-        .expect("openpty");
-    let tty_name = pair.master.tty_name().expect("outer PTY tty name");
-    let tty = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(tty_name)
-        .expect("open outer slave tty");
-    let original = tcgetattr(&tty).expect("original tty attrs");
-    let marker_dir = tempfile::tempdir().expect("signal child marker directory");
-    let child_pid_path = marker_dir.path().join("child.pid");
-    let mut child_guard = PidGuard::from_marker(&child_pid_path);
-    let mut builder = CommandBuilder::new(env!("CARGO_BIN_EXE_ptty"));
-    builder.env("PRISMTTY_CHILD_PID", &child_pid_path);
-    builder.arg("sh");
-    builder.arg("-c");
-    builder.arg(
-        "echo $$ > \"$PRISMTTY_CHILD_PID\"; trap 'sleep 0.3; exit 0' HUP INT QUIT TERM ALRM VTALRM PROF XCPU XFSZ; echo READY; while true; do sleep 0.05; done",
+    let scratch = Scratch::new();
+    let mut session = OnTerminal::start(
+        &scratch,
+        &[],
+        &format!(
+            "trap 'sleep 0.3; exit 0' HUP INT QUIT TERM ALRM VTALRM PROF XCPU XFSZ; echo READY; {IDLE}"
+        ),
     );
-    let child = pair
-        .slave
-        .spawn_command(builder)
-        .expect("spawn interactive ptty");
-    drop(pair.slave);
-    let mut ptty = PtySession::new(child, &*pair.master);
-    let ready = ptty
-        .capture()
-        .wait_until(Duration::from_secs(10), |out| contains_bytes(out, b"READY"));
+    send(session.pid, signal);
     assert!(
-        contains_bytes(&ready, b"READY"),
-        "wrapped child reached READY"
-    );
-    child_guard.set(wait_for_pid_file(&child_pid_path, Duration::from_secs(2)));
-    assert!(
-        wait_for_condition(Duration::from_secs(2), || {
-            tcgetattr(&tty)
-                .map(|attrs| !attrs.local_flags.contains(LocalFlags::ICANON))
-                .unwrap_or(false)
-        }),
-        "ptty never entered raw mode before signal {signal}"
-    );
-
-    // SAFETY: kill has no memory-safety preconditions; the target is a process this test spawned.
-    assert_eq!(unsafe { libc::kill(ptty.pid(), signal) }, 0);
-    // Read through the master: on macOS the slave is revoked from every
-    // descriptor once the wrapper, its session leader, has exited.
-    assert!(
-        wait_for_condition(Duration::from_secs(1), || {
-            outer_terminal_settings(&tty, &*pair.master) == original
-        }),
+        wait_for_condition(Duration::from_secs(1), || session.is_restored()),
         "terminal attributes were not restored after signal {signal}"
     );
+    let status = session.wait(Duration::from_secs(5));
     assert_eq!(
-        ptty.wait_for_exit(Duration::from_secs(5)),
-        Some(0),
+        (status.signal(), status.code()),
+        (None, Some(0)),
         "the wrapper did not return the exit code of the command that handled signal {signal}"
     );
-    child_guard.disarm();
 }
 
 /// The signals that end the wrapper restore the terminal it put in raw mode,
@@ -3510,9 +3470,9 @@ fn output_on_a_terminal_still_ends_lines_with_cr_lf() {
 // SIGINT set the way the test says, so a disposition or mask the test runner
 // inherited cannot decide the result.
 
-/// How a test starts a process with respect to SIGINT.
+/// How a test starts a process with respect to one signal.
 #[derive(Clone, Copy)]
-enum EntrySigint {
+enum Entry {
     /// Default action and unblocked, as a shell starts a foreground command.
     Default,
     /// Ignored, as a non-interactive shell starts `cmd &`.
@@ -3553,15 +3513,48 @@ fn settle_fork_handlers() {
     }
 }
 
-/// Sets SIGINT for the process `command` starts, and the session it runs in.
-fn start_with_sigint(command: &mut std::process::Command, entry: EntrySigint, leader: Leader) {
+/// Every signal the tests of 1.5.0's signal handling send or rely on. Each
+/// wrapper they start gets them all at their default action and unblocked.
+const TEST_SIGNALS: [libc::c_int; 11] = [
+    libc::SIGINT,
+    libc::SIGHUP,
+    libc::SIGQUIT,
+    libc::SIGTERM,
+    libc::SIGUSR1,
+    libc::SIGUSR2,
+    libc::SIGALRM,
+    libc::SIGVTALRM,
+    libc::SIGPROF,
+    libc::SIGXCPU,
+    libc::SIGXFSZ,
+];
+
+/// `signals`, each at its default action and unblocked.
+fn at_default(signals: &[libc::c_int]) -> Vec<(libc::c_int, Entry)> {
+    signals
+        .iter()
+        .map(|signal| (*signal, Entry::Default))
+        .collect()
+}
+
+/// Starts the process `command` runs in the session `leader` names, with each
+/// signal in `signals` set as its entry says, in that order, whatever this
+/// test process inherited: a runner that ignores or blocks a signal (`nohup`,
+/// a background job) must not decide a test. A test lists every signal it
+/// sends or relies on.
+fn start_with_signals(
+    command: &mut std::process::Command,
+    leader: Leader,
+    signals: &[(libc::c_int, Entry)],
+) {
     use std::os::unix::process::CommandExt;
 
     settle_fork_handlers();
-
+    let signals = signals.to_vec();
     // SAFETY: the closure runs in the forked child before exec and only calls
     // async-signal-safe functions (setsid, ioctl, signal, sigemptyset,
-    // sigaddset, sigprocmask) on a stack-local signal set.
+    // sigaddset, sigprocmask) on a stack-local signal set; `signals` was
+    // allocated before the fork and is only read.
     unsafe {
         command.pre_exec(move || {
             if leader != Leader::Inherited && libc::setsid() == -1 {
@@ -3571,16 +3564,18 @@ fn start_with_sigint(command: &mut std::process::Command, entry: EntrySigint, le
             {
                 return Err(std::io::Error::last_os_error());
             }
-            let mut sigint = std::mem::zeroed::<libc::sigset_t>();
-            libc::sigemptyset(&mut sigint);
-            libc::sigaddset(&mut sigint, libc::SIGINT);
-            let (action, how) = match entry {
-                EntrySigint::Default => (libc::SIG_DFL, libc::SIG_UNBLOCK),
-                EntrySigint::Ignored => (libc::SIG_IGN, libc::SIG_UNBLOCK),
-                EntrySigint::Blocked => (libc::SIG_DFL, libc::SIG_BLOCK),
-            };
-            libc::signal(libc::SIGINT, action);
-            libc::sigprocmask(how, &sigint, std::ptr::null_mut());
+            for &(signal, entry) in &signals {
+                let mut set = std::mem::zeroed::<libc::sigset_t>();
+                libc::sigemptyset(&mut set);
+                libc::sigaddset(&mut set, signal);
+                let (action, how) = match entry {
+                    Entry::Default => (libc::SIG_DFL, libc::SIG_UNBLOCK),
+                    Entry::Ignored => (libc::SIG_IGN, libc::SIG_UNBLOCK),
+                    Entry::Blocked => (libc::SIG_DFL, libc::SIG_BLOCK),
+                };
+                libc::signal(signal, action);
+                libc::sigprocmask(how, &set, std::ptr::null_mut());
+            }
             Ok(())
         });
     }
@@ -3804,7 +3799,11 @@ fn assert_sh_dies_from_its_own_sigint() {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    start_with_sigint(&mut bare, EntrySigint::Default, Leader::Inherited);
+    start_with_signals(
+        &mut bare,
+        Leader::Inherited,
+        &[(libc::SIGINT, Entry::Default)],
+    );
     let status = bare.status().expect("run sh without the wrapper");
     assert_eq!(
         status.signal(),
@@ -3894,7 +3893,7 @@ fn run_redirected(
     scratch: &Scratch,
     extra: &[&std::ffi::OsStr],
     script: &str,
-    entry: EntrySigint,
+    entry: Entry,
     signal: Option<libc::c_int>,
 ) -> RedirectedRun {
     use std::process::Stdio;
@@ -3905,7 +3904,13 @@ fn run_redirected(
         .stdin(Stdio::null())
         .stdout(File::create(&output_path).expect("output file"))
         .stderr(File::create(scratch.path("stderr")).expect("stderr file"));
-    start_with_sigint(&mut command, entry, Leader::Inherited);
+    let mut signals = vec![(libc::SIGINT, entry)];
+    signals.extend(
+        signal
+            .filter(|signal| *signal != libc::SIGINT)
+            .map(|signal| (signal, Entry::Default)),
+    );
+    start_with_signals(&mut command, Leader::Inherited, &signals);
     let mut wrapper = ProcessGuard::new(command.spawn().expect("spawn ptty"));
     let pid = wrapper.pid();
     let _sweep = SessionSweep::new(pid, scratch.sessions());
@@ -3942,7 +3947,7 @@ fn wrapper_dies_from_sigint_after_cleanup_when_its_command_did() {
         &scratch,
         &[std::ffi::OsStr::new("--trace-io"), trace.as_os_str()],
         "printf 'first line\\nheld''tail'; kill -INT $$; sleep 5",
-        EntrySigint::Default,
+        Entry::Default,
         None,
     );
     let trace = std::fs::read_to_string(&trace).expect("trace file");
@@ -3996,10 +4001,10 @@ fn wrapper_on_a_terminal_dies_from_sigint_after_restoring_it_when_its_command_di
         .stdin(tty.try_clone().expect("stdin tty"))
         .stdout(tty.try_clone().expect("stdout tty"))
         .stderr(tty.try_clone().expect("stderr tty"));
-    start_with_sigint(
+    start_with_signals(
         &mut command,
-        EntrySigint::Default,
         Leader::SessionOnTerminal,
+        &[(libc::SIGINT, Entry::Default)],
     );
     let mut wrapper = ProcessGuard::new(command.spawn().expect("spawn ptty"));
     let pid = wrapper.pid();
@@ -4069,10 +4074,10 @@ fn loop_after_one_ctrl_c(scratch: &Scratch, argv: &[&str], wrapped: bool) -> Vec
         .stdin(tty.try_clone().expect("stdin tty"))
         .stdout(tty.try_clone().expect("stdout tty"))
         .stderr(tty.try_clone().expect("stderr tty"));
-    start_with_sigint(
+    start_with_signals(
         &mut command,
-        EntrySigint::Default,
         Leader::SessionOnTerminal,
+        &[(libc::SIGINT, Entry::Default)],
     );
     let mut shell = ProcessGuard::new(command.spawn().expect("spawn interactive shell"));
     let _sweep = SessionSweep::new(shell.pid(), scratch.sessions());
@@ -4251,7 +4256,7 @@ fn sigint_sent_to_the_wrapper_ends_it_by_sigint_when_it_kills_the_command() {
         &scratch,
         &[],
         "echo READY; exec sleep 5",
-        EntrySigint::Default,
+        Entry::Default,
         Some(libc::SIGINT),
     );
 
@@ -4282,7 +4287,7 @@ fn a_command_that_handles_sigint_keeps_its_exit_code() {
         &scratch,
         &[],
         "trap 'exit 7' INT; kill -INT $$; sleep 5",
-        EntrySigint::Default,
+        Entry::Default,
         None,
     );
     assert_eq!(
@@ -4296,7 +4301,7 @@ fn a_command_that_handles_sigint_keeps_its_exit_code() {
         &scratch,
         &[],
         "trap 'exit 0' INT; echo READY; while :; do sleep 0.1; done",
-        EntrySigint::Default,
+        Entry::Default,
         Some(libc::SIGINT),
     );
     assert_eq!(
@@ -4319,7 +4324,7 @@ fn a_command_killed_by_another_signal_still_reports_128_plus_the_signal() {
             &scratch,
             &[],
             &format!("kill -{name} $$; sleep 5"),
-            EntrySigint::Default,
+            Entry::Default,
             None,
         );
         assert_eq!(
@@ -4351,7 +4356,7 @@ fn sigterm_to_the_wrapper_still_reports_143_when_the_command_then_dies_from_sigi
         &[],
         "trap 'echo seen > \"$SCRATCH/term-forwarded\"; kill -INT $$; echo on > \"$SCRATCH/ran-on\"' TERM; \
          echo READY; while :; do sleep 1; done",
-        EntrySigint::Default,
+        Entry::Default,
         Some(libc::SIGTERM),
     );
 
@@ -4381,10 +4386,7 @@ fn sigint_ignored_or_blocked_by_the_caller_still_reports_130() {
     use std::os::unix::process::ExitStatusExt;
 
     let scratch = Scratch::new();
-    for (entry, name) in [
-        (EntrySigint::Ignored, "ignored"),
-        (EntrySigint::Blocked, "blocked"),
-    ] {
+    for (entry, name) in [(Entry::Ignored, "ignored"), (Entry::Blocked, "blocked")] {
         let run = run_redirected(&scratch, &[], "kill -INT $$; sleep 5", entry, None);
         assert_eq!(
             (run.status.signal(), run.status.code()),
@@ -4416,7 +4418,11 @@ fn a_wrapper_started_by_a_script_with_sigint_ignored_still_reports_130() {
             .stdin(Stdio::null())
             .stdout(File::create(&output_path).expect("output file"))
             .stderr(Stdio::null());
-        start_with_sigint(&mut command, EntrySigint::Default, Leader::Session);
+        start_with_signals(
+            &mut command,
+            Leader::Session,
+            &[(libc::SIGINT, Entry::Default)],
+        );
         let mut shell = ProcessGuard::new(command.spawn().expect("spawn sh"));
         let _sweep = SessionSweep::new(shell.pid(), scratch.sessions());
         let status = shell
@@ -4520,16 +4526,27 @@ impl Redirected {
     }
 
     /// With stdout already set on `command`; `output` is where READY shows.
+    /// The wrapper starts with every one of `TEST_SIGNALS` at its default.
     fn spawn(
+        scratch: &Scratch,
+        command: std::process::Command,
+        output: std::path::PathBuf,
+    ) -> Self {
+        Self::spawn_with(scratch, command, output, &at_default(&TEST_SIGNALS))
+    }
+
+    /// As `spawn`, with the wrapper's signals set as `entries` say.
+    fn spawn_with(
         scratch: &Scratch,
         mut command: std::process::Command,
         output: std::path::PathBuf,
+        entries: &[(libc::c_int, Entry)],
     ) -> Self {
         let stderr = scratch.path("stderr");
         command
             .stdin(std::process::Stdio::null())
             .stderr(File::create(&stderr).expect("stderr file"));
-        start_with_sigint(&mut command, EntrySigint::Default, Leader::Inherited);
+        start_with_signals(&mut command, Leader::Inherited, entries);
         let wrapper = ProcessGuard::new(command.spawn().expect("spawn ptty"));
         let pid = wrapper.pid();
         Self {
@@ -4605,10 +4622,10 @@ impl OnTerminal {
             .stdin(tty.try_clone().expect("stdin tty"))
             .stdout(tty.try_clone().expect("stdout tty"))
             .stderr(tty.try_clone().expect("stderr tty"));
-        start_with_sigint(
+        start_with_signals(
             &mut command,
-            EntrySigint::Default,
             Leader::SessionOnTerminal,
+            &at_default(&TEST_SIGNALS),
         );
         let wrapper = ProcessGuard::new(command.spawn().expect("spawn ptty"));
         let pid = wrapper.pid();
@@ -4888,9 +4905,10 @@ fn a_burst_of_messages_coalesces_and_the_session_goes_on() {
         run.output()
     );
     let delivered = lines_in(&scratch, "got");
+    eprintln!("{delivered} of 2000 messages reached the command");
     assert!(
-        (1..=2000).contains(&delivered),
-        "{delivered} messages reached the command"
+        (1..2000).contains(&delivered),
+        "{delivered} messages reached the command: none coalesced"
     );
     send(run.pid, libc::SIGTERM);
     let status = run.wait(Duration::from_secs(10));
@@ -4921,6 +4939,7 @@ fn sigterm_ends_the_session_during_a_flood_of_messages() {
     let sent = flood.stop();
     let status = run.wait(Duration::from_secs(5));
     assert!(ended, "the wrapper did not end during the flood");
+    assert!(sent > 0, "the flood sent nothing");
     assert_eq!(
         (status.signal(), status.code()),
         (None, Some(7)),
@@ -4934,8 +4953,10 @@ fn sigterm_ends_the_session_during_a_flood_of_messages() {
 }
 
 /// Once the wrapper has begun to end the session, a message sent after the
-/// ending signal need not reach the command. Here the command's SIGTERM
-/// handler runs five seconds, so the 1.4.0 teardown cuts it off at about two.
+/// ending signal is not passed on. Here the command notes SIGTERM and runs on
+/// in its idle loop until the 1.4.0 teardown kills it after about two
+/// seconds. A SIGUSR2 the test sends the command directly after the SIGUSR1
+/// shows that the command still notes signals promptly then.
 #[test]
 fn a_message_sent_once_the_end_has_begun_is_not_delivered() {
     use std::os::unix::process::ExitStatusExt;
@@ -4945,9 +4966,8 @@ fn a_message_sent_once_the_end_has_begun_is_not_delivered() {
         &scratch,
         &[],
         &format!(
-            "trap 'echo usr1 >> \"$SCRATCH/got\"' USR1; \
-             trap 'echo term >> \"$SCRATCH/got\"; j=0; while [ $j -lt 50 ]; do sleep 0.1; j=$((j+1)); done; exit 0' TERM; \
-             echo READY; {IDLE}"
+            "trap 'echo usr1 >> \"$SCRATCH/got\"' USR1; trap 'echo usr2 >> \"$SCRATCH/got\"' USR2; \
+             trap 'echo term >> \"$SCRATCH/got\"' TERM; echo READY; {IDLE}"
         ),
     );
     run.wait_for_ready();
@@ -4957,8 +4977,20 @@ fn a_message_sent_once_the_end_has_begun_is_not_delivered() {
         "the command never handled SIGTERM"
     );
     send(run.pid, libc::SIGUSR1);
+    let command: libc::pid_t = std::fs::read_to_string(scratch.sessions())
+        .ok()
+        .and_then(|pids| pids.split_whitespace().next()?.parse().ok())
+        .expect("the command's pid");
+    // SAFETY: kill has no memory-safety preconditions; the command is alive until the teardown
+    // kills it, and its pid cannot be reused before the wrapper reaps it.
+    assert_eq!(unsafe { libc::kill(command, libc::SIGUSR2) }, 0);
+    let direct = wait_for_file_containing(&scratch.path("got"), b"usr2", Duration::from_secs(1));
     let status = run.wait(Duration::from_secs(10));
     let got = std::fs::read_to_string(scratch.path("got")).unwrap_or_default();
+    assert!(
+        direct,
+        "control: the command did not note a SIGUSR2 sent to it: {got:?}"
+    );
     assert_eq!(
         (status.signal(), status.code()),
         (None, Some(128 + libc::SIGTERM)),
@@ -5192,7 +5224,7 @@ fn near_the_escalation_the_status_says_whether_the_command_exited_by_itself() {
 
 /// A SIGTERM handler that writes a last, unterminated line and exits 7 gives
 /// 7, and that line is drawn with its colour closed, on the screen and in the
-/// trace, before the terminal is given back.
+/// trace. The terminal was given back when the wrapper took the signal.
 #[test]
 fn a_term_handler_that_exits_7_gives_7_after_its_last_line_is_drawn() {
     use std::os::unix::process::ExitStatusExt;
@@ -5393,4 +5425,93 @@ fn a_message_that_kills_the_command_ends_the_session_while_its_worker_holds_the_
         took < Duration::from_secs(3),
         "the session ended after {took:?}"
     );
+}
+
+static CAUGHT_USR1: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn note_usr1(_: libc::c_int) {
+    CAUGHT_USR1.store(true, Ordering::SeqCst);
+}
+
+/// The command of the test below, when PTY3_USR1_CATCHER names a marker file;
+/// as an ordinary test it does nothing. It catches SIGUSR1 whatever it
+/// inherited, which a shell cannot, writes a line to the marker for each one,
+/// and ends by itself after ten seconds.
+#[test]
+fn usr1_catcher() {
+    let Some(marker) = std::env::var_os("PTY3_USR1_CATCHER") else {
+        return;
+    };
+    let handler: extern "C" fn(libc::c_int) = note_usr1;
+    // SAFETY: the handler is an `extern "C" fn(c_int)` that only stores to an atomic; the set
+    // is a stack-local sigset_t initialized before use.
+    unsafe {
+        libc::signal(libc::SIGUSR1, handler as libc::sighandler_t);
+        let mut usr1 = std::mem::zeroed::<libc::sigset_t>();
+        libc::sigemptyset(&mut usr1);
+        libc::sigaddset(&mut usr1, libc::SIGUSR1);
+        libc::pthread_sigmask(libc::SIG_UNBLOCK, &usr1, std::ptr::null_mut());
+    }
+    println!("READY");
+    let until = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < until {
+        if CAUGHT_USR1.swap(false, Ordering::SeqCst) {
+            let mut file = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&marker)
+                .expect("catcher marker");
+            writeln!(file, "usr1").expect("note SIGUSR1");
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// PrismTTY leaves a signal it inherited as ignored or blocked as the caller
+/// set it, as 1.4.1 did: it installs no handler for an ignored one, and a
+/// blocked one stays blocked. SIGUSR1 sent to it then reaches nothing, here
+/// a command that catches SIGUSR1 whatever it inherited; with SIGUSR1 at its
+/// default, the same command gets it.
+#[test]
+fn an_inherited_ignored_or_blocked_usr1_is_not_passed_on() {
+    use std::os::unix::process::ExitStatusExt;
+
+    for (entry, name, passed_on) in [
+        (Entry::Default, "default", true),
+        (Entry::Ignored, "ignored", false),
+        (Entry::Blocked, "blocked", false),
+    ] {
+        let scratch = Scratch::new();
+        let output = scratch.path("output");
+        let mut command = scratch.wrapper(
+            &[],
+            "exec \"$PTY3_CATCHER_BIN\" --exact usr1_catcher --nocapture --test-threads=1",
+        );
+        command
+            .env("PTY3_USR1_CATCHER", scratch.path("caught"))
+            .env(
+                "PTY3_CATCHER_BIN",
+                std::env::current_exe().expect("test binary"),
+            )
+            .stdout(File::create(&output).expect("output file"));
+        let mut entries = at_default(&TEST_SIGNALS);
+        entries.push((libc::SIGUSR1, entry));
+        let mut run = Redirected::spawn_with(&scratch, command, output, &entries);
+        run.wait_for_ready();
+        send(run.pid, libc::SIGUSR1);
+        let wait = if passed_on { 5 } else { 1 };
+        let caught = wait_for_condition(Duration::from_secs(wait), || {
+            lines_in(&scratch, "caught") > 0
+        });
+        assert_eq!(caught, passed_on, "SIGUSR1 {name} at entry");
+        assert!(run.alive(), "SIGUSR1 {name} at entry ended the wrapper");
+        send(run.pid, libc::SIGTERM);
+        let status = run.wait(Duration::from_secs(10));
+        assert_eq!(
+            (status.signal(), status.code()),
+            (None, Some(128 + libc::SIGTERM)),
+            "SIGUSR1 {name} at entry: {:?}",
+            run.output()
+        );
+    }
 }
