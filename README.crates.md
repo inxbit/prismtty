@@ -181,6 +181,12 @@ line ends are saved as the command wrote them; the command can change that
 setting. With the keyboard on a terminal and the output in a pipe
 (`ptty ssh host | tee log`) the PTY keeps its usual output settings, because
 the pipe usually leads back to that terminal.
+With stdin redirected and the output on a terminal (`ptty make </dev/null`),
+the PTY keeps its usual settings too, so a recording of that terminal's output
+holds an extra carriage return on each line (CR CR LF); on screen the lines
+look the same. This is on purpose: the PTY ends each line with CR LF itself, so
+the lines still start at the left edge if another program turns off the
+terminal's output processing during the session.
 
 To page the output of a command that needs no keyboard, take the terminal off
 its stdin:
