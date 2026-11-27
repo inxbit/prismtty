@@ -162,10 +162,14 @@ const END_LIMIT: Duration = Duration::from_secs(4);
 ///    `PUBLISHED_LEADER_STATUS`. Who ends the process follows from it.
 ///
 /// So once an End is recorded the signals stay caught until the process
-/// exits, and every End recorded while a handler is installed is taken. The
-/// one boundary: an End recorded while `stop` is giving the signals back.
-/// `stop` then catches the signals again at once and takes the End, but a
-/// signal in the instant between takes its previous action.
+/// exits, and every End recorded before `stop` makes its last check is
+/// taken. Two boundaries remain. An End recorded while `stop` is giving the
+/// signals back: `stop` then catches the signals again and takes the End,
+/// but the signals are given back and caught again one `sigaction` at a
+/// time, so another signal in between takes its previous action. And a
+/// handler that was entered while installed but records its End only after
+/// `stop` made its last check: that End has no taker, and the session ends
+/// with the command's status, as it did in 1.4.1.
 struct PendingEnd {
     signal: AtomicI32,
     taken: AtomicBool,

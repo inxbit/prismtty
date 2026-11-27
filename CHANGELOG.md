@@ -43,16 +43,20 @@ All notable changes to PrismTTY are documented here.
   end cannot complete within about four seconds of the signal, as when nothing
   reads PrismTTY's output; output not yet drawn can then be lost. The four
   seconds count while PrismTTY is not stopped; on macOS a PrismTTY that leads
-  its terminal's session also waits, as it exits, while output it wrote to
-  that terminal is still unread. When PrismTTY was sent SIGINT and the command
-  died from it, PrismTTY still ends by SIGINT, and a command that dies from
-  SIGINT after PrismTTY was sent SIGTERM still gives 143. PrismTTY acts on the
-  first ending signal it receives while its handlers are installed, also while
-  the session is ending; a later one does not replace it, and from then on
-  PrismTTY keeps the signals caught until it exits, catching them again at
-  once if it was giving them back. A session that no ending signal ended gives
-  the signals back to their previous actions as it ends, and one that arrives
-  after that takes that action, as before.
+  its terminal's session also waits, as it exits, while output it wrote to that
+  terminal is still unread. When PrismTTY was sent SIGINT and the command died
+  from it, PrismTTY still ends by SIGINT, and a command that dies from SIGINT
+  after PrismTTY was sent SIGTERM still gives 143. PrismTTY acts on the first
+  ending signal it has recorded by the time the session has finished ending,
+  also when that signal arrives while the session is ending; a later one does
+  not replace it, and from then on PrismTTY keeps the signals caught until it
+  exits. A session that no ending signal ended gives the signals back to their
+  previous actions as it ends. That handoff is not exact: the signals are given
+  back one after another, so a signal that arrives during it can take its
+  previous action or still be handled by PrismTTY, and an ending signal whose
+  handling had begun but was not yet recorded when the session finished ending
+  is not acted on, as in earlier releases. A signal that arrives after that
+  takes its previous action, as before.
 
   This changes two statements of the 1.4.0 entry below: a signal other than
   SIGINT sent to PrismTTY no longer always ends it with 128 plus that signal,
