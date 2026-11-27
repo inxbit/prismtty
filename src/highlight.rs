@@ -3830,8 +3830,9 @@ const fn followed(form: Form, reason: &'static str) -> TableEntry {
 /// and APC string but one, every C1 form, and a mode restored by XTRESTORE.
 /// Among them are VT52 mode (`CSI ? 2 l`, which hands the terminal's parser
 /// to VT52, where `ESC [` starts nothing), Tektronix mode (`CSI ? 38 h`),
-/// column mode (`CSI ? 3 h` and `l`), insert-free line sizes (`ESC # 3`, `4`
-/// and `6`), window resizes, status lines, newline mode (`CSI 20 h`),
+/// column mode (`CSI ? 3 h` and `l`), rows of double width or height
+/// (`ESC # 3`, `4` and `6`), window resizes, status lines, newline mode
+/// (`CSI 20 h`),
 /// character sets other than ASCII as G0, and shift out. The references are
 /// to xterm's source.
 const CONTROL_TABLE: &[TableEntry] = &[
