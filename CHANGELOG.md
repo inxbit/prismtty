@@ -8,10 +8,13 @@ All notable changes to PrismTTY are documented here.
 
 - SIGUSR1 and SIGUSR2 sent to PrismTTY no longer end it with 128 plus the
   signal. PrismTTY passes them to the command it started, alone, while that
-  command runs, as `kill -USR1` of the command would without PrismTTY, and the
-  session goes on with the terminal in raw mode. Signals of one kind can
+  command runs, as `kill -USR1` of the command would without PrismTTY, and
+  the session goes on with the terminal in raw mode. Signals of one kind can
   coalesce, and one that arrives after PrismTTY began to end the session is
-  not passed on.
+  not passed on. A signal that PrismTTY inherited as ignored or blocked, as
+  `nohup` leaves SIGHUP and a script's background job leaves SIGINT and
+  SIGQUIT, is still not passed on and does not end PrismTTY, for SIGUSR1 and
+  SIGUSR2 as for the signals that end it.
 
   A worker that handles SIGUSR1 while the command PrismTTY started ignores it
   gets nothing, and a shell that leaves SIGUSR1 at its default action dies

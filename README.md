@@ -272,13 +272,17 @@ its process group: 0 does not mean that every process in the group finished
 cleanly.
 
 SIGUSR1 and SIGUSR2 sent to PrismTTY are passed to the command it started,
-alone, while it runs, and do not end PrismTTY themselves; like any signals of
-one kind they can coalesce, and one that arrives after PrismTTY began to end
-the session is not passed on. A worker that handles SIGUSR1 while the command
-PrismTTY started ignores it gets nothing, and a shell that leaves SIGUSR1 at
-its default action dies from it and ends the session; to reach a server started
-through a shell, start it with `exec`, or send the signal to the server's own
-pid.
+alone, while it runs, unless PrismTTY inherited them ignored or blocked, and do
+not end PrismTTY themselves; like any signals of one kind they can coalesce,
+and one that arrives after PrismTTY began to end the session is not passed on.
+A worker that handles SIGUSR1 while the command PrismTTY started ignores it
+gets nothing, and a shell that leaves SIGUSR1 at its default action dies from
+it and ends the session; to reach a server started through a shell, start it
+with `exec`, or send the signal to the server's own pid. A signal that PrismTTY
+inherited as ignored or blocked, as `nohup` leaves SIGHUP and a script's
+background job leaves SIGINT and SIGQUIT, is not passed on and does not end
+PrismTTY: PrismTTY leaves it as its caller set it, as before. This holds for
+SIGUSR1 and SIGUSR2 as for the signals that end it.
 
 To page the output of a command that needs no keyboard, take the terminal off
 its stdin:
