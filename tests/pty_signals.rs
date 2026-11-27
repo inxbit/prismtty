@@ -5365,9 +5365,15 @@ fn an_output_failure_after_a_handled_term_ends_with_143() {
     }
     let mut command = scratch.wrapper(
         &[],
-        // The command writes while it is still running, so the wrapper's
-        // write fails while the teardown of its group is under way.
-        &format!("trap 'echo bye; sleep 0.3; exit 0' TERM; echo READY; {IDLE}"),
+        // The command writes for a second while it is still running, so
+        // the wrapper has output to write, and its write fails, while the
+        // teardown of its group is under way. Output the command wrote only
+        // just before it exited can be discarded on macOS before the wrapper
+        // reads it, and the normal end then has nothing left to write.
+        &format!(
+            "trap 'j=0; while [ $j -lt 10 ]; do echo bye; sleep 0.1; j=$((j+1)); done; exit 0' TERM; \
+             echo READY; {IDLE}"
+        ),
     );
     command.stdout(write_end);
     let mut run = Redirected::spawn(&scratch, command, scratch.path("unused"));

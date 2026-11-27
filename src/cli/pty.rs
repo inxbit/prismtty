@@ -5236,10 +5236,19 @@ mod tests {
             return;
         }
         let prior: extern "C" fn(libc::c_int) = prior_usr1;
-        // SAFETY: the handler is an `extern "C" fn(c_int)` that only stores to an atomic. Only
-        // this probe runs in this process.
+        // SIGTERM at its default and unblocked, whatever the runner left, so
+        // that the watcher catches it; the watcher thread inherits this
+        // thread's mask.
+        // SAFETY: the handler is an `extern "C" fn(c_int)` that only stores to an atomic; the set
+        // is a stack-local sigset_t initialized before use. Only this probe runs in this process.
         unsafe {
+            libc::signal(libc::SIGTERM, libc::SIG_DFL);
             libc::signal(libc::SIGUSR1, prior as libc::sighandler_t);
+            let mut set = std::mem::zeroed::<libc::sigset_t>();
+            libc::sigemptyset(&mut set);
+            libc::sigaddset(&mut set, libc::SIGTERM);
+            libc::sigaddset(&mut set, libc::SIGUSR1);
+            libc::pthread_sigmask(libc::SIG_UNBLOCK, &set, std::ptr::null_mut());
         }
         let raw_mode = Arc::new(Mutex::new(super::RawModeLifecycle::Inactive));
         let watcher = super::SessionSignalWatcher::start(raw_mode, true).expect("watcher");
