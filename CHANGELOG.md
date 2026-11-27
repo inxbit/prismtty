@@ -14,11 +14,13 @@ All notable changes to PrismTTY are documented here.
     `[Connection to NAME closed by foreign host]` for the device you
     connected to, and the first prompt after it is exactly the prompt you
     were at when you opened that connection. That prompt confirms as a
-    complete line, or as the prompt waiting for input when you type your next
-    key at it: an unfinished line that only starts with it does not. The
-    prompt must end within the first 512 bytes of output after your Enter
-    (bytes as the terminal receives them, escape sequences not counted), and
-    the lines must come within 3 seconds of PrismTTY handling the Enter.
+    complete line, or as the prompt waiting for input: the next key you type
+    there must come back as its echo, so the colors change as you start the
+    next command. An unfinished line that only starts with that prompt does
+    not confirm. The prompt must end within the first 512 bytes after the
+    echo of your exit line (bytes as the terminal receives them, escape
+    sequences not counted), and the lines must come within 3 seconds of
+    PrismTTY handling the Enter.
   - After Ctrl-] and `quit` (or `q`, `qu`, `qui`) in telnet, the output shows
     telnet's own `telnet> quit` line, ending after your Enter and within 4,096
     bytes of the Ctrl-], and the first non-blank line after it is

@@ -160,10 +160,10 @@ device's colors when the output shows the end of that connection. After you
 type `exit`, `quit` or `logout`, PrismTTY needs
 `[Connection to NAME closed by foreign host]` for the device you connected to,
 and then, as the first prompt after it, exactly the prompt you were at when you
-opened that connection: as a complete line, or waiting for input when you type
-your next key at it. The prompt must end within the first 512 bytes after your
-Enter (bytes as received, escape sequences not counted) and the lines must come
-within 3 seconds. After Ctrl-] and `quit` (or `q`, `qu`, `qui`) in telnet, it
+opened that connection: as a complete line, or waiting for input, when the next
+key you type there comes back as its echo. The prompt must end within the first
+512 bytes after the echo of your exit line (bytes as received, escape sequences
+not counted) and the lines must come within 3 seconds. After Ctrl-] and `quit` (or `q`, `qu`, `qui`) in telnet, it
 needs telnet's own `telnet> quit` line within 4,096 bytes, ending after your
 Enter, then `Connection closed.` as the first non-blank line within 256 bytes,
 and every telnet in the chain must have announced its escape character
