@@ -4909,3 +4909,959 @@ fn line_end_fixtures_give_one_output_at_every_read_split() {
         }
     }
 }
+
+#[path = "support/screen.rs"]
+mod screen;
+
+use screen::{Screen, runs, shown, shown_with_sgr_stack};
+
+/// The bytes the interactive highlighter writes for `reads`, one push each,
+/// with no rules, so every SGR in the output is the program's or one the
+/// prompt-echo neutralizer writes.
+fn prompt_echo_output(reads: &[&[u8]], full_reset: bool) -> Vec<u8> {
+    let highlighter =
+        Highlighter::from_config(PrismConfig::default()).expect("empty config compiles");
+    let mut streaming = StreamingHighlighter::new_interactive(highlighter);
+    streaming.set_no_minimal_resets(full_reset);
+    let mut output = Vec::new();
+    for read in reads {
+        output.extend(streaming.push(read));
+    }
+    output.extend(streaming.finish());
+    output
+}
+
+fn assert_prompt_echo(
+    input: &[u8],
+    full_reset: bool,
+    expected: &[u8],
+    expected_runs: &[(usize, &str, &str)],
+) {
+    let output = prompt_echo_output(&[input], full_reset);
+    assert!(
+        output == expected,
+        "full reset {full_reset}: {:?}\n  got {:?}\n want {:?}",
+        String::from_utf8_lossy(input),
+        String::from_utf8_lossy(&output),
+        String::from_utf8_lossy(expected)
+    );
+    assert_eq!(
+        shown(&output),
+        runs(expected_runs),
+        "full reset {full_reset}: {:?}",
+        String::from_utf8_lossy(input)
+    );
+}
+
+/// The reset that ends a prompt's own style used to be taken out with the
+/// color after it, so the prompt's background, inverse or underline went on
+/// over the typed command, the output after it and the next prompt (the
+/// audit's ESC-6 forms a, b and c). Each removed SGR now leaves its "off"
+/// behind, where it stood: here the space after the prompt is plain again.
+#[test]
+fn prompt_echo_keeps_the_end_of_the_prompts_own_style() {
+    for full_reset in [false, true] {
+        let reset: &[u8] = if full_reset { b"\x1b[0m" } else { b"\x1b[39m" };
+        let with_reset = |before: &[u8], after: &[u8]| [before, reset, after].concat();
+        assert_prompt_echo(
+            b"\x1b[44mR1#\x1b[0m show \x1b[1mint\r\nnext output here\r\nR1#",
+            full_reset,
+            &with_reset(
+                b"\x1b[44mR1#\x1b[49m ",
+                b"show int\r\nnext output here\r\nR1#",
+            ),
+            &[
+                (0, "R1#", "bg=44"),
+                (0, " show int", ""),
+                (1, "next output here", ""),
+                (2, "R1#", ""),
+            ],
+        );
+        assert_prompt_echo(
+            b"\x1b[7muser@host:~$\x1b[0m ls \x1b[4m-la\r\nnext output here\r\n",
+            full_reset,
+            &with_reset(
+                b"\x1b[7muser@host:~$\x1b[27m ",
+                b"ls -la\r\nnext output here\r\n",
+            ),
+            &[
+                (0, "user@host:~$", "inverse"),
+                (0, " ls -la", ""),
+                (1, "next output here", ""),
+            ],
+        );
+        assert_prompt_echo(
+            b"\x1b[44mR1#\x1b[0;35m show int\r\nnext output here\r\n",
+            full_reset,
+            &with_reset(b"\x1b[44mR1#\x1b[49m ", b"show int\r\nnext output here\r\n"),
+            &[
+                (0, "R1#", "bg=44"),
+                (0, " show int", ""),
+                (1, "next output here", ""),
+            ],
+        );
+    }
+}
+
+/// Form d: a bold blue prompt ended by `22;49`. The background ends where the
+/// program ended it; bold is the documented limit and still bleeds, as in
+/// 1.4.1, because `22` ends bold and faint together and writing it safely
+/// would need the terminal's state. The full reset ends it at the command.
+#[test]
+fn prompt_echo_ends_the_background_of_a_bold_prompt_but_not_its_bold() {
+    let input = b"\x1b[1;44mR1#\x1b[22;49m show \x1b[1mint\r\nnext output here\r\n";
+    assert_prompt_echo(
+        input,
+        false,
+        b"\x1b[1;44mR1#\x1b[49m \x1b[39mshow int\r\nnext output here\r\n",
+        &[
+            (0, "R1#", "bg=44 bold"),
+            (0, " show int", "bold"),
+            (1, "next output here", "bold"),
+        ],
+    );
+    assert_prompt_echo(
+        input,
+        true,
+        b"\x1b[1;44mR1#\x1b[49m \x1b[0mshow int\r\nnext output here\r\n",
+        &[
+            (0, "R1#", "bg=44 bold"),
+            (0, " ", "bold"),
+            (0, "show int", ""),
+            (1, "next output here", ""),
+        ],
+    );
+}
+
+/// Each of the eight groups whose end PrismTTY writes: italic, underline,
+/// blink, inverse, conceal, strike, background and overline, ended by the
+/// program's `0` or by its own off code, and all eight at once.
+#[test]
+fn prompt_echo_writes_each_of_the_eight_off_codes() {
+    for (on, off, rendition) in [
+        ("3", "23", "italic"),
+        ("4", "24", "underline"),
+        ("5", "25", "blink"),
+        ("7", "27", "inverse"),
+        ("8", "28", "conceal"),
+        ("9", "29", "strike"),
+        ("44", "49", "bg=44"),
+        ("53", "55", "overline"),
+        (
+            "3;4;5;7;8;9;44;53",
+            "23;24;25;27;28;29;49;55",
+            "bg=44 italic underline blink inverse conceal strike overline",
+        ),
+    ] {
+        for source_off in ["0", off] {
+            let input =
+                format!("\x1b[{on}mR1#\x1b[{source_off}m show \x1b[1mint\r\nnext output here\r\n");
+            let expected =
+                format!("\x1b[{on}mR1#\x1b[{off}m \x1b[39mshow int\r\nnext output here\r\n");
+            assert_prompt_echo(
+                input.as_bytes(),
+                false,
+                expected.as_bytes(),
+                &[
+                    (0, "R1#", rendition),
+                    (0, " show int", ""),
+                    (1, "next output here", ""),
+                ],
+            );
+        }
+    }
+}
+
+/// Intensity, the foreground, fonts and the underline color are never
+/// ended: a removed `0` after a prompt using them leaves 1.4.1's bytes.
+#[test]
+fn prompt_echo_never_writes_intensity_foreground_font_or_underline_color_offs() {
+    for on in [
+        "1", "2", "1;2", "11", "12", "26", "35", "51", "60", "73", "58;5;196",
+    ] {
+        let input = format!("\x1b[{on}mR1#\x1b[0m show \x1b[1mint\r\nnext output here\r\n");
+        let output = prompt_echo_output(&[input.as_bytes()], false);
+        let expected = format!("\x1b[{on}mR1# \x1b[39mshow int\r\nnext output here\r\n");
+        assert!(
+            output == expected.as_bytes(),
+            "{on}: got {:?}",
+            String::from_utf8_lossy(&output)
+        );
+    }
+}
+
+/// Inside one SGR the parser's order decides: the last word on a group is
+/// what counts. `27;7` keeps inverse on and writes nothing; `7;27` ends it;
+/// `0;7` ends the background and its inverse stays suppressed as before;
+/// `7;0` ends the background.
+#[test]
+fn prompt_echo_off_follows_the_order_inside_one_sgr() {
+    for (prompt, source, expected, expected_runs) in [
+        (
+            "7",
+            "27;7",
+            "\x1b[7mR1# \x1b[39mshow int\r\nnext output here\r\n",
+            &[
+                (0, "R1# show int", "inverse"),
+                (1, "next output here", "inverse"),
+            ][..],
+        ),
+        (
+            "7",
+            "7;27",
+            "\x1b[7mR1#\x1b[27m \x1b[39mshow int\r\nnext output here\r\n",
+            &[
+                (0, "R1#", "inverse"),
+                (0, " show int", ""),
+                (1, "next output here", ""),
+            ][..],
+        ),
+        (
+            "44",
+            "0;7",
+            "\x1b[44mR1#\x1b[49m \x1b[39mshow int\r\nnext output here\r\n",
+            &[
+                (0, "R1#", "bg=44"),
+                (0, " show int", ""),
+                (1, "next output here", ""),
+            ][..],
+        ),
+        (
+            "44",
+            "7;0",
+            "\x1b[44mR1#\x1b[49m \x1b[39mshow int\r\nnext output here\r\n",
+            &[
+                (0, "R1#", "bg=44"),
+                (0, " show int", ""),
+                (1, "next output here", ""),
+            ][..],
+        ),
+    ] {
+        let input =
+            format!("\x1b[{prompt}mR1#\x1b[{source}m show \x1b[1mint\r\nnext output here\r\n");
+        assert_prompt_echo(input.as_bytes(), false, expected.as_bytes(), expected_runs);
+    }
+}
+
+/// An empty parameter is 0, and zeros in front of a number do not change it.
+#[test]
+fn prompt_echo_reads_empty_and_zero_padded_parameters_as_the_parser_does() {
+    for source in ["", ";", "000", "0049", ";1", "00;7"] {
+        let input = format!("\x1b[44mR1#\x1b[{source}m show \x1b[1mint\r\nnext output here\r\n");
+        assert_prompt_echo(
+            input.as_bytes(),
+            false,
+            b"\x1b[44mR1#\x1b[49m \x1b[39mshow int\r\nnext output here\r\n",
+            &[
+                (0, "R1#", "bg=44"),
+                (0, " show int", ""),
+                (1, "next output here", ""),
+            ],
+        );
+    }
+}
+
+/// A removed SGR that a terminal may read otherwise than the parser writes
+/// nothing in its place: one holding a sub-parameter, more than 16
+/// parameters, a parameter past 65535 (the Linux console keeps it modulo
+/// 2^32, so `4294967303` is its 7) or an extended color (the Linux console
+/// reads `58`'s arguments as codes). The output is 1.4.1's, byte for byte.
+#[test]
+fn prompt_echo_writes_no_off_for_an_sgr_terminals_read_differently() {
+    // Generated from the released 1.4.1 prismtty, stdin to a terminal.
+    let seventeen = format!("\x1b[44mR1#\x1b[0;{}1m show int\r\n", "1;".repeat(15));
+    for (input, minimal, full) in [
+        (
+            "\x1b[4mR1#\x1b[4:0;31m show int\r\n",
+            "\x1b[4mR1# \x1b[39mshow int\r\n",
+            "\x1b[4mR1# \x1b[0mshow int\r\n",
+        ),
+        (
+            "\x1b[44mR1#\x1b[0;38:5:1m show int\r\n",
+            "\x1b[44mR1# \x1b[39mshow int\r\n",
+            "\x1b[44mR1# \x1b[0mshow int\r\n",
+        ),
+        (
+            seventeen.as_str(),
+            "\x1b[44mR1# \x1b[39mshow int\r\n",
+            "\x1b[44mR1# \x1b[0mshow int\r\n",
+        ),
+        (
+            "\x1b[44mR1#\x1b[0;65536;1m show int\r\n",
+            "\x1b[44mR1# \x1b[39mshow int\r\n",
+            "\x1b[44mR1# \x1b[0mshow int\r\n",
+        ),
+        (
+            "\x1b[7mR1#\x1b[27;4294967303;1m show int\r\n",
+            "\x1b[7mR1# \x1b[39mshow int\r\n",
+            "\x1b[7mR1# \x1b[0mshow int\r\n",
+        ),
+        (
+            "\x1b[44mR1#\x1b[0;38;5;1m show int\r\n",
+            "\x1b[44mR1# \x1b[39mshow int\r\n",
+            "\x1b[44mR1# \x1b[0mshow int\r\n",
+        ),
+        (
+            "\x1b[7mR1#\x1b[27;48;5;1m show int\r\n",
+            "\x1b[7mR1# \x1b[39mshow int\r\n",
+            "\x1b[7mR1# \x1b[0mshow int\r\n",
+        ),
+        (
+            "\x1b[7mR1#\x1b[27;58;5;7;1m show int\r\n",
+            "\x1b[7mR1# \x1b[39mshow int\r\n",
+            "\x1b[7mR1# \x1b[0mshow int\r\n",
+        ),
+    ] {
+        for (full_reset, expected) in [(false, minimal), (true, full)] {
+            let output = prompt_echo_output(&[input.as_bytes()], full_reset);
+            assert!(
+                output == expected.as_bytes(),
+                "full reset {full_reset}: {input:?}\n  got {:?}\n want {expected:?}",
+                String::from_utf8_lossy(&output)
+            );
+        }
+    }
+}
+
+/// With background-color erase, a terminal fills erased cells with the
+/// current background: once the prompt's blue has ended, a later `CSI K`
+/// on the next line erases to the default background.
+#[test]
+fn prompt_echo_off_lets_a_later_erase_use_the_default_background() {
+    let output = prompt_echo_output(
+        &[b"\x1b[44mR1#\x1b[0m show \x1b[1mint\r\nnext\x1b[K\r\n"],
+        false,
+    );
+    let screen = Screen::read(&output, false);
+    let next_line = screen
+        .runs()
+        .into_iter()
+        .filter(|(row, _, _)| *row == 1)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        next_line,
+        runs(&[(
+            1,
+            &format!("next{}", " ".repeat(screen::SCREEN_WIDTH - 4)),
+            ""
+        )]),
+        "{:?}",
+        String::from_utf8_lossy(&output)
+    );
+}
+
+/// DECSCNM reverses the whole screen; it is not the inverse attribute, and
+/// the `27` written for a removed `0` leaves it set.
+#[test]
+fn prompt_echo_inverse_off_leaves_reverse_screen_mode_alone() {
+    let output = prompt_echo_output(
+        &[b"\x1b[?5h\x1b[7mR1#\x1b[0m show \x1b[1mint\r\nnext output here\r\n"],
+        false,
+    );
+    assert!(
+        output == b"\x1b[?5h\x1b[7mR1#\x1b[27m \x1b[39mshow int\r\nnext output here\r\n",
+        "{:?}",
+        String::from_utf8_lossy(&output)
+    );
+    let screen = Screen::read(&output, false);
+    assert!(screen.reverse_screen);
+    assert_eq!(
+        screen.runs_trimmed(),
+        runs(&[
+            (0, "R1#", "inverse"),
+            (0, " show int", ""),
+            (1, "next output here", "")
+        ])
+    );
+}
+
+/// A terminal runs a C0 control it meets inside a CSI, or between its ESC
+/// and `[`, and goes on with the sequence. Such a removed SGR still counts
+/// as `ESC [`: the control stays where it was and the off follows it.
+#[test]
+fn prompt_echo_off_follows_the_c0_controls_inside_the_removed_sgr() {
+    for (source, kept) in [
+        (&b"\x1b[0\x00m"[..], &b"\x00"[..]),
+        (b"\x1b[0\x0em", b"\x0e"),
+        (b"\x1b[0\x07m", b"\x07"),
+        (b"\x1b\x00[0m", b"\x00"),
+        (b"\x1b\x0e[0m", b"\x0e"),
+    ] {
+        let input = [
+            &b"\x1b[44mR1#"[..],
+            source,
+            b" show \x1b[1mint\r\nnext output here\r\n",
+        ]
+        .concat();
+        let expected = [
+            &b"\x1b[44mR1#"[..],
+            kept,
+            b"\x1b[49m \x1b[39mshow int\r\nnext output here\r\n",
+        ]
+        .concat();
+        assert_prompt_echo(
+            &input,
+            false,
+            &expected,
+            &[
+                (0, "R1#", "bg=44"),
+                (0, " show int", ""),
+                (1, "next output here", ""),
+            ],
+        );
+    }
+}
+
+/// What is not an SGR stays as in 1.4.1: a CSI that CAN or SUB cancels, and
+/// SGR-looking bytes inside an OSC or DCS cut across reads. An SGR that ends
+/// an unterminated OSC is kept, as before.
+#[test]
+fn prompt_echo_off_leaves_cancelled_sequences_and_string_contents_as_before() {
+    // Generated from the released 1.4.1 prismtty, stdin to a terminal.
+    for (reads, minimal, full) in [
+        (
+            &[&b"\x1b[44mR1#\x1b[0\x18m show \x1b[1mint\r\nnext output here\r\n"[..]][..],
+            &b"\x1b[44mR1#\x1b[0\x18\x1b[39mm show int\r\nnext output here\r\n"[..],
+            &b"\x1b[44mR1#\x1b[0\x18\x1b[0mm show int\r\nnext output here\r\n"[..],
+        ),
+        (
+            &[&b"\x1b[44mR1#\x1b[0\x1am show \x1b[1mint\r\nnext output here\r\n"[..]][..],
+            b"\x1b[44mR1#\x1b[0\x1a\x1b[39mm show int\r\nnext output here\r\n",
+            b"\x1b[44mR1#\x1b[0\x1a\x1b[0mm show int\r\nnext output here\r\n",
+        ),
+        (
+            &[
+                &b"\x1b[44mR1# \x1b]0;a"[..],
+                b"[0;1mb\x07show \x1b[1mint\r\nnext output here\r\n",
+            ][..],
+            b"\x1b[44mR1# \x1b]0;a[0;1mb\x07\x1b[39mshow int\r\nnext output here\r\n",
+            b"\x1b[44mR1# \x1b]0;a[0;1mb\x07\x1b[0mshow int\r\nnext output here\r\n",
+        ),
+        (
+            &[
+                &b"\x1b[44mR1# \x1bPq"[..],
+                b"[0;1m\x1b\\show \x1b[1mint\r\nnext output here\r\n",
+            ][..],
+            b"\x1b[44mR1# \x1bPq[0;1m\x1b\\\x1b[39mshow int\r\nnext output here\r\n",
+            b"\x1b[44mR1# \x1bPq[0;1m\x1b\\\x1b[0mshow int\r\nnext output here\r\n",
+        ),
+        (
+            &[&b"\x1b[44mR1# \x1b]0;t\x1b[0m show \x1b[1mint\r\nnext output here\r\n"[..]][..],
+            b"\x1b[44mR1# \x1b]0;t\x1b[0m \x1b[39mshow int\r\nnext output here\r\n",
+            b"\x1b[44mR1# \x1b]0;t\x1b[0m \x1b[0mshow int\r\nnext output here\r\n",
+        ),
+    ] {
+        for (full_reset, expected) in [(false, minimal), (true, full)] {
+            let output = prompt_echo_output(reads, full_reset);
+            assert!(
+                output == expected,
+                "full reset {full_reset}: {reads:?}\n  got {:?}\n want {:?}",
+                String::from_utf8_lossy(&output),
+                String::from_utf8_lossy(expected)
+            );
+        }
+    }
+}
+
+/// Documented limit: only the eight groups are ended, so the underline
+/// color a prompt set outlives the program's `0` (59 is never written) and
+/// shows again under the next underline.
+#[test]
+fn prompt_echo_off_keeps_the_underline_color_as_a_documented_limit() {
+    let output = prompt_echo_output(
+        &[b"\x1b[4;58;5;196mR1#\x1b[0m show \x1b[1mint\r\n\x1b[4mnext output here\r\n"],
+        false,
+    );
+    assert!(
+        output == b"\x1b[4;58;5;196mR1#\x1b[24m \x1b[39mshow int\r\n\x1b[4mnext output here\r\n",
+        "{:?}",
+        String::from_utf8_lossy(&output)
+    );
+    assert_eq!(
+        shown(&output),
+        runs(&[
+            (0, "R1#", "underline ulcolor=58;5;196"),
+            (0, " show int", "ulcolor=58;5;196"),
+            (1, "next output here", "underline ulcolor=58;5;196"),
+        ])
+    );
+}
+
+/// Documented limit: a removed SGR 0 can do more than end the eight groups.
+/// On WezTerm it also closes an OSC 8 hyperlink; PrismTTY writes `49` for the
+/// background, never `0` or an OSC 8 close, so there the link goes on over
+/// the typed command, as it did in 1.4.1.
+#[test]
+fn prompt_echo_off_leaves_a_hyperlink_open_as_a_documented_limit() {
+    let input = b"\x1b]8;;https://example.invalid/x\x1b\\\x1b[44mR1# \x1b[0;1mshow int\r\n";
+    let output = prompt_echo_output(&[input], false);
+    assert!(
+        output
+            == b"\x1b]8;;https://example.invalid/x\x1b\\\x1b[44mR1# \x1b[49m\x1b[39mshow int\r\n",
+        "{:?}",
+        String::from_utf8_lossy(&output)
+    );
+    assert!(!String::from_utf8_lossy(&output).contains("\x1b]8;;\x1b\\"));
+    // The source's own `0` closes the link on WezTerm; PrismTTY's output does not.
+    assert_eq!(
+        Screen::read(input, true).runs_trimmed(),
+        runs(&[(0, "R1# ", "bg=44 link"), (0, "show int", "bold")])
+    );
+    assert_eq!(
+        Screen::read(&output, true).runs_trimmed(),
+        runs(&[(0, "R1# ", "bg=44 link"), (0, "show int", "link")])
+    );
+}
+
+/// The pinned Fortinet shape keeps 1.4.1's bytes in both reset modes: its
+/// prompt sets only a foreground, which the inserted reset already ends.
+#[test]
+fn prompt_echo_keeps_the_fortinet_shape_byte_for_byte() {
+    // Generated from the released 1.4.1 prismtty, stdin to a terminal.
+    let input = b"\x1b[38;2;255;255;255mFGT01 # \x1b[38;2;255;0;255mdiagnose ";
+    assert!(
+        prompt_echo_output(&[input], false) == b"\x1b[38;2;255;255;255mFGT01 # \x1b[39mdiagnose "
+    );
+    assert!(
+        prompt_echo_output(&[input], true) == b"\x1b[38;2;255;255;255mFGT01 # \x1b[0mdiagnose "
+    );
+}
+
+/// The rendition an off is taken from is the terminal's, carried over from
+/// an earlier read: a prompt styled in one read and reset in the next keeps
+/// that reset.
+#[test]
+fn prompt_echo_off_reads_the_rendition_left_by_an_earlier_read() {
+    for (full_reset, reset) in [(false, "\x1b[39m"), (true, "\x1b[0m")] {
+        let output = prompt_echo_output(
+            &[
+                b"\x1b[44mR1#",
+                b"\x1b[0m show \x1b[1mint\r\nnext output here\r\n",
+            ],
+            full_reset,
+        );
+        let expected = format!("\x1b[44mR1#\x1b[49m {reset}show int\r\nnext output here\r\n");
+        assert!(
+            output == expected.as_bytes(),
+            "full reset {full_reset}\n  got {:?}\n want {expected:?}",
+            String::from_utf8_lossy(&output)
+        );
+        assert_eq!(
+            shown(&output),
+            runs(&[
+                (0, "R1#", "bg=44"),
+                (0, " show int", ""),
+                (1, "next output here", ""),
+            ])
+        );
+    }
+}
+
+/// An off stands where the removed SGR stood, also inside the command:
+/// the prompt's background goes on over the first word, as the program
+/// drew it, and ends before the second. With `--no-minimal-reset` the
+/// inserted `ESC[0m` already ends it before the command, so no off is
+/// needed there.
+#[test]
+fn prompt_echo_off_stays_where_the_removed_sgr_stood() {
+    let input = b"\x1b[44mR1# \x1b[4mshow \x1b[49mint\r\nnext output here\r\n";
+    assert_prompt_echo(
+        input,
+        false,
+        b"\x1b[44mR1# \x1b[39mshow \x1b[49mint\r\nnext output here\r\n",
+        &[
+            (0, "R1# show ", "bg=44"),
+            (0, "int", ""),
+            (1, "next output here", ""),
+        ],
+    );
+    assert_prompt_echo(
+        input,
+        true,
+        b"\x1b[44mR1# \x1b[0mshow int\r\nnext output here\r\n",
+        &[
+            (0, "R1# ", "bg=44"),
+            (0, "show int", ""),
+            (1, "next output here", ""),
+        ],
+    );
+}
+
+/// The limits on a plain SGR are inclusive: 16 parameters, and a parameter
+/// of 65535, still leave an off behind.
+#[test]
+fn prompt_echo_off_is_written_at_the_parameter_limits() {
+    let sixteen = format!("\x1b[44mR1#\x1b[0;{}1m show int\r\n", "1;".repeat(14));
+    for input in [sixteen.as_str(), "\x1b[44mR1#\x1b[0;65535;1m show int\r\n"] {
+        for (full_reset, reset) in [(false, "\x1b[39m"), (true, "\x1b[0m")] {
+            assert_prompt_echo(
+                input.as_bytes(),
+                full_reset,
+                format!("\x1b[44mR1#\x1b[49m {reset}show int\r\n").as_bytes(),
+                &[(0, "R1#", "bg=44"), (0, " show int", "")],
+            );
+        }
+    }
+}
+
+/// A highlight on a later line restores what the terminal shows, which no
+/// longer holds the prompt's ended background or inverse. So the bytes
+/// after the prompt-echo line differ from 1.4.1's, not only by the off:
+/// 1.4.1 restored the leaked background after `WARN` (`39;44`). Where to
+/// close stays 1.4.1's: `up` closes before the line end as under 1.4.1's
+/// leaked inverse.
+#[test]
+fn prompt_echo_off_carries_to_highlights_on_later_lines() {
+    let yaml = r#"
+rules:
+  - description: up
+    regex: '\bup\b'
+    color: f#00ff00
+  - description: warn
+    regex: 'WARN'
+    color: b#ffff00 f#000000
+"#;
+    let highlighter = Highlighter::from_config(
+        PrismConfig::from_chromaterm_yaml(yaml).expect("chromaterm config loads"),
+    )
+    .expect("rules compile");
+    let mut streaming = StreamingHighlighter::new_interactive(highlighter);
+    let mut output = streaming.push(
+        b"\x1b[7muser@host:~$\x1b[0m ls \x1b[4m-la\r\nlink is up\r\n\x1b[44mR1#\x1b[0m show \x1b[1mint\r\nWARN x\r\n",
+    );
+    output.extend(streaming.finish());
+    let expected: &[u8] = b"\x1b[7muser@host:~$\x1b[27m \x1b[39mls -la\r\nlink is \x1b[38;2;0;255;0mup\x1b[39m\r\n\x1b[38;2;0;255;0m\x1b[39m\x1b[44mR1#\x1b[49m \x1b[39mshow int\r\n\x1b[38;2;0;0;0;48;2;255;255;0mWARN\x1b[39;49m x\r\n";
+    assert!(
+        output == expected,
+        "\n  got {:?}\n want {:?}",
+        String::from_utf8_lossy(&output),
+        String::from_utf8_lossy(expected)
+    );
+    assert_eq!(
+        shown(&output),
+        runs(&[
+            (0, "user@host:~$", "inverse"),
+            (0, " ls -la", ""),
+            (1, "link is ", ""),
+            (1, "up", "fg=38;2;0;255;0"),
+            (2, "R1#", "bg=44"),
+            (2, " show int", ""),
+            (3, "WARN", "fg=38;2;0;0;0 bg=48;2;255;255;0"),
+            (3, " x", ""),
+        ])
+    );
+}
+
+/// The streaming highlighter in interactive mode with an `up` and a `WARN`
+/// rule, fed `reads` one by one.
+fn prompt_echo_rules_output(reads: &[&[u8]]) -> Vec<u8> {
+    let yaml = r#"
+rules:
+  - description: up
+    regex: '\bup\b'
+    color: f#00ff00
+  - description: warn
+    regex: 'WARN'
+    color: b#ffff00 f#000000
+"#;
+    let highlighter = Highlighter::from_config(
+        PrismConfig::from_chromaterm_yaml(yaml).expect("chromaterm config loads"),
+    )
+    .expect("rules compile");
+    let mut streaming = StreamingHighlighter::new_interactive(highlighter);
+    let mut output = Vec::new();
+    for read in reads {
+        output.extend(streaming.push(read));
+    }
+    output.extend(streaming.finish());
+    output
+}
+
+fn assert_bytes(output: &[u8], expected: &[u8], what: &str) {
+    assert!(
+        output == expected,
+        "{what}\n  got {:?}\n want {:?}",
+        String::from_utf8_lossy(output),
+        String::from_utf8_lossy(expected)
+    );
+}
+
+/// The screen helper keeps a blank between drawn cells, and xterm's SGR
+/// stack: a full and a masked push, a pop, ten entries deep, and RIS and
+/// DECSTR leaving the stack in place. Without the stack mode a push and a
+/// pop change nothing.
+#[test]
+fn screen_helper_keeps_inner_blanks_and_the_xterm_sgr_stack() {
+    assert_ne!(
+        shown(b"\x1b[41mA\x1b[49m \x1b[42mB"),
+        shown(b"\x1b[41mA\x1b[49m\x1b[42mB")
+    );
+    assert_eq!(
+        shown_with_sgr_stack(b"\x1b[44m\x1b[#p\x1b[0mA\x1b[#qB"),
+        runs(&[(0, "A", ""), (0, "B", "bg=44")])
+    );
+    assert_eq!(
+        shown(b"\x1b[44m\x1b[#p\x1b[0mA\x1b[#qB"),
+        runs(&[(0, "AB", "")])
+    );
+    assert_eq!(
+        shown_with_sgr_stack(b"\x1b[1;44m\x1b[1#{\x1b[0mA\x1b[#}B"),
+        runs(&[(0, "A", ""), (0, "B", "bold")])
+    );
+    assert_eq!(
+        shown_with_sgr_stack(b"\x1b[44m\x1b[#p\x1bc\x1b[!pA\x1b[#qB"),
+        runs(&[(0, "A", ""), (0, "B", "bg=44")])
+    );
+    // xterm's save mask: an explicit 0, or two empty parameters, saves
+    // nothing (review 76); 11 is read as the background; 4 and 21 are
+    // separate underline flags.
+    for push in ["\x1b[0#p", "\x1b[;#p", "\x1b[0;#{"] {
+        assert_eq!(
+            shown_with_sgr_stack(format!("\x1b[44m{push}\x1b[0mA\x1b[#qB").as_bytes()),
+            runs(&[(0, "AB", "")]),
+            "{push:?}"
+        );
+    }
+    assert_eq!(
+        shown_with_sgr_stack(b"\x1b[1;44m\x1b[11#p\x1b[0mA\x1b[#qB"),
+        runs(&[(0, "A", ""), (0, "B", "bg=44")])
+    );
+    assert_eq!(
+        shown_with_sgr_stack(b"\x1b[4m\x1b[21#p\x1b[24mA\x1b[#qB\x1b[4m\x1b[4#p\x1b[24mC\x1b[#qD"),
+        runs(&[(0, "ABC", ""), (0, "D", "underline")])
+    );
+    // A pop pops whatever parameters it carries.
+    for pop in ["\x1b[1#q", "\x1b[0;7#}"] {
+        assert_eq!(
+            shown_with_sgr_stack(format!("\x1b[44m\x1b[#p\x1b[0mA{pop}B").as_bytes()),
+            runs(&[(0, "A", ""), (0, "B", "bg=44")]),
+            "{pop:?}"
+        );
+    }
+    let eleven = "\x1b[#p".repeat(11);
+    assert_eq!(
+        shown_with_sgr_stack(format!("\x1b[44m{eleven}\x1b[0mA\x1b[#qB\x1b[#qC").as_bytes()),
+        runs(&[(0, "AB", ""), (0, "C", "bg=44")])
+    );
+}
+
+/// Once xterm's SGR stack may hold a rendition, a pop can bring back what a
+/// removed reset ended, and the tracked rendition, which does not follow the
+/// stack, would no longer show it. So the neutralizer writes no off there,
+/// as 1.4.1, and a later highlight restores the popped background as the
+/// program draws it. Bytes generated from the released 1.4.1.
+#[test]
+fn prompt_echo_writes_no_off_once_an_sgr_push_may_be_popped() {
+    let source: &[&[u8]] = &[
+        b"\x1b[44m\x1b[#pR1# \x1b[0;1mshow int\r\n",
+        b"\x1b[#qWARN x\r\n",
+    ];
+    let output = prompt_echo_rules_output(source);
+    assert_bytes(
+        &output,
+        b"\x1b[44m\x1b[#pR1# \x1b[39mshow int\r\n\x1b[#q\x1b[38;2;0;0;0;48;2;255;255;0mWARN\x1b[39;44m x\r\n",
+        "push then pop",
+    );
+    assert_eq!(
+        shown_with_sgr_stack(&output),
+        runs(&[
+            (0, "R1# show int", "bg=44"),
+            (1, "WARN", "fg=38;2;0;0;0 bg=48;2;255;255;0"),
+            (1, " x", "bg=44"),
+        ])
+    );
+    assert_eq!(
+        shown_with_sgr_stack(&source.concat())
+            .into_iter()
+            .filter(|(row, _, _)| *row == 1)
+            .collect::<Vec<_>>(),
+        runs(&[(1, "WARN x", "bg=44")])
+    );
+}
+
+/// The same with an inverse prompt: after the pop the program draws in
+/// inverse again, so a highlight closes before the line feed, as 1.4.1.
+#[test]
+fn prompt_echo_writes_no_off_once_an_sgr_push_may_be_popped_under_inverse() {
+    let output = prompt_echo_rules_output(&[
+        b"\x1b[7m\x1b[#pR1# \x1b[0;1mshow int\r\n",
+        b"\x1b[#qup\nnext\r\n",
+    ]);
+    assert_bytes(
+        &output,
+        b"\x1b[7m\x1b[#pR1# \x1b[39mshow int\r\n\x1b[#q\x1b[38;2;0;255;0mup\x1b[39m\n\x1b[38;2;0;255;0m\x1b[39mnext\r\n",
+        "inverse push then pop",
+    );
+    assert_eq!(
+        shown_with_sgr_stack(&output),
+        runs(&[
+            (0, "R1# show int", "inverse"),
+            (1, "up", "fg=38;2;0;255;0 inverse"),
+            (2, "next", "inverse"),
+        ])
+    );
+}
+
+/// A second prompt reset after the pop is left as 1.4.1 leaves it too.
+#[test]
+fn prompt_echo_writes_no_off_for_a_reset_after_an_sgr_pop() {
+    let output = prompt_echo_rules_output(&[
+        b"\x1b[44m\x1b[#pR1# \x1b[0;1mshow int\r\n",
+        b"\x1b[#qR2# \x1b[0;1mshow int\r\n",
+    ]);
+    assert_bytes(
+        &output,
+        b"\x1b[44m\x1b[#pR1# \x1b[39mshow int\r\n\x1b[#qR2# \x1b[39mshow int\r\n",
+        "second prompt after the pop",
+    );
+    assert_eq!(
+        shown_with_sgr_stack(&output),
+        runs(&[(0, "R1# show int", "bg=44"), (1, "R2# show int", "bg=44")])
+    );
+}
+
+/// A profile switch or a reload replaces only the highlighter, so the
+/// tracked rendition, and with it the mark the SGR stack left, stays.
+#[test]
+fn prompt_echo_writes_no_off_after_the_sgr_stack_was_used_and_the_highlighter_replaced() {
+    let highlighter =
+        Highlighter::from_config(PrismConfig::default()).expect("empty config compiles");
+    let mut streaming = StreamingHighlighter::new_interactive(highlighter.clone());
+    let mut output = streaming.push(b"\x1b[#p\x1b[#q");
+    streaming.replace_highlighter(highlighter);
+    output.extend(streaming.push(b"\x1b[44mR1#\x1b[0m show \x1b[1mint\r\n"));
+    output.extend(streaming.finish());
+    assert_bytes(
+        &output,
+        b"\x1b[#p\x1b[#q\x1b[44mR1# \x1b[39mshow int\r\n",
+        "after a replacement",
+    );
+}
+
+/// Every spelling of a push or a pop marks the stack as possibly in use,
+/// a pop without a push seen too: it may pop what was pushed before
+/// PrismTTY started. Bytes generated from the released 1.4.1.
+#[test]
+fn prompt_echo_writes_no_off_after_any_push_or_pop() {
+    for stack in [
+        "\x1b[#p",
+        "\x1b[#{",
+        "\x1b[1;4#{",
+        "\x1b[;#p",
+        "\x1b[#q",
+        "\x1b[#}",
+    ] {
+        let input = format!("{stack}\x1b[44mR1#\x1b[0m show \x1b[1mint\r\nnext output here\r\n");
+        assert_prompt_echo(
+            input.as_bytes(),
+            false,
+            format!("{stack}\x1b[44mR1# \x1b[39mshow int\r\nnext output here\r\n").as_bytes(),
+            &[
+                (0, "R1# show int", "bg=44"),
+                (1, "next output here", "bg=44"),
+            ],
+        );
+        assert_prompt_echo(
+            input.as_bytes(),
+            true,
+            format!("{stack}\x1b[44mR1# \x1b[0mshow int\r\nnext output here\r\n").as_bytes(),
+            &[
+                (0, "R1# ", "bg=44"),
+                (0, "show int", ""),
+                (1, "next output here", ""),
+            ],
+        );
+    }
+}
+
+/// xterm keeps its SGR stack through RIS and DECSTR, and SGR 0 does not
+/// touch it, so none of them ends the mark: a later pop can still restore.
+#[test]
+fn prompt_echo_writes_no_off_after_the_sgr_stack_was_used_and_reset() {
+    for reset in ["\x1bc", "\x1b[!p", "\x1b[0m"] {
+        let line = format!("{reset}\x1b[44mR1#\x1b[0m show \x1b[1mint\r\n");
+        assert_bytes(
+            &prompt_echo_output(&[b"\x1b[#p\x1b[#q", line.as_bytes()], false),
+            format!("\x1b[#p\x1b[#q{reset}\x1b[44mR1# \x1b[39mshow int\r\n").as_bytes(),
+            reset,
+        );
+    }
+}
+
+/// An off written before the first push stays, but from the push on the
+/// tracked rendition is again the one 1.4.1 tracks, without the offs, so
+/// every later byte is 1.4.1's: here the highlight restores the background
+/// the prompt ended (`39;44`), as 1.4.1 does.
+#[test]
+fn prompt_echo_tracks_as_1_4_1_from_the_first_push() {
+    let output = prompt_echo_rules_output(&[
+        b"\x1b[44mR1#\x1b[0m show \x1b[1mint\r\n",
+        b"\x1b[#pWARN x\r\n",
+    ]);
+    assert_bytes(
+        &output,
+        b"\x1b[44mR1#\x1b[49m \x1b[39mshow int\r\n\x1b[#p\x1b[38;2;0;0;0;48;2;255;255;0mWARN\x1b[39;44m x\r\n",
+        "off before the push",
+    );
+}
+
+/// Controls next to the SGR stack that do not use it leave the off in
+/// place: xterm's color stack (XTPUSHCOLORS, XTPOPCOLORS), its SGR report
+/// (XTREPORTSGR) and DECSC with DECRC, which the tracked rendition follows.
+#[test]
+fn prompt_echo_off_stays_beside_controls_that_leave_the_sgr_stack_alone() {
+    for control in ["\x1b[#P", "\x1b[#Q", "\x1b[1;1;1;1#|", "\x1b7\x1b8"] {
+        let input = format!("{control}\x1b[44mR1#\x1b[0m show \x1b[1mint\r\nnext output here\r\n");
+        assert_prompt_echo(
+            input.as_bytes(),
+            false,
+            format!("{control}\x1b[44mR1#\x1b[49m \x1b[39mshow int\r\nnext output here\r\n")
+                .as_bytes(),
+            &[
+                (0, "R1#", "bg=44"),
+                (0, " show int", ""),
+                (1, "next output here", ""),
+            ],
+        );
+    }
+}
+
+/// Framed, encircled and ideogram lines (SGR 51, 52, 60 to 65) are not
+/// ended. A highlight still closes before the line feed where 1.4.1 closes
+/// it, here for the inverse the prompt ended, so the scrolled-in blank line
+/// never takes the highlight color under these lines. The screen helper
+/// draws neither these lines nor scrolled-in blanks, so this pins the bytes.
+#[test]
+fn prompt_echo_off_leaves_framed_and_ideogram_lines_on_and_closes_as_1_4_1() {
+    for line in ["51", "52", "60", "65"] {
+        let prompt = format!("\x1b[7;{line}mR1# \x1b[0;1mshow int\r\n");
+        assert_bytes(
+            &prompt_echo_rules_output(&[prompt.as_bytes(), b"up\nnext\r\n"]),
+            format!(
+                "\x1b[7;{line}mR1# \x1b[27m\x1b[39mshow int\r\n\x1b[38;2;0;255;0mup\x1b[39m\n\x1b[38;2;0;255;0m\x1b[39mnext\r\n"
+            )
+            .as_bytes(),
+            line,
+        );
+    }
+}
+
+/// An off changes what a restore writes, never where a highlight closes:
+/// while the state without offs still shows the prompt's inverse, a
+/// highlight closes before a blank and a line end as 1.4.1 closes it. So a
+/// push in the blank between two highlights finds the same highlight state
+/// as under 1.4.1, and every byte from it on is 1.4.1's.
+#[test]
+fn prompt_echo_off_leaves_highlight_closes_where_1_4_1_writes_them() {
+    let prompt: &[u8] = b"\x1b[7mR1# \x1b[0;1mshow int\r\n";
+    assert_bytes(
+        &prompt_echo_rules_output(&[prompt, b"up up\r\n"]),
+        b"\x1b[7mR1# \x1b[27m\x1b[39mshow int\r\n\x1b[38;2;0;255;0mup\x1b[39m \x1b[38;2;0;255;0mup\x1b[39m\r\n\x1b[38;2;0;255;0m\x1b[39m",
+        "gap",
+    );
+    assert_bytes(
+        &prompt_echo_rules_output(&[prompt, b"up \x1b[#pup\r\n"]),
+        b"\x1b[7mR1# \x1b[27m\x1b[39mshow int\r\n\x1b[38;2;0;255;0mup\x1b[39m \x1b[#p\x1b[38;2;0;255;0mup\x1b[39m\r\n\x1b[38;2;0;255;0m\x1b[39m",
+        "push in the gap",
+    );
+}

@@ -44,6 +44,59 @@ All notable changes to PrismTTY are documented here.
   colors change, and with `--show-profile` and a stderr that nobody reads, the
   read that confirms the switch waits until stderr drains.
 
+## 1.5.1 - 2026-11-27
+
+### Fixed
+
+- In interactive output, a prompt with a colored background, or drawn in
+  inverse or underlined, no longer bleeds into the typed command, the output
+  after it, and a next prompt that sets no style of its own, when the
+  prompt's own reset comes after the prompt on the same line. On a line it
+  takes for a prompt and a typed command, PrismTTY removes the program's SGR
+  sequences after the prompt and writes `ESC[39m`, or `ESC[0m` with
+  `--no-minimal-reset`, before the command; that removed the prompt's reset
+  too. In place of each SGR it removes, it now writes the end of each of
+  these styles that the removed SGR ended and the terminal still shows:
+  italic, underline, blink, inverse, hidden text, strike-through, overline
+  and the background (SGR 23, 24, 25, 27, 28, 29, 55 and 49). PrismTTY
+  writes at the same moments as before, and piped output is unchanged.
+
+  Later highlights follow the ended style. The restore after a highlight
+  sets the program's styles without it: for example, after a prompt with a
+  blue background, the restore that 1.4.1 wrote as `39;44` after a
+  highlight with a background is now `39;49`. Where a highlight closes
+  stays as in 1.4.1, also before a blank or a line end for an inverse,
+  underline, strike-through or overline that was ended.
+
+  What this does not cover:
+
+  - With the default minimal resets, a bold or faint prompt still bleeds
+    into the command and the output after it: SGR 22 ends bold and faint
+    together, and writing it where only one of them ended would need to know
+    the terminal's state. With `--no-minimal-reset`, the `ESC[0m` written
+    before the command ends them there.
+  - The foreground is not ended where the prompt's reset stood; the reset
+    written before the command ends it.
+  - Fonts and the rarer styles (proportional spacing, framed, encircled,
+    ideogram lines, superscript and subscript, and the underline color) are
+    not ended, so framed, encircled and ideogram lines (SGR 51, 52 and 60
+    to 65) stay on, as in 1.4.1.
+  - A reset written with an extended color (`38`, `48` or `58`), a colon
+    form such as `4:0`, more than 16 parameters, a parameter above 65535, or
+    a C1 introducer (a raw `9B` or `C2 9B`) is left as before, because
+    terminals read these differently.
+  - Once the program pushes or pops xterm's SGR stack (XTPUSHSGR `CSI # {`
+    or `CSI # p`, XTPOPSGR `CSI # }` or `CSI # q`), also a pop without a
+    push, PrismTTY writes no style end for the rest of the session, and from
+    that push or pop on it writes what 1.4.1 writes. PrismTTY does not
+    follow the stack, and a pop can bring back a style an end was written
+    for. A style ended before the first push can come back at a later
+    highlight, as in 1.4.1. RIS, DECSTR and SGR 0 do not lift this, because
+    xterm keeps the stack through them.
+  - A removed reset's other effects are not reproduced: on a terminal where
+    SGR 0 also closes an OSC 8 hyperlink, such as WezTerm, the link still goes
+    on over the typed command.
+
 ## 1.5.0 - 2026-11-27
 
 ### Changed
