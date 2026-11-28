@@ -3774,10 +3774,11 @@ struct NativeSgrState {
     /// In a UTF-8 locale, this state as a terminal that also runs the UTF-8
     /// form `C2 9B` holds it; `None` while the two agree. No restore after a
     /// highlight is written from it, so a terminal that prints `C2 9B` gets
-    /// no new live control from one. Only the prompt-echo offs read it: a
-    /// style such an SGR may have set is ended like any other, and on a
-    /// terminal that printed the SGR the off ends a style that is not there,
-    /// which changes nothing.
+    /// no new live control from one. Only the prompt-echo offs and the
+    /// choice to close a highlight before a line end read it: a style such
+    /// an SGR may have set is ended like any other, and on a terminal that
+    /// printed the SGR the off ends a style that is not there, which changes
+    /// nothing.
     encoded_csi: Option<Box<NativeSgrState>>,
 }
 
