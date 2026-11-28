@@ -3938,10 +3938,23 @@ impl NativeSgrState {
     /// is read from the state without offs, as 1.4.1 reads it: an off only
     /// ever ends one of them, so a highlight closes exactly where 1.4.1
     /// closes it, and an off changes what a restore writes, never when.
+    ///
+    /// A style that only a `C2 9B` SGR may have set counts too (see
+    /// `encoded_csi`): closing the highlight before a line end only moves
+    /// where the highlight ends, and what is restored after it still comes
+    /// from this state, so a terminal that printed that SGR gets nothing new.
     fn draws_blank_cells_with_the_foreground(&self) -> bool {
         if let Some(without_offs) = self.without_offs.as_deref() {
             return without_offs.draws_blank_cells_with_the_foreground();
         }
+        self.rendition_draws_blank_cells_with_the_foreground()
+            || self
+                .encoded_csi
+                .as_deref()
+                .is_some_and(Self::rendition_draws_blank_cells_with_the_foreground)
+    }
+
+    fn rendition_draws_blank_cells_with_the_foreground(&self) -> bool {
         let attributes = &self.rendition.attributes;
         [7, 9, 53]
             .iter()
