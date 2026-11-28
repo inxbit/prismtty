@@ -11,9 +11,9 @@ All notable changes to PrismTTY are documented here.
   the conditions below hold, as they are when they arrive alone. zsh's
   right prompt and a device prompt redrawn with `CSI G` are such redraws,
   and ssh or a slow link often delivers a command's last lines in the same
-  read. Before, a read that held any cursor move was written unchanged as a
-  whole. Now the complete lines before the line with the first cursor move
-  are colored when all of these hold:
+  read. Before, a read that held any cursor move was written as it came as
+  a whole. Now the complete lines before the line with the first cursor
+  move are colored when all of these hold:
   - The read's last line still shows its prompt when the read ends. A
     percentage such as `50% ` does not count. PrismTTY follows the cursor on
     that line with the terminal's width, and the read stays as it came when
@@ -23,10 +23,8 @@ All notable changes to PrismTTY are documented here.
     a line feed from past the first column. A prompt holding characters
     that are not ASCII, whose widths PrismTTY does not know, is taken to
     cover two columns for each of them and counts only if that fits on the
-    row. After it may come only controls that do not move the cursor and an
-    erase to the right (`CSI K`), the erase only when the prompt so counted
-    ends before the last column; anything else, such as a right prompt,
-    keeps the read as it came.
+    row; a write or erase after it that PrismTTY cannot place clear of
+    those columns, such as a right prompt or an erase in line, forgets it.
   - Every other control in the read keeps the cursor on its row or below:
     moves along the row, erase in line and below, SGR, bracketed paste,
     cursor-key and keypad modes, and the window title or directory. A line
@@ -34,38 +32,48 @@ All notable changes to PrismTTY are documented here.
     command, and every line after it, stays as it came.
   - No control is cut off at the end of the read.
   - A read with text past ASCII qualifies only when the locale says the
-    terminal reads UTF-8. To a terminal that reads 8-bit bytes, a byte of a
-    UTF-8 character can be a control that moves the cursor.
-  - No state set earlier in the output can bring the cursor back to those
-    lines or make a row narrower than the terminal's width: a scroll region
-    that is not the whole screen, left and right margins, reverse
-    wraparound (modes 45 and 1045), autowrap off, a restore of saved modes,
-    insert mode, a row of double width or double height, a screen size the
-    program asked for (80 or 132 columns, columns per page, lines per
-    screen, a window resize, a status line), or a decoding other than
-    UTF-8. A state counts as on after any form of
-    a control that may set it, and as off again only after its exact reset
-    or a full reset (RIS). A row of double size, and a screen size the
-    program asked for, are cleared only by RIS, and a decoding switch only
-    by its exact reverse. A scroll region set on the main screen counts
-    until it is reset there, for terminals that keep one region for each
-    screen.
+    terminal reads UTF-8: PrismTTY takes a UTF-8 locale as the terminal's
+    decoding. To a terminal that reads 8-bit bytes, a byte of a UTF-8
+    character can be a control that moves the cursor.
+  - PrismTTY has seen nothing but controls on its list since it started or
+    since a full reset (RIS). The list holds SGR, cursor moves, erases and
+    edits, saved and restored cursors, tab stops, modes that change only
+    what the keys or the mouse send or how the cursor or the screen looks,
+    queries the terminal answers, titles, the working directory,
+    hyperlinks, colors, the clipboard, shell integration marks, vim's
+    terminal test, and ASCII as the character set; the code gives the
+    reason for each. Any other control, known or not, keeps every such read
+    as it came until RIS: VT52 or Tektronix mode, a row of double width or
+    height, 80 or 132 columns, a window resize, a status line, a character
+    set other than ASCII, a DCS string and a restore of saved modes among
+    them.
+  - A few controls on the list leave a state that keeps such reads as they
+    came until its exact reset, or RIS: a scroll region that is not the
+    whole screen, left and right margins, reverse wraparound (modes 45 and
+    1045), autowrap off, insert mode, and a soft reset (DECSTR), which can
+    leave autowrap off. A state counts as on after any form that may set
+    it. A scroll region set on the main screen counts until it is reset
+    there, for terminals that keep one region for each screen. A switch to
+    a decoding other than UTF-8 (`ESC % @`, or national character sets)
+    counts until its exact reverse, and RIS does not clear it.
 
-  PrismTTY reads the terminal's size just before it writes such a read. A
-  resize between the two is not seen. Any other read with a cursor move is
-  written unchanged, as before, and so is every such read when PrismTTY
-  cannot get the terminal's size. Piped and file output, `profiles test`
-  and the library's `Highlighter::highlight*` are unchanged.
+  PrismTTY reads the terminal's size before it processes such a read. A
+  resize between then and the terminal drawing the read is not seen. Any
+  other read with a cursor move is written as before: as it came, after
+  the end of a highlight that an earlier read left open. So is every such
+  read when PrismTTY cannot get the terminal's size. Piped and file output,
+  `profiles test` and the library's `Highlighter::highlight*` are
+  unchanged.
 
   Known limits:
   - If a later read moves the cursor back into one of those lines and
     rewrites only part of it without erasing, the text left untouched keeps
     its color.
-  - A reverse-wraparound, margin, scroll-region, autowrap, insert or
-    line-size state that the terminal was already in when PrismTTY started,
-    for example set by a program run before it or by an outer terminal
+  - A state that the terminal was already in when PrismTTY started, for
+    example set by a program run before it or by an outer terminal
     multiplexer, is not seen. Then the same read can move back over those
-    lines and leave color on part of them.
+    lines and leave color on part of them, or show the added colors as
+    text.
   - A terminal resized after PrismTTY read its size, and before it drew
     the read, can stop a move at another edge than PrismTTY expected and
     leave a prompt written over with those lines colored.
