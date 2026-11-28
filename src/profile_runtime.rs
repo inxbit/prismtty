@@ -8,11 +8,35 @@ const PROFILE_STACK_LIMIT: usize = 8;
 /// Lines typed after a remote command before its attempt expires: a user
 /// name, a password, a one-time code, and the Enter that redraws a prompt.
 const REMOTE_ATTEMPT_LINE_GRACE: u8 = 4;
+/// Bytes of visible output after a typed `exit` within which the parent's
+/// prompt must end, counted after the echo of the exit line, as the terminal
+/// receives them (escape sequences are not counted).
+const EXIT_CONFIRM_WINDOW: usize = 512;
+/// Room for the echo of the exit line itself before the window starts.
+const EXIT_ECHO_LIMIT: usize = 16;
+/// Time after a typed `exit` in which the connection's end must be shown. A
+/// device's own client prints its close line one round trip after the
+/// session ends; three seconds leaves room for a slow link.
+const EXIT_CONFIRM_TIME: std::time::Duration = std::time::Duration::from_secs(3);
+/// The longest line typed at a waiting parent prompt that is matched
+/// against its echo; a longer one keeps the child.
+const LINE_ECHO_LIMIT: usize = 512;
+/// Output allowed between telnet's command echo and its close line.
+const TELNET_EXCHANGE_WINDOW: usize = 256;
+/// Output allowed between the Ctrl-] and the end of telnet's command echo:
+/// device output already in flight when the escape was typed comes first.
+const TELNET_ESCAPE_ECHO_WINDOW: usize = 4096;
+/// The longest unterminated line kept to finish a telnet client's
+/// `Escape character is 'X'.` announcement in the next read.
+const TELNET_ANNOUNCEMENT_LIMIT: usize = 64;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ClosePolicy {
     SshLike,
     Telnet,
+    /// Telnet started with `-e`, `-E` or `-r`: Ctrl-] does not open its
+    /// command prompt.
+    TelnetOtherEscape,
     Screen,
     Serial,
     Generic,
@@ -25,16 +49,23 @@ enum CloseMarkerKind {
     Screen,
     Serial,
     Logout,
+    /// `[Connection to X closed by foreign host]` from a device's own client;
+    /// handled only through `confirm_exit_close`.
+    ForeignHostBracket,
 }
 
 impl ClosePolicy {
     fn accepts(self, marker: CloseMarkerKind) -> bool {
+        if marker == CloseMarkerKind::ForeignHostBracket {
+            return false;
+        }
         self == ClosePolicy::Generic
             || marker == CloseMarkerKind::Logout
             || matches!(
                 (self, marker),
                 (ClosePolicy::SshLike, CloseMarkerKind::SshLike)
                     | (ClosePolicy::Telnet, CloseMarkerKind::Telnet)
+                    | (ClosePolicy::TelnetOtherEscape, CloseMarkerKind::Telnet)
                     | (ClosePolicy::Screen, CloseMarkerKind::Screen)
                     | (ClosePolicy::Serial, CloseMarkerKind::Serial)
             )
@@ -88,6 +119,108 @@ struct ProfileFrame {
     /// A remote command was typed inside this connection, so a close message
     /// that names no known target may belong to that nested attempt.
     nested_attempt_seen: bool,
+    /// The prompt that waited where the command opening this connection was
+    /// typed: what the parent shows again once the connection has ended.
+    parent_prompt: Option<String>,
+    /// A default-escape telnet whose `telnet> !` subshell or `z` suspend
+    /// handed the keyboard to a local shell: Ctrl-] may not reach it now.
+    telnet_keyboard_lost: bool,
+    /// A prompt has waited while this connection was the innermost one.
+    prompt_seen: bool,
+    /// A line was typed into this connection before any prompt of it was
+    /// seen: what it typed into is unknown, so its exit is not trusted.
+    typed_before_prompt: bool,
+    /// The escape character the telnet client announced, for telnet frames.
+    telnet_escape: TelnetEscape,
+}
+
+/// What a telnet client said its escape character is.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum TelnetEscape {
+    /// No `Escape character is` line was seen.
+    #[default]
+    Unknown,
+    /// `Escape character is '^]'.`
+    Default,
+    /// Another character, or none, announced or set on the command line.
+    Other,
+}
+
+/// A reliably typed `exit`, `quit` or `logout` on a connection whose parent
+/// prompt is known, waiting for proof that the connection ended.
+#[derive(Clone, Debug)]
+struct ExitIntent {
+    /// Stack depth when the exit was typed: the connection it may end.
+    depth: usize,
+    /// When the exit was typed.
+    armed_at: std::time::Instant,
+    /// The typed word, lowercase: its echo is not counted. Empty for a
+    /// Ctrl-D.
+    word: String,
+    /// Armed by Ctrl-D on an empty line: the shell may show `exit` or
+    /// `logout` for it, and that line is not counted either.
+    ctrl_d: bool,
+    /// Visible output bytes since the Enter, at most one past the window
+    /// and the echo: enough to see whether a line ends within the window.
+    seen: Vec<u8>,
+    /// Where the window starts in `seen`: after the echo of the exit line,
+    /// once that line has ended. Typed slowly, the echo came before the
+    /// Enter; typed fast or pasted, it comes after.
+    origin: Option<usize>,
+    /// How much of `seen` has been read as complete lines, in output order.
+    scanned: usize,
+    /// The bracketed close naming this connection's target has been seen.
+    bracket_seen: bool,
+    /// The parent's prompt is the waiting line: the unterminated end of the
+    /// output, after the bracket.
+    parent_waiting: bool,
+    /// The line typed at the waiting parent prompt, matched against the
+    /// output that follows it.
+    line_echo: Option<LineEcho>,
+}
+
+/// The keys typed at a waiting parent prompt, from the first one to the
+/// Enter, and how much of them the output has echoed. Every visible byte
+/// after the first key must be the next one of them; the echo of the Enter
+/// confirms the prompt.
+#[derive(Clone, Debug, Default)]
+struct LineEcho {
+    /// Typed bytes in order, Enter kept as `\r`; nothing after the Enter.
+    typed: Vec<u8>,
+    /// How many of `typed` the output has echoed.
+    matched: usize,
+    /// The line opened a connection before the echo confirmed the return:
+    /// that attempt was made from the parent.
+    remote_armed: bool,
+}
+
+/// A typed byte whose echo is the byte itself: printable ASCII and the
+/// bytes of a UTF-8 character, and Enter (as `\r`). Backspace, Ctrl-U, Tab
+/// and other control keys are echoed or acted on in ways that cannot be
+/// matched exactly.
+fn line_echo_key(byte: u8) -> Option<u8> {
+    match byte {
+        b'\r' | b'\n' => Some(b'\r'),
+        0x20..=0x7e | 0x80..=0xff => Some(byte),
+        _ => None,
+    }
+}
+
+/// From a Ctrl-] that reaches a tracked default-escape telnet: the command
+/// typed at telnet's prompt and the output since that byte.
+#[derive(Clone, Debug)]
+struct TelnetExchange {
+    /// The command typed so far, at most 8 bytes.
+    command: String,
+    /// Set when Enter submitted `quit` or a prefix of it: the length of
+    /// `seen` then, since telnet's echo of the command ends after it.
+    enter_at: Option<usize>,
+    /// Visible output bytes since the Ctrl-], at most what the two windows
+    /// and a close line need.
+    seen: Vec<u8>,
+    /// The stack as it was at the Ctrl-]: any frame pushed or popped since
+    /// cancels the exchange.
+    stack_generation: u64,
 }
 
 /// How firmly output identified the active profile's device.
@@ -150,6 +283,25 @@ pub(crate) struct ProfileRuntime {
     pending_prompt_profiles: Option<Vec<String>>,
     pending_prompt_hits: usize,
     transition_rollback: Option<ProfileTransitionState>,
+    /// Visible output since the last line terminator (bounded).
+    last_output_line: String,
+    /// The prompt that waited where the pending attempt was typed.
+    pending_parent_prompt: Option<(RemoteAttempt, String)>,
+    /// The waiting prompt when the first key of the current input line
+    /// arrived (`None` until then): edits and history keys cannot hide it.
+    line_start_prompt: Option<Option<String>>,
+    exit_intent: Option<ExitIntent>,
+    telnet_exchange: Option<TelnetExchange>,
+    /// The unterminated last line of a read that may begin a telnet
+    /// client's escape announcement (bounded).
+    telnet_announcement_partial: String,
+    /// Counts every frame push and pop.
+    stack_generation: u64,
+    /// What the client of a pending telnet attempt announced.
+    pending_telnet_escape: Option<TelnetEscape>,
+    /// The time the exit rule reads; `None` is the system clock. Tests set
+    /// it so the 3 second bound is checked exactly.
+    clock: Option<std::time::Instant>,
 }
 
 impl ProfileRuntime {
@@ -174,7 +326,25 @@ impl ProfileRuntime {
             pending_prompt_profiles: None,
             pending_prompt_hits: 0,
             transition_rollback: None,
+            last_output_line: String::new(),
+            pending_parent_prompt: None,
+            line_start_prompt: None,
+            exit_intent: None,
+            telnet_exchange: None,
+            telnet_announcement_partial: String::new(),
+            stack_generation: 0,
+            pending_telnet_escape: None,
+            clock: None,
         }
+    }
+
+    fn now(&self) -> std::time::Instant {
+        self.clock.unwrap_or_else(std::time::Instant::now)
+    }
+
+    #[cfg(test)]
+    fn set_clock(&mut self, now: std::time::Instant) {
+        self.clock = Some(now);
     }
 
     #[cfg(test)]
@@ -189,6 +359,19 @@ impl ProfileRuntime {
 
     pub(crate) fn observe_input(&mut self, input: &[u8]) {
         for byte in input {
+            // Leaving a connection needs work per key only while one is open
+            // or being opened: one check otherwise.
+            if self.leaving_watched() {
+                // A key, not part of an escape sequence such as a paste
+                // marker or a focus report.
+                if self.exit_intent.is_some()
+                    && self.input_escape_state == InputEscapeState::None
+                    && *byte != 0x1b
+                {
+                    self.exit_key_typed(*byte);
+                }
+                self.observe_telnet_command_byte(*byte);
+            }
             match self.input_escape_state {
                 InputEscapeState::Esc => {
                     self.input_escape_state = match *byte {
@@ -233,6 +416,26 @@ impl ProfileRuntime {
                 InputEscapeState::None => {}
             }
 
+            // The ESC of an input sequence (an arrow, a focus report, a paste
+            // marker) is not a key: the line starts at the first key.
+            if self.line_start_prompt.is_none() && !matches!(byte, b'\r' | b'\n' | 0x1b) {
+                let prompt = self.waiting_prompt_now();
+                // A connection waiting at its parent's exact prompt text cannot
+                // be told apart from that parent, so C-2b stops trusting it;
+                // unless that prompt is the parent's own, after the bracket.
+                let confirming = self
+                    .exit_intent
+                    .as_ref()
+                    .is_some_and(|intent| intent.line_echo.is_some());
+                if let (Some(prompt), Some(frame), false) =
+                    (prompt.as_ref(), self.stack.last_mut(), confirming)
+                {
+                    if frame.parent_prompt.as_ref() == Some(prompt) {
+                        frame.parent_prompt = None;
+                    }
+                }
+                self.line_start_prompt = Some(prompt);
+            }
             match byte {
                 0x1b => self.input_escape_state = InputEscapeState::Esc,
                 0x03 => {
@@ -240,6 +443,8 @@ impl ProfileRuntime {
                     self.input_line_reliable = true;
                     self.unreliable_remote_attempt = None;
                     self.pending_remote = None;
+                    self.exit_intent = None;
+                    self.line_start_prompt = None;
                 }
                 0x15 => {
                     self.input_line.clear();
@@ -247,14 +452,23 @@ impl ProfileRuntime {
                     self.unreliable_remote_attempt = None;
                 }
                 0x17 => self.invalidate_input_line(),
+                // Ctrl-D on an empty line ends most shells and devices like
+                // `exit`. It ends the line too: the next key starts a new one.
+                0x04 if self.input_line_reliable && self.input_line.is_empty() => {
+                    self.arm_exit_intent(String::new(), true);
+                    self.line_start_prompt = None;
+                }
                 b'\r' | b'\n' => {
                     if self.input_line_reliable {
                         self.submit_input_line();
                     } else if let Some(attempt) = self.unreliable_remote_attempt.take() {
-                        self.arm_remote_attempt(attempt);
+                        let parent_prompt = self.line_start_prompt.clone().flatten();
+                        self.arm_remote_attempt(attempt.clone());
+                        self.pending_parent_prompt = parent_prompt.map(|prompt| (attempt, prompt));
                     } else {
                         self.age_pending_remote();
                     }
+                    self.line_start_prompt = None;
                     self.input_line.clear();
                     self.input_line_reliable = true;
                     self.unreliable_remote_attempt = None;
@@ -278,6 +492,194 @@ impl ProfileRuntime {
                 _ => self.invalidate_input_line(),
             }
         }
+    }
+
+    /// A connection is open or being opened, or a leave exchange is armed:
+    /// everything `exit_key_typed` and `observe_telnet_command_byte` read.
+    fn leaving_watched(&self) -> bool {
+        !self.stack.is_empty()
+            || self.pending_remote.is_some()
+            || self.exit_intent.is_some()
+            || self.telnet_exchange.is_some()
+    }
+
+    /// Follows telnet's command mode: Ctrl-] then one command line.
+    fn observe_telnet_command_byte(&mut self, byte: u8) {
+        if byte == 0x1d {
+            let stack_generation = self.stack_generation;
+            self.telnet_exchange = self
+                .default_escape_telnet_reachable()
+                .then(|| TelnetExchange {
+                    command: String::new(),
+                    enter_at: None,
+                    seen: Vec::new(),
+                    stack_generation,
+                });
+            return;
+        }
+        let Some(exchange) = self.telnet_exchange.as_mut() else {
+            return;
+        };
+        if exchange.enter_at.is_some() {
+            // The command was submitted; a later Enter ends the exchange.
+            if matches!(byte, b'\r' | b'\n') {
+                self.telnet_exchange = None;
+            }
+            return;
+        }
+        match byte {
+            b'\r' | b'\n' => {
+                let command = exchange.command.trim().to_ascii_lowercase();
+                if command.starts_with('!') || command == "z" {
+                    // A local shell owns the keyboard now (`!` subshell, `z`
+                    // suspend); this rule cannot tell when telnet has it again.
+                    if let Some(outermost) = self.outermost_default_escape_telnet() {
+                        self.stack[outermost].telnet_keyboard_lost = true;
+                    }
+                    self.telnet_exchange = None;
+                } else if !command.is_empty() && "quit".starts_with(&command) {
+                    // Not `close`: it leaves telnet's own `telnet>` prompt
+                    // waiting, so the keyboard does not return to the parent.
+                    exchange.command = command;
+                    exchange.enter_at = Some(exchange.seen.len());
+                } else {
+                    self.telnet_exchange = None;
+                }
+            }
+            0x08 | 0x7f => {
+                exchange.command.pop();
+            }
+            byte if (byte.is_ascii_graphic() || byte == b' ') && exchange.command.len() < 8 => {
+                exchange.command.push(byte as char);
+            }
+            _ => self.telnet_exchange = None,
+        }
+    }
+
+    fn outermost_default_escape_telnet(&self) -> Option<usize> {
+        self.stack.iter().position(|frame| {
+            frame.close_policy == ClosePolicy::Telnet
+                && frame.telnet_escape == TelnetEscape::Default
+        })
+    }
+
+    /// Ctrl-] is known to open a tracked telnet's command prompt: every
+    /// telnet in the stack said which escape it uses, one of them uses
+    /// Ctrl-], and no local shell took the keyboard from it.
+    fn default_escape_telnet_reachable(&self) -> bool {
+        let telnets = || {
+            self.stack.iter().filter(|frame| {
+                matches!(
+                    frame.close_policy,
+                    ClosePolicy::Telnet | ClosePolicy::TelnetOtherEscape
+                )
+            })
+        };
+        if telnets()
+            .any(|frame| frame.telnet_keyboard_lost || frame.telnet_escape == TelnetEscape::Unknown)
+        {
+            return false;
+        }
+        self.outermost_default_escape_telnet().is_some()
+            || (self
+                .pending_remote
+                .as_ref()
+                .is_some_and(|pending| pending.policy == ClosePolicy::Telnet)
+                && self.pending_telnet_escape == Some(TelnetEscape::Default))
+    }
+
+    /// Reads a telnet client's `Escape character is 'X'.` line into the
+    /// pending attempt or the innermost telnet frame that has none yet. The
+    /// line may arrive across reads: a bounded unterminated tail is kept.
+    fn note_telnet_escape(&mut self, text: &str) {
+        let pending_telnet = self
+            .pending_remote
+            .as_ref()
+            .is_some_and(|pending| pending.policy == ClosePolicy::Telnet);
+        let unknown_frame = self.stack.last().is_some_and(|frame| {
+            frame.close_policy == ClosePolicy::Telnet
+                && frame.telnet_escape == TelnetEscape::Unknown
+        });
+        if !pending_telnet && !unknown_frame {
+            self.telnet_announcement_partial.clear();
+            return;
+        }
+        let mut combined = std::mem::take(&mut self.telnet_announcement_partial);
+        combined.push_str(text);
+        let complete_end = combined.rfind(is_line_terminator).map_or(0, |end| end + 1);
+        for line in combined[..complete_end].split(is_line_terminator) {
+            let line = line.trim().to_ascii_lowercase();
+            let Some(value) = line
+                .strip_prefix("escape character is '")
+                .and_then(|rest| rest.strip_suffix("'."))
+            else {
+                continue;
+            };
+            let escape = if value == "^]" {
+                TelnetEscape::Default
+            } else {
+                TelnetEscape::Other
+            };
+            if pending_telnet {
+                self.pending_telnet_escape = Some(escape);
+            } else if let Some(frame) = self.stack.last_mut().filter(|frame| {
+                frame.close_policy == ClosePolicy::Telnet
+                    && frame.telnet_escape == TelnetEscape::Unknown
+            }) {
+                frame.telnet_escape = escape;
+            }
+        }
+        let tail = &combined[complete_end..];
+        if tail.len() <= TELNET_ANNOUNCEMENT_LIMIT {
+            self.telnet_announcement_partial = tail.to_string();
+        }
+    }
+
+    /// A prompt waiting after this read, while a connection is the innermost
+    /// one, is that connection's. A child that shows its parent's exact
+    /// prompt cannot be told apart from it, so C-2b stops trusting it.
+    fn note_child_prompt(&mut self) {
+        if self
+            .exit_intent
+            .as_ref()
+            .is_some_and(|intent| intent.parent_waiting)
+        {
+            return;
+        }
+        let Some(prompt) = self.waiting_prompt_now() else {
+            return;
+        };
+        if let Some(frame) = self.stack.last_mut() {
+            frame.prompt_seen = true;
+            if frame.parent_prompt.as_ref() == Some(&prompt) {
+                frame.parent_prompt = None;
+            }
+        }
+    }
+
+    /// The last output line, when it is a waiting prompt.
+    fn waiting_prompt_now(&self) -> Option<String> {
+        let prompt = self.last_output_line.trim_end();
+        (!prompt.is_empty() && looks_like_prompt_detection_boundary(prompt)).then(|| {
+            prompt
+                .trim_start_matches(|ch: char| ch.is_ascii_control())
+                .to_string()
+        })
+    }
+
+    /// The prompt left on the line once the echo of `typed` is taken off it.
+    fn waiting_prompt_before(&self, typed: &str) -> Option<String> {
+        let line = self.last_output_line.as_str();
+        let echoed = (0..=typed.len())
+            .rev()
+            .find(|len| typed.is_char_boundary(*len) && line.ends_with(&typed[..*len]))
+            .unwrap_or(0);
+        let prompt = line[..line.len() - echoed].trim_end();
+        (!prompt.is_empty() && looks_like_prompt_detection_boundary(prompt)).then(|| {
+            prompt
+                .trim_start_matches(|ch: char| ch.is_ascii_control())
+                .to_string()
+        })
     }
 
     fn invalidate_input_line(&mut self) {
@@ -305,6 +707,7 @@ impl ProfileRuntime {
         self.transition_rollback = None;
         let rollback = self.transition_state();
         let transition = self.observe_output_inner(visible_output, store);
+        self.note_child_prompt();
         if transition.is_some() {
             self.transition_rollback = Some(rollback);
         }
@@ -318,6 +721,42 @@ impl ProfileRuntime {
     ) -> Option<Vec<String>> {
         let text = String::from_utf8_lossy(visible_output);
         if text.is_empty() {
+            return None;
+        }
+
+        match text.rfind(is_line_terminator) {
+            Some(end) => {
+                self.last_output_line.clear();
+                self.last_output_line.push_str(&text[end + 1..]);
+            }
+            None => self.last_output_line.push_str(&text),
+        }
+        trim_to_recent_chars(&mut self.last_output_line, 512);
+        self.note_telnet_escape(&text);
+        if let Some(transition) = self.confirm_exit_close(visible_output) {
+            self.output_window.push_str(&text);
+            self.output_window_lower
+                .push_str(&text.to_ascii_lowercase());
+            return transition;
+        }
+        if self.telnet_quit_confirmed(visible_output) {
+            self.clear_output_window();
+            self.clear_pending_prompt();
+            if let Some(outermost) = self.outermost_default_escape_telnet() {
+                self.pending_remote = None;
+                let before = self.active_profiles.clone();
+                while self.stack.len() > outermost {
+                    self.pop_profile();
+                }
+                return (self.active_profiles != before).then(|| self.active_profiles.clone());
+            }
+            if self
+                .pending_remote
+                .as_ref()
+                .is_some_and(|pending| pending.policy == ClosePolicy::Telnet)
+            {
+                self.pending_remote = None;
+            }
             return None;
         }
 
@@ -618,11 +1057,354 @@ impl ProfileRuntime {
     }
 
     fn submit_input_line(&mut self) {
-        match self.typed_remote_attempt(self.input_line.trim_start()) {
-            Some(attempt) => self.arm_remote_attempt(attempt),
+        let typed = std::mem::take(&mut self.input_line);
+        match self.typed_remote_attempt(typed.trim_start()) {
+            Some(attempt) => {
+                let parent_prompt = self
+                    .line_start_prompt
+                    .clone()
+                    .flatten()
+                    .or_else(|| self.waiting_prompt_before(&typed));
+                self.arm_remote_attempt(attempt.clone());
+                self.pending_parent_prompt = parent_prompt.map(|prompt| (attempt, prompt));
+            }
             None => self.age_pending_remote(),
         }
+        if let Some(frame) = self.stack.last_mut().filter(|frame| !frame.prompt_seen) {
+            frame.typed_before_prompt = true;
+        }
+        let word = typed.trim().to_ascii_lowercase();
+        if matches!(word.as_str(), "exit" | "quit" | "logout") {
+            self.arm_exit_intent(word, false);
+        }
+        self.input_line = typed;
         self.remember_local_client();
+    }
+
+    /// `exit`, `quit` or `logout` typed, or Ctrl-D on an empty line, in the
+    /// innermost connection: C-2b watches for the proof that it ended.
+    fn arm_exit_intent(&mut self, word: String, ctrl_d: bool) {
+        let confirming = self
+            .exit_intent
+            .as_ref()
+            .is_some_and(|intent| intent.line_echo.is_some());
+        if !confirming
+            && self.stack.last().is_some_and(|frame| {
+                frame.target.is_some()
+                    && frame.parent_prompt.is_some()
+                    && frame.prompt_seen
+                    && !frame.typed_before_prompt
+                    && matches!(
+                        frame.close_policy,
+                        ClosePolicy::SshLike | ClosePolicy::Telnet | ClosePolicy::TelnetOtherEscape
+                    )
+            })
+        {
+            self.exit_intent = Some(ExitIntent {
+                depth: self.stack.len(),
+                armed_at: self.now(),
+                word,
+                ctrl_d,
+                seen: Vec::new(),
+                origin: None,
+                scanned: 0,
+                bracket_seen: false,
+                parent_waiting: false,
+                line_echo: None,
+            });
+        }
+    }
+
+    /// The connection an exit intent may end: its target and the prompt its
+    /// parent showed, while it is still the top frame.
+    fn exit_intent_frame(&self) -> Option<(String, String)> {
+        let intent = self.exit_intent.as_ref()?;
+        let frame = self
+            .stack
+            .last()
+            .filter(|_| self.stack.len() == intent.depth)?;
+        Some((frame.target.clone()?, frame.parent_prompt.clone()?))
+    }
+
+    /// C-2b: after a typed exit, a `[Connection to X closed by foreign host]`
+    /// line naming the top connection ends it only when, reading the output
+    /// since the Enter line by line in the order it came, the first prompt
+    /// after that line is the one its parent showed when the connection was
+    /// opened, ending within the first `EXIT_CONFIRM_WINDOW` bytes after the
+    /// echo of the exit line and shown within `EXIT_CONFIRM_TIME`. The first
+    /// prompt decides either way. A complete line decides at once. The
+    /// unterminated last line is the waiting prompt only once the whole line
+    /// typed at it comes back as its echo, up to the line end of its Enter
+    /// (`exit_key_typed`, `match_line_echo`); a line that goes on is judged
+    /// when it ends. Bytes are counted as they arrive, so read grouping and
+    /// typing speed do not change the result.
+    fn confirm_exit_close(&mut self, visible: &[u8]) -> Option<Option<Vec<String>>> {
+        let Some((target, parent_prompt)) = self.exit_intent_frame() else {
+            self.exit_intent = None;
+            return None;
+        };
+        let now = self.now();
+        let intent = self.exit_intent.as_mut()?;
+        if intent.line_echo.is_some() {
+            return self.match_line_echo(visible);
+        }
+        if now.saturating_duration_since(intent.armed_at) > EXIT_CONFIRM_TIME {
+            self.exit_intent = None;
+            return None;
+        }
+        intent.parent_waiting = false;
+        let room = (EXIT_ECHO_LIMIT + EXIT_CONFIRM_WINDOW + 1).saturating_sub(intent.seen.len());
+        intent
+            .seen
+            .extend_from_slice(&visible[..visible.len().min(room)]);
+        if intent.origin.is_none() {
+            let Some(end) = intent
+                .seen
+                .iter()
+                .position(|byte| matches!(byte, b'\r' | b'\n'))
+            else {
+                if intent.seen.len() > EXIT_ECHO_LIMIT {
+                    intent.origin = Some(0);
+                }
+                return None;
+            };
+            let first = String::from_utf8_lossy(&intent.seen[..end]);
+            let first = first.trim();
+            let echo = first.is_empty()
+                || first.eq_ignore_ascii_case(&intent.word)
+                || (intent.ctrl_d
+                    && ["exit", "logout", "^d"]
+                        .iter()
+                        .any(|shown| first.eq_ignore_ascii_case(shown)));
+            let origin = if echo {
+                let crlf = intent.seen[end] == b'\r' && intent.seen.get(end + 1) == Some(&b'\n');
+                if intent.seen[end] == b'\r' && end + 1 == intent.seen.len() {
+                    // The `\n` of the echo's line end may follow.
+                    return None;
+                }
+                end + 1 + usize::from(crlf)
+            } else {
+                0
+            };
+            intent.origin = Some(origin);
+            intent.scanned = origin;
+        }
+        let origin = intent.origin.unwrap_or(0);
+        let mut decision = None;
+        while let Some(length) = intent.seen[intent.scanned..]
+            .iter()
+            .position(|byte| matches!(byte, b'\r' | b'\n'))
+        {
+            let start = intent.scanned;
+            let end = start + length;
+            intent.scanned = end + 1;
+            let line = String::from_utf8_lossy(&intent.seen[start..end]);
+            if is_foreign_host_bracket(&line, &target) {
+                intent.bracket_seen = true;
+            } else if !line.trim().is_empty() && looks_like_prompt_detection_boundary(&line) {
+                decision = Some(
+                    intent.bracket_seen
+                        && end - origin <= EXIT_CONFIRM_WINDOW
+                        && waiting_prompt_text(&line) == parent_prompt,
+                );
+                break;
+            }
+        }
+        match decision {
+            Some(true) => {
+                self.exit_intent = None;
+                Some(self.pop_exited_connection())
+            }
+            Some(false) => {
+                self.exit_intent = None;
+                None
+            }
+            None if intent.seen.len() - origin > EXIT_CONFIRM_WINDOW => {
+                // Nothing that ends past the window can confirm.
+                self.exit_intent = None;
+                None
+            }
+            None => {
+                let rest = String::from_utf8_lossy(&intent.seen[intent.scanned..]);
+                intent.parent_waiting =
+                    intent.bracket_seen && waiting_prompt_text(&rest) == parent_prompt;
+                None
+            }
+        }
+    }
+
+    /// The output after the first key typed at the waiting parent prompt:
+    /// each visible byte must be the next typed byte not yet echoed. The
+    /// echo of the Enter (a line end) proves the prompt was waiting, so the
+    /// connection ends there; anything else, or output with nothing typed
+    /// left to echo, keeps the child.
+    fn match_line_echo(&mut self, visible: &[u8]) -> Option<Option<Vec<String>>> {
+        let line = self.exit_intent.as_mut()?.line_echo.as_mut()?;
+        for byte in visible {
+            let Some(&expected) = line.typed.get(line.matched) else {
+                self.exit_intent = None;
+                return None;
+            };
+            let echoed = match expected {
+                b'\r' => matches!(byte, b'\r' | b'\n'),
+                expected => *byte == expected,
+            };
+            if !echoed {
+                self.exit_intent = None;
+                return None;
+            }
+            if expected == b'\r' {
+                let remote_armed = line.remote_armed;
+                self.exit_intent = None;
+                return Some(self.pop_confirmed_exit(remote_armed));
+            }
+            line.matched += 1;
+        }
+        None
+    }
+
+    /// A key typed while an exit intent is set. At the parent's waiting
+    /// prompt it starts the line whose echo confirms the prompt; after that,
+    /// each key up to the Enter joins the line. A key whose echo cannot be
+    /// matched, a line too long, or a key typed at the child's prompt or
+    /// ahead of the output ends the intent. Keys after the Enter belong to
+    /// the next command.
+    fn exit_key_typed(&mut self, byte: u8) {
+        let Some(intent) = self.exit_intent.as_mut() else {
+            return;
+        };
+        let key = line_echo_key(byte);
+        match intent.line_echo.as_mut() {
+            Some(line) if line.typed.last() == Some(&b'\r') => {}
+            Some(line) => match key {
+                Some(key) if line.typed.len() < LINE_ECHO_LIMIT => line.typed.push(key),
+                _ => self.exit_intent = None,
+            },
+            None => match key.filter(|_| intent.parent_waiting) {
+                Some(key) => {
+                    intent.line_echo = Some(LineEcho {
+                        typed: vec![key],
+                        ..LineEcho::default()
+                    });
+                }
+                None => self.exit_intent = None,
+            },
+        }
+    }
+
+    /// The return proven by the echo of a line typed at the parent prompt.
+    /// A connection that line started was opened from the parent, so it
+    /// stays pending through the pop.
+    fn pop_confirmed_exit(&mut self, remote_armed: bool) -> Option<Vec<String>> {
+        let pending = remote_armed.then(|| {
+            (
+                self.pending_remote.clone(),
+                self.pending_remote_lines,
+                self.pending_parent_prompt.clone(),
+            )
+        });
+        let transition = self.pop_exited_connection();
+        if let Some((remote, lines, parent_prompt)) = pending {
+            self.pending_remote = remote;
+            self.pending_remote_lines = lines;
+            self.pending_parent_prompt = parent_prompt;
+        }
+        transition
+    }
+
+    fn pop_exited_connection(&mut self) -> Option<Vec<String>> {
+        self.pending_remote = None;
+        self.clear_output_window();
+        self.clear_pending_prompt();
+        let before = self.active_profiles.clone();
+        self.pop_profile();
+        (self.active_profiles != before).then(|| self.active_profiles.clone())
+    }
+
+    /// C-2c: after the Ctrl-], telnet's own `telnet> COMMAND` line must end
+    /// within `TELNET_ESCAPE_ECHO_WINDOW` bytes, after the Enter that
+    /// submitted the command, and the first non-blank line after it must be
+    /// a bare `Connection closed.` that starts within another
+    /// `TELNET_EXCHANGE_WINDOW` bytes. Lines are read in the order they came:
+    /// a close message before the echo changes the stack first (the
+    /// close-marker path), which cancels the exchange. Returns whether the
+    /// exchange completed.
+    fn telnet_quit_confirmed(&mut self, visible: &[u8]) -> bool {
+        let Some(exchange) = self.telnet_exchange.as_mut() else {
+            return false;
+        };
+        if exchange.stack_generation != self.stack_generation {
+            self.telnet_exchange = None;
+            return false;
+        }
+        let limit = TELNET_ESCAPE_ECHO_WINDOW + TELNET_EXCHANGE_WINDOW + 64;
+        let room = limit.saturating_sub(exchange.seen.len());
+        exchange
+            .seen
+            .extend_from_slice(&visible[..visible.len().min(room)]);
+        let enter_at = exchange.enter_at;
+        let echo = format!("telnet> {}", exchange.command);
+        let mut offset = 0usize;
+        let mut echo_end = None;
+        let mut decided = None;
+        for piece in exchange
+            .seen
+            .split_inclusive(|byte| matches!(byte, b'\r' | b'\n'))
+        {
+            let start = offset;
+            offset += piece.len();
+            if !matches!(piece.last(), Some(b'\r' | b'\n')) {
+                break;
+            }
+            let line = String::from_utf8_lossy(piece).trim().to_ascii_lowercase();
+            match echo_end {
+                None => {
+                    if !observed_close_markers(&line).is_empty() {
+                        // A close message before telnet's echo: the stack
+                        // changes first, and the exchange with it.
+                        decided = Some(false);
+                        break;
+                    }
+                    // The echo ends with the line end that follows the
+                    // user's Enter; a `telnet> q` line already complete
+                    // before it is not this command's echo.
+                    if line == echo && enter_at.is_some_and(|enter_at| offset > enter_at) {
+                        if offset > TELNET_ESCAPE_ECHO_WINDOW {
+                            decided = Some(false);
+                            break;
+                        }
+                        echo_end = Some(offset);
+                    }
+                }
+                Some(end) => {
+                    if line.is_empty() {
+                        continue;
+                    }
+                    decided = Some(
+                        matches!(line.as_str(), "connection closed" | "connection closed.")
+                            && start - end <= TELNET_EXCHANGE_WINDOW,
+                    );
+                    break;
+                }
+            }
+        }
+        match decided {
+            Some(confirmed) => {
+                self.telnet_exchange = None;
+                confirmed
+            }
+            None => {
+                // The echo line must end within the first window; the close
+                // line must start within one more window after it.
+                let bound = echo_end.map_or(TELNET_ESCAPE_ECHO_WINDOW, |end| {
+                    end + TELNET_EXCHANGE_WINDOW
+                });
+                if offset > bound || exchange.seen.len() >= limit {
+                    self.telnet_exchange = None;
+                }
+                false
+            }
+        }
     }
 
     /// `sftp` or `mysql` started by name where the local baseline's profiles
@@ -663,6 +1445,15 @@ impl ProfileRuntime {
     }
 
     fn arm_remote_attempt(&mut self, attempt: RemoteAttempt) {
+        if let Some(line) = self
+            .exit_intent
+            .as_mut()
+            .and_then(|intent| intent.line_echo.as_mut())
+        {
+            line.remote_armed = true;
+        }
+        self.pending_parent_prompt = None;
+        self.pending_telnet_escape = None;
         self.pending_remote = Some(attempt);
         self.pending_remote_lines = 0;
         if let Some(frame) = self.stack.last_mut() {
@@ -761,11 +1552,17 @@ impl ProfileRuntime {
             .position(|frame| frame.profiles == profiles)
         {
             self.stack.truncate(stack_index);
+            self.stack_generation += 1;
+            self.telnet_exchange = None;
+            self.exit_intent = None;
             self.active_profiles = profiles;
             return Some(self.active_profiles.clone());
         }
         if profiles == self.baseline_profiles {
             self.stack.clear();
+            self.stack_generation += 1;
+            self.telnet_exchange = None;
+            self.exit_intent = None;
             self.active_profiles = self.baseline_profiles.clone();
             return Some(self.active_profiles.clone());
         }
@@ -785,6 +1582,8 @@ impl ProfileRuntime {
 
     fn pop_profile(&mut self) -> Option<Vec<String>> {
         self.active_evidence = ActiveEvidence::Weak;
+        self.exit_intent = None;
+        self.stack_generation += 1;
         let next = self
             .stack
             .pop()
@@ -845,13 +1644,30 @@ impl ProfileRuntime {
             // it and collapse the oldest interior nesting level instead.
             self.stack.remove(1);
         }
+        let parent_prompt = self
+            .pending_parent_prompt
+            .as_ref()
+            .filter(|(attempt, _)| *attempt == remote_attempt)
+            .map(|(_, prompt)| prompt.clone());
+        self.exit_intent = None;
         self.stack.push(ProfileFrame {
             profiles: self.active_profiles.clone(),
             close_policy: remote_attempt.policy,
             target: remote_attempt.target,
             unresolved_detection,
             nested_attempt_seen: false,
+            parent_prompt,
+            telnet_keyboard_lost: false,
+            prompt_seen: false,
+            typed_before_prompt: false,
+            telnet_escape: match remote_attempt.policy {
+                ClosePolicy::TelnetOtherEscape => TelnetEscape::Other,
+                ClosePolicy::Telnet => self.pending_telnet_escape.take().unwrap_or_default(),
+                _ => TelnetEscape::Unknown,
+            },
         });
+        self.stack_generation += 1;
+        self.telnet_exchange = None;
     }
 
     fn clear_pending_prompt(&mut self) {
@@ -894,7 +1710,7 @@ fn remote_attempt(line: &str, openssh_client: bool) -> Option<RemoteAttempt> {
         .map(|word| word.as_str())
         .or_else(|| line.split_whitespace().next())?
         .to_ascii_lowercase();
-    let policy = match command.as_str() {
+    let mut policy = match command.as_str() {
         "ssh" | "mosh" => ClosePolicy::SshLike,
         "telnet" => ClosePolicy::Telnet,
         "screen" => ClosePolicy::Screen,
@@ -924,6 +1740,9 @@ fn remote_attempt(line: &str, openssh_client: bool) -> Option<RemoteAttempt> {
             continue;
         }
         if !options_ended && word.starts_with('-') {
+            if command == "telnet" && telnet_option_changes_escape(word) {
+                policy = ClosePolicy::TelnetOtherEscape;
+            }
             skip_option_value = remote_option_takes_value(&command, word);
             no_session |= remote_option_opens_no_session(&command, word);
             force_tty |= command == "ssh" && ssh_option_flags(word).contains(&'t');
@@ -950,6 +1769,41 @@ fn remote_attempt(line: &str, openssh_client: bool) -> Option<RemoteAttempt> {
         return None;
     }
     Some(RemoteAttempt { policy, target })
+}
+
+/// `[Connection to X closed by foreign host]` naming `target`.
+fn is_foreign_host_bracket(line: &str, target: &str) -> bool {
+    observed_close_markers(&line.to_ascii_lowercase())
+        .iter()
+        .any(|marker| {
+            marker.kind == CloseMarkerKind::ForeignHostBracket
+                && marker.target.as_deref() == Some(target)
+        })
+}
+
+/// A prompt line as it is compared: trailing blanks and leading control
+/// characters dropped.
+fn waiting_prompt_text(line: &str) -> &str {
+    line.trim_end()
+        .trim_start_matches(|ch: char| ch.is_ascii_control())
+}
+
+/// `-e` (another escape character), `-E` (none) and `-r` (rlogin-style `~`)
+/// among a telnet option word's flags, up to the first flag that takes a
+/// value.
+fn telnet_option_changes_escape(option: &str) -> bool {
+    let Some(flags) = option.strip_prefix('-') else {
+        return false;
+    };
+    for flag in flags.chars() {
+        if matches!(flag, 'e' | 'E' | 'r') {
+            return true;
+        }
+        if remote_option_word_takes_value("telnet", &format!("-{flag}")) {
+            return false;
+        }
+    }
+    false
 }
 
 fn remote_option_opens_no_session(command: &str, option: &str) -> bool {
@@ -1095,7 +1949,7 @@ fn remote_option_word_takes_value(command: &str, option: &str) -> bool {
                 | "-w"
         ),
         "mosh" => matches!(option, "-p" | "--port" | "--ssh"),
-        "telnet" => matches!(option, "-l"),
+        "telnet" => matches!(option, "-e" | "-k" | "-l" | "-n" | "-S" | "-s" | "-X"),
         "screen" => matches!(option, "-c" | "-d" | "-m" | "-S" | "-T"),
         "cu" => matches!(option, "-l" | "-s"),
         "minicom" => matches!(option, "-D" | "-b" | "-c" | "-t"),
@@ -1147,6 +2001,15 @@ fn observed_close_markers(text: &str) -> Vec<ObservedCloseMarker> {
                 Some(ObservedCloseMarker {
                     kind: CloseMarkerKind::SshLike,
                     target: None,
+                })
+            } else if let Some(target) = line
+                .strip_prefix("[connection to ")
+                .and_then(|rest| rest.strip_suffix(" closed by foreign host]"))
+                .filter(|target| !target.is_empty() && !target.contains(char::is_whitespace))
+            {
+                Some(ObservedCloseMarker {
+                    kind: CloseMarkerKind::ForeignHostBracket,
+                    target: Some(normalize_remote_target(target)),
                 })
             } else if let Some(target) = ssh_close_target(line) {
                 Some(ObservedCloseMarker {
@@ -1261,7 +2124,7 @@ fn contains_remote_open_failure(text: &str, policy: ClosePolicy) -> bool {
                         .iter()
                         .any(|failure| line.ends_with(failure)))
             }
-            ClosePolicy::Telnet => {
+            ClosePolicy::Telnet | ClosePolicy::TelnetOtherEscape => {
                 line.starts_with("telnet: unable to connect to remote host:")
                     || line.starts_with("telnet: could not resolve ")
             }
@@ -3283,5 +4146,1593 @@ mod tests {
             Some("router-b")
         );
         assert!(runtime.baseline_locked);
+    }
+}
+
+/// Leaving a nested device: C-2b (`exit`, a device's own bracketed close and
+/// the parent's waiting prompt) and C-2c (Ctrl-], `quit`, telnet's own echo
+/// and close line). Witnesses from design reviews 44, 54 and 68, replayed at
+/// the runtime's seam the way a PTY delivers them.
+#[cfg(test)]
+mod leave_tests {
+    use super::ProfileRuntime;
+    use crate::profiles::ProfileStore;
+
+    const LOCAL: &[&str] = &["generic", "linux-unix"];
+    const CISCO: &[&str] = &["generic", "cisco"];
+    const JUNIPER: &[&str] = &["generic", "juniper"];
+    const ARISTA: &[&str] = &["generic", "arista"];
+    const BRACKET: &str = "[Connection to sw2 closed by foreign host]";
+
+    fn names(names: &[&str]) -> Vec<String> {
+        names.iter().map(|name| (*name).to_string()).collect()
+    }
+
+    /// Output as a PTY passes it on: `\n` becomes `\r\n`.
+    fn crlf(text: &str) -> String {
+        text.replace("\r\n", "\n").replace('\n', "\r\n")
+    }
+
+    /// How a terminal in canonical mode echoes typed bytes: control bytes as
+    /// `^X`.
+    fn echo(typed: &str) -> String {
+        typed
+            .chars()
+            .map(|ch| match ch {
+                ch if (ch as u32) < 0x20 => format!("^{}", ((ch as u8) + 0x40) as char),
+                ch => ch.to_string(),
+            })
+            .collect()
+    }
+
+    /// A local shell waiting at `user@laptop:~$ `.
+    fn local(store: &ProfileStore) -> ProfileRuntime {
+        let mut runtime = ProfileRuntime::new(names(LOCAL));
+        runtime.observe_output(b"user@laptop:~$ ", store);
+        runtime
+    }
+
+    /// Types `typed` and Enter, the way a person does: the keys are read
+    /// with their echo, Enter with its line end. Then each chunk of the reply
+    /// arrives in its own read. Returns the last profile change.
+    fn step(
+        runtime: &mut ProfileRuntime,
+        store: &ProfileStore,
+        typed: &str,
+        reply: &[&str],
+    ) -> Option<Vec<String>> {
+        let mut last = None;
+        runtime.observe_input(typed.as_bytes());
+        last = runtime
+            .observe_output(echo(typed).as_bytes(), store)
+            .or(last);
+        runtime.observe_input(b"\r");
+        last = runtime.observe_output(b"\r\n", store).or(last);
+        for chunk in reply {
+            last = runtime
+                .observe_output(crlf(chunk).as_bytes(), store)
+                .or(last);
+        }
+        last
+    }
+
+    /// A raw-mode program: it echoes nothing itself.
+    fn step_raw(
+        runtime: &mut ProfileRuntime,
+        store: &ProfileStore,
+        keys: &[u8],
+        reply: &[&str],
+    ) -> Option<Vec<String>> {
+        let mut last = None;
+        runtime.observe_input(keys);
+        for chunk in reply {
+            last = runtime.observe_output(chunk.as_bytes(), store).or(last);
+        }
+        last
+    }
+
+    /// `ssh sw1` (Cisco, `sw1#`), then `ssh -l admin sw2` (Junos).
+    fn cisco_then_juniper(store: &ProfileStore) -> ProfileRuntime {
+        let mut runtime = local(store);
+        assert_eq!(
+            step(
+                &mut runtime,
+                store,
+                "ssh sw1",
+                &["Cisco IOS Software\nsw1#"]
+            ),
+            Some(names(CISCO))
+        );
+        assert_eq!(
+            step(
+                &mut runtime,
+                store,
+                "ssh -l admin sw2",
+                &["--- JUNOS 22.4R3 Kernel 64-bit\nlab@sw2> "]
+            ),
+            Some(names(JUNIPER))
+        );
+        runtime
+    }
+
+    /// The same, with a nested shell entered on sw2 first.
+    fn cisco_then_juniper_shell(store: &ProfileStore) -> ProfileRuntime {
+        let mut runtime = cisco_then_juniper(store);
+        step(&mut runtime, store, "start shell", &["[admin@sw2 ~]$ "]);
+        runtime
+    }
+
+    /// Types `exit` and feeds `reply` (already in PTY form) split into reads
+    /// at `splits`.
+    fn exit_with(
+        runtime: &mut ProfileRuntime,
+        store: &ProfileStore,
+        reply: &str,
+        splits: &[usize],
+    ) -> Option<Vec<String>> {
+        let mut last = None;
+        runtime.observe_input(b"exit");
+        runtime.observe_output(b"exit", store);
+        runtime.observe_input(b"\r");
+        let bytes = reply.as_bytes();
+        let mut start = 0;
+        for &end in splits.iter().chain(std::iter::once(&bytes.len())) {
+            last = runtime.observe_output(&bytes[start..end], store).or(last);
+            start = end;
+        }
+        last
+    }
+
+    /// The first command typed at the waiting prompt: `s` read with its
+    /// echo, then Enter with its line end. The colors may change only at the
+    /// echo of the Enter (review 81).
+    fn key(runtime: &mut ProfileRuntime, store: &ProfileStore) -> Option<Vec<String>> {
+        runtime.observe_input(b"s");
+        assert_eq!(
+            runtime.observe_output(b"s", store),
+            None,
+            "the echo of a key alone does not confirm"
+        );
+        runtime.observe_input(b"\r");
+        runtime.observe_output(b"\r\n", store)
+    }
+
+    /// Asserts the child is still the active connection and answers a
+    /// command in its own colors.
+    fn assert_child_kept(runtime: &mut ProfileRuntime, store: &ProfileStore, child: &[&str]) {
+        step(
+            runtime,
+            store,
+            "show version",
+            &["Hostname: sw2\nlab@sw2> "],
+        );
+        assert_eq!(runtime.active_profiles(), names(child));
+    }
+
+    fn genuine_reply() -> String {
+        format!("\r\n{BRACKET}\r\nsw1#")
+    }
+
+    // C-2b, genuine closes.
+
+    #[test]
+    fn c2b_parent_prompt_waiting_after_the_bracket_returns_at_the_first_command_s_enter() {
+        let store = ProfileStore::builtin();
+        let mut runtime = cisco_then_juniper(&store);
+        assert_eq!(exit_with(&mut runtime, &store, &genuine_reply(), &[]), None);
+        // The parent prompt waits; the echo of the whole line typed at it,
+        // up to its Enter, proves it.
+        assert_eq!(key(&mut runtime, &store), Some(names(CISCO)));
+        assert_eq!(runtime.stack_len(), 1);
+        step(
+            &mut runtime,
+            &store,
+            "show version",
+            &["Hostname: sw1\nsw1#"],
+        );
+        assert_eq!(runtime.active_profiles(), names(CISCO));
+    }
+
+    #[test]
+    fn c2b_genuine_close_bytes_split_at_every_position_return_alike() {
+        let store = ProfileStore::builtin();
+        let reply = genuine_reply();
+        for split in 1..reply.len() {
+            let mut runtime = cisco_then_juniper(&store);
+            assert_eq!(
+                exit_with(&mut runtime, &store, &reply, &[split]),
+                None,
+                "split at {split}"
+            );
+            assert_eq!(
+                key(&mut runtime, &store),
+                Some(names(CISCO)),
+                "split at {split}"
+            );
+            assert_eq!(runtime.stack_len(), 1, "split at {split}");
+        }
+    }
+
+    #[test]
+    fn c2b_nested_exits_return_one_level_each() {
+        let store = ProfileStore::builtin();
+        let mut runtime = cisco_then_juniper(&store);
+        assert_eq!(
+            step(
+                &mut runtime,
+                &store,
+                "ssh leaf3",
+                &["Arista Networks EOS version 4.31\nleaf3#"]
+            ),
+            Some(names(ARISTA))
+        );
+        exit_with(
+            &mut runtime,
+            &store,
+            "\r\n[Connection to leaf3 closed by foreign host]\r\nlab@sw2> ",
+            &[],
+        );
+        assert_eq!(key(&mut runtime, &store), Some(names(JUNIPER)));
+        runtime.observe_input(b"\x7f");
+        runtime.observe_output(b"\x08 \x08", &store);
+        exit_with(&mut runtime, &store, &genuine_reply(), &[]);
+        assert_eq!(key(&mut runtime, &store), Some(names(CISCO)));
+        assert_eq!(runtime.stack_len(), 1);
+    }
+
+    #[test]
+    fn c2b_parent_prompt_split_across_reads_is_the_parent_prompt() {
+        // The read loop passes visible bytes, so a colored prompt arrives
+        // here as its text; the scenario runs cover the colors.
+        let store = ProfileStore::builtin();
+        // The prompt itself split across reads.
+        let mut runtime = cisco_then_juniper(&store);
+        exit_with(
+            &mut runtime,
+            &store,
+            &format!("\r\n{BRACKET}\r\nsw1#"),
+            &[47],
+        );
+        assert_eq!(key(&mut runtime, &store), Some(names(CISCO)));
+    }
+
+    #[test]
+    fn c2b_complete_parent_prompt_line_followed_by_output_returns_at_once() {
+        let store = ProfileStore::builtin();
+        let filler = format!("{}\r\n", "x".repeat(380));
+        for splits in [&[][..], &[50][..]] {
+            let mut runtime = cisco_then_juniper(&store);
+            assert_eq!(
+                exit_with(
+                    &mut runtime,
+                    &store,
+                    &format!("\r\n{BRACKET}\r\nsw1#\r\n{filler}"),
+                    splits
+                ),
+                Some(names(CISCO)),
+                "{splits:?}"
+            );
+        }
+    }
+
+    // C-2b, the unfinished line (review 68, must-change 1).
+
+    #[test]
+    fn c2b_unfinished_line_that_starts_like_the_parent_prompt_is_not_it() {
+        let store = ProfileStore::builtin();
+        let reply = format!("\r\n{BRACKET}\r\nsw1#backup\r\nlab@sw2> ");
+        let prefix_end = reply.find("backup").expect("prefix");
+        let mut splits: Vec<Vec<usize>> = vec![vec![], vec![prefix_end]];
+        splits.extend((1..reply.len()).map(|split| vec![split]));
+        for split in splits {
+            let mut runtime = cisco_then_juniper_shell(&store);
+            assert_eq!(
+                exit_with(&mut runtime, &store, &reply, &split),
+                None,
+                "split at {split:?}"
+            );
+            assert_child_kept(&mut runtime, &store, JUNIPER);
+            assert_eq!(runtime.stack_len(), 2, "split at {split:?}");
+        }
+    }
+
+    #[test]
+    fn c2b_key_typed_while_the_line_still_goes_on_is_not_a_waiting_prompt() {
+        let store = ProfileStore::builtin();
+        let mut runtime = cisco_then_juniper_shell(&store);
+        exit_with(&mut runtime, &store, &genuine_reply(), &[]);
+        // A key typed while `sw1#` is the last output, but the next output
+        // is the rest of a line still in flight, not the key's echo.
+        runtime.observe_input(b"s");
+        assert_eq!(
+            runtime.observe_output(b"backup\r\nlab@sw2> s", &store),
+            None
+        );
+        assert_child_kept(&mut runtime, &store, JUNIPER);
+        assert_eq!(runtime.stack_len(), 2);
+    }
+
+    #[test]
+    fn c2b_pasted_exit_returns_like_a_typed_one() {
+        // The paste-end marker comes after the Enter inside the paste; it is
+        // not a key typed ahead of the output.
+        let store = ProfileStore::builtin();
+        let mut runtime = cisco_then_juniper(&store);
+        runtime.observe_input(b"\x1b[200~exit\r\x1b[201~");
+        runtime.observe_output(format!("exit{}", genuine_reply()).as_bytes(), &store);
+        assert_eq!(key(&mut runtime, &store), Some(names(CISCO)));
+    }
+
+    // C-2b, the whole typed line (review 81, must-fix 1).
+
+    /// After the genuine reply: `input` and `output` chunks in the order
+    /// listed. Returns the last profile change, and the index of the chunk
+    /// that made it.
+    fn at_parent_prompt(
+        runtime: &mut ProfileRuntime,
+        store: &ProfileStore,
+        exchange: &[(&[u8], &[u8])],
+    ) -> Option<(usize, Vec<String>)> {
+        let mut last = None;
+        for (index, (input, output)) in exchange.iter().enumerate() {
+            runtime.observe_input(input);
+            if let Some(profiles) = runtime.observe_output(output, store) {
+                last = Some((index, profiles));
+            }
+        }
+        last
+    }
+
+    /// `bytes` split into reads at `split` (0: one read).
+    fn reads(bytes: &[u8], split: usize) -> Vec<&[u8]> {
+        if split == 0 || split >= bytes.len() {
+            vec![bytes]
+        } else {
+            vec![&bytes[..split], &bytes[split..]]
+        }
+    }
+
+    #[test]
+    fn c2b_the_whole_line_and_its_enter_confirm_in_any_read_grouping() {
+        let store = ProfileStore::builtin();
+        let typed = b"show version\r";
+        let echo = b"show version\r\nHostname: sw1\r\nsw1#";
+        let enter_echo = echo.iter().position(|byte| *byte == b'\r').expect("cr");
+        // Each key read with its echo.
+        let mut runtime = cisco_then_juniper(&store);
+        exit_with(&mut runtime, &store, &genuine_reply(), &[]);
+        let mut exchange: Vec<(&[u8], &[u8])> = (0..enter_echo)
+            .map(|at| (&typed[at..=at], &echo[at..=at]))
+            .collect();
+        exchange.push((&typed[enter_echo..], &echo[enter_echo..]));
+        assert_eq!(
+            at_parent_prompt(&mut runtime, &store, &exchange),
+            Some((enter_echo, names(CISCO))),
+            "the colors change at the Enter's echo, not before"
+        );
+        // Typed fast or pasted: every key and the Enter read before any
+        // echo, which then comes split at every position.
+        for split in 0..echo.len() {
+            let mut runtime = cisco_then_juniper(&store);
+            exit_with(&mut runtime, &store, &genuine_reply(), &[]);
+            let chunks = reads(echo, split);
+            let mut exchange: Vec<(&[u8], &[u8])> = vec![(typed, chunks[0])];
+            exchange.extend(chunks[1..].iter().map(|chunk| (&b""[..], *chunk)));
+            let expected_chunk = usize::from(split != 0 && split <= enter_echo);
+            assert_eq!(
+                at_parent_prompt(&mut runtime, &store, &exchange),
+                Some((expected_chunk, names(CISCO))),
+                "split at {split}"
+            );
+            assert_eq!(runtime.stack_len(), 1, "split at {split}");
+        }
+    }
+
+    #[test]
+    fn c2b_a_line_that_goes_on_with_the_typed_key_is_not_its_echo() {
+        // Review 81's witness: still connected, echo off. The key is `b`
+        // and the line goes on with `backup`, with or without the Enter read
+        // first, the continuation split at every position.
+        let store = ProfileStore::builtin();
+        let continuation = b"backup\r\nlab@sw2> ";
+        for typed in [&b"b"[..], b"b\r"] {
+            for split in 0..continuation.len() {
+                let mut runtime = cisco_then_juniper_shell(&store);
+                exit_with(&mut runtime, &store, &genuine_reply(), &[]);
+                let chunks = reads(continuation, split);
+                let mut exchange: Vec<(&[u8], &[u8])> = vec![(typed, chunks[0])];
+                exchange.extend(chunks[1..].iter().map(|chunk| (&b""[..], *chunk)));
+                assert_eq!(
+                    at_parent_prompt(&mut runtime, &store, &exchange),
+                    None,
+                    "typed {typed:?}, split at {split}"
+                );
+                assert_child_kept(&mut runtime, &store, JUNIPER);
+                assert_eq!(runtime.stack_len(), 2, "typed {typed:?}, split at {split}");
+            }
+        }
+    }
+
+    #[test]
+    fn c2b_a_line_that_goes_on_with_part_of_the_typed_line_is_not_its_echo() {
+        let store = ProfileStore::builtin();
+        for (name, typed, continuation) in [
+            (
+                "the first two bytes",
+                &b"ba\r"[..],
+                &b"backup\r\nlab@sw2> "[..],
+            ),
+            ("all bytes but the last", b"backup\r", b"backu\r\nlab@sw2> "),
+            (
+                "all bytes, then not the Enter",
+                b"backup\r",
+                b"backupx\r\nlab@sw2> ",
+            ),
+        ] {
+            for split in 0..continuation.len() {
+                let mut runtime = cisco_then_juniper_shell(&store);
+                exit_with(&mut runtime, &store, &genuine_reply(), &[]);
+                let chunks = reads(continuation, split);
+                let mut exchange: Vec<(&[u8], &[u8])> = vec![(typed, chunks[0])];
+                exchange.extend(chunks[1..].iter().map(|chunk| (&b""[..], *chunk)));
+                assert_eq!(
+                    at_parent_prompt(&mut runtime, &store, &exchange),
+                    None,
+                    "{name}, split at {split}"
+                );
+                assert_child_kept(&mut runtime, &store, JUNIPER);
+            }
+        }
+    }
+
+    #[test]
+    fn c2b_output_between_two_echoes_keeps_the_child() {
+        let store = ProfileStore::builtin();
+        for exchange in [
+            // A log line between the echo of `s` and the echo of `h`.
+            vec![
+                (&b"s"[..], &b"s"[..]),
+                (b"", b"\r\n%SYS-5-CONFIG_I: Configured\r\n"),
+                (b"h\r", b"h\r\n"),
+            ],
+            // Both keys read first; a byte that is neither echo in between.
+            vec![(&b"sh\r"[..], &b"s"[..]), (b"", b"x"), (b"", b"h\r\n")],
+            // More output than was typed, before the Enter.
+            vec![(&b"s"[..], &b"sh"[..]), (b"\r", b"\r\n")],
+        ] {
+            let mut runtime = cisco_then_juniper_shell(&store);
+            exit_with(&mut runtime, &store, &genuine_reply(), &[]);
+            assert_eq!(
+                at_parent_prompt(&mut runtime, &store, &exchange),
+                None,
+                "{exchange:?}"
+            );
+            assert_eq!(runtime.stack_len(), 2, "{exchange:?}");
+        }
+    }
+
+    #[test]
+    fn c2b_keys_whose_echo_cannot_be_matched_keep_the_child() {
+        // Backspace, Ctrl-U and Tab are echoed or completed in ways the
+        // rule does not try to model.
+        let store = ProfileStore::builtin();
+        for (typed, echo) in [
+            (&b"sx\x7fh\r"[..], &b"sx\x08 \x08h\r\n"[..]),
+            (b"x\x15sh\r", b"x\r\x1b[Ksh\r\n"),
+            (b"sh\t\r", b"show \r\n"),
+            // A control key the device shows nothing for still ends it.
+            (b"s\x01h\r", b"sh\r\n"),
+        ] {
+            let mut runtime = cisco_then_juniper_shell(&store);
+            exit_with(&mut runtime, &store, &genuine_reply(), &[]);
+            assert_eq!(
+                at_parent_prompt(&mut runtime, &store, &[(typed, echo)]),
+                None,
+                "{typed:?}"
+            );
+            assert_eq!(runtime.stack_len(), 2, "{typed:?}");
+        }
+    }
+
+    #[test]
+    fn c2b_a_pasted_command_at_the_parent_prompt_confirms() {
+        let store = ProfileStore::builtin();
+        let mut runtime = cisco_then_juniper(&store);
+        exit_with(&mut runtime, &store, &genuine_reply(), &[]);
+        assert_eq!(
+            at_parent_prompt(
+                &mut runtime,
+                &store,
+                &[(
+                    b"\x1b[200~show version\r\x1b[201~",
+                    b"show version\r\nHostname: sw1\r\nsw1#"
+                )]
+            ),
+            Some((0, names(CISCO)))
+        );
+    }
+
+    #[test]
+    fn c2b_keys_typed_before_the_parent_prompt_keep_the_child() {
+        // The next command typed ahead, before the close arrives.
+        let store = ProfileStore::builtin();
+        let mut runtime = cisco_then_juniper(&store);
+        runtime.observe_input(b"exit\r");
+        runtime.observe_input(b"show version\r");
+        assert_eq!(
+            runtime.observe_output(
+                format!(
+                    "exit{}show version\r\nHostname: sw1\r\nsw1#",
+                    genuine_reply()
+                )
+                .as_bytes(),
+                &store
+            ),
+            None
+        );
+        assert_eq!(runtime.stack_len(), 2);
+    }
+
+    #[test]
+    fn c2b_a_remote_command_typed_first_at_the_parent_prompt_opens_from_it() {
+        // The first command at the parent prompt is read before its echo
+        // confirms the return; it still opens a connection from the parent.
+        let store = ProfileStore::builtin();
+        let mut runtime = cisco_then_juniper(&store);
+        exit_with(&mut runtime, &store, &genuine_reply(), &[]);
+        assert_eq!(
+            step(
+                &mut runtime,
+                &store,
+                "ssh sw3",
+                &["Arista Networks EOS version 4.31\nleaf3#"]
+            ),
+            Some(names(ARISTA))
+        );
+        assert_eq!(runtime.stack_len(), 2);
+        exit_with(
+            &mut runtime,
+            &store,
+            "\r\n[Connection to sw3 closed by foreign host]\r\nsw1#",
+            &[],
+        );
+        assert_eq!(key(&mut runtime, &store), Some(names(CISCO)));
+        assert_eq!(runtime.stack_len(), 1);
+    }
+
+    // C-2b, input sequences that are not keys (review 81, must-fix 2).
+
+    #[test]
+    fn c2b_input_sequences_that_are_not_keys_keep_the_waiting_parent_prompt() {
+        let store = ProfileStore::builtin();
+        for (name, sequence) in [
+            ("arrow", &b"\x1b[A"[..]),
+            ("application arrow", b"\x1bOA"),
+            ("focus report", b"\x1b[I"),
+            ("paste begin", b"\x1b[200~"),
+            ("paste end", b"\x1b[201~"),
+        ] {
+            let mut runtime = cisco_then_juniper(&store);
+            exit_with(&mut runtime, &store, &genuine_reply(), &[]);
+            runtime.observe_input(sequence);
+            assert_eq!(key(&mut runtime, &store), Some(names(CISCO)), "{name}");
+            assert_eq!(runtime.stack_len(), 1, "{name}");
+        }
+        // A history recall redraws the line: not the echo of a typed key.
+        let mut runtime = cisco_then_juniper(&store);
+        exit_with(&mut runtime, &store, &genuine_reply(), &[]);
+        assert_eq!(
+            at_parent_prompt(
+                &mut runtime,
+                &store,
+                &[(b"\x1b[A", b"show clock"), (b"\r", b"\r\nCLOCK\r\nsw1#")]
+            ),
+            None
+        );
+        assert_eq!(runtime.stack_len(), 2);
+    }
+
+    #[test]
+    fn c2b_an_input_sequence_the_device_shows_keeps_the_child() {
+        // A line discipline in canonical mode shows the bytes of an arrow or
+        // a paste marker as `^[[A` or `^[[200~`: output that is not the echo
+        // of a typed key, so the prompt is not confirmed (review 81's fake
+        // device does this).
+        let store = ProfileStore::builtin();
+        for (sequence, shown) in [(&b"\x1b[A"[..], &b"^[[A"[..]), (b"\x1b[200~", b"^[[200~")] {
+            let mut runtime = cisco_then_juniper(&store);
+            exit_with(&mut runtime, &store, &genuine_reply(), &[]);
+            runtime.observe_input(sequence);
+            runtime.observe_output(shown, &store);
+            assert_eq!(key(&mut runtime, &store), None, "{shown:?}");
+            assert_eq!(runtime.stack_len(), 2, "{shown:?}");
+        }
+    }
+
+    // C-2b, Ctrl-D at the child's empty prompt (review 81, item 3).
+
+    #[test]
+    fn c2b_ctrl_d_at_the_child_s_empty_prompt_returns_like_exit() {
+        let store = ProfileStore::builtin();
+        // Nothing shown for the Ctrl-D, or the shell's word for it. A
+        // `logout` line is also an existing close marker, which returns at
+        // once.
+        for (shown, at_once) in [("", false), ("exit", false), ("logout", true)] {
+            let mut runtime = cisco_then_juniper(&store);
+            runtime.observe_input(b"\x04");
+            let reply =
+                runtime.observe_output(format!("{shown}{}", genuine_reply()).as_bytes(), &store);
+            assert_eq!(reply.is_some(), at_once, "{shown:?}");
+            let returned = reply.or_else(|| key(&mut runtime, &store));
+            assert_eq!(returned, Some(names(CISCO)), "{shown:?}");
+            assert_eq!(runtime.stack_len(), 1, "{shown:?}");
+        }
+    }
+
+    #[test]
+    fn c2b_ctrl_d_on_a_typed_line_or_without_the_evidence_keeps_the_child() {
+        let store = ProfileStore::builtin();
+        // Not an empty line.
+        let mut runtime = cisco_then_juniper(&store);
+        runtime.observe_input(b"sh");
+        runtime.observe_output(b"sh", &store);
+        runtime.observe_input(b"\x04");
+        runtime.observe_output(genuine_reply().as_bytes(), &store);
+        assert_eq!(key(&mut runtime, &store), None);
+        assert_eq!(runtime.stack_len(), 2);
+        // An empty line, but the child's own prompt comes back.
+        let mut runtime = cisco_then_juniper(&store);
+        runtime.observe_input(b"\x04");
+        runtime.observe_output(b"\r\nlab@sw2> ", &store);
+        assert_eq!(key(&mut runtime, &store), None);
+        assert_child_kept(&mut runtime, &store, JUNIPER);
+    }
+
+    #[test]
+    fn c2b_after_ctrl_d_the_first_line_starts_at_the_parent_prompt() {
+        // `ssh sw3` typed first at the parent prompt after a Ctrl-D: sw3's
+        // parent prompt is `sw1#`, so leaving sw3 returns to sw1.
+        let store = ProfileStore::builtin();
+        let mut runtime = cisco_then_juniper(&store);
+        runtime.observe_input(b"\x04");
+        runtime.observe_output(genuine_reply().as_bytes(), &store);
+        assert_eq!(
+            step(
+                &mut runtime,
+                &store,
+                "ssh sw3",
+                &["Arista Networks EOS version 4.31\nleaf3#"]
+            ),
+            Some(names(ARISTA))
+        );
+        exit_with(
+            &mut runtime,
+            &store,
+            "\r\n[Connection to sw3 closed by foreign host]\r\nsw1#",
+            &[],
+        );
+        assert_eq!(key(&mut runtime, &store), Some(names(CISCO)));
+        assert_eq!(runtime.stack_len(), 1);
+    }
+
+    // C-2b, the 512-byte bound (review 68, must-change 2).
+
+    /// The reply whose parent prompt ends at byte `end` after the echo of
+    /// the exit line, with `filler` repeated on a line between.
+    fn reply_ending_at(end: usize, filler: &str) -> String {
+        let head = format!("{BRACKET}\r\n");
+        let tail = "\r\nsw1#";
+        let room = end - head.len() - tail.len();
+        let mut line = filler.repeat(room / filler.len());
+        line.push_str(&"x".repeat(room - line.len()));
+        let body = format!("{head}{line}{tail}");
+        assert_eq!(body.len(), end);
+        format!("\r\n{body}")
+    }
+
+    #[test]
+    fn c2b_parent_prompt_must_end_within_512_bytes_in_any_read_grouping() {
+        let store = ProfileStore::builtin();
+        for filler in ["x", "\u{e9}", "\u{2500}"] {
+            for (end, returns) in [(511, true), (512, true), (513, false)] {
+                let reply = reply_ending_at(end, filler);
+                let last = reply.len();
+                for splits in [
+                    &[][..],
+                    &[3][..],
+                    &[last - 4][..],
+                    &[last - 1][..],
+                    &[100, 300][..],
+                ] {
+                    let mut runtime = cisco_then_juniper(&store);
+                    exit_with(&mut runtime, &store, &reply, splits);
+                    let expected = returns.then(|| names(CISCO));
+                    assert_eq!(
+                        key(&mut runtime, &store),
+                        expected,
+                        "prompt ends at byte {end}, filler {filler:?}, splits {splits:?}"
+                    );
+                }
+                // Typed fast or pasted: the Enter is read before the echo
+                // of the word, which then arrives with the reply.
+                let mut runtime = cisco_then_juniper(&store);
+                runtime.observe_input(b"exit\r");
+                runtime.observe_output(format!("exit{reply}").as_bytes(), &store);
+                assert_eq!(
+                    key(&mut runtime, &store),
+                    returns.then(|| names(CISCO)),
+                    "typed fast, prompt ends at byte {end}, filler {filler:?}"
+                );
+            }
+        }
+    }
+
+    // C-2b, time (review 54, must-change 7). The clock is set by the test,
+    // so the bound is checked exactly and nothing sleeps (review 81).
+
+    fn close_shown_after(delay: std::time::Duration) -> Option<Vec<String>> {
+        let store = ProfileStore::builtin();
+        let mut runtime = cisco_then_juniper(&store);
+        let start = std::time::Instant::now();
+        runtime.set_clock(start);
+        runtime.observe_input(b"exit");
+        runtime.observe_output(b"exit", &store);
+        runtime.observe_input(b"\r");
+        runtime.observe_output(b"\r\n", &store);
+        runtime.set_clock(start + delay);
+        runtime.observe_output(format!("{BRACKET}\r\nsw1#").as_bytes(), &store);
+        key(&mut runtime, &store)
+    }
+
+    #[test]
+    fn c2b_close_shown_at_three_seconds_returns() {
+        assert_eq!(
+            close_shown_after(std::time::Duration::from_secs(3)),
+            Some(names(CISCO))
+        );
+    }
+
+    #[test]
+    fn c2b_close_shown_after_three_seconds_does_not_return() {
+        assert_eq!(
+            close_shown_after(
+                std::time::Duration::from_secs(3) + std::time::Duration::from_nanos(1)
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn c2b_bracket_in_time_but_parent_prompt_after_three_seconds_does_not_return() {
+        let store = ProfileStore::builtin();
+        let mut runtime = cisco_then_juniper(&store);
+        let start = std::time::Instant::now();
+        runtime.set_clock(start);
+        runtime.observe_input(b"exit");
+        runtime.observe_output(b"exit", &store);
+        runtime.observe_input(b"\r");
+        runtime.set_clock(start + std::time::Duration::from_secs(3));
+        runtime.observe_output(format!("\r\n{BRACKET}\r\n").as_bytes(), &store);
+        runtime.set_clock(
+            start + std::time::Duration::from_secs(3) + std::time::Duration::from_nanos(1),
+        );
+        runtime.observe_output(b"sw1#", &store);
+        assert_eq!(key(&mut runtime, &store), None);
+        assert_eq!(runtime.stack_len(), 2);
+    }
+
+    // C-2b, what must not return (pinned to 1.4.1: the child stays).
+
+    #[test]
+    fn c2b_child_output_without_the_whole_evidence_keeps_the_child() {
+        let store = ProfileStore::builtin();
+        for (name, shell, reply) in [
+            // Review 44: a nested shell's logout text, then the child's prompt.
+            (
+                "subshell_logout",
+                true,
+                vec![format!("{BRACKET}\nlab@sw2> ")],
+            ),
+            (
+                "delayed_log",
+                true,
+                vec!["lab@sw2> ".to_string(), format!("\n{BRACKET}\nlab@sw2> ")],
+            ),
+            // Review 54: the child's prompt before or after the bracket.
+            (
+                "child_prompt_before_bracket",
+                true,
+                vec![format!("lab@sw2> \n{BRACKET}\nsw1#")],
+            ),
+            (
+                "child_prompt_after_bracket",
+                true,
+                vec![format!("{BRACKET}\nlab@sw2> \nsw1#")],
+            ),
+            (
+                "child_prompt_split",
+                false,
+                vec![format!("{BRACKET}\nlab@sw2> "), "\nsw1#".to_string()],
+            ),
+            (
+                "parent_prompt_changed",
+                false,
+                vec![format!("{BRACKET}\nsw1(config)#")],
+            ),
+            (
+                "renamed_hostname",
+                false,
+                vec![format!("{BRACKET}\ncore1#")],
+            ),
+            (
+                "show_run_hostname_only",
+                true,
+                vec![format!(
+                    "{BRACKET}\nCurrent configuration:\nhostname sw1\nlab@sw2> "
+                )],
+            ),
+            (
+                "long_logout_banner",
+                false,
+                vec![format!("Goodbye\n{}\n{BRACKET}\nsw1#", "x".repeat(500))],
+            ),
+            // Review 68: the natural declines.
+            (
+                "natural_hostname_only",
+                false,
+                vec![format!("{BRACKET}\nhostname sw1\nlab@sw2> ")],
+            ),
+            ("natural_parent_only", false, vec!["sw1#".to_string()]),
+            (
+                "natural_wrong_bracket",
+                false,
+                vec!["[Connection to sw3 closed by foreign host]\nsw1#".to_string()],
+            ),
+        ] {
+            let mut runtime = if shell {
+                cisco_then_juniper_shell(&store)
+            } else {
+                cisco_then_juniper(&store)
+            };
+            let chunks: Vec<&str> = reply.iter().map(String::as_str).collect();
+            assert_eq!(step(&mut runtime, &store, "exit", &chunks), None, "{name}");
+            assert_child_kept(&mut runtime, &store, JUNIPER);
+            assert_eq!(runtime.stack_len(), 2, "{name}");
+        }
+    }
+
+    #[test]
+    fn c2b_changed_parent_prompts_keep_the_child() {
+        let store = ProfileStore::builtin();
+        // clock_prompt: the parent's prompt shows the time.
+        let mut runtime = local(&store);
+        step(
+            &mut runtime,
+            &store,
+            "ssh sw1",
+            &["Cisco IOS Software\n[09:00] sw1#"],
+        );
+        step(
+            &mut runtime,
+            &store,
+            "ssh sw2",
+            &["--- JUNOS 22.4R3 Kernel 64-bit\nlab@sw2> "],
+        );
+        step(
+            &mut runtime,
+            &store,
+            "exit",
+            &[&format!("{BRACKET}\n[09:05] sw1#")],
+        );
+        step(
+            &mut runtime,
+            &store,
+            "show version",
+            &["Hostname: sw1\n[09:05] sw1#"],
+        );
+        assert_eq!(runtime.active_profiles(), names(JUNIPER), "clock_prompt");
+        assert_eq!(runtime.stack_len(), 2, "clock_prompt");
+        // changed_directory_prompt: the local shell's prompt changed.
+        let mut runtime = local(&store);
+        step(
+            &mut runtime,
+            &store,
+            "ssh sw2",
+            &["--- JUNOS 22.4R3 Kernel 64-bit\nlab@sw2> "],
+        );
+        step(
+            &mut runtime,
+            &store,
+            "exit",
+            &[&format!("{BRACKET}\nuser@laptop:~/new$")],
+        );
+        step(
+            &mut runtime,
+            &store,
+            "pwd",
+            &["/home/user/new\nuser@laptop:~/new$"],
+        );
+        assert_eq!(
+            runtime.active_profiles(),
+            names(JUNIPER),
+            "changed_directory_prompt"
+        );
+        assert_eq!(runtime.stack_len(), 1, "changed_directory_prompt");
+    }
+
+    #[test]
+    fn c2b_bracket_before_the_exit_is_stale() {
+        let store = ProfileStore::builtin();
+        let mut runtime = cisco_then_juniper(&store);
+        step(
+            &mut runtime,
+            &store,
+            "show run",
+            &[&format!("{BRACKET}\nlab@sw2> ")],
+        );
+        assert_eq!(step(&mut runtime, &store, "exit", &["sw1#"]), None);
+        assert_child_kept(&mut runtime, &store, JUNIPER);
+    }
+
+    #[test]
+    fn c2b_typeahead_and_same_hostname_children_keep_the_child() {
+        let store = ProfileStore::builtin();
+        for (name, leaf_banner) in [
+            // A line typed into the child before any prompt of it.
+            ("residual_typeahead", "Arista Networks EOS version 4.31\n"),
+            // A child showing its parent's exact prompt.
+            (
+                "same_hostname_live",
+                "Arista Networks EOS version 4.31\nRouter#",
+            ),
+        ] {
+            let mut runtime = local(&store);
+            step(
+                &mut runtime,
+                &store,
+                "ssh core",
+                &["Cisco IOS Software\nRouter#"],
+            );
+            assert_eq!(
+                step(&mut runtime, &store, "ssh leaf", &[leaf_banner]),
+                Some(names(ARISTA)),
+                "{name}"
+            );
+            step(&mut runtime, &store, "bash", &["[admin@Router ~]$ "]);
+            step(
+                &mut runtime,
+                &store,
+                "exit",
+                &["[Connection to leaf closed by foreign host]\nRouter#"],
+            );
+            step(
+                &mut runtime,
+                &store,
+                "show version",
+                &["Arista DCS-7050\nRouter#"],
+            );
+            assert_eq!(runtime.active_profiles(), names(ARISTA), "{name}");
+            assert_eq!(runtime.stack_len(), 2, "{name}");
+        }
+    }
+
+    #[test]
+    fn c2b_compares_the_exact_parent_prompt_not_the_vendor() {
+        let store = ProfileStore::builtin();
+        let cisco_pair = |store: &ProfileStore| {
+            let mut runtime = local(store);
+            step(
+                &mut runtime,
+                store,
+                "ssh sw1",
+                &["Cisco IOS Software\nsw1#"],
+            );
+            step(
+                &mut runtime,
+                store,
+                "ssh sw2",
+                &["Cisco IOS Software\nsw2#"],
+            );
+            assert_eq!(runtime.stack_len(), 2);
+            runtime
+        };
+        let mut runtime = cisco_pair(&store);
+        exit_with(&mut runtime, &store, &format!("\r\n{BRACKET}\r\nsw2#"), &[]);
+        key(&mut runtime, &store);
+        assert_eq!(runtime.stack_len(), 2, "the child's own prompt came back");
+        let mut runtime = cisco_pair(&store);
+        exit_with(&mut runtime, &store, &genuine_reply(), &[]);
+        key(&mut runtime, &store);
+        assert_eq!(runtime.stack_len(), 1, "the parent's prompt came back");
+    }
+
+    #[test]
+    fn c2b_parent_prompt_survives_an_edited_command_line() {
+        let store = ProfileStore::builtin();
+        let mut runtime = local(&store);
+        step(
+            &mut runtime,
+            &store,
+            "ssh sw1",
+            &["Cisco IOS Software\nsw1#"],
+        );
+        runtime.observe_input(b"s");
+        runtime.observe_output(b"s", &store);
+        runtime.observe_input(b"sh sw3\x7f");
+        runtime.observe_output(b"sh sw3\x08 \x08", &store);
+        runtime.observe_input(b"2\r");
+        assert_eq!(
+            runtime.observe_output(b"2\r\n--- JUNOS 22.4R3 Kernel 64-bit\r\nlab@sw2> ", &store),
+            Some(names(JUNIPER))
+        );
+        exit_with(&mut runtime, &store, &genuine_reply(), &[]);
+        assert_eq!(key(&mut runtime, &store), Some(names(CISCO)));
+    }
+
+    // C-2b, the accepted limit: a still-connected child that prints the
+    // whole evidence. These pin the early switch, so it cannot drift
+    // silently.
+
+    #[test]
+    fn c2b_accepted_limit_child_printing_bracket_and_parent_prompt_line() {
+        let store = ProfileStore::builtin();
+        for (name, reply) in [
+            (
+                "saved_log_split_read",
+                [format!("{BRACKET}\nsw1#"), "\nlab@sw2> ".to_string()],
+            ),
+            (
+                "show_run_parent_line",
+                [
+                    format!("{BRACKET}\nCurrent configuration:\nhostname sw1\nbanner motd ^\nsw1#"),
+                    "\n^\nlab@sw2> ".to_string(),
+                ],
+            ),
+        ] {
+            let mut runtime = cisco_then_juniper_shell(&store);
+            let chunks: Vec<&str> = reply.iter().map(String::as_str).collect();
+            assert_eq!(
+                step(&mut runtime, &store, "exit", &chunks),
+                Some(names(CISCO)),
+                "{name}: the complete parent prompt line after the bracket"
+            );
+            assert_eq!(runtime.stack_len(), 1, "{name}");
+        }
+    }
+
+    #[test]
+    fn c2b_accepted_limit_child_echoing_the_whole_line_at_the_parent_prompt() {
+        // A still-connected child that prints the bracket and the exact
+        // parent prompt, then shows exactly the bytes typed and a line end:
+        // its own echo (review 81's `lookalike`), or, with echo off, output
+        // that happens to be the typed line. Nothing tells it from the
+        // parent, so it switches at the Enter's echo.
+        let store = ProfileStore::builtin();
+        for (name, typed, output) in [
+            (
+                "echoing_child",
+                &b"show version\r"[..],
+                &b"show version\r\nlab@sw2> "[..],
+            ),
+            (
+                "continuation_equal_to_the_line",
+                b"backup\r",
+                b"backup\r\nlab@sw2> ",
+            ),
+        ] {
+            let mut runtime = cisco_then_juniper_shell(&store);
+            exit_with(&mut runtime, &store, &genuine_reply(), &[]);
+            assert_eq!(
+                at_parent_prompt(&mut runtime, &store, &[(typed, output)]),
+                Some((0, names(CISCO))),
+                "{name}"
+            );
+        }
+    }
+
+    // C-2c, genuine closes.
+
+    fn telnet_to_juniper(store: &ProfileStore, command: &str) -> ProfileRuntime {
+        let mut runtime = local(store);
+        assert_eq!(
+            step(
+                &mut runtime,
+                store,
+                command,
+                &[
+                    "Connected to r1.\nEscape character is '^]'.\n--- JUNOS 22.4R3 Kernel 64-bit\nlab@r1> "
+                ]
+            ),
+            Some(names(JUNIPER)),
+            "{command}"
+        );
+        runtime
+    }
+
+    #[test]
+    fn c2c_ctrl_bracket_quit_returns_to_the_profile_before_telnet() {
+        let store = ProfileStore::builtin();
+        for command in ["telnet r1", "telnet r1 2323", "telnet -l admin r1"] {
+            let mut runtime = telnet_to_juniper(&store, command);
+            assert_eq!(
+                step(
+                    &mut runtime,
+                    &store,
+                    "\x1dq",
+                    &["\ntelnet> q\nConnection closed.\nuser@laptop:~$ "]
+                ),
+                Some(names(LOCAL)),
+                "{command}"
+            );
+            assert_eq!(runtime.stack_len(), 0, "{command}");
+        }
+    }
+
+    #[test]
+    fn c2c_quit_pops_the_telnet_and_what_was_opened_inside_it() {
+        let store = ProfileStore::builtin();
+        let mut runtime = telnet_to_juniper(&store, "telnet a1");
+        assert_eq!(
+            step(&mut runtime, &store, "ssh b1", &["Cisco IOS Software\nb1#"]),
+            Some(names(CISCO))
+        );
+        assert_eq!(
+            step(
+                &mut runtime,
+                &store,
+                "\x1dq",
+                &["\ntelnet> q\nConnection closed.\nuser@laptop:~$ "]
+            ),
+            Some(names(LOCAL))
+        );
+        assert_eq!(runtime.stack_len(), 0);
+    }
+
+    #[test]
+    fn c2c_escape_announcement_split_at_every_position_is_still_read() {
+        let store = ProfileStore::builtin();
+        let banner = crlf(
+            "Trying 192.0.2.1...\nConnected to r1.\nEscape character is '^]'.\n--- JUNOS 22.4R3 Kernel 64-bit\nlab@r1> ",
+        );
+        let announcement = banner.find("Escape").expect("announcement");
+        let announcement_end = banner.find("--- JUNOS").expect("banner");
+        for split in announcement..announcement_end {
+            let mut runtime = local(&store);
+            runtime.observe_input(b"telnet r1\r");
+            runtime.observe_output(b"telnet r1\r\n", &store);
+            runtime.observe_output(&banner.as_bytes()[..split], &store);
+            runtime.observe_output(&banner.as_bytes()[split..], &store);
+            assert_eq!(
+                runtime.active_profiles(),
+                names(JUNIPER),
+                "split at {split}"
+            );
+            assert_eq!(
+                step(
+                    &mut runtime,
+                    &store,
+                    "\x1dq",
+                    &["\ntelnet> q\nConnection closed.\nuser@laptop:~$ "]
+                ),
+                Some(names(LOCAL)),
+                "split at {split}"
+            );
+        }
+    }
+
+    #[test]
+    fn c2c_echo_and_close_line_bounds_are_counted_in_bytes() {
+        let store = ProfileStore::builtin();
+        // From the Ctrl-]: `^]` echo, then output in flight, then telnet's
+        // `telnet> q` line, whose line end must come within 4,096 bytes.
+        for (echo_end, returns) in [(4_095, true), (4_096, true), (4_097, false)] {
+            let head = "^]";
+            let echo_line = "\r\ntelnet> q\r";
+            let room = echo_end - head.len() - echo_line.len();
+            let flight = format!("{}\r\n", "y".repeat(room - 2));
+            let output =
+                format!("{head}{flight}{echo_line}\nConnection closed.\r\nuser@laptop:~$ ");
+            assert_eq!(
+                output.find("telnet> q\r").expect("echo") + "telnet> q\r".len(),
+                echo_end
+            );
+            for splits in [&[][..], &[1_000][..], &[echo_end - 1][..]] {
+                let mut runtime = telnet_to_juniper(&store, "telnet r1");
+                runtime.observe_input(b"\x1dq\r");
+                let expected = returns.then(|| names(LOCAL));
+                assert_eq!(
+                    step_split(&mut runtime, &store, &output, splits),
+                    expected,
+                    "echo ends at byte {echo_end}, splits {splits:?}"
+                );
+            }
+        }
+        // After the echo's line end, the close line must start within 256
+        // bytes; blank lines may come between.
+        for (start, returns) in [(255, true), (256, true), (257, false)] {
+            let head = "^]\r\ntelnet> q\r";
+            let blanks = format!("\n{}\n", " ".repeat(start - 2));
+            assert_eq!(blanks.len(), start);
+            let output = format!("{head}{blanks}Connection closed.\r\nuser@laptop:~$ ");
+            for splits in [&[][..], &[head.len() + 10][..], &[head.len() + start][..]] {
+                let mut runtime = telnet_to_juniper(&store, "telnet r1");
+                runtime.observe_input(b"\x1dq\r");
+                let expected = returns.then(|| names(LOCAL));
+                assert_eq!(
+                    step_split(&mut runtime, &store, &output, splits),
+                    expected,
+                    "close line starts {start} bytes after the echo, splits {splits:?}"
+                );
+            }
+        }
+    }
+
+    fn step_split(
+        runtime: &mut ProfileRuntime,
+        store: &ProfileStore,
+        output: &str,
+        splits: &[usize],
+    ) -> Option<Vec<String>> {
+        let bytes = output.as_bytes();
+        let mut last = None;
+        let mut start = 0;
+        for &end in splits.iter().chain(std::iter::once(&bytes.len())) {
+            last = runtime.observe_output(&bytes[start..end], store).or(last);
+            start = end;
+        }
+        last
+    }
+
+    // C-2c, what must not return (pinned to 1.4.1).
+
+    #[test]
+    fn c2c_without_telnet_s_own_exchange_the_telnet_stays() {
+        let store = ProfileStore::builtin();
+        for (name, command, steps) in [
+            (
+                "no_telnet_command_prompt",
+                "telnet r1",
+                vec![("\x1dq", "Connection closed.\nlab@r1> ")],
+            ),
+            (
+                "rlogin_escape",
+                "telnet -r r1",
+                vec![("\x1dq", "Connection closed.\nlab@r1> ")],
+            ),
+            (
+                "other_escape",
+                "telnet -e ^X r1",
+                vec![("\x1dq", "\ntelnet> q\nConnection closed.\nlab@r1> ")],
+            ),
+            (
+                "over_budget_same_read",
+                "telnet r1",
+                vec![("\x1dq", "\ntelnet> q\n<300>\nConnection closed.\nlab@r1> ")],
+            ),
+            (
+                "telnet_subshell",
+                "telnet r1",
+                vec![
+                    ("\x1d!", "\ntelnet> !\nuser@laptop:~$ "),
+                    ("\x1dq", "\ntelnet> q\nConnection closed.\nuser@laptop:~$ "),
+                ],
+            ),
+            (
+                "suspended",
+                "telnet r1",
+                vec![
+                    (
+                        "\x1dz",
+                        "\ntelnet> z\n[1]+  Stopped telnet r1\nuser@laptop:~$ ",
+                    ),
+                    ("\x1dq", "Connection closed.\nuser@laptop:~$ "),
+                ],
+            ),
+            (
+                "stale_close",
+                "telnet r1",
+                vec![
+                    ("cat notes", "Connection closed.\nlab@r1> "),
+                    ("\x1dq", "\ntelnet> q\nlab@r1> "),
+                ],
+            ),
+            (
+                "stale_partial",
+                "telnet r1",
+                vec![("cat notes", "Connection closed."), ("\x1dq", "\nlab@r1> ")],
+            ),
+            (
+                "unsolicited_after_armed",
+                "telnet r1",
+                vec![
+                    ("\x1dq", "\ntelnet> q\nNo connection to close.\nlab@r1> "),
+                    ("cat notes", "Connection closed.\nlab@r1> "),
+                ],
+            ),
+            (
+                "close_command",
+                "telnet r1",
+                vec![("\x1dclose", "\ntelnet> close\nConnection closed.\ntelnet> ")],
+            ),
+        ] {
+            let mut runtime = telnet_to_juniper(&store, command);
+            for (typed, reply) in steps {
+                let reply = reply.replace("<300>", &"x".repeat(300));
+                step(&mut runtime, &store, typed, &[&reply]);
+            }
+            assert_eq!(runtime.active_profiles(), names(JUNIPER), "{name}");
+            assert_eq!(runtime.stack_len(), 1, "{name}");
+        }
+    }
+
+    #[test]
+    fn c2c_telnet_started_with_another_escape_is_not_closed_by_ctrl_bracket() {
+        let store = ProfileStore::builtin();
+        for command in [
+            "telnet -r r1",
+            "telnet -E r1",
+            "telnet -e ^X r1",
+            "telnet -8e^X r1",
+        ] {
+            let mut runtime = telnet_to_juniper(&store, command);
+            step(
+                &mut runtime,
+                &store,
+                "\x1dq",
+                &["\ntelnet> q\nConnection closed.\nuser@laptop:~$ "],
+            );
+            assert_eq!(runtime.active_profiles(), names(JUNIPER), "{command}");
+        }
+    }
+
+    #[test]
+    fn c2c_telnet_option_values_keep_the_target() {
+        for (command, policy) in [
+            ("telnet -e ^X r1", super::ClosePolicy::TelnetOtherEscape),
+            ("telnet -l admin r1 2323", super::ClosePolicy::Telnet),
+            ("telnet -r r1", super::ClosePolicy::TelnetOtherEscape),
+            ("telnet -n trace.log r1", super::ClosePolicy::Telnet),
+        ] {
+            assert_eq!(
+                super::remote_attempt(command, false),
+                Some(super::RemoteAttempt {
+                    policy,
+                    target: Some("r1".to_string()),
+                }),
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn c2c_echo_and_close_line_split_across_reads() {
+        let store = ProfileStore::builtin();
+        let mut runtime = telnet_to_juniper(&store, "telnet r1");
+        runtime.observe_input(b"\x1d");
+        assert_eq!(runtime.observe_output(b"\r\ntel", &store), None);
+        assert_eq!(runtime.observe_output(b"net> qu", &store), None);
+        runtime.observe_input(b"qu\r");
+        assert_eq!(runtime.observe_output(b"\r\nConnection clo", &store), None);
+        assert_eq!(
+            runtime.observe_output(b"sed.\r\n", &store),
+            Some(names(LOCAL))
+        );
+    }
+
+    #[test]
+    fn c2c_nested_telnets_need_every_escape_announced() {
+        let store = ProfileStore::builtin();
+        for (inner_announcement, returns) in [("Escape character is '^X'.\n", true), ("", false)] {
+            let mut runtime = telnet_to_juniper(&store, "telnet a1");
+            step(
+                &mut runtime,
+                &store,
+                "telnet b1",
+                &[&format!(
+                    "Connected to b1.\n{inner_announcement}Cisco IOS Software\nb1#"
+                )],
+            );
+            assert_eq!(runtime.active_profiles(), names(CISCO));
+            let quit = step(
+                &mut runtime,
+                &store,
+                "\x1dq",
+                &["\ntelnet> q\nConnection closed.\nuser@laptop:~$ "],
+            );
+            // The local client's Ctrl-] closes a1 and b1 inside it, when
+            // every telnet said which escape it uses.
+            assert_eq!(
+                quit,
+                returns.then(|| names(LOCAL)),
+                "{inner_announcement:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn c2c_announced_other_escape_keeps_the_telnet_in_any_read_grouping() {
+        let store = ProfileStore::builtin();
+        for reply in [
+            &["\ntelnet> q\nConnection closed.\nlab@r1> "][..],
+            &["\ntel", "net> q\nConnec", "tion closed.\nlab@r1> "][..],
+        ] {
+            let mut runtime = local(&store);
+            step(
+                &mut runtime,
+                &store,
+                "telnet r1",
+                &[
+                    "Trying 192.0.2.1...\nConnected to r1.\nEscape character is '^X'.\n--- JUNOS 22.4R3 Kernel 64-bit\nlab@r1> ",
+                ],
+            );
+            step(&mut runtime, &store, "\x1dq", reply);
+            assert_eq!(runtime.active_profiles(), names(JUNIPER));
+        }
+    }
+
+    #[test]
+    fn c2c_telnet_echo_before_the_enter_is_not_the_echo() {
+        // audit-echo-before-enter: a raw-mode program prints `telnet> q` at
+        // the Ctrl-], before `q` and Enter are typed.
+        let store = ProfileStore::builtin();
+        let mut runtime = local(&store);
+        runtime.observe_input(b"telnet r1\r");
+        runtime.observe_output(
+            b"\r\nConnected to r1.\r\nEscape character is '^]'.\r\n--- JUNOS 22.4R3 Kernel 64-bit\r\nlab@r1> ",
+            &store,
+        );
+        step_raw(&mut runtime, &store, b"\x1d", &["\r\ntelnet> q\r\n"]);
+        step_raw(
+            &mut runtime,
+            &store,
+            b"q\r",
+            &["\r\nConnection closed.\r\nlab@r1> "],
+        );
+        assert_eq!(runtime.active_profiles(), names(JUNIPER));
+    }
+
+    #[test]
+    fn c2c_a_stack_change_earlier_in_the_exchange_cancels_it() {
+        let store = ProfileStore::builtin();
+        let two_telnets = |store: &ProfileStore| {
+            let mut runtime = local(store);
+            step(
+                &mut runtime,
+                store,
+                "telnet a1",
+                &[
+                    "Connected to a1.\nEscape character is '^]'.\n--- JUNOS 22.4R3 Kernel 64-bit\nlab@a1> ",
+                ],
+            );
+            assert_eq!(
+                step(
+                    &mut runtime,
+                    store,
+                    "telnet b1",
+                    &["Connected to b1.\nEscape character is '^]'.\nCisco IOS Software\nb1#"]
+                ),
+                Some(names(CISCO))
+            );
+            runtime
+        };
+        // audit-wrong-frame: b1's close in its own read, then the exchange.
+        let mut runtime = two_telnets(&store);
+        step_raw(
+            &mut runtime,
+            &store,
+            b"\x1d",
+            &["\r\nConnection closed by foreign host.\r\n"],
+        );
+        step_raw(
+            &mut runtime,
+            &store,
+            b"q\r",
+            &["\r\ntelnet> q\r\nConnection closed.\r\nlab@a1> "],
+        );
+        assert_eq!(runtime.active_profiles(), names(JUNIPER), "separate reads");
+        assert_eq!(runtime.stack_len(), 1, "separate reads");
+        // same_read_transition: all of it in one read, and split anywhere.
+        let output = "^]q\r\nConnection closed by foreign host.\r\ntelnet> q\r\nConnection closed.\r\nlab@a1> ";
+        for split in 0..output.len() {
+            let mut runtime = two_telnets(&store);
+            runtime.observe_input(b"\x1dq\r");
+            let splits: &[usize] = if split == 0 { &[] } else { &[split] };
+            step_split(&mut runtime, &store, output, splits);
+            assert_eq!(
+                runtime.active_profiles(),
+                names(JUNIPER),
+                "split at {split}"
+            );
+            assert_eq!(runtime.stack_len(), 1, "split at {split}");
+        }
+    }
+
+    #[test]
+    fn c2c_budget_after_an_ordinary_pop_is_spent() {
+        let store = ProfileStore::builtin();
+        let mut runtime = local(&store);
+        step(
+            &mut runtime,
+            &store,
+            "telnet a1",
+            &[
+                "Connected to a1.\nEscape character is '^]'.\n--- JUNOS 22.4R3 Kernel 64-bit\nlab@a1> ",
+            ],
+        );
+        step(
+            &mut runtime,
+            &store,
+            "telnet b1",
+            &["Connected to b1.\nEscape character is '^]'.\nCisco IOS Software\nb1#"],
+        );
+        step(
+            &mut runtime,
+            &store,
+            "\x1dq",
+            &["\ntelnet> q\nConnection closed by foreign host.\nlab@a1> "],
+        );
+        step(
+            &mut runtime,
+            &store,
+            "cat notes",
+            &["Connection closed.\nlab@a1> "],
+        );
+        assert_eq!(runtime.active_profiles(), names(JUNIPER));
+        assert_eq!(runtime.stack_len(), 1);
+    }
+
+    #[test]
+    fn c2c_outermost_telnet_behind_a_subshell_is_not_closed() {
+        let store = ProfileStore::builtin();
+        let mut runtime = local(&store);
+        step(
+            &mut runtime,
+            &store,
+            "telnet a1",
+            &[
+                "Connected to a1.\nEscape character is '^]'.\n--- JUNOS 22.4R3 Kernel 64-bit\nlab@a1> ",
+            ],
+        );
+        step(
+            &mut runtime,
+            &store,
+            "\x1d!",
+            &["\ntelnet> !\nuser@laptop:~$ "],
+        );
+        step(
+            &mut runtime,
+            &store,
+            "telnet b1",
+            &["Connected to b1.\nEscape character is '^]'.\nCisco IOS Software\nb1#"],
+        );
+        step(
+            &mut runtime,
+            &store,
+            "\x1dq",
+            &["\ntelnet> q\nConnection closed.\nuser@laptop:~$ "],
+        );
+        assert!(runtime.stack_len() >= 1, "a1's frame must survive");
+    }
+
+    #[test]
+    fn c2c_an_exchange_armed_across_a_rejected_switch_does_not_close() {
+        let store = ProfileStore::builtin();
+        let mut runtime = telnet_to_juniper(&store, "telnet r1");
+        runtime.observe_input(b"\x1d");
+        // The telnet's close is shown while the exchange is armed, and the
+        // session rejects the switch back (its rules failed to build).
+        assert_eq!(
+            runtime.observe_output(b"^]\r\nConnection closed by foreign host.\r\n", &store),
+            Some(names(LOCAL))
+        );
+        runtime.reject_transition();
+        assert_eq!(runtime.active_profiles(), names(JUNIPER));
+        assert_eq!(runtime.stack_len(), 1);
+        runtime.observe_input(b"q\r");
+        runtime.observe_output(
+            b"\r\ntelnet> q\r\nConnection closed.\r\nuser@laptop:~$ ",
+            &store,
+        );
+        assert_eq!(runtime.active_profiles(), names(JUNIPER));
     }
 }

@@ -2,6 +2,80 @@
 
 All notable changes to PrismTTY are documented here.
 
+## Unreleased
+
+### Fixed
+
+- Leaving a device that you reached from another device now returns to the
+  first device's colors, where PrismTTY used to keep the colors of the device
+  you left. It watches for two exchanges:
+
+  - After you type or paste `exit`, `quit` or `logout`, or press Ctrl-D on an
+    empty line, on a device you opened by typing `ssh`, `mosh` or `telnet` on
+    another device, the output shows `[Connection to NAME closed by foreign
+    host]`, where NAME is the host you typed in that command, and the first
+    prompt after it is exactly the prompt you were at when you opened that
+    connection. The exit line may be edited with Backspace or Ctrl-U; a line
+    edited with the arrow keys, Tab, Ctrl-W or another control key, or
+    recalled from history, does not count. The prompt must end within the
+    first 512 bytes after the echo of your exit line (for Ctrl-D, after the
+    `exit` or `logout` line the device shows for it, if any), counting bytes
+    as the terminal receives them, escape sequences not counted. The close
+    line and the prompt must come within 3 seconds of PrismTTY handling the
+    Enter or the Ctrl-D.
+
+    A prompt shown as a complete line confirms at once. A prompt waiting for
+    input confirms only when the whole next line you type there comes back as
+    its echo: from your first key to your Enter, every byte the terminal shows
+    (escape sequences not counted) is the next byte you typed, and the colors
+    change at the line end that echoes your Enter. So the parent's prompt line
+    and the first command you type there are drawn in the colors of the device
+    you left, and that command's output in the parent's colors; an echo that
+    arrives together with its line end, as in a paste, is drawn in the
+    parent's colors. Pasted text counts as typed; arrow keys, focus reports
+    and paste markers are not keys and are ignored. Once the prompt waits, the
+    line may be typed later than 3 seconds if no other output comes first. A
+    line longer than 512 bytes keeps the colors.
+
+  - After Ctrl-] and `quit` (or `q`, `qu`, `qui`) in telnet, the output shows
+    telnet's own `telnet> quit` line (or `telnet> q`, `telnet> qu`, `telnet>
+    qui`), ending after your Enter and within 4,096 bytes of the Ctrl-], and
+    the first non-blank line after it is `Connection closed.` or `Connection
+    closed`, starting within 256 bytes of the end of that line. This rule has
+    these byte bounds and no time limit. Every telnet you went through must
+    have announced its escape character (`Escape character is '^]'.`). The
+    first telnet that announced `^]` is closed, with every device you opened
+    from it, and a close message printed before telnet's line cancels the
+    exchange.
+
+  Missed, so the colors stay as before: a close shown after 3 seconds or past
+  512 bytes; a close after you typed ahead of the parent prompt; at a waiting
+  parent prompt, Backspace, Ctrl-U, Tab, a first Ctrl-C (which prints `^C`) or
+  another control key, output that is not the echo of what you typed (a log
+  message, a redraw, a completion, a history recall, or an arrow key or paste
+  marker shown as `^[[A` or `^[[200~`), and a parent that does not echo what
+  you type (`--local-echo` does not count: its echo is not the device's
+  output); a parent prompt that changed (configuration mode, a clock or status
+  in the prompt); a telnet that printed no escape announcement, a custom
+  escape (`-e`, `-E`, `-r`, or another announced character), telnet's `close`,
+  `!` and `z`; and a telnet whose connection drops with a bare `Connection
+  closed.` line, which a still-connected telnet session can also print. The
+  clock is checked when PrismTTY reads output, so a stopped or very slow
+  session can also miss a close.
+
+  Outside these two exchanges, the close messages PrismTTY already recognized,
+  such as `Connection to NAME closed.`, `Connection closed by foreign host.`
+  or a `logout` line, still end a connection as before.
+
+  PrismTTY trusts these lines. A device, or a logout script on it, that prints
+  the same lines while you are still connected, for example a saved session
+  log or a configuration that holds the parent prompt as a line, switches the
+  colors early; so does a device that, still connected, shows the bracket and
+  the parent prompt and then exactly the line you type and a line end. Only
+  colors change, with one exception: with `--show-profile` and a stderr that
+  nobody reads, the read that confirms the switch waits until stderr drains,
+  and terminal output waits with it.
+
 ## 1.5.1 - 2026-11-27
 
 ### Fixed
