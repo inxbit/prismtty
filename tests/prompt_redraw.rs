@@ -854,13 +854,11 @@ fn reads_after_a_layout_state_the_tracker_must_see_stay_on_the_bypass_review_77(
 #[test]
 fn layout_states_that_are_reset_or_change_nothing_let_the_lines_be_colored() {
     let read: &[u8] = b"error\r\n\x1b[1GR# ";
-    let cases: [(&str, &[&[u8]]); 12] = [
-        ("double width, then RIS", &[b"\x1b#6", b"\x1bc", read]),
+    let cases: [(&str, &[&[u8]]); 10] = [
         ("single width alone", &[b"\x1b#5", read]),
         ("screen alignment test", &[b"\x1b#8", read]),
         ("insert mode, then reset", &[b"\x1b[4h", b"\x1b[4l", read]),
         ("insert mode, then RIS", &[b"\x1b[4h", b"\x1bc", read]),
-        ("132 columns, then RIS", &[b"\x1b[?3h", b"\x1bc", read]),
         ("UTF-8 again", &[b"\x1b%@", b"\x1b%G", read]),
         (
             "national character sets off",
@@ -922,7 +920,25 @@ fn a_read_with_text_past_ascii_keeps_the_bypass_until_the_terminal_reads_utf8() 
 #[test]
 fn reads_after_a_control_off_the_table_stay_on_the_bypass_until_ris_review_79() {
     let read: &[u8] = b"error\r\n\x1b[1GR# ";
-    let cases: [(&str, &[&[u8]]); 26] = [
+    let cases: [(&str, &[&[u8]]); 32] = [
+        (
+            "VT52 mode, then what looks like RIS",
+            &[b"\x1b[?2l\x1bc", read],
+        ),
+        (
+            "VT52 mode, then what looks like RIS in its own read",
+            &[b"\x1b[?2l", b"\x1bc", read],
+        ),
+        (
+            "Tektronix mode, then what looks like RIS",
+            &[b"\x1b[?38h\x1bc", read],
+        ),
+        ("double width, then RIS", &[b"\x1b#6", b"\x1bc", read]),
+        ("132 columns, then RIS", &[b"\x1b[?3h", b"\x1bc", read]),
+        (
+            "a soft reset, then autowrap on",
+            &[b"\x1b[!p", b"\x1b[?7h", read],
+        ),
         ("VT52 mode, the read before", &[b"\x1b[?2l", read]),
         (
             "VT52 mode, several reads before",
@@ -983,8 +999,15 @@ fn reads_after_a_control_off_the_table_stay_on_the_bypass_until_ris_review_79() 
 fn reads_after_controls_on_the_table_let_the_lines_be_colored_review_79() {
     let read: &[u8] = b"error\r\n\x1b[1GR# ";
     let cases: [(&str, &[&[u8]]); 18] = [
-        ("VT52 mode, then RIS", &[b"\x1b[?2l", b"\x1bc", read]),
-        ("Tektronix mode, then RIS", &[b"\x1b[?38h", b"\x1bc", read]),
+        ("RIS with nothing off the table before it", &[b"\x1bc", read]),
+        (
+            "a save while every followed mode is safe",
+            &[b"\x1b7\x1b[?7l\x1b[?7h\x1b8\x1b[s\x1b[u", read],
+        ),
+        (
+            "the alternate screen entered while every followed mode is safe",
+            &[b"\x1b[?1049h\x1b[?7l\x1b[?7h\x1b[?1049l", read],
+        ),
         ("cursor shown and hidden", &[b"\x1b[?25l", b"\x1b[?25h", read]),
         (
             "mouse and focus reporting",
@@ -1012,7 +1035,6 @@ fn reads_after_controls_on_the_table_let_the_lines_be_colored_review_79() {
         ("G0 back to ASCII", &[b"\x1b(B\x1b[m", read]),
         ("tab stops", &[b"\x1bH\x1b[3g", read]),
         ("edits that leave no mode", &[b"\x1b[2@\x1b[3P\x1b[2X\x1b[1L\x1b[1M\x1b[S\x1b[T", read]),
-        ("a soft reset, then autowrap on", &[b"\x1b[!p", b"\x1b[?7h", read]),
     ];
     for (name, reads) in cases {
         let output = render_on(6, 24, reads);
@@ -1031,6 +1053,102 @@ fn reads_after_controls_on_the_table_let_the_lines_be_colored_review_79() {
             "{name}: {:?}",
             String::from_utf8_lossy(&output)
         );
+    }
+}
+
+/// A saved cursor can bring a mode back. Kitty saves autowrap with the
+/// cursor and restores it (screen.c `screen_save_cursor`,
+/// `screen_restore_cursor`), on `ESC 7`, `CSI s` and on the switch to the
+/// alternate screen by mode 1049; iTerm2 does the same (VT100Terminal.m
+/// `saveCursor`, `restoreCursor`). A save while any followed mode is in its
+/// hazardous value keeps every later read on the bypass for the session;
+/// so does a soft reset, which can leave autowrap off and saves the cursor.
+#[test]
+fn reads_after_a_save_while_a_mode_is_hazardous_stay_on_the_bypass_review_82() {
+    let read: &[u8] = b"error\r\n\x1b[1GR# ";
+    let cases: [(&str, &[&[u8]]); 11] = [
+        (
+            "autowrap off saved by DECSC, on, restored",
+            &[b"\x1b[?7l\x1b7\x1b[?7h\x1b8", read],
+        ),
+        (
+            "autowrap off saved by SCOSC, on, restored",
+            &[b"\x1b[?7l\x1b[s\x1b[?7h\x1b[u", read],
+        ),
+        (
+            "autowrap off saved by the alternate screen",
+            &[b"\x1b[?7l\x1b[?1049h\x1b[?7h\x1b[?1049l", read],
+        ),
+        (
+            "the save and the reset in reads of their own",
+            &[b"\x1b[?7l", b"\x1b7", b"\x1b[?7h", b"\x1b8", read],
+        ),
+        (
+            "a save with no restore after it",
+            &[b"\x1b[?7l\x1b7\x1b[?7h", read],
+        ),
+        (
+            "a save while insert mode is on",
+            &[b"\x1b[4h\x1b7\x1b[4l\x1b8", read],
+        ),
+        (
+            "a save while a scroll region is set",
+            &[b"\x1b[1;3r\x1b7\x1b[r\x1b8", read],
+        ),
+        (
+            "a save while reverse wrap is on",
+            &[b"\x1b[?45h\x1b7\x1b[?45l\x1b8", read],
+        ),
+        (
+            "a save while the margins are on",
+            &[b"\x1b[?69h\x1b7\x1b[?69l\x1b8", read],
+        ),
+        (
+            "the alternate screen entered in a list after autowrap off",
+            &[b"\x1b[?7l", b"\x1b[?25;1049h\x1b[?7h\x1b[?1049l", read],
+        ),
+        ("a soft reset", &[b"\x1b[!p", read]),
+    ];
+    for (name, reads) in cases {
+        assert_bypassed_on(name, 6, 24, reads);
+    }
+}
+
+/// A string on the table is inert only when nothing inside it can run as a
+/// control: xterm runs a raw C1 CSI inside an OSC string (VTPrsTbl.c). A
+/// payload with a C0 control, ESC, DEL or a byte from 80 to 9F keeps the
+/// read on the bypass, and so does any byte from 80 up while the terminal
+/// is not known to read UTF-8, as here: the library is not told it does.
+#[test]
+fn reads_after_a_string_holding_a_control_stay_on_the_bypass_review_82() {
+    let read: &[u8] = b"error\r\n\x1b[1GR# ";
+    let earlier: [(&str, &[u8]); 10] = [
+        ("a C1 CSI in a title", b"\x1b]0;X\x9b?2l\x07"),
+        ("a C1 CSI in a title ended by ST", b"\x1b]2;X\x9b?2l\x1b\\"),
+        ("a C1 CSI in a hyperlink", b"\x1b]8;;http://h/\x9b?2l\x07"),
+        ("a C1 CSI in the clipboard", b"\x1b]52;c;\x9b?2l\x07"),
+        ("a C1 CSI in OSC 1337", b"\x1b]1337;CurrentDir=/\x9b?2l\x07"),
+        ("a UTF-8 C1 CSI in a title", b"\x1b]0;X\xc2\x9b?2l\x07"),
+        ("shift out in a title", b"\x1b]0;X\x0eY\x07"),
+        ("DEL in a title", b"\x1b]0;X\x7fY\x07"),
+        ("an escape in a title", b"\x1b]0;X\x1b[?2lY\x07"),
+        ("a byte past ASCII in a title", b"\x1b]0;caf\xe9\x07"),
+    ];
+    for (name, string) in earlier {
+        assert_bypassed_on(name, 6, 24, &[string, read]);
+    }
+    let same_read: [(&str, &[u8]); 2] = [
+        (
+            "a C1 CSI in a title",
+            b"error\r\n\x1b]0;X\x9b?2l\x07\x1b[1GR# ",
+        ),
+        (
+            "a C1 CSI in the directory",
+            b"error\r\n\x1b]7;file://h/\x9b?2l\x07\x1b[1GR# ",
+        ),
+    ];
+    for (name, string) in same_read {
+        assert_bypassed_on(name, 6, 24, &[string]);
     }
 }
 
@@ -1144,6 +1262,17 @@ fn run_in_pty_of(
     script: &str,
     during: impl FnOnce(&dyn portable_pty::MasterPty, &Path),
 ) -> Run {
+    run_in_pty_with(rows, cols, &[], script, during)
+}
+
+/// As [`run_in_pty_of`], with `extra` arguments to prismtty.
+fn run_in_pty_with(
+    rows: u16,
+    cols: u16,
+    extra: &[&str],
+    script: &str,
+    during: impl FnOnce(&dyn portable_pty::MasterPty, &Path),
+) -> Run {
     let dir = tempfile::tempdir().expect("tempdir");
     let home = dir.path().join("home");
     let runtime = dir.path().join("rt");
@@ -1183,6 +1312,7 @@ fn run_in_pty_of(
         "--trace-io",
     ]);
     builder.arg(&trace);
+    builder.args(extra);
     // Raw output in the child's PTY, so the bytes arrive as written; each
     // printf goes through cat so that it is one write, not one per line.
     let script = format!("stty -opost; {script}");
@@ -1470,6 +1600,91 @@ fn pty_a_unicode_prompt_followed_by_an_erase_keeps_the_bypass_review_79() {
             String::from_utf8_lossy(&run.renders)
         );
     }
+}
+
+/// The reads written by the child one after another, each in one write,
+/// in a PTY `rows` by `cols`.
+fn pty_reads(rows: u16, cols: u16, extra: &[&str], reads: &[&[u8]]) -> Run {
+    let script = reads
+        .iter()
+        .map(|read| printf_script(read).replace("; sleep 0.2", "; sleep 0.3"))
+        .collect::<Vec<_>>()
+        .join("; ");
+    let run = run_in_pty_with(rows, cols, extra, &script, |_, _| {});
+    assert_eq!(
+        run.reads.len(),
+        reads.len(),
+        "one read each: {:?}",
+        run.reads
+    );
+    run
+}
+
+/// Where the terminal reads UTF-8, a string on the table holding a C1
+/// control, in its UTF-8 form or as a byte that is no UTF-8, keeps the read
+/// on the bypass; one holding plain UTF-8 text does not.
+#[test]
+fn pty_strings_are_judged_as_a_utf8_terminal_reads_them_review_82() {
+    let read: &[u8] = b"error\r\n\x1b[1GR# ";
+    let raw: [(&str, &[&[u8]]); 3] = [
+        (
+            "a UTF-8 C1 CSI in a title",
+            &[b"\x1b]0;X\xc2\x9b?2l\x07", read],
+        ),
+        (
+            "a byte that is no UTF-8 in a title",
+            &[b"\x1b]0;X\x9b?2l\x07", read],
+        ),
+        (
+            "a UTF-8 C1 CSI in a title in the same read",
+            &[b"error\r\n\x1b]2;X\xc2\x9b?2l\x07\x1b[1GR# "],
+        ),
+    ];
+    for (name, reads) in raw {
+        let run = pty_reads(5, 40, &[], reads);
+        assert_eq!(
+            run.renders,
+            reads.concat(),
+            "{name}: {:?}",
+            String::from_utf8_lossy(&run.renders)
+        );
+    }
+    let colored: [(&str, &[&[u8]]); 2] = [
+        ("a UTF-8 title", &["\x1b]0;caf\u{e9}\x07".as_bytes(), read]),
+        (
+            "a UTF-8 title in the same read",
+            &["error\r\n\x1b]2;caf\u{e9}\x07\x1b[1GR# ".as_bytes()],
+        ),
+    ];
+    for (name, reads) in colored {
+        let run = pty_reads(5, 40, &[], reads);
+        assert!(
+            contains(&run.renders, b"\x1b[38;2;255;0;0m"),
+            "{name}: {:?}",
+            String::from_utf8_lossy(&run.renders)
+        );
+    }
+}
+
+/// With `--local-echo` PrismTTY writes typed bytes to the terminal outside
+/// the highlighter, where the guard does not see them, so no read is
+/// promoted in that session.
+#[test]
+fn pty_local_echo_keeps_every_read_on_the_bypass_review_82() {
+    let read: &[u8] = b"error\r\n\x1b[1GR# ";
+    let run = pty_reads(5, 40, &["--local-echo"], &[read]);
+    assert_eq!(
+        run.renders,
+        read,
+        "{:?}",
+        String::from_utf8_lossy(&run.renders)
+    );
+    let run = pty_reads(5, 40, &[], &[read]);
+    assert!(
+        contains(&run.renders, b"\x1b[38;2;255;0;0m"),
+        "{:?}",
+        String::from_utf8_lossy(&run.renders)
+    );
 }
 
 #[test]
