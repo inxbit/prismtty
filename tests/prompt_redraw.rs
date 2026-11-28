@@ -258,7 +258,7 @@ fn a_mode_reset_lets_the_next_prompt_redraw_color_its_lines_again() {
             "both, both off",
             &[b"\x1b[?45;1045h", b"\x1b[?45;1045l", read],
         ),
-        ("margins", &[b"\x1b[?69h\x1b[2;10s", b"\x1b[?69l", read]),
+        ("margins", &[b"\x1b[?69h", b"\x1b[?69l", read]),
         ("autowrap", &[b"\x1b[?7l", b"\x1b[?7h", read]),
         ("leading zeros", &[b"\x1b[?01045h", b"\x1b[?001045l", read]),
         ("scroll region", &[b"\x1b[1;3r", b"\x1b[r", read]),
@@ -292,7 +292,7 @@ fn narrow_rows_keep_text_and_color_only_the_matches() {
         ),
         (
             "metadata in the tail",
-            b"error\r\n\x1b]2;a\nb\x07\x1b[?2004h\x1b[?1h\x1b=\x1b[1Gp$ ",
+            b"error\r\n\x1b]2;ab\x07\x1b[?2004h\x1b[?1h\x1b=\x1b[1Gp$ ",
             &[0],
         ),
     ];
@@ -672,12 +672,18 @@ fn a_read_pushed_without_the_terminal_size_keeps_the_bypass() {
 /// still has the main screen's region after a reset on the alternate screen,
 /// so a region set on the main screen counts until an exact reset there, or
 /// RIS. Any form that may switch to the alternate screen counts as
-/// switching; only an exact switch back counts as back.
+/// switching; only an exact switch back counts as back. A switch to the
+/// alternate screen while a region is set is a save of the cursor while a
+/// followed state is hazardous, which keeps the session on the bypass.
 #[test]
 fn a_main_screen_region_counts_until_it_is_reset_there_review_70() {
     let region: &[u8] = b"\x1b[1;3r\x1b[8;1H";
     let read: &[u8] = &concat(&[b"error\r\n", PROMPT]);
-    let cases: [(&str, &[&[u8]]); 7] = [
+    let cases: [(&str, &[&[u8]]); 8] = [
+        (
+            "reset on the main screen after the switch back",
+            &[region, b"\x1b[?1049h", b"\x1b[?1049l", b"\x1b[r", read],
+        ),
         (
             "set on the alternate screen and left set, 1049",
             &[b"\x1b[?1049h", b"\x1b[1;3r", b"\x1b[?1049l", read],
@@ -737,8 +743,16 @@ fn a_main_screen_region_counts_until_it_is_reset_there_review_70() {
             ],
         ),
         (
-            "reset on the main screen after the switch back",
-            &[region, b"\x1b[?1049h", b"\x1b[?1049l", b"\x1b[r", read],
+            "reset on the main screen before the switch",
+            &[
+                region,
+                b"\x1b[r",
+                b"\x1b[?1049h",
+                b"\x1b[1;5r",
+                b"\x1b[r",
+                b"\x1b[?1049l",
+                read,
+            ],
         ),
     ];
     for (name, reads) in recovered {
@@ -1066,7 +1080,19 @@ fn reads_after_controls_on_the_table_let_the_lines_be_colored_review_79() {
 #[test]
 fn reads_after_a_save_while_a_mode_is_hazardous_stay_on_the_bypass_review_82() {
     let read: &[u8] = b"error\r\n\x1b[1GR# ";
-    let cases: [(&str, &[&[u8]]); 11] = [
+    let cases: [(&str, &[&[u8]]); 14] = [
+        (
+            "margins set while mode 69 is on, taken as a save",
+            &[b"\x1b[?69h\x1b[2;10s\x1b[?69l", read],
+        ),
+        (
+            "autowrap off, then the alternate screen by mode 47",
+            &[b"\x1b[?7l\x1b[?47h\x1b[?7h\x1b[?47l", read],
+        ),
+        (
+            "autowrap off, then the alternate screen by mode 1047",
+            &[b"\x1b[?7l\x1b[?1047h\x1b[?7h\x1b[?1047l", read],
+        ),
         (
             "autowrap off saved by DECSC, on, restored",
             &[b"\x1b[?7l\x1b7\x1b[?7h\x1b8", read],
@@ -1122,7 +1148,8 @@ fn reads_after_a_save_while_a_mode_is_hazardous_stay_on_the_bypass_review_82() {
 #[test]
 fn reads_after_a_string_holding_a_control_stay_on_the_bypass_review_82() {
     let read: &[u8] = b"error\r\n\x1b[1GR# ";
-    let earlier: [(&str, &[u8]); 10] = [
+    let earlier: [(&str, &[u8]); 11] = [
+        ("a line feed in a title", b"\x1b]0;a\nb\x07"),
         ("a C1 CSI in a title", b"\x1b]0;X\x9b?2l\x07"),
         ("a C1 CSI in a title ended by ST", b"\x1b]2;X\x9b?2l\x1b\\"),
         ("a C1 CSI in a hyperlink", b"\x1b]8;;http://h/\x9b?2l\x07"),
@@ -1137,7 +1164,11 @@ fn reads_after_a_string_holding_a_control_stay_on_the_bypass_review_82() {
     for (name, string) in earlier {
         assert_bypassed_on(name, 6, 24, &[string, read]);
     }
-    let same_read: [(&str, &[u8]); 2] = [
+    let same_read: [(&str, &[u8]); 3] = [
+        (
+            "a line feed in a title",
+            b"error\r\n\x1b]2;a\nb\x07\x1b[1GR# ",
+        ),
         (
             "a C1 CSI in a title",
             b"error\r\n\x1b]0;X\x9b?2l\x07\x1b[1GR# ",
