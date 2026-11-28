@@ -4231,7 +4231,8 @@ fn listed_text_control(byte: u8) -> bool {
 /// it.
 #[derive(Clone, Debug, Default)]
 struct LayoutModes {
-    /// A control off [`CONTROL_TABLE`] came. Only RIS clears it.
+    /// A control off [`CONTROL_TABLE`] came, or a save of the cursor while a
+    /// followed state was hazardous. Nothing clears it during the session.
     unlisted_control: bool,
     scroll_region: ScrollRegion,
     /// The main screen's region on a terminal that keeps one for each
@@ -4275,7 +4276,11 @@ impl LayoutModes {
 
     fn observe_control(&mut self, bytes: &[u8]) {
         if bytes == b"\x1bc" {
+            // After a control off the table these bytes need not be RIS: in
+            // VT52 mode `ESC c` is no reset, and in Tektronix mode it sets a
+            // vector style. The off-table flag stays set for the session.
             *self = Self {
+                unlisted_control: self.unlisted_control,
                 decoding_switched: self.decoding_switched,
                 national_charsets: self.national_charsets,
                 ..Self::default()
