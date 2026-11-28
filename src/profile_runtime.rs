@@ -4480,6 +4480,65 @@ mod leave_tests {
     }
 
     #[test]
+    fn c2b_changed_parent_prompts_keep_the_child() {
+        let store = ProfileStore::builtin();
+        // clock_prompt: the parent's prompt shows the time.
+        let mut runtime = local(&store);
+        step(
+            &mut runtime,
+            &store,
+            "ssh sw1",
+            &["Cisco IOS Software\n[09:00] sw1#"],
+        );
+        step(
+            &mut runtime,
+            &store,
+            "ssh sw2",
+            &["--- JUNOS 22.4R3 Kernel 64-bit\nlab@sw2> "],
+        );
+        step(
+            &mut runtime,
+            &store,
+            "exit",
+            &[&format!("{BRACKET}\n[09:05] sw1#")],
+        );
+        step(
+            &mut runtime,
+            &store,
+            "show version",
+            &["Hostname: sw1\n[09:05] sw1#"],
+        );
+        assert_eq!(runtime.active_profiles(), names(JUNIPER), "clock_prompt");
+        assert_eq!(runtime.stack_len(), 2, "clock_prompt");
+        // changed_directory_prompt: the local shell's prompt changed.
+        let mut runtime = local(&store);
+        step(
+            &mut runtime,
+            &store,
+            "ssh sw2",
+            &["--- JUNOS 22.4R3 Kernel 64-bit\nlab@sw2> "],
+        );
+        step(
+            &mut runtime,
+            &store,
+            "exit",
+            &[&format!("{BRACKET}\nuser@laptop:~/new$")],
+        );
+        step(
+            &mut runtime,
+            &store,
+            "pwd",
+            &["/home/user/new\nuser@laptop:~/new$"],
+        );
+        assert_eq!(
+            runtime.active_profiles(),
+            names(JUNIPER),
+            "changed_directory_prompt"
+        );
+        assert_eq!(runtime.stack_len(), 1, "changed_directory_prompt");
+    }
+
+    #[test]
     fn c2b_bracket_before_the_exit_is_stale() {
         let store = ProfileStore::builtin();
         let mut runtime = cisco_then_juniper(&store);
