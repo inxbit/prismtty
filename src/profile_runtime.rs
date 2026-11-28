@@ -154,8 +154,12 @@ struct ExitIntent {
     depth: usize,
     /// When the exit was typed.
     armed_at: std::time::Instant,
-    /// The typed word, lowercase: its echo is not counted.
+    /// The typed word, lowercase: its echo is not counted. Empty for a
+    /// Ctrl-D.
     word: String,
+    /// Armed by Ctrl-D on an empty line: the shell may show `exit` or
+    /// `logout` for it, and that line is not counted either.
+    ctrl_d: bool,
     /// Visible output bytes since the Enter, at most one past the window
     /// and the echo: enough to see whether a line ends within the window.
     seen: Vec<u8>,
@@ -431,6 +435,12 @@ impl ProfileRuntime {
                     self.unreliable_remote_attempt = None;
                 }
                 0x17 => self.invalidate_input_line(),
+                // Ctrl-D on an empty line ends most shells and devices like
+                // `exit`. It ends the line too: the next key starts a new one.
+                0x04 if self.input_line_reliable && self.input_line.is_empty() => {
+                    self.arm_exit_intent(String::new(), true);
+                    self.line_start_prompt = None;
+                }
                 b'\r' | b'\n' => {
                     if self.input_line_reliable {
                         self.submit_input_line();
@@ -1038,12 +1048,21 @@ impl ProfileRuntime {
             frame.typed_before_prompt = true;
         }
         let word = typed.trim().to_ascii_lowercase();
+        if matches!(word.as_str(), "exit" | "quit" | "logout") {
+            self.arm_exit_intent(word, false);
+        }
+        self.input_line = typed;
+        self.remember_local_client();
+    }
+
+    /// `exit`, `quit` or `logout` typed, or Ctrl-D on an empty line, in the
+    /// innermost connection: C-2b watches for the proof that it ended.
+    fn arm_exit_intent(&mut self, word: String, ctrl_d: bool) {
         let confirming = self
             .exit_intent
             .as_ref()
             .is_some_and(|intent| intent.line_echo.is_some());
-        if matches!(word.as_str(), "exit" | "quit" | "logout")
-            && !confirming
+        if !confirming
             && self.stack.last().is_some_and(|frame| {
                 frame.target.is_some()
                     && frame.parent_prompt.is_some()
@@ -1059,6 +1078,7 @@ impl ProfileRuntime {
                 depth: self.stack.len(),
                 armed_at: std::time::Instant::now(),
                 word,
+                ctrl_d,
                 seen: Vec::new(),
                 origin: None,
                 scanned: 0,
@@ -1067,8 +1087,6 @@ impl ProfileRuntime {
                 line_echo: None,
             });
         }
-        self.input_line = typed;
-        self.remember_local_client();
     }
 
     /// The connection an exit intent may end: its target and the prompt its
@@ -1125,7 +1143,13 @@ impl ProfileRuntime {
             };
             let first = String::from_utf8_lossy(&intent.seen[..end]);
             let first = first.trim();
-            let origin = if first.is_empty() || first.eq_ignore_ascii_case(&intent.word) {
+            let echo = first.is_empty()
+                || first.eq_ignore_ascii_case(&intent.word)
+                || (intent.ctrl_d
+                    && ["exit", "logout", "^d"]
+                        .iter()
+                        .any(|shown| first.eq_ignore_ascii_case(shown)));
+            let origin = if echo {
                 let crlf = intent.seen[end] == b'\r' && intent.seen.get(end + 1) == Some(&b'\n');
                 if intent.seen[end] == b'\r' && end + 1 == intent.seen.len() {
                     // The `\n` of the echo's line end may follow.
@@ -4684,15 +4708,17 @@ mod leave_tests {
     #[test]
     fn c2b_ctrl_d_at_the_child_s_empty_prompt_returns_like_exit() {
         let store = ProfileStore::builtin();
-        for shown in ["", "logout", "exit"] {
+        // Nothing shown for the Ctrl-D, or the shell's word for it. A
+        // `logout` line is also an existing close marker, which returns at
+        // once.
+        for (shown, at_once) in [("", false), ("exit", false), ("logout", true)] {
             let mut runtime = cisco_then_juniper(&store);
             runtime.observe_input(b"\x04");
-            assert_eq!(
-                runtime.observe_output(format!("{shown}{}", genuine_reply()).as_bytes(), &store),
-                None,
-                "{shown:?}"
-            );
-            assert_eq!(key(&mut runtime, &store), Some(names(CISCO)), "{shown:?}");
+            let reply =
+                runtime.observe_output(format!("{shown}{}", genuine_reply()).as_bytes(), &store);
+            assert_eq!(reply.is_some(), at_once, "{shown:?}");
+            let returned = reply.or_else(|| key(&mut runtime, &store));
+            assert_eq!(returned, Some(names(CISCO)), "{shown:?}");
             assert_eq!(runtime.stack_len(), 1, "{shown:?}");
         }
     }
