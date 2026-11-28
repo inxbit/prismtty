@@ -89,10 +89,16 @@ examples that preserve only the token shape needed to reproduce the issue.
   highlighted. `--sanitize` removes both switches, so the terminal stays in
   UTF-8. Without a UTF-8 locale a raw `9B` is read as the control an 8-bit
   terminal runs, and a color it sets is written back in the 7-bit form after
-  a highlight. In a UTF-8 locale no color is taken from the UTF-8 form
-  `C2 9B` either, because terminals that read UTF-8 do not agree on running
-  it; on one that does, a color set that way is not restored after a
-  highlight.
+  a highlight. In a UTF-8 locale the color PrismTTY restores after a
+  highlight is not taken from the UTF-8 form `C2 9B` either, because
+  terminals that read UTF-8 do not agree on running it. On one that runs
+  it, a style that form turns on is not restored after a highlight, and one
+  it turns off, by a reset, a soft reset or a cursor restore, can come back
+  there; one that prints it gets no new live control from a restore. The
+  prompt-echo handling and the choice to close a highlight before a line
+  end do read that form: a style it may have set is ended after a prompt
+  like any other, and on a terminal that printed it the off ends a style
+  that is not there, which changes nothing.
 - By default PrismTTY reads an ESC followed by a byte from 80 up as an ESC
   that ends before that byte. A terminal like xterm ignores an invalid byte
   there and still holds the ESC open, and output PrismTTY adds can then
@@ -133,8 +139,10 @@ examples that preserve only the token shape needed to reproduce the issue.
   8-bit bytes, whatever the locale, these flags do not keep every string
   control from reaching it. When a filter processes the bytes it drops a `C2`
   that begins no character, so a removal cannot join a `C2` and a raw byte
-  into a C1 control; a `C2` cut off by the end of the output is written as it
-  is, and the next byte another program writes can complete it.
+  into a C1 control. In the stream a `C2` cut off by the end of the output
+  is written as it is, and the next byte another program writes can
+  complete it; `profiles test`, which filters its whole fixture at once,
+  drops it.
 - The filters work on the bytes of one PrismTTY process and promise nothing
   about what another process writes to the same terminal before or after it.
   On a terminal, `--sanitize` does not neutralize every incomplete control

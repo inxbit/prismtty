@@ -19,9 +19,18 @@ All notable changes to PrismTTY are documented here.
   UTF-8), not checked. On a terminal that reads 8-bit bytes behind a UTF-8
   locale this lets C1 controls, an OSC 52 opened by a raw `9D` included,
   through both flags; see SECURITY.md. Other locales are unchanged.
-- In a UTF-8 locale a highlight no longer widens over an invalid byte, no
-  color is taken from the UTF-8 form `C2 9B`, and when a filter processes
-  the bytes it drops a `C2` that begins no character.
+- In a UTF-8 locale a highlight no longer widens over an invalid byte, and
+  when a filter processes the bytes it drops a `C2` that begins no
+  character. `profiles test` with `--sanitize` or `--strip-ansi`, which
+  filters its whole fixture at once, therefore drops a `C2` that ends the
+  fixture, where 1.5.1 kept it; the stream still writes it.
+- In a UTF-8 locale the color restored after a highlight is not taken from
+  the UTF-8 form `C2 9B`, so on a terminal that runs that form a style it
+  set is not restored after a highlight and one it ended can come back
+  there: for `ESC[7m failed C2 9B 3 LF 1m next` with `failed` highlighted,
+  PrismTTY ends the highlight with `ESC[39m` where 1.5.1 wrote `ESC[31m`.
+  The prompt-echo handling and the choice to close a highlight before a
+  line end still read that form, as 1.5.1 does.
 
 ### Known limits
 
