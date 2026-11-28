@@ -359,15 +359,19 @@ impl ProfileRuntime {
 
     pub(crate) fn observe_input(&mut self, input: &[u8]) {
         for byte in input {
-            // A key, not part of an escape sequence such as a paste marker or
-            // a focus report.
-            if self.exit_intent.is_some()
-                && self.input_escape_state == InputEscapeState::None
-                && *byte != 0x1b
-            {
-                self.exit_key_typed(*byte);
+            // Leaving a connection needs work per key only while one is open
+            // or being opened: one check otherwise.
+            if self.leaving_watched() {
+                // A key, not part of an escape sequence such as a paste
+                // marker or a focus report.
+                if self.exit_intent.is_some()
+                    && self.input_escape_state == InputEscapeState::None
+                    && *byte != 0x1b
+                {
+                    self.exit_key_typed(*byte);
+                }
+                self.observe_telnet_command_byte(*byte);
             }
-            self.observe_telnet_command_byte(*byte);
             match self.input_escape_state {
                 InputEscapeState::Esc => {
                     self.input_escape_state = match *byte {
@@ -488,6 +492,15 @@ impl ProfileRuntime {
                 _ => self.invalidate_input_line(),
             }
         }
+    }
+
+    /// A connection is open or being opened, or a leave exchange is armed:
+    /// everything `exit_key_typed` and `observe_telnet_command_byte` read.
+    fn leaving_watched(&self) -> bool {
+        !self.stack.is_empty()
+            || self.pending_remote.is_some()
+            || self.exit_intent.is_some()
+            || self.telnet_exchange.is_some()
     }
 
     /// Follows telnet's command mode: Ctrl-] then one command line.
