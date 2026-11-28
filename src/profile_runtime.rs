@@ -299,6 +299,9 @@ pub(crate) struct ProfileRuntime {
     stack_generation: u64,
     /// What the client of a pending telnet attempt announced.
     pending_telnet_escape: Option<TelnetEscape>,
+    /// The time the exit rule reads; `None` is the system clock. Tests set
+    /// it so the 3 second bound is checked exactly.
+    clock: Option<std::time::Instant>,
 }
 
 impl ProfileRuntime {
@@ -331,7 +334,17 @@ impl ProfileRuntime {
             telnet_announcement_partial: String::new(),
             stack_generation: 0,
             pending_telnet_escape: None,
+            clock: None,
         }
+    }
+
+    fn now(&self) -> std::time::Instant {
+        self.clock.unwrap_or_else(std::time::Instant::now)
+    }
+
+    #[cfg(test)]
+    fn set_clock(&mut self, now: std::time::Instant) {
+        self.clock = Some(now);
     }
 
     #[cfg(test)]
@@ -1076,7 +1089,7 @@ impl ProfileRuntime {
         {
             self.exit_intent = Some(ExitIntent {
                 depth: self.stack.len(),
-                armed_at: std::time::Instant::now(),
+                armed_at: self.now(),
                 word,
                 ctrl_d,
                 seen: Vec::new(),
@@ -1117,11 +1130,12 @@ impl ProfileRuntime {
             self.exit_intent = None;
             return None;
         };
+        let now = self.now();
         let intent = self.exit_intent.as_mut()?;
         if intent.line_echo.is_some() {
             return self.match_line_echo(visible);
         }
-        if intent.armed_at.elapsed() > EXIT_CONFIRM_TIME {
+        if now.saturating_duration_since(intent.armed_at) > EXIT_CONFIRM_TIME {
             self.exit_intent = None;
             return None;
         }
@@ -4821,39 +4835,55 @@ mod leave_tests {
         }
     }
 
-    // C-2b, time (review 54, must-change 7): real time, as the rule uses it.
+    // C-2b, time (review 54, must-change 7). The clock is set by the test,
+    // so the bound is checked exactly and nothing sleeps (review 81).
 
-    fn close_shown_after(delay_ms: u64) -> Option<Vec<String>> {
+    fn close_shown_after(delay: std::time::Duration) -> Option<Vec<String>> {
         let store = ProfileStore::builtin();
         let mut runtime = cisco_then_juniper(&store);
+        let start = std::time::Instant::now();
+        runtime.set_clock(start);
         runtime.observe_input(b"exit");
         runtime.observe_output(b"exit", &store);
         runtime.observe_input(b"\r");
         runtime.observe_output(b"\r\n", &store);
-        std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+        runtime.set_clock(start + delay);
         runtime.observe_output(format!("{BRACKET}\r\nsw1#").as_bytes(), &store);
         key(&mut runtime, &store)
     }
 
     #[test]
-    fn c2b_close_shown_within_three_seconds_returns() {
-        assert_eq!(close_shown_after(2_500), Some(names(CISCO)));
+    fn c2b_close_shown_at_three_seconds_returns() {
+        assert_eq!(
+            close_shown_after(std::time::Duration::from_secs(3)),
+            Some(names(CISCO))
+        );
     }
 
     #[test]
     fn c2b_close_shown_after_three_seconds_does_not_return() {
-        assert_eq!(close_shown_after(3_500), None);
+        assert_eq!(
+            close_shown_after(
+                std::time::Duration::from_secs(3) + std::time::Duration::from_nanos(1)
+            ),
+            None
+        );
     }
 
     #[test]
     fn c2b_bracket_in_time_but_parent_prompt_after_three_seconds_does_not_return() {
         let store = ProfileStore::builtin();
         let mut runtime = cisco_then_juniper(&store);
+        let start = std::time::Instant::now();
+        runtime.set_clock(start);
         runtime.observe_input(b"exit");
         runtime.observe_output(b"exit", &store);
         runtime.observe_input(b"\r");
+        runtime.set_clock(start + std::time::Duration::from_secs(3));
         runtime.observe_output(format!("\r\n{BRACKET}\r\n").as_bytes(), &store);
-        std::thread::sleep(std::time::Duration::from_millis(3_200));
+        runtime.set_clock(
+            start + std::time::Duration::from_secs(3) + std::time::Duration::from_nanos(1),
+        );
         runtime.observe_output(b"sw1#", &store);
         assert_eq!(key(&mut runtime, &store), None);
         assert_eq!(runtime.stack_len(), 2);
