@@ -1662,3 +1662,45 @@ fn known_limit_sanitize_on_a_terminal_can_end_with_an_unfinished_escape() {
         }
     }
 }
+
+/// A prompt whose style the UTF-8 form `C2 9B` opened, with a plain reset
+/// after the prompt (review 80's witness). The reset is taken out with the
+/// other SGRs of the prompt echo, so what it ended is written in its place,
+/// as 1.5.1 writes it: `49`, `27` or `24`. A terminal that runs `C2 9B`
+/// would otherwise keep the style on the command and the lines after it;
+/// on one that prints `C2 9B` the style was never set and the off changes
+/// nothing. The bytes are 1.5.1's in both locales, both reset modes and
+/// under `--sanitize`.
+#[test]
+fn a_prompt_style_opened_by_c2_9b_is_ended_where_its_reset_was() {
+    for (code, off) in [("44", "49"), ("7", "27"), ("4", "24")] {
+        let format =
+            format!("\\302\\233{code}mR1#\\033[0m show \\033[1mint\\r\\nnext output here\\r\\nR1#");
+        for (flags, reset) in [
+            (&[][..], "\x1b[39m"),
+            (&["--no-minimal-reset"][..], "\x1b[0m"),
+            (&["--sanitize"][..], "\x1b[39m"),
+            (&["--sanitize", "--no-minimal-reset"][..], "\x1b[0m"),
+        ] {
+            let expected = [
+                b"\xc2\x9b".as_slice(),
+                code.as_bytes(),
+                b"mR1#\x1b[",
+                off.as_bytes(),
+                b"m ",
+                reset.as_bytes(),
+                b"show int\r\r\nnext output here\r\r\nR1#",
+            ]
+            .concat();
+            for locale in [&[("LC_ALL", "en_US.UTF-8")][..], &[("LC_ALL", "C")][..]] {
+                let out = printf_on_a_pty(OnPty::Stdout, locale, flags, &format);
+                assert!(
+                    out == expected,
+                    "{code} {flags:?} {locale:?}\n  got {:?}\n want {:?}",
+                    String::from_utf8_lossy(&out),
+                    String::from_utf8_lossy(&expected)
+                );
+            }
+        }
+    }
+}
