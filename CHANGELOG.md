@@ -52,15 +52,16 @@ All notable changes to PrismTTY are documented here.
   512 bytes; a close after you typed ahead of the parent prompt; at a waiting
   parent prompt, Backspace, Ctrl-U, Tab, a first Ctrl-C (which prints `^C`) or
   another control key, output that is not the echo of what you typed (a log
-  message, a redraw, a completion, a history recall), and a parent that does
-  not echo what you type (`--local-echo` does not count: its echo is not the
-  device's output); a parent prompt that changed (configuration mode, a clock
-  or status in the prompt); a telnet that printed no escape announcement, a
-  custom escape (`-e`, `-E`, `-r`, or another announced character), telnet's
-  `close`, `!` and `z`; and a telnet whose connection drops with a bare
-  `Connection closed.` line, which a still-connected telnet session can also
-  print. The clock is checked when PrismTTY reads output, so a stopped or very
-  slow session can also miss a close.
+  message, a redraw, a completion, a history recall, or an arrow key or paste
+  marker shown as `^[[A` or `^[[200~`), and a parent that does not echo what
+  you type (`--local-echo` does not count: its echo is not the device's
+  output); a parent prompt that changed (configuration mode, a clock or status
+  in the prompt); a telnet that printed no escape announcement, a custom
+  escape (`-e`, `-E`, `-r`, or another announced character), telnet's `close`,
+  `!` and `z`; and a telnet whose connection drops with a bare `Connection
+  closed.` line, which a still-connected telnet session can also print. The
+  clock is checked when PrismTTY reads output, so a stopped or very slow
+  session can also miss a close.
 
   Outside these two exchanges, the close messages PrismTTY already recognized,
   such as `Connection to NAME closed.`, `Connection closed by foreign host.`

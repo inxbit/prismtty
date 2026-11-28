@@ -4730,6 +4730,23 @@ mod leave_tests {
         assert_eq!(runtime.stack_len(), 2);
     }
 
+    #[test]
+    fn c2b_an_input_sequence_the_device_shows_keeps_the_child() {
+        // A line discipline in canonical mode shows the bytes of an arrow or
+        // a paste marker as `^[[A` or `^[[200~`: output that is not the echo
+        // of a typed key, so the prompt is not confirmed (review 81's fake
+        // device does this).
+        let store = ProfileStore::builtin();
+        for (sequence, shown) in [(&b"\x1b[A"[..], &b"^[[A"[..]), (b"\x1b[200~", b"^[[200~")] {
+            let mut runtime = cisco_then_juniper(&store);
+            exit_with(&mut runtime, &store, &genuine_reply(), &[]);
+            runtime.observe_input(sequence);
+            runtime.observe_output(shown, &store);
+            assert_eq!(key(&mut runtime, &store), None, "{shown:?}");
+            assert_eq!(runtime.stack_len(), 2, "{shown:?}");
+        }
+    }
+
     // C-2b, Ctrl-D at the child's empty prompt (review 81, item 3).
 
     #[test]
