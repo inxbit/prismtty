@@ -4620,6 +4620,8 @@ mod leave_tests {
             (&b"sx\x7fh\r"[..], &b"sx\x08 \x08h\r\n"[..]),
             (b"x\x15sh\r", b"x\r\x1b[Ksh\r\n"),
             (b"sh\t\r", b"show \r\n"),
+            // A control key the device shows nothing for still ends it.
+            (b"s\x01h\r", b"sh\r\n"),
         ] {
             let mut runtime = cisco_then_juniper_shell(&store);
             exit_with(&mut runtime, &store, &genuine_reply(), &[]);
