@@ -3668,7 +3668,8 @@ fn bounded_parameter(digits: &[u8]) -> Option<u32> {
 /// `CSI D`), erase in line (`CSI K`, `CSI 0K`, `CSI 1K`, `CSI 2K`), erase below
 /// (`CSI J`, `CSI 0J`), bracketed paste and cursor-key mode (`CSI ? 2004 h/l`,
 /// `CSI ? 1 h/l`), keypad mode (`ESC =`, `ESC >`) and a window title or
-/// working directory (OSC 0, 1, 2 or 7, UTF-8, ended by BEL or `ESC \`).
+/// working directory (OSC 0, 1, 2 or 7, ended by BEL or `ESC \`, whose text
+/// holds no control; see [`string_payload_is_inert`]).
 /// Exact bytes only: the `ESC [` introducer with nothing between ESC and `[`,
 /// decimal parameters, no intermediate bytes. Everything else, the C1 forms
 /// included, keeps the bypass.
@@ -3683,19 +3684,13 @@ fn is_same_row_redraw_control(bytes: &[u8]) -> bool {
         else {
             return false;
         };
-        let Ok(payload) = std::str::from_utf8(payload) else {
+        if !string_payload_is_inert(payload) {
+            return false;
+        }
+        let Some(separator) = payload.iter().position(|byte| *byte == b';') else {
             return false;
         };
-        let Some((id, text)) = payload.split_once(';') else {
-            return false;
-        };
-        return matches!(id, "0" | "1" | "2" | "7")
-            && !text.chars().any(|c| {
-                matches!(
-                    c,
-                    '\u{07}' | '\u{18}' | '\u{1a}' | '\u{1b}' | '\u{80}'..='\u{9f}'
-                )
-            });
+        return matches!(&payload[..separator], b"0" | b"1" | b"2" | b"7");
     }
     let Some((&final_byte, parameters)) = bytes
         .strip_prefix(b"\x1b[")
@@ -4095,6 +4090,9 @@ fn listed_control(bytes: &[u8]) -> Option<Listed> {
         let text = body
             .strip_suffix(b"\x07")
             .or_else(|| body.strip_suffix(b"\x1b\\"))?;
+        if !string_payload_is_inert(text) {
+            return None;
+        }
         let number = text.split(|byte| *byte == b';').next().unwrap_or_default();
         return CONTROL_TABLE
             .iter()
@@ -4198,6 +4196,22 @@ fn listed_control(bytes: &[u8]) -> Option<Listed> {
 fn saves_the_cursor(bytes: &[u8]) -> bool {
     bytes == b"\x1b7"
         || (bytes.starts_with(b"\x1b[") && bytes.ends_with(b"s") && !bytes.contains(&b'?'))
+}
+
+/// Whether the text of a string control, between its introducer and its
+/// terminator, holds nothing a terminal could run as a control: xterm runs a
+/// raw C1 CSI inside an OSC string (VTPrsTbl.c), and one built to end a
+/// string on a C0 control ends it there. So no C0 control, ESC or DEL, no
+/// byte from 80 to 9F, and past ASCII only valid UTF-8 on a terminal known to
+/// read UTF-8.
+fn string_payload_is_inert(text: &[u8]) -> bool {
+    if text
+        .iter()
+        .any(|byte| *byte < 0x20 || (0x7f..=0x9f).contains(byte))
+    {
+        return false;
+    }
+    text.is_ascii() || (terminal_reads_utf8() && std::str::from_utf8(text).is_ok())
 }
 
 /// Whether `byte`, a C0 control or DEL in the text, is on [`CONTROL_TABLE`].
