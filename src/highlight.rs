@@ -1587,6 +1587,13 @@ impl StreamingHighlighter {
         output
     }
 
+    /// Tells the highlighter that something else writes to the same terminal
+    /// (the command line's local echo), so the guard on earlier output cannot
+    /// see every control: no read is promoted for the rest of the session.
+    pub(crate) fn note_output_outside_the_highlighter(&mut self) {
+        self.layout_modes.unlisted_control = true;
+    }
+
     /// Tells the highlighter whether the read loop carries bytes cut off at the
     /// end of the next chunk into the read after it.
     pub(crate) fn set_read_ends_mid_sequence(&mut self, cut: bool) {
@@ -4246,7 +4253,8 @@ fn listed_text_control(byte: u8) -> bool {
 #[derive(Clone, Debug, Default)]
 struct LayoutModes {
     /// A control off [`CONTROL_TABLE`] came, or a save of the cursor while a
-    /// followed state was hazardous. Nothing clears it during the session.
+    /// followed state was hazardous, or output reached the terminal outside
+    /// the highlighter. Nothing clears it during the session.
     unlisted_control: bool,
     scroll_region: ScrollRegion,
     /// The main screen's region on a terminal that keeps one for each

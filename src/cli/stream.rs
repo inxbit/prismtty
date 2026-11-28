@@ -490,12 +490,18 @@ impl<'a> HighlightSession<'a> {
             &overlay_config,
             &mut rule_identities,
         )?;
-        let streaming = new_streaming_highlighter(
+        let mut streaming = new_streaming_highlighter(
             highlighter.clone(),
             interactive,
             options.benchmark,
             options.no_minimal_reset,
         );
+        if options.local_echo {
+            // Typed bytes reach the terminal from the input thread, outside
+            // the highlighter, where the guard on earlier output cannot see
+            // them.
+            streaming.note_output_outside_the_highlighter();
+        }
         let mut highlighter_cache = HighlighterCache::default();
         highlighter_cache.replace_generation(&profile_names, &highlighter);
         let reporter = ProfileReporter::new(options.show_profile, auto_detect_enabled(options));
