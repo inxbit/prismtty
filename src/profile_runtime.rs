@@ -18,6 +18,9 @@ const EXIT_ECHO_LIMIT: usize = 16;
 /// device's own client prints its close line one round trip after the
 /// session ends; three seconds leaves room for a slow link.
 const EXIT_CONFIRM_TIME: std::time::Duration = std::time::Duration::from_secs(3);
+/// The longest line typed at a waiting parent prompt that is matched
+/// against its echo; a longer one keeps the child.
+const LINE_ECHO_LIMIT: usize = 512;
 /// Output allowed between telnet's command echo and its close line.
 const TELNET_EXCHANGE_WINDOW: usize = 256;
 /// Output allowed between the Ctrl-] and the end of telnet's command echo:
@@ -167,10 +170,36 @@ struct ExitIntent {
     /// The parent's prompt is the waiting line: the unterminated end of the
     /// output, after the bracket.
     parent_waiting: bool,
-    /// A key was typed at the waiting parent prompt: the next output must
-    /// begin with its echo, or the prompt was not waiting (a line that goes
-    /// on, still in flight).
-    echo_expected: Option<u8>,
+    /// The line typed at the waiting parent prompt, matched against the
+    /// output that follows it.
+    line_echo: Option<LineEcho>,
+}
+
+/// The keys typed at a waiting parent prompt, from the first one to the
+/// Enter, and how much of them the output has echoed. Every visible byte
+/// after the first key must be the next one of them; the echo of the Enter
+/// confirms the prompt.
+#[derive(Clone, Debug, Default)]
+struct LineEcho {
+    /// Typed bytes in order, Enter kept as `\r`; nothing after the Enter.
+    typed: Vec<u8>,
+    /// How many of `typed` the output has echoed.
+    matched: usize,
+    /// The line opened a connection before the echo confirmed the return:
+    /// that attempt was made from the parent.
+    remote_armed: bool,
+}
+
+/// A typed byte whose echo is the byte itself: printable ASCII and the
+/// bytes of a UTF-8 character, and Enter (as `\r`). Backspace, Ctrl-U, Tab
+/// and other control keys are echoed or acted on in ways that cannot be
+/// matched exactly.
+fn line_echo_key(byte: u8) -> Option<u8> {
+    match byte {
+        b'\r' | b'\n' => Some(b'\r'),
+        0x20..=0x7e | 0x80..=0xff => Some(byte),
+        _ => None,
+    }
 }
 
 /// From a Ctrl-] that reaches a tracked default-escape telnet: the command
@@ -374,7 +403,7 @@ impl ProfileRuntime {
                 let confirming = self
                     .exit_intent
                     .as_ref()
-                    .is_some_and(|intent| intent.echo_expected.is_some());
+                    .is_some_and(|intent| intent.line_echo.is_some());
                 if let (Some(prompt), Some(frame), false) =
                     (prompt.as_ref(), self.stack.last_mut(), confirming)
                 {
@@ -1010,7 +1039,7 @@ impl ProfileRuntime {
         let confirming = self
             .exit_intent
             .as_ref()
-            .is_some_and(|intent| intent.echo_expected.is_some());
+            .is_some_and(|intent| intent.line_echo.is_some());
         if matches!(word.as_str(), "exit" | "quit" | "logout")
             && !confirming
             && self.stack.last().is_some_and(|frame| {
@@ -1033,7 +1062,7 @@ impl ProfileRuntime {
                 scanned: 0,
                 bracket_seen: false,
                 parent_waiting: false,
-                echo_expected: None,
+                line_echo: None,
             });
         }
         self.input_line = typed;
@@ -1058,24 +1087,19 @@ impl ProfileRuntime {
     /// opened, ending within the first `EXIT_CONFIRM_WINDOW` bytes after the
     /// echo of the exit line and shown within `EXIT_CONFIRM_TIME`. The first
     /// prompt decides either way. A complete line decides at once. The
-    /// unterminated last line is the waiting prompt only once a key typed at
-    /// it comes back as the next output (`exit_key_typed`); a line that goes
-    /// on is judged when it ends. Bytes are counted as they arrive, so read
-    /// grouping and typing speed do not change the result.
+    /// unterminated last line is the waiting prompt only once the whole line
+    /// typed at it comes back as its echo, up to the line end of its Enter
+    /// (`exit_key_typed`, `match_line_echo`); a line that goes on is judged
+    /// when it ends. Bytes are counted as they arrive, so read grouping and
+    /// typing speed do not change the result.
     fn confirm_exit_close(&mut self, visible: &[u8]) -> Option<Option<Vec<String>>> {
         let Some((target, parent_prompt)) = self.exit_intent_frame() else {
             self.exit_intent = None;
             return None;
         };
         let intent = self.exit_intent.as_mut()?;
-        if let Some(expected) = intent.echo_expected {
-            let first = visible.first()?;
-            let echoed = match expected {
-                b'\r' | b'\n' => matches!(first, b'\r' | b'\n'),
-                byte => *first == byte,
-            };
-            self.exit_intent = None;
-            return echoed.then(|| self.pop_exited_connection());
+        if intent.line_echo.is_some() {
+            return self.match_line_echo(visible);
         }
         if intent.armed_at.elapsed() > EXIT_CONFIRM_TIME {
             self.exit_intent = None;
@@ -1156,22 +1180,83 @@ impl ProfileRuntime {
         }
     }
 
+    /// The output after the first key typed at the waiting parent prompt:
+    /// each visible byte must be the next typed byte not yet echoed. The
+    /// echo of the Enter (a line end) proves the prompt was waiting, so the
+    /// connection ends there; anything else, or output with nothing typed
+    /// left to echo, keeps the child.
+    fn match_line_echo(&mut self, visible: &[u8]) -> Option<Option<Vec<String>>> {
+        let line = self.exit_intent.as_mut()?.line_echo.as_mut()?;
+        for byte in visible {
+            let Some(&expected) = line.typed.get(line.matched) else {
+                self.exit_intent = None;
+                return None;
+            };
+            let echoed = match expected {
+                b'\r' => matches!(byte, b'\r' | b'\n'),
+                expected => *byte == expected,
+            };
+            if !echoed {
+                self.exit_intent = None;
+                return None;
+            }
+            if expected == b'\r' {
+                let remote_armed = line.remote_armed;
+                self.exit_intent = None;
+                return Some(self.pop_confirmed_exit(remote_armed));
+            }
+            line.matched += 1;
+        }
+        None
+    }
+
     /// A key typed while an exit intent is set. At the parent's waiting
-    /// prompt it is expected back as the next output: that proves the prompt
-    /// was waiting. Any other key, typed at the child's prompt or ahead of
-    /// the output, ends the intent.
+    /// prompt it starts the line whose echo confirms the prompt; after that,
+    /// each key up to the Enter joins the line. A key whose echo cannot be
+    /// matched, a line too long, or a key typed at the child's prompt or
+    /// ahead of the output ends the intent. Keys after the Enter belong to
+    /// the next command.
     fn exit_key_typed(&mut self, byte: u8) {
         let Some(intent) = self.exit_intent.as_mut() else {
             return;
         };
-        if intent.echo_expected.is_some() {
-            return;
+        let key = line_echo_key(byte);
+        match intent.line_echo.as_mut() {
+            Some(line) if line.typed.last() == Some(&b'\r') => {}
+            Some(line) => match key {
+                Some(key) if line.typed.len() < LINE_ECHO_LIMIT => line.typed.push(key),
+                _ => self.exit_intent = None,
+            },
+            None => match key.filter(|_| intent.parent_waiting) {
+                Some(key) => {
+                    intent.line_echo = Some(LineEcho {
+                        typed: vec![key],
+                        ..LineEcho::default()
+                    });
+                }
+                None => self.exit_intent = None,
+            },
         }
-        if intent.parent_waiting {
-            intent.echo_expected = Some(byte);
-        } else {
-            self.exit_intent = None;
+    }
+
+    /// The return proven by the echo of a line typed at the parent prompt.
+    /// A connection that line started was opened from the parent, so it
+    /// stays pending through the pop.
+    fn pop_confirmed_exit(&mut self, remote_armed: bool) -> Option<Vec<String>> {
+        let pending = remote_armed.then(|| {
+            (
+                self.pending_remote.clone(),
+                self.pending_remote_lines,
+                self.pending_parent_prompt.clone(),
+            )
+        });
+        let transition = self.pop_exited_connection();
+        if let Some((remote, lines, parent_prompt)) = pending {
+            self.pending_remote = remote;
+            self.pending_remote_lines = lines;
+            self.pending_parent_prompt = parent_prompt;
         }
+        transition
     }
 
     fn pop_exited_connection(&mut self) -> Option<Vec<String>> {
@@ -1307,6 +1392,13 @@ impl ProfileRuntime {
     }
 
     fn arm_remote_attempt(&mut self, attempt: RemoteAttempt) {
+        if let Some(line) = self
+            .exit_intent
+            .as_mut()
+            .and_then(|intent| intent.line_echo.as_mut())
+        {
+            line.remote_armed = true;
+        }
         self.pending_parent_prompt = None;
         self.pending_telnet_escape = None;
         self.pending_remote = Some(attempt);
