@@ -157,23 +157,34 @@ the remote profile active.
 
 Leaving a device that you reached from another device returns to the first
 device's colors when the output shows the end of that connection. After you type
-or paste `exit`, `quit` or `logout`, PrismTTY needs `[Connection to NAME closed
-by foreign host]`, where NAME is the host you typed in the `ssh`, `mosh` or
-`telnet` command, and then, as the first prompt after it, exactly the prompt you
-were at when you opened that connection: as a complete line, or waiting for
-input, when the next key you type there comes back as its echo. The prompt must
-end within the first 512 bytes after the echo of your exit line (bytes as
-received, escape sequences not counted) and the lines must come within 3
-seconds. After Ctrl-] and `quit` (or `q`, `qu`, `qui`) in telnet, it needs
-telnet's own `telnet> quit` line within 4,096 bytes, ending after your Enter,
-then `Connection closed.` as the first non-blank line within 256 bytes, and
-every telnet in the chain must have announced its escape character (`Escape
-character is '^]'.`). Anything else keeps the colors as they were: a changed
-parent prompt, a late or buried close, keys typed ahead, a custom telnet escape.
-These lines are trusted: a device, or a logout script on it, that prints the
-same lines while you are still connected, such as a saved session log, switches
-the colors early. Only colors change; with `--show-profile` and an unread
-stderr, the confirming read waits until stderr drains.
+or paste `exit`, `quit` or `logout`, or press Ctrl-D on an empty line (a line
+edited with the arrow keys, Tab, Ctrl-W or another control key, or recalled from
+history, does not count; Backspace and Ctrl-U do), PrismTTY needs `[Connection
+to NAME closed by foreign host]`, where NAME is the host you typed in the `ssh`,
+`mosh` or `telnet` command, and then, as the first prompt after it, exactly the
+prompt you were at when you opened that connection, ending within the first 512
+bytes after the echo of your exit line (bytes as received, escape sequences not
+counted), with both lines within 3 seconds. A complete prompt line confirms at
+once. A waiting prompt confirms when the whole next line you type there comes
+back as its echo, byte for byte with nothing else shown, and the colors change
+at the echo of your Enter: the parent's prompt line and that first command are
+drawn in the colors of the device you left, the command's output in the
+parent's. At a waiting prompt, Backspace, Ctrl-U, Tab, Ctrl-C, output that is
+not your echo, and a parent that does not echo keep the child's colors, as do
+keys typed before the prompt appeared. After Ctrl-] and `quit` (or `q`, `qu`,
+`qui`) in telnet, PrismTTY needs telnet's own `telnet> quit` line (or the
+shorter word you typed) within 4,096 bytes, ending after your Enter, then
+`Connection closed.` or `Connection closed` as the first non-blank line within
+256 bytes, with no time limit, and every telnet in the chain must have announced
+its escape character (`Escape character is '^]'.`). A telnet that drops with a
+bare `Connection closed.` keeps its colors. The close messages PrismTTY already
+recognized, such as `Connection to NAME closed.` or `Connection closed by
+foreign host.`, still end a connection as before. These lines are trusted: a
+device, or a logout script on it, that prints the same lines while you are still
+connected, such as a saved session log, switches the colors early, as does a
+device that shows the parent prompt and then exactly the line you type. Only
+colors change, except that with `--show-profile` and an unread stderr, the
+confirming read, and terminal output with it, waits until stderr drains.
 
 Use stdin mode for noninteractive output from files or pipes:
 
