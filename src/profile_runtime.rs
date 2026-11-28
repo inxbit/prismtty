@@ -395,7 +395,9 @@ impl ProfileRuntime {
                 InputEscapeState::None => {}
             }
 
-            if self.line_start_prompt.is_none() && !matches!(byte, b'\r' | b'\n') {
+            // The ESC of an input sequence (an arrow, a focus report, a paste
+            // marker) is not a key: the line starts at the first key.
+            if self.line_start_prompt.is_none() && !matches!(byte, b'\r' | b'\n' | 0x1b) {
                 let prompt = self.waiting_prompt_now();
                 // A connection waiting at its parent's exact prompt text cannot
                 // be told apart from that parent, so C-2b stops trusting it;
