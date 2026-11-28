@@ -1148,8 +1148,12 @@ fn reads_after_a_save_while_a_mode_is_hazardous_stay_on_the_bypass_review_82() {
 #[test]
 fn reads_after_a_string_holding_a_control_stay_on_the_bypass_review_82() {
     let read: &[u8] = b"error\r\n\x1b[1GR# ";
-    let earlier: [(&str, &[u8]); 11] = [
+    let earlier: [(&str, &[u8]); 12] = [
         ("a line feed in a title", b"\x1b]0;a\nb\x07"),
+        (
+            "a UTF-8 title while the terminal is not known to read UTF-8",
+            b"\x1b]0;caf\xc3\xa9\x07",
+        ),
         ("a C1 CSI in a title", b"\x1b]0;X\x9b?2l\x07"),
         ("a C1 CSI in a title ended by ST", b"\x1b]2;X\x9b?2l\x1b\\"),
         ("a C1 CSI in a hyperlink", b"\x1b]8;;http://h/\x9b?2l\x07"),
