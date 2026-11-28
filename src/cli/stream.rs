@@ -184,6 +184,7 @@ pub(super) fn highlight_stream<R: Read, W: Write>(
             next_profile_names,
         );
     }
+    prepare_layout_state(&mut session, &chunk_filter, &first_chunk);
     session.push(writer, &trace, &first_chunk)?;
     if let Some(warning) = session.slow_rule_warning() {
         super::diagnostic(format_args!("{warning}"));
@@ -298,6 +299,7 @@ pub(super) fn highlight_stream<R: Read, W: Write>(
                 }
             }
         }
+        prepare_layout_state(&mut session, &chunk_filter, &chunk);
         session.push(writer, &trace, &chunk)?;
         if let Some(warning) = session.slow_rule_warning() {
             super::diagnostic(format_args!("{warning}"));
@@ -488,12 +490,18 @@ impl<'a> HighlightSession<'a> {
             &overlay_config,
             &mut rule_identities,
         )?;
-        let streaming = new_streaming_highlighter(
+        let mut streaming = new_streaming_highlighter(
             highlighter.clone(),
             interactive,
             options.benchmark,
             options.no_minimal_reset,
         );
+        if options.local_echo {
+            // Typed bytes reach the terminal from the input thread, outside
+            // the highlighter, where the guard on earlier output cannot see
+            // them.
+            streaming.note_output_outside_the_highlighter();
+        }
         let mut highlighter_cache = HighlighterCache::default();
         highlighter_cache.replace_generation(&profile_names, &highlighter);
         let reporter = ProfileReporter::new(options.show_profile, auto_detect_enabled(options));
@@ -901,6 +909,24 @@ fn write_benchmark_report(
         }
     }
     writeln!(out, "Processed {input_bytes} bytes in {elapsed_secs:.3}s")
+}
+
+/// Before a chunk is pushed: whether the read loop carries bytes cut off at
+/// its end into the next read, and, for a chunk that holds a cursor move, the
+/// terminal's size. The cursor-move bypass colors the output lines of a read
+/// that ends with a prompt redraw only when it knows both.
+fn prepare_layout_state(
+    session: &mut HighlightSession<'_>,
+    chunk_filter: &ChunkFilterState,
+    chunk: &AnsiChunk,
+) {
+    session
+        .streaming
+        .set_read_ends_mid_sequence(!chunk_filter.carry.is_empty());
+    if session.streaming.wants_terminal_size(chunk) {
+        let (rows, columns) = super::pty::output_terminal_size();
+        session.streaming.set_terminal_size(rows, columns);
+    }
 }
 
 fn prepare_chunk(
