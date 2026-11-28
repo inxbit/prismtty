@@ -268,6 +268,15 @@ Important options:
 - `--strip-ansi` removes existing ANSI before PrismTTY styles output.
 - `--sanitize` strips window-title, clipboard (OSC 52), and other OSC/DCS
   string escapes from program output while preserving normal CSI/SGR styling.
+  It assumes a terminal that really reads UTF-8 when the locale variables
+  name UTF-8; PrismTTY infers that from their text and checks nothing. There
+  an isolated invalid raw byte from 80 to 9F in ordinary text is kept as
+  text, and a terminal that reads 8-bit bytes runs it as a C1 control, so
+  `--sanitize` and `--strip-ansi` let raw C1 controls, an OSC 52 opened by
+  `9D` included, through to it. On a terminal `--sanitize` does not
+  neutralize every incomplete control at the end of input, and it promises
+  nothing about what another process writes to the same terminal. See
+  SECURITY.md.
 - `--show-profile` prints profile selections and transitions to stderr. With
   auto-detection on, a selection that stays `generic` is not reported, so a
   session that never leaves `generic` prints nothing.

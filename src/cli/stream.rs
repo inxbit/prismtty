@@ -3708,11 +3708,13 @@ mod tests {
         }
     }
 
-    // The same guarantees with the UTF-8 switch on, where a raw C1 string ends
-    // at its line end: however the reads fall, `--sanitize` and `--strip-ansi`
-    // give the same bytes and never let a terminal open a string control, an
-    // 8-bit terminal included. The input leans on raw C1 openers, line ends
-    // and the terminators that used to close such a string.
+    // The same guarantees with the UTF-8 switch on, where an isolated invalid
+    // raw byte from 80 to 9F is text: however the reads fall, `--sanitize` and
+    // `--strip-ansi` give the same bytes and never let a terminal that reads
+    // UTF-8 open a string control. On such a terminal a raw byte outside a
+    // character is an invalid one, so the walk reads it as FF. The input leans
+    // on raw C1 openers, line ends and the terminators that used to close such
+    // a string.
     #[test]
     fn utf8_terminal_switch_keeps_filtered_output_closed_and_independent_of_reads() {
         const FRAGMENTS: &[&[u8]] = &[
@@ -3750,10 +3752,10 @@ mod tests {
         ];
 
         crate::highlight::TERMINAL_READS_UTF8_IN_THIS_THREAD.with(|switch| switch.set(Some(true)));
-        // The switch is on for this thread: the string ends with its line.
+        // The switch is on for this thread: the raw byte is text.
         assert_eq!(
             run_chunk_pipeline(&[b"a\x9f b\nc\n"], ChunkPipeline::Sanitize),
-            b"a\nc\n"
+            b"a\x9f b\nc\n"
         );
         let mut rng = XorShift(0x0c15_7e87_0b0d_5eed);
         for case in 0..600 {
@@ -3789,7 +3791,8 @@ mod tests {
                         chunks.len()
                     );
                 }
-                let (first_string, _) = walk_vt_parser(&expected, false);
+                let shown = raw_c1_as_ff(&expected);
+                let (first_string, _) = walk_vt_parser(&shown, false);
                 assert_eq!(
                     first_string, None,
                     "{pipeline:?} let a string control through for {input:02x?}: {expected:02x?}"
@@ -3800,12 +3803,138 @@ mod tests {
                     "{pipeline:?} let a terminal read ESC with a non-ASCII byte for {input:02x?}: {expected:02x?}"
                 );
                 assert_eq!(
-                    csi_that_could_switch_xterm_out_of_utf8(&expected),
+                    csi_that_could_switch_xterm_out_of_utf8(&shown),
                     None,
                     "{pipeline:?} let a CSI with a byte from 80 up or DECNRCM through for {input:02x?}: {expected:02x?}"
                 );
+                assert_eq!(
+                    decoded_c1_made_by_the_filter(input.as_slice(), &expected),
+                    None,
+                    "{pipeline:?} made a C2 C1 pair for {input:02x?}: {expected:02x?}"
+                );
             }
         }
+        crate::highlight::TERMINAL_READS_UTF8_IN_THIS_THREAD.with(|switch| switch.set(None));
+    }
+
+    /// `bytes` as a terminal that reads UTF-8 sees them: a byte from 80 to 9F
+    /// that is not part of a valid character is an invalid byte, like FF. A
+    /// character cut off by the end is left as it is.
+    fn raw_c1_as_ff(bytes: &[u8]) -> Vec<u8> {
+        let mut shown = Vec::with_capacity(bytes.len());
+        let chunks: Vec<_> = bytes.utf8_chunks().collect();
+        for (index, chunk) in chunks.iter().enumerate() {
+            shown.extend_from_slice(chunk.valid().as_bytes());
+            let invalid = chunk.invalid();
+            let cut_off = index + 1 == chunks.len()
+                && std::str::from_utf8(invalid).is_err_and(|error| error.error_len().is_none());
+            if cut_off {
+                shown.extend_from_slice(invalid);
+            } else {
+                shown.extend(invalid.iter().map(|byte| match byte {
+                    0x80..=0x9f => 0xff,
+                    other => *other,
+                }));
+            }
+        }
+        shown
+    }
+
+    /// The offset of a `C2 80..9F` pair in `output` when `input` holds fewer
+    /// such pairs: the filter put a `C2` next to a byte it did not precede.
+    fn decoded_c1_made_by_the_filter(input: &[u8], output: &[u8]) -> Option<usize> {
+        let pairs = |bytes: &[u8]| {
+            bytes
+                .windows(2)
+                .filter(|pair| pair[0] == 0xc2 && (0x80..=0x9f).contains(&pair[1]))
+                .count()
+        };
+        (pairs(output) > pairs(input)).then(|| {
+            output
+                .windows(2)
+                .position(|pair| pair[0] == 0xc2 && (0x80..=0x9f).contains(&pair[1]))
+                .unwrap_or(0)
+        })
+    }
+
+    // When a filter processes the bytes it drops a `C2` that begins no
+    // character, and an ESC in front of a raw byte, however the reads fall:
+    // no removal joins a `C2` with a raw byte into a C1 control, and
+    // `ESC 9D ]52` is no OSC 52. Outside a UTF-8 locale the same inputs keep
+    // their 1.4.1 bytes, also however the reads fall.
+    #[test]
+    fn filters_keep_raw_c1_text_and_drop_lone_c2_however_the_reads_fall() {
+        type Case = (&'static [u8], &'static [u8], &'static [u8]);
+        const IN_UTF8: &[Case] = &[
+            (
+                b"A\xc2\x1b]0;x\x07\x9d0;PWNED\x07B\n",
+                b"A\x9d0;PWNED\x07B\n",
+                b"A\x9d0;PWNED\x07B\n",
+            ),
+            (
+                b"A\xc2\x8e\xc2\x1b\x9d0;x\x07B\n",
+                b"A\xc2\x8e\x9d0;x\x07B\n",
+                b"A\x9d0;x\x07B\n",
+            ),
+            (
+                b"A\x1b\x9d]52;c;QUJD\x07B\n",
+                b"A\x9d]52;c;QUJD\x07B\n",
+                b"A\x9d]52;c;QUJD\x07B\n",
+            ),
+            (b"A\x1b]0;x\x9cSECRET\x07B\n", b"AB\n", b"AB\n"),
+            (
+                b"Stav: dr\x9e\xed, rest of line\nnext\n",
+                b"Stav: dr\x9e\xed, rest of line\nnext\n",
+                b"Stav: dr\x9e\xed, rest of line\nnext\n",
+            ),
+        ];
+        const IN_EIGHT_BIT: &[Case] = &[
+            (
+                b"A\xc2\x1b]0;x\x07\x9d0;PWNED\x07B\n",
+                b"A\xc2B\n",
+                b"A\xc2B\n",
+            ),
+            (
+                b"A\xc2\x8e\xc2\x1b\x9d0;x\x07B\n",
+                b"A\xc2\x8e\xc2B\n",
+                b"A\xc2B\n",
+            ),
+            (b"A\x1b\x9d]52;c;QUJD\x07B\n", b"AB\n", b"AB\n"),
+            (
+                b"A\x1b]0;x\x9cSECRET\x07B\n",
+                b"ASECRET\x07B\n",
+                b"ASECRET\x07B\n",
+            ),
+            (
+                b"Stav: dr\x9e\xed, rest of line\nnext\n",
+                b"Stav: dr",
+                b"Stav: dr",
+            ),
+        ];
+        for (reads_utf8, cases) in [(true, IN_UTF8), (false, IN_EIGHT_BIT)] {
+            crate::highlight::TERMINAL_READS_UTF8_IN_THIS_THREAD
+                .with(|switch| switch.set(Some(reads_utf8)));
+            for (input, sanitized, stripped) in cases {
+                let mut chunkings: Vec<Vec<&[u8]>> = vec![vec![input], input.chunks(1).collect()];
+                for cut in 0..=input.len() {
+                    chunkings.push(vec![&input[..cut], &input[cut..]]);
+                }
+                for (pipeline, expected) in [
+                    (ChunkPipeline::Sanitize, sanitized),
+                    (ChunkPipeline::Strip, stripped),
+                ] {
+                    for chunks in &chunkings {
+                        let output = run_chunk_pipeline(chunks, pipeline);
+                        assert!(
+                            output == *expected,
+                            "UTF-8 {reads_utf8}, {pipeline:?}, {} reads of {input:02x?}:\n{output:02x?}\n{expected:02x?}",
+                            chunks.len()
+                        );
+                    }
+                }
+            }
+        }
+        crate::highlight::TERMINAL_READS_UTF8_IN_THIS_THREAD.with(|switch| switch.set(None));
     }
 
     #[test]

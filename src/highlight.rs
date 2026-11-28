@@ -246,9 +246,10 @@ pub struct StreamingHighlighter {
     disabled_rule_identities: HashSet<RuleIdentity>,
 }
 
-/// Whether the terminal is known to read UTF-8, as the locale says. Off unless
-/// the command line turns it on at startup, so the library keeps treating a
-/// raw C1 byte as the control an 8-bit terminal sees.
+/// Whether the locale says the terminal reads UTF-8. The command line infers
+/// it at startup from the text of the locale variables; nothing checks the
+/// terminal. Off unless the command line turns it on, so the library keeps
+/// treating a raw C1 byte as the control an 8-bit terminal sees.
 static TERMINAL_READS_UTF8: AtomicBool = AtomicBool::new(false);
 
 thread_local! {
@@ -274,37 +275,6 @@ fn terminal_reads_utf8() -> bool {
         }
     }
     TERMINAL_READS_UTF8.load(Ordering::Relaxed)
-}
-
-/// Whether a string control opened by a C1 byte of this encoded `width` also
-/// ends at the end of its line.
-///
-/// A raw C1 byte (one byte, not the UTF-8 form `C2 xx`) opens a string only on
-/// a terminal that is not in UTF-8 mode. On a UTF-8 terminal it is an invalid
-/// byte, and line noise, a legacy code page and a UTF-8 character cut in half
-/// all produce one with no terminator to follow: held to the usual rule, one
-/// stray byte swallows the rest of the session. So when the terminal is known
-/// to read UTF-8, such a string is bounded by its line. Otherwise nothing
-/// changes, and the string runs to its terminator as an 8-bit terminal reads
-/// it.
-fn raw_c1_string_ends_at_line_end(width: usize) -> bool {
-    width == 1 && terminal_reads_utf8()
-}
-
-/// Whether `bytes` is a CSI sequence the terminal does not run: one opened by
-/// the raw C1 byte `9B` on a terminal that is known to read UTF-8. There the
-/// byte is an invalid one and the rest is text, so the sequence sets no color,
-/// switches no screen and saves, restores and resets nothing. Taking it for
-/// the program's rendition would make the bytes written to end a highlight a
-/// live control the program never sent. The UTF-8 form `C2 9B` is not such a
-/// sequence.
-///
-/// A decoding switch that the program sends and PrismTTY passes on (`ESC % @`
-/// or DEC private mode 42) does not change the answer: the terminal may
-/// ignore it, PrismTTY cannot tell, and the string scanners keep to the
-/// answer given at startup in the same way.
-fn is_raw_c1_csi_the_terminal_does_not_run(bytes: &[u8]) -> bool {
-    bytes.first() == Some(&0x9b) && terminal_reads_utf8()
 }
 
 /// Incrementally tracks an incomplete terminal string control. Once the
@@ -361,14 +331,6 @@ impl StringControlKind {
         matches!(self, Self::EscOsc | Self::C1Osc(_))
     }
 
-    /// See `raw_c1_string_ends_at_line_end`.
-    fn ends_at_line_end(self) -> bool {
-        match self {
-            Self::C1Osc(width) | Self::C1String(_, width) => raw_c1_string_ends_at_line_end(width),
-            Self::EscOsc | Self::EscString(_) => false,
-        }
-    }
-
     fn matches_at(self, bytes: &[u8], start: usize) -> bool {
         Self::at(bytes, start).is_some_and(|(kind, _payload_start)| kind == self)
     }
@@ -405,7 +367,7 @@ impl TrackedStringControl {
             carry_offset: start.saturating_sub(drop_start),
             scanned: payload_start,
             total_bytes: payload_start - start,
-            payload: StringPayloadScanner::new(kind.allows_bel(), kind.ends_at_line_end()),
+            payload: StringPayloadScanner::new(kind.allows_bel()),
         }
     }
 
@@ -543,7 +505,6 @@ impl DiscardedStringControl {
 #[derive(Clone, Debug)]
 struct StringPayloadScanner {
     allows_bel: bool,
-    ends_at_line_end: bool,
     saw_escape: bool,
     utf8_remaining: u8,
     next_utf8_min: u8,
@@ -555,10 +516,9 @@ struct StringPayloadScanner {
 }
 
 impl StringPayloadScanner {
-    fn new(allows_bel: bool, ends_at_line_end: bool) -> Self {
+    fn new(allows_bel: bool) -> Self {
         Self {
             allows_bel,
-            ends_at_line_end,
             saw_escape: false,
             utf8_remaining: 0,
             next_utf8_min: 0x80,
@@ -583,7 +543,7 @@ impl StringPayloadScanner {
                     debug_assert!(replay_len < self.utf8_raw_st_replay.len());
                     self.utf8_raw_st_replay[replay_len] = byte;
                     self.utf8_raw_st_replay_len += 1;
-                } else if byte == 0x9c {
+                } else if byte == 0x9c && !terminal_reads_utf8() {
                     self.utf8_raw_st_pending = true;
                     self.utf8_raw_st_replay_len = 0;
                 }
@@ -622,15 +582,11 @@ impl StringPayloadScanner {
             return StringPayloadScan::RestartAtEscape;
         }
 
-        if matches!(byte, 0x18 | 0x1a) || (self.allows_bel && byte == 0x07) || byte == 0x9c {
+        if matches!(byte, 0x18 | 0x1a)
+            || (self.allows_bel && byte == 0x07)
+            || (byte == 0x9c && !terminal_reads_utf8())
+        {
             return StringPayloadScan::CompleteAfterCurrent;
-        }
-        if self.ends_at_line_end && matches!(byte, b'\r' | b'\n') {
-            // The line end is not part of the string: it stays visible text.
-            return StringPayloadScan::CompleteBeforeCurrent {
-                replay: [0; MAX_TENTATIVE_UTF8_SUFFIX_BYTES],
-                replay_len: 0,
-            };
         }
         if byte == 0x1b {
             self.saw_escape = true;
@@ -2306,8 +2262,7 @@ fn visible_byte_map_and_ansi_ranges(input: &[u8]) -> (Vec<VisibleByte>, Vec<Ansi
             } else {
                 ansi_sequence_end(input, idx)
             };
-            let is_sgr = sgr_parameters(&input[idx..end]).is_some()
-                && !is_raw_c1_csi_the_terminal_does_not_run(&input[idx..end]);
+            let is_sgr = sgr_parameters(&input[idx..end]).is_some();
             let ends_open_control = is_sgr
                 && ansi_ranges.last().is_some_and(|previous: &AnsiRange| {
                     previous.end == idx
@@ -2348,7 +2303,13 @@ fn prompt_echo_source_sgr_leaves_active_style(input: &[u8], ranges: &[(usize, us
         return false;
     }
 
-    let mut state = NativeSgrState::default();
+    // Whether the program may have left a style on, which a terminal that
+    // runs the SGR would draw the command in: one opened by the UTF-8 form
+    // `C2 9B` counts as well (see `NativeSgrState::encoded_csi`).
+    let mut state = NativeSgrState {
+        reads_encoded_csi: true,
+        ..NativeSgrState::default()
+    };
     for (start, end) in ranges {
         state.apply_sequence(&input[*start..*end]);
     }
@@ -2892,16 +2853,38 @@ impl Highlighter {
     }
 }
 
-/// Largest UTF-8 char-boundary index at or below `index` in `bytes`.
+/// Largest UTF-8 char-boundary index at or below `index` in `bytes`. In a
+/// UTF-8 locale only a valid character has inner positions, so a highlight is
+/// never widened over an invalid byte, a stray one from 80 to BF included.
 fn floor_char_boundary(bytes: &[u8], mut index: usize) -> usize {
+    if terminal_reads_utf8() {
+        return validated_char_start(bytes, index).unwrap_or(index);
+    }
     while index > 0 && index < bytes.len() && (bytes[index] & 0xC0) == 0x80 {
         index -= 1;
     }
     index
 }
 
-/// Smallest UTF-8 char-boundary index at or above `index` in `bytes`.
+/// The start of the valid UTF-8 character that `index` falls strictly inside,
+/// if any. An invalid byte is a character of its own.
+fn validated_char_start(bytes: &[u8], index: usize) -> Option<usize> {
+    if index == 0 || index >= bytes.len() {
+        return None;
+    }
+    (index.saturating_sub(3)..index).find(|&start| {
+        valid_utf8_char_width_at(bytes, start).is_some_and(|width| start + width > index)
+    })
+}
+
+/// Smallest UTF-8 char-boundary index at or above `index` in `bytes`, read
+/// the same way as `floor_char_boundary`.
 fn ceil_char_boundary(bytes: &[u8], mut index: usize) -> usize {
+    if terminal_reads_utf8() {
+        return validated_char_start(bytes, index)
+            .and_then(|start| valid_utf8_char_width_at(bytes, start).map(|width| start + width))
+            .unwrap_or(index);
+    }
     while index < bytes.len() && (bytes[index] & 0xC0) == 0x80 {
         index += 1;
     }
@@ -3184,7 +3167,7 @@ fn csi_sequence_end(input: &[u8], mut idx: usize) -> usize {
 }
 
 fn osc_sequence_end(input: &[u8], mut idx: usize) -> usize {
-    string_terminator_end(input, &mut idx, true, false).unwrap_or(input.len())
+    string_terminator_end(input, &mut idx, true).unwrap_or(input.len())
 }
 
 fn c1_string_escape_end(input: &[u8], start: usize, control: u8, width: usize) -> usize {
@@ -3194,29 +3177,15 @@ fn c1_string_escape_end(input: &[u8], start: usize, control: u8, width: usize) -
         _ => return (start + width).min(input.len()),
     };
     let mut idx = start + width;
-    string_terminator_end(
-        input,
-        &mut idx,
-        allows_bel,
-        raw_c1_string_ends_at_line_end(width),
-    )
-    .unwrap_or(input.len())
+    string_terminator_end(input, &mut idx, allows_bel).unwrap_or(input.len())
 }
 
 fn string_sequence_end(input: &[u8], mut idx: usize) -> usize {
-    string_terminator_end(input, &mut idx, false, false).unwrap_or(input.len())
+    string_terminator_end(input, &mut idx, false).unwrap_or(input.len())
 }
 
-fn string_terminator_end(
-    input: &[u8],
-    idx: &mut usize,
-    allows_bel: bool,
-    ends_at_line_end: bool,
-) -> Option<usize> {
+fn string_terminator_end(input: &[u8], idx: &mut usize, allows_bel: bool) -> Option<usize> {
     while *idx < input.len() {
-        if ends_at_line_end && matches!(input[*idx], b'\r' | b'\n') {
-            return Some(*idx);
-        }
         if c1_control_at(input, *idx) == Some((0x9c, 2)) {
             return Some(*idx + 2);
         }
@@ -3230,7 +3199,10 @@ fn string_terminator_end(
         if matches!(input[*idx], 0x18 | 0x1a) {
             return Some(*idx + 1);
         }
-        if input[*idx] == 0x9c && !byte_is_inside_utf8_codepoint_or_prefix(input, *idx) {
+        if input[*idx] == 0x9c
+            && !terminal_reads_utf8()
+            && !byte_is_inside_utf8_codepoint_or_prefix(input, *idx)
+        {
             return Some(*idx + 1);
         }
         if input[*idx] == 0x1b && *idx + 1 < input.len() {
@@ -3263,9 +3235,6 @@ fn contains_alternate_screen_enable_tokens(tokens: &[Token]) -> bool {
 }
 
 fn alternate_screen_command(bytes: &[u8]) -> Option<bool> {
-    if is_raw_c1_csi_the_terminal_does_not_run(bytes) {
-        return None;
-    }
     let (modes, enable) = private_mode_sequence(bytes)?;
     let has_alternate_screen_mode =
         private_mode_numbers(&modes).any(|mode| matches!(mode, 47 | 1047 | 1049));
@@ -3467,35 +3436,7 @@ fn emit_interactive_highlighted(
                     output.extend(style_reset_bytes(style, native_sgr, reset_mode));
                 }
                 native_sgr.apply_sequence(bytes);
-                match active_style.as_ref().filter(|_| {
-                    shows_on_blank_line
-                        && !closes_before
-                        && is_raw_c1_csi_the_terminal_does_not_run(bytes)
-                        && bytes.iter().any(|byte| is_line_end(*byte))
-                }) {
-                    // A UTF-8 terminal shows these bytes as text, drawn in the
-                    // open highlight; only their line ends leave it. When the
-                    // highlight is already closed before them, they stay so.
-                    Some(style) => {
-                        let reset = style_reset_bytes(style, native_sgr, reset_mode);
-                        let mut rest = bytes.as_slice();
-                        while let Some(start) = rest.iter().position(|byte| is_line_end(*byte)) {
-                            let end = rest[start..]
-                                .iter()
-                                .position(|byte| !is_line_end(*byte))
-                                .map_or(rest.len(), |len| start + len);
-                            output.extend_from_slice(&rest[..start]);
-                            output.extend_from_slice(&reset);
-                            output.extend_from_slice(&rest[start..end]);
-                            rest = &rest[end..];
-                            if !rest.is_empty() {
-                                output.extend_from_slice(starts.start(style, color_mode));
-                            }
-                        }
-                        output.extend_from_slice(rest);
-                    }
-                    None => output.extend_from_slice(bytes),
-                }
+                output.extend_from_slice(bytes);
                 if let Some(style) = active_style {
                     output.extend_from_slice(starts.start(style, color_mode));
                 }
@@ -3620,9 +3561,9 @@ fn is_line_end(byte: u8) -> bool {
 ///
 /// Only controls whose run is certain count, and only whole ones in ASCII:
 /// where a byte from 80 to FF sits in a control, or cuts one short before its
-/// final byte, terminals disagree on how it runs. A raw `9B` CSI counts only
-/// on a terminal that does not read UTF-8: one that does shows it as text (see
-/// `is_raw_c1_csi_the_terminal_does_not_run`). `C2 9B` never counts: an 8-bit
+/// final byte, terminals disagree on how it runs. A raw `9B` CSI exists only
+/// outside a UTF-8 locale: in one the byte is text (see `c1_control_at`).
+/// `C2 9B` never counts: an 8-bit
 /// terminal draws the `C2`, and a UTF-8 one may not run it at all. VT and FF
 /// are not line ends here: some terminals draw them.
 fn control_runs_a_line_end(bytes: &[u8]) -> bool {
@@ -3638,7 +3579,7 @@ fn control_runs_a_line_end(bytes: &[u8]) -> bool {
     };
     let has_line_end = |body: &[u8]| body.iter().any(|byte| is_line_end(*byte));
     if first == 0x9b {
-        return !terminal_reads_utf8() && ends_in(rest, 0x40..=0x7e) && has_line_end(rest);
+        return ends_in(rest, 0x40..=0x7e) && has_line_end(rest);
     }
     let introducer = skip_escape_state_controls(bytes, 1);
     let prefix_line_end = has_line_end(&bytes[1..introducer]);
@@ -3827,10 +3768,30 @@ struct NativeSgrState {
     /// since the two last agreed; `None` while they agree. It is taken over
     /// at the first use of the SGR stack.
     without_offs: Option<Box<NativeSgrState>>,
+    /// Set on the copy in `encoded_csi`, which also takes rendition from the
+    /// UTF-8 form `C2 9B` in a UTF-8 locale.
+    reads_encoded_csi: bool,
+    /// In a UTF-8 locale, this state as a terminal that also runs the UTF-8
+    /// form `C2 9B` holds it; `None` while the two agree. No restore after a
+    /// highlight is written from it, so a terminal that prints `C2 9B` gets
+    /// no new live control from one. Only the prompt-echo offs and the
+    /// choice to close a highlight before a line end read it: a style such
+    /// an SGR may have set is ended like any other, and on a terminal that
+    /// printed the SGR the off ends a style that is not there, which changes
+    /// nothing.
+    encoded_csi: Option<Box<NativeSgrState>>,
 }
 
 impl NativeSgrState {
     fn apply_sequence(&mut self, bytes: &[u8]) {
+        let encoded_csi =
+            !self.reads_encoded_csi && bytes.starts_with(b"\xc2\x9b") && terminal_reads_utf8();
+        if encoded_csi && self.encoded_csi.is_none() {
+            self.encoded_csi = Some(Box::new(self.reading_encoded_csi()));
+        }
+        if let Some(encoded) = self.encoded_csi.as_deref_mut() {
+            encoded.apply_sequence(bytes);
+        }
         if let Some(without_offs) = self.without_offs.as_deref_mut() {
             without_offs.apply_sequence(bytes);
         }
@@ -3841,7 +3802,11 @@ impl NativeSgrState {
             self.sgr_stack_used = true;
             return;
         }
-        if is_raw_c1_csi_the_terminal_does_not_run(bytes) {
+        // In a UTF-8 locale no rendition is taken from the UTF-8 form `C2 9B`:
+        // terminals that read UTF-8 do not agree on running it, and a color
+        // taken from one that shows it as text would come back as a live
+        // `ESC [` control after a highlight. `encoded_csi` keeps it.
+        if encoded_csi {
             return;
         }
         match bytes {
@@ -3887,6 +3852,26 @@ impl NativeSgrState {
         {
             self.without_offs = None;
         }
+        if self
+            .encoded_csi
+            .as_deref()
+            .is_some_and(|encoded| encoded.agrees_with(self))
+        {
+            self.encoded_csi = None;
+        }
+    }
+
+    /// A copy of this state that also takes rendition from `C2 9B`.
+    fn reading_encoded_csi(&self) -> Self {
+        Self {
+            rendition: self.rendition.clone(),
+            saved: self.saved.clone(),
+            alternate_screen: self.alternate_screen,
+            sgr_stack_used: self.sgr_stack_used,
+            without_offs: None,
+            reads_encoded_csi: true,
+            encoded_csi: None,
+        }
     }
 
     fn agrees_with(&self, other: &Self) -> bool {
@@ -3902,6 +3887,9 @@ impl NativeSgrState {
             self.without_offs = Some(Box::new(self.clone()));
         }
         self.rendition.apply_sequence(off);
+        if let Some(encoded) = self.encoded_csi.as_deref_mut() {
+            encoded.rendition.apply_sequence(off);
+        }
     }
 
     /// Follows a prompt-echo line written as `written`, which may begin
@@ -3951,10 +3939,23 @@ impl NativeSgrState {
     /// is read from the state without offs, as 1.4.1 reads it: an off only
     /// ever ends one of them, so a highlight closes exactly where 1.4.1
     /// closes it, and an off changes what a restore writes, never when.
+    ///
+    /// A style that only a `C2 9B` SGR may have set counts too (see
+    /// `encoded_csi`): closing the highlight before a line end only moves
+    /// where the highlight ends, and what is restored after it still comes
+    /// from this state, so a terminal that printed that SGR gets nothing new.
     fn draws_blank_cells_with_the_foreground(&self) -> bool {
         if let Some(without_offs) = self.without_offs.as_deref() {
             return without_offs.draws_blank_cells_with_the_foreground();
         }
+        self.rendition_draws_blank_cells_with_the_foreground()
+            || self
+                .encoded_csi
+                .as_deref()
+                .is_some_and(Self::rendition_draws_blank_cells_with_the_foreground)
+    }
+
+    fn rendition_draws_blank_cells_with_the_foreground(&self) -> bool {
         let attributes = &self.rendition.attributes;
         [7, 9, 53]
             .iter()
@@ -3969,22 +3970,26 @@ impl NativeSgrState {
     /// The SGR left in place of the removed prompt-echo SGR `sequence` on a
     /// terminal showing this rendition: the code from
     /// `PROMPT_ECHO_OFF_CODES` of each group shown here that `sequence`,
-    /// read by the parser, leaves off, in ascending order. Empty when there
-    /// is none, when `sequence` is not plain (`is_plain_sgr`), and once the
-    /// SGR stack has been used.
+    /// read by the parser, leaves off, in ascending order. A group that only
+    /// a `C2 9B` SGR may have turned on counts (see `encoded_csi`). Empty
+    /// when there is none, when `sequence` is not plain (`is_plain_sgr`),
+    /// and once the SGR stack has been used.
     fn prompt_echo_off(&self, sequence: &[u8]) -> Vec<u8> {
         if self.sgr_stack_used || !is_plain_sgr(sequence) {
             return Vec::new();
         }
-        let mut after = self.rendition.clone();
+        let shown = self
+            .encoded_csi
+            .as_deref()
+            .map_or(&self.rendition, |encoded| &encoded.rendition);
+        let mut after = shown.clone();
         after.apply_sequence(sequence);
         let codes = PROMPT_ECHO_OFF_CODES
             .iter()
             .filter(|(group, _)| match group {
-                None => self.rendition.background.is_some() && after.background.is_none(),
+                None => shown.background.is_some() && after.background.is_none(),
                 Some(group) => {
-                    self.rendition.attributes.contains_key(group)
-                        && !after.attributes.contains_key(group)
+                    shown.attributes.contains_key(group) && !after.attributes.contains_key(group)
                 }
             })
             .map(|(_, code)| code.to_string())
@@ -5000,20 +5005,10 @@ fn scan_escape_for_neutralization(bytes: &[u8], start: usize) -> EscapeScan {
         return match control {
             0x8e | 0x8f => scan_single_shift_for_neutralization(bytes, start, start + width),
             0x9b => scan_c1_csi_for_neutralization(bytes, start, start + width),
-            0x9d => scan_c1_string_for_neutralization(
-                bytes,
-                start,
-                start + width,
-                true,
-                raw_c1_string_ends_at_line_end(width),
-            ),
-            0x90 | 0x98 | 0x9e | 0x9f => scan_c1_string_for_neutralization(
-                bytes,
-                start,
-                start + width,
-                false,
-                raw_c1_string_ends_at_line_end(width),
-            ),
+            0x9d => scan_c1_string_for_neutralization(bytes, start, start + width, true),
+            0x90 | 0x98 | 0x9e | 0x9f => {
+                scan_c1_string_for_neutralization(bytes, start, start + width, false)
+            }
             _ => EscapeScan::Complete(start + width),
         };
     }
@@ -5033,6 +5028,11 @@ fn scan_escape_for_neutralization(bytes: &[u8], start: usize) -> EscapeScan {
         }
         b'N' | b'O' => scan_single_shift_for_neutralization(bytes, start, introducer + 1),
         0x20..=0x2f => scan_esc_intermediate_for_neutralization(bytes, start),
+        // In a UTF-8 locale a raw byte from 80 to 9F ends the escape before
+        // it, as FF and every other non-ASCII byte do.
+        0x80..=0x9f if terminal_reads_utf8() => {
+            non_ascii_after_escape_scan(bytes, start, introducer)
+        }
         0x1b | 0x80..=0x9f => EscapeScan::Restart(introducer),
         0xa0..=0xff => non_ascii_after_escape_scan(bytes, start, introducer),
         _ => EscapeScan::Complete(introducer + 1),
@@ -5136,14 +5136,10 @@ fn scan_c1_string_for_neutralization(
     start: usize,
     mut idx: usize,
     allows_bel: bool,
-    ends_at_line_end: bool,
 ) -> EscapeScan {
     while idx < bytes.len() {
         if idx.saturating_sub(start) > MAX_INCOMPLETE_ESCAPE_BYTES {
             return EscapeScan::IncompleteOversized;
-        }
-        if ends_at_line_end && matches!(bytes[idx], b'\r' | b'\n') {
-            return EscapeScan::Complete(idx);
         }
         if c1_control_at(bytes, idx) == Some((0x9c, 2)) {
             return EscapeScan::Complete(idx + 2);
@@ -5154,7 +5150,9 @@ fn scan_c1_string_for_neutralization(
         }
         if (allows_bel && bytes[idx] == 0x07)
             || matches!(bytes[idx], 0x18 | 0x1a)
-            || (bytes[idx] == 0x9c && !byte_is_inside_utf8_codepoint_or_prefix(bytes, idx))
+            || (bytes[idx] == 0x9c
+                && !terminal_reads_utf8()
+                && !byte_is_inside_utf8_codepoint_or_prefix(bytes, idx))
         {
             return EscapeScan::Complete(idx + 1);
         }
@@ -5218,7 +5216,10 @@ fn scan_st_terminated_for_neutralization(
         if matches!(bytes[idx], 0x18 | 0x1a) {
             return EscapeScan::Complete(idx + 1);
         }
-        if bytes[idx] == 0x9c && !byte_is_inside_utf8_codepoint_or_prefix(bytes, idx) {
+        if bytes[idx] == 0x9c
+            && !terminal_reads_utf8()
+            && !byte_is_inside_utf8_codepoint_or_prefix(bytes, idx)
+        {
             return EscapeScan::Complete(idx + 1);
         }
         if bytes[idx] == 0x1b && idx + 1 < bytes.len() {
@@ -5251,9 +5252,12 @@ fn is_token_continuation(byte: u8) -> bool {
 /// Inside a string control they are payload and go with it.
 pub fn strip_ansi(input: &[u8]) -> Vec<u8> {
     let mut stripped = Vec::new();
+    let mut offset = 0;
     for token in tokenize_ansi(input) {
+        let start = offset;
+        offset += token.as_bytes().len();
         match token {
-            Token::Text(text) => stripped.extend(text),
+            Token::Text(_) => extend_without_lone_c2(&mut stripped, input, start..offset),
             Token::Ansi(bytes) if StringControlKind::at(&bytes, 0).is_none() => stripped.extend(
                 bytes
                     .iter()
@@ -5420,7 +5424,7 @@ pub fn strip_string_escapes(input: &[u8]) -> Vec<u8> {
                         break;
                     }
                     EscapeScan::Complete(end) => {
-                        sanitized.extend_from_slice(&input[copied..end]);
+                        extend_without_lone_c2(&mut sanitized, input, copied..end);
                         idx = end;
                         break;
                     }
@@ -5442,7 +5446,7 @@ pub fn strip_string_escapes(input: &[u8]) -> Vec<u8> {
                         break;
                     }
                     EscapeScan::IncompleteWithinLimit | EscapeScan::IncompleteOversized => {
-                        sanitized.extend_from_slice(&input[copied..]);
+                        extend_without_lone_c2(&mut sanitized, input, copied..input.len());
                         idx = input.len();
                         break;
                     }
@@ -5455,7 +5459,7 @@ pub fn strip_string_escapes(input: &[u8]) -> Vec<u8> {
             idx += width;
             continue;
         }
-        sanitized.push(input[idx]);
+        extend_without_lone_c2(&mut sanitized, input, idx..idx + 1);
         idx += 1;
     }
     sanitized
@@ -5504,7 +5508,11 @@ fn push_escape_run_controls(
         }
         open = from + previous;
     }
-    sanitized.extend(input[open..end].iter().filter(|byte| **byte != 0x1b));
+    for idx in open..end {
+        if input[idx] != 0x1b {
+            extend_without_lone_c2(sanitized, input, idx..idx + 1);
+        }
+    }
 }
 
 /// Where the parameters of a CSI that starts at `start` begin: after `ESC [`,
@@ -5579,6 +5587,27 @@ fn valid_utf8_char_width_at(input: &[u8], idx: usize) -> Option<usize> {
     }
 }
 
+/// Appends `input[range]` without the `C2` bytes in it that begin no
+/// character in `input` (the byte after one is not one from 80 to
+/// BF). On a terminal that reads UTF-8 such a `C2` is one invalid byte, and
+/// both filters drop it wherever they write it, as text or inside a control
+/// they keep: a control they remove after it could otherwise put it next to
+/// a raw byte from 80 to 9F, and `C2 9D` is an OSC to a terminal that runs
+/// the UTF-8 form of C1 controls. `C2` is the only lead byte such a join can
+/// make a control of.
+fn extend_without_lone_c2(output: &mut Vec<u8>, input: &[u8], range: std::ops::Range<usize>) {
+    if !terminal_reads_utf8() {
+        output.extend_from_slice(&input[range]);
+        return;
+    }
+    for idx in range {
+        let lone = input[idx] == 0xc2 && !matches!(input.get(idx + 1), Some(0x80..=0xbf));
+        if !lone {
+            output.push(input[idx]);
+        }
+    }
+}
+
 fn is_c1_string_escape_start(byte: u8) -> bool {
     matches!(byte, 0x90 | 0x98 | 0x9d | 0x9e | 0x9f)
 }
@@ -5593,11 +5622,18 @@ fn is_c1_control(byte: u8) -> bool {
 
 /// Returns the decoded C1 control and its encoded width. Terminals may accept
 /// either the legacy single-byte form or the Unicode C1 codepoint encoded as
-/// UTF-8 (`C2 80` through `C2 9F`).
+/// UTF-8 (`C2 80` through `C2 9F`). When the locale says UTF-8 only the
+/// encoded form counts: there a raw byte from 80 to 9F that is not part of a
+/// character is an isolated invalid byte in ordinary text, as on a terminal
+/// that reads UTF-8. Every classifier asks this function, so such a byte
+/// starts and ends no control anywhere; inside an ESC, CSI or string that is
+/// already open, that control's own rules decide what the byte does.
 fn c1_control_at(input: &[u8], start: usize) -> Option<(u8, usize)> {
     let byte = *input.get(start)?;
     if is_c1_control(byte) {
-        return Some((byte, 1));
+        // On a terminal that reads UTF-8 a raw byte from 80 to 9F is an
+        // invalid byte, shown as text: it starts nothing.
+        return (!terminal_reads_utf8()).then_some((byte, 1));
     }
     if byte == 0xc2 {
         let control = *input.get(start + 1)?;
@@ -10595,9 +10631,10 @@ rules:
     }
 
     // A color after the prompt is taken out and the foreground reset before
-    // the typed command, so the command is not drawn in it. A raw `9B`
-    // sequence sets no color on a terminal that reads UTF-8: it stays, it
-    // does not count as a color left active, and no reset is written for it.
+    // the typed command, so the command is not drawn in it. On a terminal
+    // that reads UTF-8 a raw `9B` is an isolated invalid byte in ordinary
+    // text: it sets no color and is the first byte of the typed command, so
+    // a color in front of it is taken out before it.
     #[test]
     fn prompt_color_is_neutralized_only_for_controls_the_terminal_runs() {
         let highlighter =
@@ -10615,8 +10652,8 @@ rules:
             (b"\x9b31mshow", false, true, b"\x1b[0mshow"),
             (b"\x1b[31mshow", true, false, b"\x1b[39mshow"),
             (b"\x1b[31mshow", false, false, b"\x1b[39mshow"),
-            // The 7-bit color is still active where `9B 0 m` is not a reset.
-            (b"\x1b[31m\x9b0mshow", true, false, b"\x9b0m\x1b[39mshow"),
+            // Where `9B 0 m` is text, the 7-bit color goes before it.
+            (b"\x1b[31m\x9b0mshow", true, false, b"\x1b[39m\x9b0mshow"),
             (b"\x1b[31m\x9b0mshow", false, false, b"\x1b[31m\x9b0mshow"),
         ] {
             super::TERMINAL_READS_UTF8_IN_THIS_THREAD.with(|switch| switch.set(Some(reads_utf8)));
@@ -10820,8 +10857,8 @@ rules:
     // as `1049` is. Every place that looks for the screen and save modes has
     // to read the spelling the same way, or a full-screen frame behind it is
     // highlighted like scrolling text. A number too long to be one of them
-    // must not come out as one, and a raw C1 CSI on a UTF-8 terminal still
-    // names no mode.
+    // must not come out as one, and in a UTF-8 locale a raw `9B` is text, so
+    // it starts no sequence to read a mode from.
     #[test]
     fn private_modes_are_read_as_numbers() {
         for (sequence, enable) in [
@@ -10898,10 +10935,11 @@ rules:
         }
 
         super::TERMINAL_READS_UTF8_IN_THIS_THREAD.with(|switch| switch.set(Some(true)));
-        let raw = super::alternate_screen_command(b"\x9b?01049h");
+        let raw =
+            super::contains_alternate_screen_enable_tokens(&super::tokenize_ansi(b"\x9b?01049h"));
         let encoded = super::alternate_screen_command(b"\xc2\x9b?01049h");
         super::TERMINAL_READS_UTF8_IN_THIS_THREAD.with(|switch| switch.set(None));
-        assert_eq!((raw, encoded), (None, Some(true)));
+        assert_eq!((raw, encoded), (false, Some(true)));
     }
 
     // xterm keeps 30 parameters. Past them it ignores each `;` and reads the

@@ -1234,11 +1234,11 @@ fn quiet_piped_output_tail_is_visible_after_holdback() {
 }
 
 /// Whether the terminal reads UTF-8 decides what a raw `9B` is: in a UTF-8
-/// locale an invalid byte with text after it, in an 8-bit one a CSI. A line
-/// end it holds runs either way, so under an inverse rendition an open
-/// highlight leaves it out. In UTF-8 only the line end leaves the highlight,
-/// and the text around it keeps it; in an 8-bit locale the highlight closes
-/// before the whole CSI and opens again after it.
+/// locale an isolated invalid byte in ordinary text, in an 8-bit one a CSI.
+/// In UTF-8 the bytes after it are text like any other, so the highlight
+/// ends after the matched word and nothing after the byte is colored; in an
+/// 8-bit locale a line end the CSI holds runs, so under an inverse rendition
+/// the highlight closes before the whole CSI and opens again after it.
 #[test]
 fn a_line_end_in_a_raw_9b_sequence_leaves_the_highlight_as_the_locale_reads_it() {
     let home = tempfile::tempdir().expect("scratch home");
@@ -1257,13 +1257,13 @@ fn a_line_end_in_a_raw_9b_sequence_leaves_the_highlight_as_the_locale_reads_it()
     .expect("config");
 
     const RED: &str = "\x1b[38;2;255;0;0m";
-    let utf8_minimal = format!("failed\u{9b}3\x1b[39m\r\n{RED}1m{RED}\x1b[39mnext");
-    let utf8_full = format!("failed\u{9b}3\x1b[0m\x1b[7m\r\n{RED}1m{RED}\x1b[0m\x1b[7mnext");
+    let utf8_minimal = "failed\x1b[39m\u{9b}3\r\n1mnext".to_string();
+    let utf8_full = "failed\x1b[0m\x1b[7m\u{9b}3\r\n1mnext".to_string();
     let eight_bit_minimal = "failed\x1b[39m\u{9b}3\r\n1m\x1b[".to_string();
     let eight_bit_full = "failed\x1b[0m\x1b[7m\u{9b}3\r\n1m\x1b[".to_string();
-    // A raw 9B holding no line end keeps 1.4.0's bytes in either locale:
-    // inert text in UTF-8, the program's own red in an 8-bit locale.
-    let utf8_no_line_end = format!("failed\u{9b}31m{RED}\x1b[39mx");
+    // Without a line end: text after the highlight in UTF-8, the program's
+    // own red in an 8-bit locale.
+    let utf8_no_line_end = "failed\x1b[39m\u{9b}31mx".to_string();
     let eight_bit_no_line_end = format!("failed\u{9b}31m{RED}\x1b[31mx");
     for (locale, flags, printed, expected) in [
         ("en_US.UTF-8", &[][..], "\\2333\\n1m", utf8_minimal),
@@ -1386,40 +1386,42 @@ fn ptty_printf_output(
 /// A raw 9B sequence that ends in a command saving the rendition (`s`, mode
 /// 1048 or 1049, XTPUSHSGR), or one filling blank cells under a highlight
 /// that paints them (`J`, `K`, `X`, `@`, `P`, `L`, `M`, `S`, `T`), already has
-/// the highlight closed before it in 1.4.0. In a UTF-8 locale these bytes are
-/// text, so the line end inside one must not open the highlight again over
-/// the text after it: the output is 1.4.0's, byte for byte, in both locales
-/// and both reset modes.
+/// the highlight closed before it in 1.4.0. In an 8-bit locale the output is
+/// 1.4.0's, byte for byte, in both reset modes. In a UTF-8 locale the raw
+/// `9B` is an isolated invalid byte in ordinary text, so no sequence ends
+/// there and nothing after the line end is colored again.
 #[test]
-fn a_raw_9b_sequence_with_the_highlight_closed_before_it_keeps_release_bytes() {
-    // Generated from the released 1.4.0 ptty: locale, full reset, rule, printf format, output.
+fn a_raw_9b_sequence_with_the_highlight_closed_before_it_keeps_its_bytes() {
+    // Locale, full reset, rule, printf format, output. The C rows were
+    // generated from the released 1.4.0 ptty; the UTF-8 rows give the bytes
+    // 1.4.1 gives when the raw byte is FF instead.
     const RELEASE_RAW_9B_FAMILY: &[(&str, bool, &str, &str, &[u8])] = &[
-        ("en_US.UTF-8", false, "failed", "\\033[7mfailed\\233\\nsnext\\033[0m\\n", b"\x1b[7m\x1b[38;2;255;0;0mfailed\x1b[39m\x9b\x0d\x0as\x1b[38;2;255;0;0m\x1b[39mnext\x1b[0m\x0d\x0a"),
-        ("en_US.UTF-8", false, "failed", "\\033[7mfailed\\233?1049\\nhnext\\033[0m\\n", b"\x1b[7m\x1b[38;2;255;0;0mfailed\x1b[39m\x9b?1049\x0d\x0ah\x1b[38;2;255;0;0m\x1b[39mnext\x1b[0m\x0d\x0a"),
-        ("en_US.UTF-8", false, "failed", "\\033[7mfailed\\233?1048\\nhnext\\033[0m\\n", b"\x1b[7m\x1b[38;2;255;0;0mfailed\x1b[39m\x9b?1048\x0d\x0ah\x1b[38;2;255;0;0m\x1b[39mnext\x1b[0m\x0d\x0a"),
-        ("en_US.UTF-8", false, "failed", "\\033[7mfailed\\233\\n#{next\\033[0m\\n", b"\x1b[7m\x1b[38;2;255;0;0mfailed\x1b[39m\x9b\x0d\x0a#{\x1b[38;2;255;0;0m\x1b[39mnext\x1b[0m\x0d\x0a"),
-        ("en_US.UTF-8", false, "WARN", "WARN\\233\\nJnext\\n", b"\x1b[38;2;0;0;0;48;2;255;255;0mWARN\x1b[39;49m\x9b\x0d\x0aJ\x1b[38;2;0;0;0;48;2;255;255;0m\x1b[39;49mnext\x0d\x0a"),
-        ("en_US.UTF-8", false, "WARN", "WARN\\233\\nKnext\\n", b"\x1b[38;2;0;0;0;48;2;255;255;0mWARN\x1b[39;49m\x9b\x0d\x0aK\x1b[38;2;0;0;0;48;2;255;255;0m\x1b[39;49mnext\x0d\x0a"),
-        ("en_US.UTF-8", false, "WARN", "WARN\\233\\nXnext\\n", b"\x1b[38;2;0;0;0;48;2;255;255;0mWARN\x1b[39;49m\x9b\x0d\x0aX\x1b[38;2;0;0;0;48;2;255;255;0m\x1b[39;49mnext\x0d\x0a"),
-        ("en_US.UTF-8", false, "WARN", "WARN\\233\\n@next\\n", b"\x1b[38;2;0;0;0;48;2;255;255;0mWARN\x1b[39;49m\x9b\x0d\x0a@\x1b[38;2;0;0;0;48;2;255;255;0m\x1b[39;49mnext\x0d\x0a"),
-        ("en_US.UTF-8", false, "WARN", "WARN\\233\\nPnext\\n", b"\x1b[38;2;0;0;0;48;2;255;255;0mWARN\x1b[39;49m\x9b\x0d\x0aP\x1b[38;2;0;0;0;48;2;255;255;0m\x1b[39;49mnext\x0d\x0a"),
-        ("en_US.UTF-8", false, "WARN", "WARN\\233\\nLnext\\n", b"\x1b[38;2;0;0;0;48;2;255;255;0mWARN\x1b[39;49m\x9b\x0d\x0aL\x1b[38;2;0;0;0;48;2;255;255;0m\x1b[39;49mnext\x0d\x0a"),
-        ("en_US.UTF-8", false, "WARN", "WARN\\233\\nMnext\\n", b"\x1b[38;2;0;0;0;48;2;255;255;0mWARN\x1b[39;49m\x9b\x0d\x0aM\x1b[38;2;0;0;0;48;2;255;255;0m\x1b[39;49mnext\x0d\x0a"),
-        ("en_US.UTF-8", false, "WARN", "WARN\\233\\nSnext\\n", b"\x1b[38;2;0;0;0;48;2;255;255;0mWARN\x1b[39;49m\x9b\x0d\x0aS\x1b[38;2;0;0;0;48;2;255;255;0m\x1b[39;49mnext\x0d\x0a"),
-        ("en_US.UTF-8", false, "WARN", "WARN\\233\\nTnext\\n", b"\x1b[38;2;0;0;0;48;2;255;255;0mWARN\x1b[39;49m\x9b\x0d\x0aT\x1b[38;2;0;0;0;48;2;255;255;0m\x1b[39;49mnext\x0d\x0a"),
-        ("en_US.UTF-8", true, "failed", "\\033[7mfailed\\233\\nsnext\\033[0m\\n", b"\x1b[7m\x1b[38;2;255;0;0mfailed\x1b[0m\x1b[7m\x9b\x0d\x0as\x1b[38;2;255;0;0m\x1b[0m\x1b[7mnext\x1b[0m\x0d\x0a"),
-        ("en_US.UTF-8", true, "failed", "\\033[7mfailed\\233?1049\\nhnext\\033[0m\\n", b"\x1b[7m\x1b[38;2;255;0;0mfailed\x1b[0m\x1b[7m\x9b?1049\x0d\x0ah\x1b[38;2;255;0;0m\x1b[0m\x1b[7mnext\x1b[0m\x0d\x0a"),
-        ("en_US.UTF-8", true, "failed", "\\033[7mfailed\\233?1048\\nhnext\\033[0m\\n", b"\x1b[7m\x1b[38;2;255;0;0mfailed\x1b[0m\x1b[7m\x9b?1048\x0d\x0ah\x1b[38;2;255;0;0m\x1b[0m\x1b[7mnext\x1b[0m\x0d\x0a"),
-        ("en_US.UTF-8", true, "failed", "\\033[7mfailed\\233\\n#{next\\033[0m\\n", b"\x1b[7m\x1b[38;2;255;0;0mfailed\x1b[0m\x1b[7m\x9b\x0d\x0a#{\x1b[38;2;255;0;0m\x1b[0m\x1b[7mnext\x1b[0m\x0d\x0a"),
-        ("en_US.UTF-8", true, "WARN", "WARN\\233\\nJnext\\n", b"\x1b[38;2;0;0;0;48;2;255;255;0mWARN\x1b[0m\x9b\x0d\x0aJ\x1b[38;2;0;0;0;48;2;255;255;0m\x1b[0mnext\x0d\x0a"),
-        ("en_US.UTF-8", true, "WARN", "WARN\\233\\nKnext\\n", b"\x1b[38;2;0;0;0;48;2;255;255;0mWARN\x1b[0m\x9b\x0d\x0aK\x1b[38;2;0;0;0;48;2;255;255;0m\x1b[0mnext\x0d\x0a"),
-        ("en_US.UTF-8", true, "WARN", "WARN\\233\\nXnext\\n", b"\x1b[38;2;0;0;0;48;2;255;255;0mWARN\x1b[0m\x9b\x0d\x0aX\x1b[38;2;0;0;0;48;2;255;255;0m\x1b[0mnext\x0d\x0a"),
-        ("en_US.UTF-8", true, "WARN", "WARN\\233\\n@next\\n", b"\x1b[38;2;0;0;0;48;2;255;255;0mWARN\x1b[0m\x9b\x0d\x0a@\x1b[38;2;0;0;0;48;2;255;255;0m\x1b[0mnext\x0d\x0a"),
-        ("en_US.UTF-8", true, "WARN", "WARN\\233\\nPnext\\n", b"\x1b[38;2;0;0;0;48;2;255;255;0mWARN\x1b[0m\x9b\x0d\x0aP\x1b[38;2;0;0;0;48;2;255;255;0m\x1b[0mnext\x0d\x0a"),
-        ("en_US.UTF-8", true, "WARN", "WARN\\233\\nLnext\\n", b"\x1b[38;2;0;0;0;48;2;255;255;0mWARN\x1b[0m\x9b\x0d\x0aL\x1b[38;2;0;0;0;48;2;255;255;0m\x1b[0mnext\x0d\x0a"),
-        ("en_US.UTF-8", true, "WARN", "WARN\\233\\nMnext\\n", b"\x1b[38;2;0;0;0;48;2;255;255;0mWARN\x1b[0m\x9b\x0d\x0aM\x1b[38;2;0;0;0;48;2;255;255;0m\x1b[0mnext\x0d\x0a"),
-        ("en_US.UTF-8", true, "WARN", "WARN\\233\\nSnext\\n", b"\x1b[38;2;0;0;0;48;2;255;255;0mWARN\x1b[0m\x9b\x0d\x0aS\x1b[38;2;0;0;0;48;2;255;255;0m\x1b[0mnext\x0d\x0a"),
-        ("en_US.UTF-8", true, "WARN", "WARN\\233\\nTnext\\n", b"\x1b[38;2;0;0;0;48;2;255;255;0mWARN\x1b[0m\x9b\x0d\x0aT\x1b[38;2;0;0;0;48;2;255;255;0m\x1b[0mnext\x0d\x0a"),
+        ("en_US.UTF-8", false, "failed", "\\033[7mfailed\\233\\nsnext\\033[0m\\n", b"\x1b[7m\x1b[38;2;255;0;0mfailed\x1b[39m\x9b\x0d\x0asnext\x1b[0m\x0d\x0a"),
+        ("en_US.UTF-8", false, "failed", "\\033[7mfailed\\233?1049\\nhnext\\033[0m\\n", b"\x1b[7m\x1b[38;2;255;0;0mfailed\x1b[39m\x9b?1049\x0d\x0ahnext\x1b[0m\x0d\x0a"),
+        ("en_US.UTF-8", false, "failed", "\\033[7mfailed\\233?1048\\nhnext\\033[0m\\n", b"\x1b[7m\x1b[38;2;255;0;0mfailed\x1b[39m\x9b?1048\x0d\x0ahnext\x1b[0m\x0d\x0a"),
+        ("en_US.UTF-8", false, "failed", "\\033[7mfailed\\233\\n#{next\\033[0m\\n", b"\x1b[7m\x1b[38;2;255;0;0mfailed\x1b[39m\x9b\x0d\x0a#{next\x1b[0m\x0d\x0a"),
+        ("en_US.UTF-8", false, "WARN", "WARN\\233\\nJnext\\n", b"\x1b[38;2;0;0;0;48;2;255;255;0mWARN\x1b[39;49m\x9b\x0d\x0aJnext\x0d\x0a"),
+        ("en_US.UTF-8", false, "WARN", "WARN\\233\\nKnext\\n", b"\x1b[38;2;0;0;0;48;2;255;255;0mWARN\x1b[39;49m\x9b\x0d\x0aKnext\x0d\x0a"),
+        ("en_US.UTF-8", false, "WARN", "WARN\\233\\nXnext\\n", b"\x1b[38;2;0;0;0;48;2;255;255;0mWARN\x1b[39;49m\x9b\x0d\x0aXnext\x0d\x0a"),
+        ("en_US.UTF-8", false, "WARN", "WARN\\233\\n@next\\n", b"\x1b[38;2;0;0;0;48;2;255;255;0mWARN\x1b[39;49m\x9b\x0d\x0a@next\x0d\x0a"),
+        ("en_US.UTF-8", false, "WARN", "WARN\\233\\nPnext\\n", b"\x1b[38;2;0;0;0;48;2;255;255;0mWARN\x1b[39;49m\x9b\x0d\x0aPnext\x0d\x0a"),
+        ("en_US.UTF-8", false, "WARN", "WARN\\233\\nLnext\\n", b"\x1b[38;2;0;0;0;48;2;255;255;0mWARN\x1b[39;49m\x9b\x0d\x0aLnext\x0d\x0a"),
+        ("en_US.UTF-8", false, "WARN", "WARN\\233\\nMnext\\n", b"\x1b[38;2;0;0;0;48;2;255;255;0mWARN\x1b[39;49m\x9b\x0d\x0aMnext\x0d\x0a"),
+        ("en_US.UTF-8", false, "WARN", "WARN\\233\\nSnext\\n", b"\x1b[38;2;0;0;0;48;2;255;255;0mWARN\x1b[39;49m\x9b\x0d\x0aSnext\x0d\x0a"),
+        ("en_US.UTF-8", false, "WARN", "WARN\\233\\nTnext\\n", b"\x1b[38;2;0;0;0;48;2;255;255;0mWARN\x1b[39;49m\x9b\x0d\x0aTnext\x0d\x0a"),
+        ("en_US.UTF-8", true, "failed", "\\033[7mfailed\\233\\nsnext\\033[0m\\n", b"\x1b[7m\x1b[1;38;2;255;0;0mfailed\x1b[0m\x1b[7m\x9b\x0d\x0asnext\x1b[0m\x0d\x0a"),
+        ("en_US.UTF-8", true, "failed", "\\033[7mfailed\\233?1049\\nhnext\\033[0m\\n", b"\x1b[7m\x1b[1;38;2;255;0;0mfailed\x1b[0m\x1b[7m\x9b?1049\x0d\x0ahnext\x1b[0m\x0d\x0a"),
+        ("en_US.UTF-8", true, "failed", "\\033[7mfailed\\233?1048\\nhnext\\033[0m\\n", b"\x1b[7m\x1b[1;38;2;255;0;0mfailed\x1b[0m\x1b[7m\x9b?1048\x0d\x0ahnext\x1b[0m\x0d\x0a"),
+        ("en_US.UTF-8", true, "failed", "\\033[7mfailed\\233\\n#{next\\033[0m\\n", b"\x1b[7m\x1b[1;38;2;255;0;0mfailed\x1b[0m\x1b[7m\x9b\x0d\x0a#{next\x1b[0m\x0d\x0a"),
+        ("en_US.UTF-8", true, "WARN", "WARN\\233\\nJnext\\n", b"\x1b[38;2;0;0;0;48;2;255;255;0mWARN\x1b[0m\x9b\x0d\x0aJnext\x0d\x0a"),
+        ("en_US.UTF-8", true, "WARN", "WARN\\233\\nKnext\\n", b"\x1b[38;2;0;0;0;48;2;255;255;0mWARN\x1b[0m\x9b\x0d\x0aKnext\x0d\x0a"),
+        ("en_US.UTF-8", true, "WARN", "WARN\\233\\nXnext\\n", b"\x1b[38;2;0;0;0;48;2;255;255;0mWARN\x1b[0m\x9b\x0d\x0aXnext\x0d\x0a"),
+        ("en_US.UTF-8", true, "WARN", "WARN\\233\\n@next\\n", b"\x1b[38;2;0;0;0;48;2;255;255;0mWARN\x1b[0m\x9b\x0d\x0a@next\x0d\x0a"),
+        ("en_US.UTF-8", true, "WARN", "WARN\\233\\nPnext\\n", b"\x1b[38;2;0;0;0;48;2;255;255;0mWARN\x1b[0m\x9b\x0d\x0aPnext\x0d\x0a"),
+        ("en_US.UTF-8", true, "WARN", "WARN\\233\\nLnext\\n", b"\x1b[38;2;0;0;0;48;2;255;255;0mWARN\x1b[0m\x9b\x0d\x0aLnext\x0d\x0a"),
+        ("en_US.UTF-8", true, "WARN", "WARN\\233\\nMnext\\n", b"\x1b[38;2;0;0;0;48;2;255;255;0mWARN\x1b[0m\x9b\x0d\x0aMnext\x0d\x0a"),
+        ("en_US.UTF-8", true, "WARN", "WARN\\233\\nSnext\\n", b"\x1b[38;2;0;0;0;48;2;255;255;0mWARN\x1b[0m\x9b\x0d\x0aSnext\x0d\x0a"),
+        ("en_US.UTF-8", true, "WARN", "WARN\\233\\nTnext\\n", b"\x1b[38;2;0;0;0;48;2;255;255;0mWARN\x1b[0m\x9b\x0d\x0aTnext\x0d\x0a"),
         ("C", false, "failed", "\\033[7mfailed\\233\\nsnext\\033[0m\\n", b"\x1b[7m\x1b[38;2;255;0;0mfailed\x1b[39m\x9b\x0d\x0as\x1b[38;2;255;0;0m\x1b[39mnext\x1b[0m\x0d\x0a"),
         ("C", false, "WARN", "WARN\\233\\nKnext\\n", b"\x1b[38;2;0;0;0;48;2;255;255;0mWARN\x1b[39;49m\x9b\x0d\x0aK\x1b[38;2;0;0;0;48;2;255;255;0m\x1b[39;49mnext\x0d\x0a"),
         ("C", true, "failed", "\\033[7mfailed\\233\\nsnext\\033[0m\\n", b"\x1b[7m\x1b[38;2;255;0;0mfailed\x1b[0m\x1b[7m\x9b\x0d\x0as\x1b[38;2;255;0;0m\x1b[0m\x1b[7mnext\x1b[0m\x0d\x0a"),
@@ -1467,5 +1469,288 @@ fn prompt_background_ends_where_the_program_ends_it() {
             ]),
             "full reset {full_reset}"
         );
+    }
+}
+
+/// How a test puts prismtty on a terminal: `Stdout` makes the PTY its
+/// standard output and a pipe its input (`printf | prismtty`); `Wrapped` runs
+/// the command under `ptty`, which reads it from a PTY of its own.
+#[derive(Clone, Copy, Debug)]
+enum OnPty {
+    Stdout,
+    Wrapped,
+}
+
+/// Puts the output of `printf <format>` through prismtty on a PTY this test
+/// creates, with `up` painted green, in an environment that holds only the
+/// given locale variables, and returns what reached the PTY when it closes or
+/// after five seconds.
+fn printf_on_a_pty(how: OnPty, locale: &[(&str, &str)], flags: &[&str], format: &str) -> Vec<u8> {
+    let home = tempfile::tempdir().expect("scratch home");
+    let runtime = home.path().join("runtime");
+    std::fs::create_dir(&runtime).expect("runtime dir");
+    std::fs::set_permissions(
+        &runtime,
+        std::os::unix::fs::PermissionsExt::from_mode(0o700),
+    )
+    .expect("runtime dir mode");
+    let config = home.path().join("rules.yml");
+    std::fs::write(
+        &config,
+        "rules:\n  - description: up\n    regex: '\\bup\\b'\n    color: f#00ff00\n",
+    )
+    .expect("config");
+    let pair = native_pty_system()
+        .openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("openpty");
+    let mut builder = match how {
+        OnPty::Stdout => {
+            let mut builder = CommandBuilder::new("sh");
+            builder.arg("-c");
+            builder.arg(format!(
+                "printf '{format}' | '{}' -c '{}' --rgb --no-auto-detect {}",
+                env!("CARGO_BIN_EXE_prismtty"),
+                config.display(),
+                flags.join(" ")
+            ));
+            builder
+        }
+        OnPty::Wrapped => {
+            let mut builder = CommandBuilder::new(env!("CARGO_BIN_EXE_ptty"));
+            builder.arg("-c");
+            builder.arg(&config);
+            builder.args(["--rgb", "--no-auto-detect", "--no-dynamic-profile"]);
+            builder.args(flags);
+            builder.args(["sh", "-c"]);
+            builder.arg(format!("printf '{format}'"));
+            builder
+        }
+    };
+    builder.env_clear();
+    builder.env("PATH", std::env::var_os("PATH").unwrap_or_default());
+    builder.env("TERM", "xterm-256color");
+    builder.env("HOME", home.path());
+    builder.env("XDG_CONFIG_HOME", home.path());
+    builder.env("PRISMTTY_RUNTIME_DIR", &runtime);
+    for (name, value) in locale {
+        builder.env(name, value);
+    }
+    let child = pair.slave.spawn_command(builder).expect("spawn prismtty");
+    drop(pair.slave);
+    let session = PtySession::new(child, &*pair.master);
+    let finished = session.capture().finished_flag();
+    session
+        .capture()
+        .wait_until(Duration::from_secs(5), |_| finished.load(Ordering::Acquire))
+}
+
+const UTF8_LOCALES_ON_A_PTY: &[&[(&str, &str)]] = &[
+    &[("LC_ALL", "en_US.UTF-8")],
+    &[("LC_ALL", ""), ("LC_CTYPE", "en_US.UTF-8")],
+    &[("LANG", "bogus.UTF-8")],
+];
+
+const EIGHT_BIT_LOCALES_ON_A_PTY: &[&[(&str, &str)]] = &[
+    &[("LC_ALL", "C")],
+    &[("LC_ALL", "en_US.ISO8859-1")],
+    &[("LC_ALL", "C"), ("LANG", "en_US.UTF-8")],
+];
+
+/// On a terminal the rule is the pipe's: in a UTF-8 locale an isolated
+/// invalid raw byte in ordinary text is text, by default and under
+/// `--sanitize`, and the text after it is highlighted; outside one it opens
+/// the string an 8-bit terminal reads, which hides the rest. `--sanitize`
+/// drops the ESC in front of a raw byte either way, so no OSC 52 reaches the
+/// terminal.
+#[test]
+fn a_stray_raw_c1_byte_reaches_a_terminal_as_the_locale_reads_it() {
+    const UP: &[u8] = b"\x1b[38;2;0;255;0mup";
+    let stav = "Stav: dr\\236\\355, rest of line up\\nnext up\\n";
+    for how in [OnPty::Stdout, OnPty::Wrapped] {
+        for flags in [&[][..], &["--sanitize"][..]] {
+            for locale in UTF8_LOCALES_ON_A_PTY {
+                let out = printf_on_a_pty(how, locale, flags, stav);
+                let kept = [b"Stav: dr\x9e\xed, rest of line ".as_slice(), UP].concat();
+                assert!(
+                    contains_bytes(&out, &kept) && contains_bytes(&out, &[b"next ", UP].concat()),
+                    "{how:?} {flags:?} {locale:?}: {:?}",
+                    String::from_utf8_lossy(&out)
+                );
+            }
+            for locale in EIGHT_BIT_LOCALES_ON_A_PTY {
+                let out = printf_on_a_pty(how, locale, flags, stav);
+                assert!(
+                    contains_bytes(&out, b"Stav: dr") && !contains_bytes(&out, b"rest of line"),
+                    "{how:?} {flags:?} {locale:?}: {:?}",
+                    String::from_utf8_lossy(&out)
+                );
+            }
+        }
+        for (locales, expected) in [
+            (UTF8_LOCALES_ON_A_PTY, b"A\x9d]52;c;QUJD\x07B".as_slice()),
+            (EIGHT_BIT_LOCALES_ON_A_PTY, b"AB".as_slice()),
+        ] {
+            for locale in locales {
+                let out = printf_on_a_pty(
+                    how,
+                    locale,
+                    &["--sanitize"],
+                    "A\\033\\235]52;c;QUJD\\007B\\n",
+                );
+                assert!(
+                    contains_bytes(&out, expected) && !contains_bytes(&out, b"\x1b]"),
+                    "{how:?} {locale:?}: {:?}",
+                    String::from_utf8_lossy(&out)
+                );
+            }
+        }
+    }
+}
+
+/// A color set after a prompt is taken out before the typed command. With a
+/// raw `9B` in the prompt, a UTF-8 terminal shows the byte and the text after
+/// it, so the line is no prompt and the program's red stays; in an 8-bit
+/// locale `9B ?1049h` switches to the alternate screen, where prompts are not
+/// read either.
+#[test]
+fn a_prompt_holding_a_raw_c1_byte_is_read_as_the_terminal_shows_it() {
+    let prompt = "\\233?1049hrouter\\233?9999999h#\\033[31mshow";
+    for how in [OnPty::Stdout, OnPty::Wrapped] {
+        for locale in UTF8_LOCALES_ON_A_PTY
+            .iter()
+            .chain(EIGHT_BIT_LOCALES_ON_A_PTY)
+        {
+            let out = printf_on_a_pty(how, locale, &[], prompt);
+            assert!(
+                contains_bytes(&out, b"\x9b?1049hrouter\x9b?9999999h#\x1b[31mshow"),
+                "{how:?} {locale:?}: {:?}",
+                String::from_utf8_lossy(&out)
+            );
+        }
+    }
+}
+
+/// Known limit, stated in SECURITY.md and both READMEs: on a terminal
+/// `--sanitize` does not end every unfinished control at the end of input.
+/// In a UTF-8 locale `9D X` is text, and the ESC after it reaches the
+/// terminal as it came, still open for whatever writes to the terminal next.
+/// In an 8-bit locale the raw OSC is dropped and nothing is left open.
+#[test]
+fn known_limit_sanitize_on_a_terminal_can_end_with_an_unfinished_escape() {
+    let tail = "user@host $ \\235X\\033";
+    for how in [OnPty::Stdout, OnPty::Wrapped] {
+        for locale in UTF8_LOCALES_ON_A_PTY {
+            let out = printf_on_a_pty(how, locale, &["--sanitize"], tail);
+            assert!(
+                out.ends_with(b"user@host $ \x9dX\x1b"),
+                "{how:?} {locale:?}: {:?}",
+                String::from_utf8_lossy(&out)
+            );
+        }
+        for locale in EIGHT_BIT_LOCALES_ON_A_PTY {
+            let out = printf_on_a_pty(how, locale, &["--sanitize"], tail);
+            assert!(
+                out.ends_with(b"user@host $ ") && !contains_bytes(&out, b"X"),
+                "{how:?} {locale:?}: {:?}",
+                String::from_utf8_lossy(&out)
+            );
+        }
+    }
+}
+
+/// A prompt whose style the UTF-8 form `C2 9B` opened, with a plain reset
+/// after the prompt (review 80's witness). The reset is taken out with the
+/// other SGRs of the prompt echo, so what it ended is written in its place,
+/// as 1.5.1 writes it: `49`, `27` or `24`. A terminal that runs `C2 9B`
+/// would otherwise keep the style on the command and the lines after it;
+/// on one that prints `C2 9B` the style was never set and the off changes
+/// nothing. The bytes are 1.5.1's in both locales, both reset modes and
+/// under `--sanitize`.
+#[test]
+fn a_prompt_style_opened_by_c2_9b_is_ended_where_its_reset_was() {
+    for (code, off) in [("44", "49"), ("7", "27"), ("4", "24")] {
+        let format =
+            format!("\\302\\233{code}mR1#\\033[0m show \\033[1mint\\r\\nnext output here\\r\\nR1#");
+        for (flags, reset) in [
+            (&[][..], "\x1b[39m"),
+            (&["--no-minimal-reset"][..], "\x1b[0m"),
+            (&["--sanitize"][..], "\x1b[39m"),
+            (&["--sanitize", "--no-minimal-reset"][..], "\x1b[0m"),
+        ] {
+            let expected = [
+                b"\xc2\x9b".as_slice(),
+                code.as_bytes(),
+                b"mR1#\x1b[",
+                off.as_bytes(),
+                b"m ",
+                reset.as_bytes(),
+                b"show int\r\r\nnext output here\r\r\nR1#",
+            ]
+            .concat();
+            for locale in [&[("LC_ALL", "en_US.UTF-8")][..], &[("LC_ALL", "C")][..]] {
+                let out = printf_on_a_pty(OnPty::Stdout, locale, flags, &format);
+                assert!(
+                    out == expected,
+                    "{code} {flags:?} {locale:?}\n  got {:?}\n want {:?}",
+                    String::from_utf8_lossy(&out),
+                    String::from_utf8_lossy(&expected)
+                );
+            }
+        }
+    }
+}
+
+/// A highlight is closed before a line end when the program's rendition
+/// draws blank cells in the foreground (inverse, strike-through,
+/// overline), so the next line is not painted in it. A style that a
+/// `C2 9B` SGR may have set counts too, as in 1.5.1: on a terminal that
+/// prints `C2 9B` the close and reopen change nothing. In a UTF-8 locale
+/// the full reset that closes it is not followed by the `C2 9B` style,
+/// because no restore is written from that form; in C the bytes are
+/// 1.5.1's.
+#[test]
+fn a_highlight_closes_before_a_line_end_where_a_c2_9b_style_may_draw_blank_cells() {
+    const GREEN: &[u8] = b"\x1b[38;2;0;255;0m";
+    for code in ["7", "9", "53"] {
+        let format = format!("\\302\\233{code}mlink up\\r\\nnext\\r\\n");
+        let restore = format!("\x1b[{code}m");
+        for (locale, full_reset_restore) in [
+            (&[("LC_ALL", "en_US.UTF-8")][..], ""),
+            (&[("LC_ALL", "C")][..], restore.as_str()),
+        ] {
+            for (flags, close) in [
+                (&[][..], "\x1b[39m".to_string()),
+                (
+                    &["--no-minimal-reset"][..],
+                    format!("\x1b[0m{full_reset_restore}"),
+                ),
+            ] {
+                let expected = [
+                    b"\xc2\x9b".as_slice(),
+                    code.as_bytes(),
+                    b"mlink ",
+                    GREEN,
+                    b"up",
+                    close.as_bytes(),
+                    b"\r\r\n",
+                    GREEN,
+                    close.as_bytes(),
+                    b"next\r\r\n",
+                ]
+                .concat();
+                let out = printf_on_a_pty(OnPty::Stdout, locale, flags, &format);
+                assert!(
+                    out == expected,
+                    "{code} {flags:?} {locale:?}\n  got {:?}\n want {:?}",
+                    String::from_utf8_lossy(&out),
+                    String::from_utf8_lossy(&expected)
+                );
+            }
+        }
     }
 }
