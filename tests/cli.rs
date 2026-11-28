@@ -3426,3 +3426,31 @@ fn profiles_test_drops_the_title_string_with_both_flags() {
     assert!(output.status.success(), "{output:?}");
     assert_eq!(String::from_utf8_lossy(&output.stdout), "one two\n");
 }
+
+// Stated in SECURITY.md and the changelog: in a UTF-8 locale both filters
+// drop a `C2` that begins no character when they process the bytes. The
+// stream writes a `C2` that ends the output as it is, a character cut off
+// by the end; `profiles test` filters its whole fixture at once and drops it.
+#[test]
+fn a_c2_that_ends_the_output_is_written_by_the_stream_and_dropped_by_profiles_test() {
+    let mut empty_config = tempfile::NamedTempFile::new().expect("empty config");
+    writeln!(empty_config, "rules: []").expect("write empty config");
+    let config = empty_config.path().to_str().expect("UTF-8 path");
+    let mut fixture = tempfile::NamedTempFile::new().expect("fixture");
+    fixture.write_all(b"A\xc2").expect("write fixture");
+    let fixture = fixture.path().to_str().expect("UTF-8 path");
+    let utf8 = &[("LC_ALL", "en_US.UTF-8")][..];
+
+    for flag in ["--sanitize", "--strip-ansi"] {
+        let stream = prismtty_in_locale(&[flag, "--config", config], utf8, b"A\xc2");
+        assert_eq!(stream.stdout, b"A\xc2", "{flag}, stream");
+        let tested = prismtty_in_locale(
+            &[
+                flag, "--config", config, "profiles", "test", "generic", "--", fixture,
+            ],
+            utf8,
+            b"",
+        );
+        assert_eq!(tested.stdout, b"A", "{flag}, profiles test");
+    }
+}
