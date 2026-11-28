@@ -2305,15 +2305,13 @@ fn prompt_echo_source_sgr_leaves_active_style(input: &[u8], ranges: &[(usize, us
 
     // Whether the program may have left a style on, which a terminal that
     // runs the SGR would draw the command in: one opened by the UTF-8 form
-    // `C2 9B` counts as well, read as its 7-bit form, though no rendition is
-    // learned from it (see `NativeSgrState::apply_sequence`).
-    let mut state = NativeSgrState::default();
+    // `C2 9B` counts as well (see `NativeSgrState::encoded_csi`).
+    let mut state = NativeSgrState {
+        reads_encoded_csi: true,
+        ..NativeSgrState::default()
+    };
     for (start, end) in ranges {
-        let sequence = &input[*start..*end];
-        match sequence.strip_prefix(b"\xc2\x9b") {
-            Some(rest) => state.apply_sequence(&[b"\x1b[".as_slice(), rest].concat()),
-            None => state.apply_sequence(sequence),
-        }
+        state.apply_sequence(&input[*start..*end]);
     }
     state.ansi_start().is_some()
 }
@@ -3770,10 +3768,29 @@ struct NativeSgrState {
     /// since the two last agreed; `None` while they agree. It is taken over
     /// at the first use of the SGR stack.
     without_offs: Option<Box<NativeSgrState>>,
+    /// Set on the copy in `encoded_csi`, which also takes rendition from the
+    /// UTF-8 form `C2 9B` in a UTF-8 locale.
+    reads_encoded_csi: bool,
+    /// In a UTF-8 locale, this state as a terminal that also runs the UTF-8
+    /// form `C2 9B` holds it; `None` while the two agree. No restore after a
+    /// highlight is written from it, so a terminal that prints `C2 9B` gets
+    /// no new live control from one. Only the prompt-echo offs read it: a
+    /// style such an SGR may have set is ended like any other, and on a
+    /// terminal that printed the SGR the off ends a style that is not there,
+    /// which changes nothing.
+    encoded_csi: Option<Box<NativeSgrState>>,
 }
 
 impl NativeSgrState {
     fn apply_sequence(&mut self, bytes: &[u8]) {
+        let encoded_csi =
+            !self.reads_encoded_csi && bytes.starts_with(b"\xc2\x9b") && terminal_reads_utf8();
+        if encoded_csi && self.encoded_csi.is_none() {
+            self.encoded_csi = Some(Box::new(self.reading_encoded_csi()));
+        }
+        if let Some(encoded) = self.encoded_csi.as_deref_mut() {
+            encoded.apply_sequence(bytes);
+        }
         if let Some(without_offs) = self.without_offs.as_deref_mut() {
             without_offs.apply_sequence(bytes);
         }
@@ -3787,8 +3804,8 @@ impl NativeSgrState {
         // In a UTF-8 locale no rendition is taken from the UTF-8 form `C2 9B`:
         // terminals that read UTF-8 do not agree on running it, and a color
         // taken from one that shows it as text would come back as a live
-        // `ESC [` control after a highlight.
-        if bytes.starts_with(b"\xc2\x9b") && terminal_reads_utf8() {
+        // `ESC [` control after a highlight. `encoded_csi` keeps it.
+        if encoded_csi {
             return;
         }
         match bytes {
@@ -3834,6 +3851,26 @@ impl NativeSgrState {
         {
             self.without_offs = None;
         }
+        if self
+            .encoded_csi
+            .as_deref()
+            .is_some_and(|encoded| encoded.agrees_with(self))
+        {
+            self.encoded_csi = None;
+        }
+    }
+
+    /// A copy of this state that also takes rendition from `C2 9B`.
+    fn reading_encoded_csi(&self) -> Self {
+        Self {
+            rendition: self.rendition.clone(),
+            saved: self.saved.clone(),
+            alternate_screen: self.alternate_screen,
+            sgr_stack_used: self.sgr_stack_used,
+            without_offs: None,
+            reads_encoded_csi: true,
+            encoded_csi: None,
+        }
     }
 
     fn agrees_with(&self, other: &Self) -> bool {
@@ -3849,6 +3886,9 @@ impl NativeSgrState {
             self.without_offs = Some(Box::new(self.clone()));
         }
         self.rendition.apply_sequence(off);
+        if let Some(encoded) = self.encoded_csi.as_deref_mut() {
+            encoded.rendition.apply_sequence(off);
+        }
     }
 
     /// Follows a prompt-echo line written as `written`, which may begin
@@ -3916,22 +3956,26 @@ impl NativeSgrState {
     /// The SGR left in place of the removed prompt-echo SGR `sequence` on a
     /// terminal showing this rendition: the code from
     /// `PROMPT_ECHO_OFF_CODES` of each group shown here that `sequence`,
-    /// read by the parser, leaves off, in ascending order. Empty when there
-    /// is none, when `sequence` is not plain (`is_plain_sgr`), and once the
-    /// SGR stack has been used.
+    /// read by the parser, leaves off, in ascending order. A group that only
+    /// a `C2 9B` SGR may have turned on counts (see `encoded_csi`). Empty
+    /// when there is none, when `sequence` is not plain (`is_plain_sgr`),
+    /// and once the SGR stack has been used.
     fn prompt_echo_off(&self, sequence: &[u8]) -> Vec<u8> {
         if self.sgr_stack_used || !is_plain_sgr(sequence) {
             return Vec::new();
         }
-        let mut after = self.rendition.clone();
+        let shown = self
+            .encoded_csi
+            .as_deref()
+            .map_or(&self.rendition, |encoded| &encoded.rendition);
+        let mut after = shown.clone();
         after.apply_sequence(sequence);
         let codes = PROMPT_ECHO_OFF_CODES
             .iter()
             .filter(|(group, _)| match group {
-                None => self.rendition.background.is_some() && after.background.is_none(),
+                None => shown.background.is_some() && after.background.is_none(),
                 Some(group) => {
-                    self.rendition.attributes.contains_key(group)
-                        && !after.attributes.contains_key(group)
+                    shown.attributes.contains_key(group) && !after.attributes.contains_key(group)
                 }
             })
             .map(|(_, code)| code.to_string())
