@@ -4138,10 +4138,18 @@ mod leave_tests {
         last
     }
 
-    /// A key typed at the waiting prompt, read with its echo.
+    /// The first command typed at the waiting prompt: `s` read with its
+    /// echo, then Enter with its line end. The colors may change only at the
+    /// echo of the Enter (review 81).
     fn key(runtime: &mut ProfileRuntime, store: &ProfileStore) -> Option<Vec<String>> {
         runtime.observe_input(b"s");
-        runtime.observe_output(b"s", store)
+        assert_eq!(
+            runtime.observe_output(b"s", store),
+            None,
+            "the echo of a key alone does not confirm"
+        );
+        runtime.observe_input(b"\r");
+        runtime.observe_output(b"\r\n", store)
     }
 
     /// Asserts the child is still the active connection and answers a
@@ -4163,17 +4171,18 @@ mod leave_tests {
     // C-2b, genuine closes.
 
     #[test]
-    fn c2b_parent_prompt_waiting_after_the_bracket_returns_at_the_next_key() {
+    fn c2b_parent_prompt_waiting_after_the_bracket_returns_at_the_first_command_s_enter() {
         let store = ProfileStore::builtin();
         let mut runtime = cisco_then_juniper(&store);
         assert_eq!(exit_with(&mut runtime, &store, &genuine_reply(), &[]), None);
-        // The parent prompt waits; the key typed at it proves it.
+        // The parent prompt waits; the echo of the whole line typed at it,
+        // up to its Enter, proves it.
         assert_eq!(key(&mut runtime, &store), Some(names(CISCO)));
         assert_eq!(runtime.stack_len(), 1);
         step(
             &mut runtime,
             &store,
-            "how version",
+            "show version",
             &["Hostname: sw1\nsw1#"],
         );
         assert_eq!(runtime.active_profiles(), names(CISCO));
@@ -4307,6 +4316,337 @@ mod leave_tests {
         runtime.observe_input(b"\x1b[200~exit\r\x1b[201~");
         runtime.observe_output(format!("exit{}", genuine_reply()).as_bytes(), &store);
         assert_eq!(key(&mut runtime, &store), Some(names(CISCO)));
+    }
+
+    // C-2b, the whole typed line (review 81, must-fix 1).
+
+    /// After the genuine reply: `input` and `output` chunks in the order
+    /// listed. Returns the last profile change, and the index of the chunk
+    /// that made it.
+    fn at_parent_prompt(
+        runtime: &mut ProfileRuntime,
+        store: &ProfileStore,
+        exchange: &[(&[u8], &[u8])],
+    ) -> Option<(usize, Vec<String>)> {
+        let mut last = None;
+        for (index, (input, output)) in exchange.iter().enumerate() {
+            runtime.observe_input(input);
+            if let Some(profiles) = runtime.observe_output(output, store) {
+                last = Some((index, profiles));
+            }
+        }
+        last
+    }
+
+    /// `bytes` split into reads at `split` (0: one read).
+    fn reads(bytes: &[u8], split: usize) -> Vec<&[u8]> {
+        if split == 0 || split >= bytes.len() {
+            vec![bytes]
+        } else {
+            vec![&bytes[..split], &bytes[split..]]
+        }
+    }
+
+    #[test]
+    fn c2b_the_whole_line_and_its_enter_confirm_in_any_read_grouping() {
+        let store = ProfileStore::builtin();
+        let typed = b"show version\r";
+        let echo = b"show version\r\nHostname: sw1\r\nsw1#";
+        let enter_echo = echo.iter().position(|byte| *byte == b'\r').expect("cr");
+        // Each key read with its echo.
+        let mut runtime = cisco_then_juniper(&store);
+        exit_with(&mut runtime, &store, &genuine_reply(), &[]);
+        let mut exchange: Vec<(&[u8], &[u8])> = (0..enter_echo)
+            .map(|at| (&typed[at..=at], &echo[at..=at]))
+            .collect();
+        exchange.push((&typed[enter_echo..], &echo[enter_echo..]));
+        assert_eq!(
+            at_parent_prompt(&mut runtime, &store, &exchange),
+            Some((enter_echo, names(CISCO))),
+            "the colors change at the Enter's echo, not before"
+        );
+        // Typed fast or pasted: every key and the Enter read before any
+        // echo, which then comes split at every position.
+        for split in 0..echo.len() {
+            let mut runtime = cisco_then_juniper(&store);
+            exit_with(&mut runtime, &store, &genuine_reply(), &[]);
+            let chunks = reads(echo, split);
+            let mut exchange: Vec<(&[u8], &[u8])> = vec![(typed, chunks[0])];
+            exchange.extend(chunks[1..].iter().map(|chunk| (&b""[..], *chunk)));
+            let expected_chunk = usize::from(split != 0 && split <= enter_echo);
+            assert_eq!(
+                at_parent_prompt(&mut runtime, &store, &exchange),
+                Some((expected_chunk, names(CISCO))),
+                "split at {split}"
+            );
+            assert_eq!(runtime.stack_len(), 1, "split at {split}");
+        }
+    }
+
+    #[test]
+    fn c2b_a_line_that_goes_on_with_the_typed_key_is_not_its_echo() {
+        // Review 81's witness: still connected, echo off. The key is `b`
+        // and the line goes on with `backup`, with or without the Enter read
+        // first, the continuation split at every position.
+        let store = ProfileStore::builtin();
+        let continuation = b"backup\r\nlab@sw2> ";
+        for typed in [&b"b"[..], b"b\r"] {
+            for split in 0..continuation.len() {
+                let mut runtime = cisco_then_juniper_shell(&store);
+                exit_with(&mut runtime, &store, &genuine_reply(), &[]);
+                let chunks = reads(continuation, split);
+                let mut exchange: Vec<(&[u8], &[u8])> = vec![(typed, chunks[0])];
+                exchange.extend(chunks[1..].iter().map(|chunk| (&b""[..], *chunk)));
+                assert_eq!(
+                    at_parent_prompt(&mut runtime, &store, &exchange),
+                    None,
+                    "typed {typed:?}, split at {split}"
+                );
+                assert_child_kept(&mut runtime, &store, JUNIPER);
+                assert_eq!(runtime.stack_len(), 2, "typed {typed:?}, split at {split}");
+            }
+        }
+    }
+
+    #[test]
+    fn c2b_a_line_that_goes_on_with_part_of_the_typed_line_is_not_its_echo() {
+        let store = ProfileStore::builtin();
+        for (name, typed, continuation) in [
+            (
+                "the first two bytes",
+                &b"ba\r"[..],
+                &b"backup\r\nlab@sw2> "[..],
+            ),
+            ("all bytes but the last", b"backup\r", b"backu\r\nlab@sw2> "),
+            (
+                "all bytes, then not the Enter",
+                b"backup\r",
+                b"backupx\r\nlab@sw2> ",
+            ),
+        ] {
+            for split in 0..continuation.len() {
+                let mut runtime = cisco_then_juniper_shell(&store);
+                exit_with(&mut runtime, &store, &genuine_reply(), &[]);
+                let chunks = reads(continuation, split);
+                let mut exchange: Vec<(&[u8], &[u8])> = vec![(typed, chunks[0])];
+                exchange.extend(chunks[1..].iter().map(|chunk| (&b""[..], *chunk)));
+                assert_eq!(
+                    at_parent_prompt(&mut runtime, &store, &exchange),
+                    None,
+                    "{name}, split at {split}"
+                );
+                assert_child_kept(&mut runtime, &store, JUNIPER);
+            }
+        }
+    }
+
+    #[test]
+    fn c2b_output_between_two_echoes_keeps_the_child() {
+        let store = ProfileStore::builtin();
+        for exchange in [
+            // A log line between the echo of `s` and the echo of `h`.
+            vec![
+                (&b"s"[..], &b"s"[..]),
+                (b"", b"\r\n%SYS-5-CONFIG_I: Configured\r\n"),
+                (b"h\r", b"h\r\n"),
+            ],
+            // Both keys read first; a byte that is neither echo in between.
+            vec![(&b"sh\r"[..], &b"s"[..]), (b"", b"x"), (b"", b"h\r\n")],
+            // More output than was typed, before the Enter.
+            vec![(&b"s"[..], &b"sh"[..]), (b"\r", b"\r\n")],
+        ] {
+            let mut runtime = cisco_then_juniper_shell(&store);
+            exit_with(&mut runtime, &store, &genuine_reply(), &[]);
+            assert_eq!(
+                at_parent_prompt(&mut runtime, &store, &exchange),
+                None,
+                "{exchange:?}"
+            );
+            assert_eq!(runtime.stack_len(), 2, "{exchange:?}");
+        }
+    }
+
+    #[test]
+    fn c2b_keys_whose_echo_cannot_be_matched_keep_the_child() {
+        // Backspace, Ctrl-U and Tab are echoed or completed in ways the
+        // rule does not try to model.
+        let store = ProfileStore::builtin();
+        for (typed, echo) in [
+            (&b"sx\x7fh\r"[..], &b"sx\x08 \x08h\r\n"[..]),
+            (b"x\x15sh\r", b"x\r\x1b[Ksh\r\n"),
+            (b"sh\t\r", b"show \r\n"),
+        ] {
+            let mut runtime = cisco_then_juniper_shell(&store);
+            exit_with(&mut runtime, &store, &genuine_reply(), &[]);
+            assert_eq!(
+                at_parent_prompt(&mut runtime, &store, &[(typed, echo)]),
+                None,
+                "{typed:?}"
+            );
+            assert_eq!(runtime.stack_len(), 2, "{typed:?}");
+        }
+    }
+
+    #[test]
+    fn c2b_a_pasted_command_at_the_parent_prompt_confirms() {
+        let store = ProfileStore::builtin();
+        let mut runtime = cisco_then_juniper(&store);
+        exit_with(&mut runtime, &store, &genuine_reply(), &[]);
+        assert_eq!(
+            at_parent_prompt(
+                &mut runtime,
+                &store,
+                &[(
+                    b"\x1b[200~show version\r\x1b[201~",
+                    b"show version\r\nHostname: sw1\r\nsw1#"
+                )]
+            ),
+            Some((0, names(CISCO)))
+        );
+    }
+
+    #[test]
+    fn c2b_keys_typed_before_the_parent_prompt_keep_the_child() {
+        // The next command typed ahead, before the close arrives.
+        let store = ProfileStore::builtin();
+        let mut runtime = cisco_then_juniper(&store);
+        runtime.observe_input(b"exit\r");
+        runtime.observe_input(b"show version\r");
+        assert_eq!(
+            runtime.observe_output(
+                format!(
+                    "exit{}show version\r\nHostname: sw1\r\nsw1#",
+                    genuine_reply()
+                )
+                .as_bytes(),
+                &store
+            ),
+            None
+        );
+        assert_eq!(runtime.stack_len(), 2);
+    }
+
+    #[test]
+    fn c2b_a_remote_command_typed_first_at_the_parent_prompt_opens_from_it() {
+        // The first command at the parent prompt is read before its echo
+        // confirms the return; it still opens a connection from the parent.
+        let store = ProfileStore::builtin();
+        let mut runtime = cisco_then_juniper(&store);
+        exit_with(&mut runtime, &store, &genuine_reply(), &[]);
+        assert_eq!(
+            step(
+                &mut runtime,
+                &store,
+                "ssh sw3",
+                &["Arista Networks EOS version 4.31\nleaf3#"]
+            ),
+            Some(names(ARISTA))
+        );
+        assert_eq!(runtime.stack_len(), 2);
+        exit_with(
+            &mut runtime,
+            &store,
+            "\r\n[Connection to sw3 closed by foreign host]\r\nsw1#",
+            &[],
+        );
+        assert_eq!(key(&mut runtime, &store), Some(names(CISCO)));
+        assert_eq!(runtime.stack_len(), 1);
+    }
+
+    // C-2b, input sequences that are not keys (review 81, must-fix 2).
+
+    #[test]
+    fn c2b_input_sequences_that_are_not_keys_keep_the_waiting_parent_prompt() {
+        let store = ProfileStore::builtin();
+        for (name, sequence) in [
+            ("arrow", &b"\x1b[A"[..]),
+            ("application arrow", b"\x1bOA"),
+            ("focus report", b"\x1b[I"),
+            ("paste begin", b"\x1b[200~"),
+            ("paste end", b"\x1b[201~"),
+        ] {
+            let mut runtime = cisco_then_juniper(&store);
+            exit_with(&mut runtime, &store, &genuine_reply(), &[]);
+            runtime.observe_input(sequence);
+            assert_eq!(key(&mut runtime, &store), Some(names(CISCO)), "{name}");
+            assert_eq!(runtime.stack_len(), 1, "{name}");
+        }
+        // A history recall redraws the line: not the echo of a typed key.
+        let mut runtime = cisco_then_juniper(&store);
+        exit_with(&mut runtime, &store, &genuine_reply(), &[]);
+        assert_eq!(
+            at_parent_prompt(
+                &mut runtime,
+                &store,
+                &[(b"\x1b[A", b"show clock"), (b"\r", b"\r\nCLOCK\r\nsw1#")]
+            ),
+            None
+        );
+        assert_eq!(runtime.stack_len(), 2);
+    }
+
+    // C-2b, Ctrl-D at the child's empty prompt (review 81, item 3).
+
+    #[test]
+    fn c2b_ctrl_d_at_the_child_s_empty_prompt_returns_like_exit() {
+        let store = ProfileStore::builtin();
+        for shown in ["", "logout", "exit"] {
+            let mut runtime = cisco_then_juniper(&store);
+            runtime.observe_input(b"\x04");
+            assert_eq!(
+                runtime.observe_output(format!("{shown}{}", genuine_reply()).as_bytes(), &store),
+                None,
+                "{shown:?}"
+            );
+            assert_eq!(key(&mut runtime, &store), Some(names(CISCO)), "{shown:?}");
+            assert_eq!(runtime.stack_len(), 1, "{shown:?}");
+        }
+    }
+
+    #[test]
+    fn c2b_ctrl_d_on_a_typed_line_or_without_the_evidence_keeps_the_child() {
+        let store = ProfileStore::builtin();
+        // Not an empty line.
+        let mut runtime = cisco_then_juniper(&store);
+        runtime.observe_input(b"sh");
+        runtime.observe_output(b"sh", &store);
+        runtime.observe_input(b"\x04");
+        runtime.observe_output(genuine_reply().as_bytes(), &store);
+        assert_eq!(key(&mut runtime, &store), None);
+        assert_eq!(runtime.stack_len(), 2);
+        // An empty line, but the child's own prompt comes back.
+        let mut runtime = cisco_then_juniper(&store);
+        runtime.observe_input(b"\x04");
+        runtime.observe_output(b"\r\nlab@sw2> ", &store);
+        assert_eq!(key(&mut runtime, &store), None);
+        assert_child_kept(&mut runtime, &store, JUNIPER);
+    }
+
+    #[test]
+    fn c2b_after_ctrl_d_the_first_line_starts_at_the_parent_prompt() {
+        // `ssh sw3` typed first at the parent prompt after a Ctrl-D: sw3's
+        // parent prompt is `sw1#`, so leaving sw3 returns to sw1.
+        let store = ProfileStore::builtin();
+        let mut runtime = cisco_then_juniper(&store);
+        runtime.observe_input(b"\x04");
+        runtime.observe_output(genuine_reply().as_bytes(), &store);
+        assert_eq!(
+            step(
+                &mut runtime,
+                &store,
+                "ssh sw3",
+                &["Arista Networks EOS version 4.31\nleaf3#"]
+            ),
+            Some(names(ARISTA))
+        );
+        exit_with(
+            &mut runtime,
+            &store,
+            "\r\n[Connection to sw3 closed by foreign host]\r\nsw1#",
+            &[],
+        );
+        assert_eq!(key(&mut runtime, &store), Some(names(CISCO)));
+        assert_eq!(runtime.stack_len(), 1);
     }
 
     // C-2b, the 512-byte bound (review 68, must-change 2).
@@ -4675,6 +5015,36 @@ mod leave_tests {
                 "{name}: the complete parent prompt line after the bracket"
             );
             assert_eq!(runtime.stack_len(), 1, "{name}");
+        }
+    }
+
+    #[test]
+    fn c2b_accepted_limit_child_echoing_the_whole_line_at_the_parent_prompt() {
+        // A still-connected child that prints the bracket and the exact
+        // parent prompt, then shows exactly the bytes typed and a line end:
+        // its own echo (review 81's `lookalike`), or, with echo off, output
+        // that happens to be the typed line. Nothing tells it from the
+        // parent, so it switches at the Enter's echo.
+        let store = ProfileStore::builtin();
+        for (name, typed, output) in [
+            (
+                "echoing_child",
+                &b"show version\r"[..],
+                &b"show version\r\nlab@sw2> "[..],
+            ),
+            (
+                "continuation_equal_to_the_line",
+                b"backup\r",
+                b"backup\r\nlab@sw2> ",
+            ),
+        ] {
+            let mut runtime = cisco_then_juniper_shell(&store);
+            exit_with(&mut runtime, &store, &genuine_reply(), &[]);
+            assert_eq!(
+                at_parent_prompt(&mut runtime, &store, &[(typed, output)]),
+                Some((0, names(CISCO))),
+                "{name}"
+            );
         }
     }
 

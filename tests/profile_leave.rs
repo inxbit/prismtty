@@ -185,3 +185,45 @@ done"#,
     );
     session.type_keys(b"quit\r");
 }
+
+#[test]
+fn a_line_that_goes_on_after_the_parent_prompt_keeps_the_child_colors() {
+    // Review 81's witness: still connected to sw2, the device prints the
+    // bracket and `sw1#`, turns its echo off, reads one key, and goes on with
+    // the same line. The key is the line's next byte.
+    let mut session = Session::start(
+        r#"printf 'user@laptop:~$ '
+while IFS= read -r line; do
+  case "$line" in
+    'ssh sw1') printf 'Cisco IOS Software\nsw1#' ;;
+    'ssh sw2') printf -- '--- JUNOS 22.4R3 Kernel 64-bit\nlab@sw2> ' ;;
+    exit)
+      printf '[Connection to sw2 closed by foreign host]\nsw1#'
+      stty -echo -icanon min 1 time 0
+      dd bs=1 count=1 >/dev/null 2>&1
+      printf 'backup\nlab@sw2> '
+      stty sane ;;
+    'show version') printf 'Hostname: sw2\nlab@sw2> ' ;;
+    quit) exit 0 ;;
+  esac
+done"#,
+    );
+    session.wait_for("user@laptop:~$ ", 1);
+    session.type_keys(b"ssh sw1\r");
+    session.wait_for("sw1#", 1);
+    session.type_keys(b"ssh sw2\r");
+    session.wait_for("lab@sw2> ", 1);
+    session.type_keys(b"exit\r");
+    session.wait_for("sw1#", 2);
+    session.type_keys(b"b");
+    session.wait_for("lab@sw2> ", 2);
+    session.type_keys(b"show version\r");
+    session.wait_for("Hostname: sw2", 1);
+    assert_eq!(
+        session.profile_before("Hostname: sw2"),
+        "generic, juniper",
+        "{:?}",
+        session.text()
+    );
+    session.type_keys(b"quit\r");
+}
