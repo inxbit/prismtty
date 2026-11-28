@@ -1704,3 +1704,53 @@ fn a_prompt_style_opened_by_c2_9b_is_ended_where_its_reset_was() {
         }
     }
 }
+
+/// A highlight is closed before a line end when the program's rendition
+/// draws blank cells in the foreground (inverse, strike-through,
+/// overline), so the next line is not painted in it. A style that a
+/// `C2 9B` SGR may have set counts too, as in 1.5.1: on a terminal that
+/// prints `C2 9B` the close and reopen change nothing. In a UTF-8 locale
+/// the full reset that closes it is not followed by the `C2 9B` style,
+/// because no restore is written from that form; in C the bytes are
+/// 1.5.1's.
+#[test]
+fn a_highlight_closes_before_a_line_end_where_a_c2_9b_style_may_draw_blank_cells() {
+    const GREEN: &[u8] = b"\x1b[38;2;0;255;0m";
+    for code in ["7", "9", "53"] {
+        let format = format!("\\302\\233{code}mlink up\\r\\nnext\\r\\n");
+        let restore = format!("\x1b[{code}m");
+        for (locale, full_reset_restore) in [
+            (&[("LC_ALL", "en_US.UTF-8")][..], ""),
+            (&[("LC_ALL", "C")][..], restore.as_str()),
+        ] {
+            for (flags, close) in [
+                (&[][..], "\x1b[39m".to_string()),
+                (
+                    &["--no-minimal-reset"][..],
+                    format!("\x1b[0m{full_reset_restore}"),
+                ),
+            ] {
+                let expected = [
+                    b"\xc2\x9b".as_slice(),
+                    code.as_bytes(),
+                    b"mlink ",
+                    GREEN,
+                    b"up",
+                    close.as_bytes(),
+                    b"\r\r\n",
+                    GREEN,
+                    close.as_bytes(),
+                    b"next\r\r\n",
+                ]
+                .concat();
+                let out = printf_on_a_pty(OnPty::Stdout, locale, flags, &format);
+                assert!(
+                    out == expected,
+                    "{code} {flags:?} {locale:?}\n  got {:?}\n want {:?}",
+                    String::from_utf8_lossy(&out),
+                    String::from_utf8_lossy(&expected)
+                );
+            }
+        }
+    }
+}
