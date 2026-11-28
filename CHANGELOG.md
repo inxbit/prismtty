@@ -35,27 +35,38 @@ All notable changes to PrismTTY are documented here.
     terminal reads UTF-8: PrismTTY takes a UTF-8 locale as the terminal's
     decoding. To a terminal that reads 8-bit bytes, a byte of a UTF-8
     character can be a control that moves the cursor.
-  - PrismTTY has seen nothing but controls on its list since it started or
-    since a full reset (RIS). The list holds SGR, cursor moves, erases and
-    edits, saved and restored cursors, tab stops, modes that change only
-    what the keys or the mouse send or how the cursor or the screen looks,
-    queries the terminal answers, titles, the working directory,
-    hyperlinks, colors, the clipboard, shell integration marks, vim's
-    terminal test, and ASCII as the character set; the code gives the
-    reason for each. Any other control, known or not, keeps every such read
-    as it came until RIS: VT52 or Tektronix mode, a row of double width or
-    height, 80 or 132 columns, a window resize, a status line, a character
-    set other than ASCII, a DCS string and a restore of saved modes among
-    them.
+  - PrismTTY has seen nothing but controls on its list since it started,
+    and local echo (`--local-echo`), which writes typed bytes to the
+    terminal outside the highlighter, is off. The list holds SGR, cursor
+    moves, erases and edits, saved and restored cursors, tab stops, modes
+    that change only what the keys or the mouse send or how the cursor or
+    the screen looks, queries the terminal answers, titles, the working
+    directory, hyperlinks, colors, the clipboard, shell integration marks,
+    vim's terminal test, and ASCII as the character set; the code gives
+    the reason for each. A title or another string on the list counts only
+    when its text holds no control: no C0 control, ESC or DEL, no byte
+    from 80 to 9F, and past ASCII only valid UTF-8 under a UTF-8 locale.
+    Any other control, known or not, keeps every such read as it came for
+    the rest of the session, RIS after it included: VT52 or Tektronix
+    mode, a row of double width or height, 80 or 132 columns, a window
+    resize, a status line, a soft reset (DECSTR), a character set other
+    than ASCII, other DCS strings and a restore of saved modes among them.
   - A few controls on the list leave a state that keeps such reads as they
-    came until its exact reset, or RIS: a scroll region that is not the
-    whole screen, left and right margins, reverse wraparound (modes 45 and
-    1045), autowrap off, insert mode, and a soft reset (DECSTR), which can
-    leave autowrap off. A state counts as on after any form that may set
-    it. A scroll region set on the main screen counts until it is reset
-    there, for terminals that keep one region for each screen. A switch to
-    a decoding other than UTF-8 (`ESC % @`, or national character sets)
+    came until its exact reset, or RIS when nothing off the list came
+    before it: a scroll region that is not the whole screen, left and
+    right margins, reverse wraparound (modes 45 and 1045), autowrap off
+    and insert mode. A state counts as on after any form that may set it.
+    A scroll region set on the main screen counts until it is reset there,
+    for terminals that keep one region for each screen. A switch to a
+    decoding other than UTF-8 (`ESC % @`, or national character sets)
     counts until its exact reverse, and RIS does not clear it.
+  - A save of the cursor (`ESC 7`, `CSI s`, or a switch to the alternate
+    screen) while one of those states is on keeps such reads as they came
+    for the rest of the session, because some terminals save autowrap with
+    the cursor and restore it. After a program saves the cursor while a
+    scroll region is set, as apt's and dpkg's progress bar does, lines that
+    share a read with a prompt redraw are written as before for the rest
+    of the session.
 
   PrismTTY reads the terminal's size before it processes such a read. A
   resize between then and the terminal drawing the read is not seen. Any
