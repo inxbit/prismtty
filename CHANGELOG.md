@@ -9,11 +9,12 @@ All notable changes to PrismTTY are documented here.
 - Leaving a device that you reached from another device now returns to the
   first device's colors, where PrismTTY used to keep the colors of the device
   you left. It watches for two exchanges:
-  - After you type `exit`, `quit` or `logout` on a device you opened with
-    `ssh`, `mosh` or `telnet` from another device, the output shows
-    `[Connection to NAME closed by foreign host]` for the device you
-    connected to, and the first prompt after it is exactly the prompt you
-    were at when you opened that connection. That prompt confirms as a
+  - After you type or paste `exit`, `quit` or `logout` (not recalled from
+    history or edited) on a device you opened by typing `ssh`, `mosh` or
+    `telnet` on another device, the output shows
+    `[Connection to NAME closed by foreign host]`, where NAME is the host you
+    typed in that command, and the first prompt after it is exactly the
+    prompt you were at when you opened that connection. That prompt confirms as a
     complete line, or as the prompt waiting for input: the next key you type
     there must come back as its echo, so the colors change as you start the
     next command. An unfinished line that only starts with that prompt does
@@ -38,11 +39,12 @@ All notable changes to PrismTTY are documented here.
   and telnet's `!` and `z`. The clock is checked when PrismTTY reads output,
   so a stopped or very slow session can also miss a close.
 
-  PrismTTY trusts these lines. A device that is still connected and prints
-  them, for example a saved session log shown at logout or a configuration
-  that holds the parent prompt as a line, switches the colors too early. Only
-  colors change, and with `--show-profile` and a stderr that nobody reads, the
-  read that confirms the switch waits until stderr drains.
+  PrismTTY trusts these lines. A device, or a logout script on it, that
+  prints the same lines while you are still connected, for example a saved
+  session log or a configuration that holds the parent prompt as a line,
+  switches the colors early. Only colors change. With `--show-profile` and a
+  stderr that nobody reads, the read that confirms the switch waits until
+  stderr drains.
 
 ## 1.5.1 - 2026-11-27
 
