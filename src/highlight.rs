@@ -3885,12 +3885,28 @@ const CONTROL_TABLE: &[TableEntry] = &[
     inert(Form::Bytes(b"\x1bD"), "IND: moves down or scrolls"),
     inert(Form::Bytes(b"\x1bE"), "NEL: moves to the next line"),
     inert(Form::Bytes(b"\x1bM"), "RI: moves up or scrolls"),
-    // Saved and restored cursors. xterm saves and restores the position, the
-    // rendition, origin mode, protection, the character sets and the wrap
-    // flag (cursor.c `CursorSave2`, `CursorRestoreFlags` with `DECSC_FLAGS`).
-    // Origin mode is on the table; a character set other than the default,
-    // and protection, are not, so a restore brings back nothing the guard has
-    // not already taken as off the table.
+    // Saved and restored cursors. A save of the cursor (`ESC 7`, `CSI s`,
+    // and modes 47, 1047 and 1049 set) is on the table only while every
+    // followed state is safe; a save while any is hazardous turns the guard
+    // off for the session (`LayoutModes::observe_control`), so a restore
+    // brings back nothing the guard has not seen as safe.
+    //
+    // That is wider than the terminals read need. xterm saves the position,
+    // the rendition, origin mode, protection, the character sets and the
+    // wrap flag, and its restore brings back `DECSC_FLAGS` = ATTRIBUTES,
+    // ORIGIN and PROTECTED (cursor.c:398-417, 461, 508-520). Kitty saves the
+    // cursor, DECOM, DECAWM, DECSCNM and the character sets, and restores
+    // them (screen.c:5243-5251, 5345-5360), on mode 1049 but not 47 or 1047
+    // (screen.c:4600-4607); its soft reset drops both save points. iTerm2
+    // saves the position, the character sets, the rendition, origin,
+    // wraparound, the Unicode version and protection (VT100Terminal.m:
+    // 1700-1716, restored at 1758-1777), on modes 1048 and 1049 but not 47 or
+    // 1047 (1040-1067), and its DECSTR saves after turning wraparound on. Of
+    // the followed states only autowrap is saved by any of them. A narrower
+    // rule, a save while autowrap is off, could replace this one once every
+    // terminal with a cursor save is shown to keep the rest out of it: VTE,
+    // WezTerm, Windows Terminal, tmux, screen, foot, alacritty, Terminal.app
+    // and the Linux console.
     inert(Form::Bytes(b"\x1b7"), "DECSC: saves the cursor"),
     inert(Form::Bytes(b"\x1b8"), "DECRC: restores what DECSC saved"),
     inert(
@@ -4064,10 +4080,6 @@ const CONTROL_TABLE: &[TableEntry] = &[
         "DECNRCM: national character sets, until `CSI ? 42 l`, across RIS",
     ),
     followed(Form::AnsiMode(4), "IRM: insert mode, until `CSI 4 l`"),
-    followed(
-        Form::CsiWith(b'!', b'p'),
-        "DECSTR: can leave autowrap off, until `CSI ? 7 h`",
-    ),
 ];
 
 /// How [`CONTROL_TABLE`] takes `bytes`, a control token, or `None` when it
@@ -4180,6 +4192,14 @@ fn listed_control(bytes: &[u8]) -> Option<Listed> {
         .map(|entry| entry.listed)
 }
 
+/// Whether `bytes`, a control on [`CONTROL_TABLE`], saves the cursor: DECSC
+/// (`ESC 7`) or `CSI s`, taken as SCOSC also while mode 69 makes it set the
+/// margins. The alternate-screen modes are judged where they are followed.
+fn saves_the_cursor(bytes: &[u8]) -> bool {
+    bytes == b"\x1b7"
+        || (bytes.starts_with(b"\x1b[") && bytes.ends_with(b"s") && !bytes.contains(&b'?'))
+}
+
 /// Whether `byte`, a C0 control or DEL in the text, is on [`CONTROL_TABLE`].
 fn listed_text_control(byte: u8) -> bool {
     CONTROL_TABLE
@@ -4266,12 +4286,18 @@ impl LayoutModes {
             self.decoding_switched = coding != b"G";
             return;
         }
+        let hazard_before = self.holds_a_hazard();
         match listed_control(bytes) {
             None => {
                 self.unlisted_control = true;
                 return;
             }
-            Some(Listed::Inert) => return,
+            Some(Listed::Inert) => {
+                if hazard_before && saves_the_cursor(bytes) {
+                    self.unlisted_control = true;
+                }
+                return;
+            }
             Some(Listed::Followed) => {}
         }
         // A followed control: an exact `ESC [` form with plain parameters.
@@ -4279,7 +4305,6 @@ impl LayoutModes {
             return;
         };
         match (final_byte, parameters.strip_prefix(b"?")) {
-            (b'p', None) => self.autowrap_off = true,
             (b'r', None) => {
                 let region = scroll_region_set_by(parameters, true);
                 self.scroll_region = region;
@@ -4287,10 +4312,35 @@ impl LayoutModes {
                     self.main_screen_region = region;
                 }
             }
-            (b'h' | b'l', Some(modes)) => self.set_private_modes(modes, final_byte == b'h'),
+            (b'h' | b'l', Some(modes)) => {
+                self.set_private_modes(modes, final_byte == b'h');
+                // The switch to the alternate screen saves the cursor in some
+                // terminals (1049), and is taken as a save for all three.
+                if final_byte == b'h'
+                    && (hazard_before || self.holds_a_hazard())
+                    && liberal_mode_numbers(modes)
+                        .any(|mode| matches!(mode, Some(47 | 1047 | 1049)))
+                {
+                    self.unlisted_control = true;
+                }
+            }
             (b'h' | b'l', None) => self.set_ansi_modes(parameters, final_byte == b'h'),
             _ => {}
         }
+    }
+
+    /// Whether a followed state is in its hazardous value, which a save of
+    /// the cursor now could keep for a later restore to bring back.
+    fn holds_a_hazard(&self) -> bool {
+        self.reverse_wrap
+            || self.reverse_wrap_any_line
+            || self.left_right_margins
+            || self.autowrap_off
+            || self.insert_mode
+            || self.decoding_switched
+            || self.national_charsets
+            || self.scroll_region != ScrollRegion::Whole
+            || self.main_screen_region != ScrollRegion::Whole
     }
 
     /// `CSI ... h` and `l` without `?`: insert mode is 4.
